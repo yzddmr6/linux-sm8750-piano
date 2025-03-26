@@ -5158,7 +5158,15 @@ int of_clk_add_provider(struct device_node *np,
 	mutex_unlock(&of_clk_mutex);
 	pr_debug("Added clock from %pOF\n", np);
 
+	ret = clk_pm_runtime_get_all();
+	if (ret) {
+		of_clk_del_provider(np);
+		return ret;
+	}
+
 	clk_core_reparent_orphans();
+
+	clk_pm_runtime_put_all();
 
 	ret = of_clk_set_defaults(np, true);
 	if (ret < 0)
@@ -5200,7 +5208,15 @@ int of_clk_add_hw_provider(struct device_node *np,
 	mutex_unlock(&of_clk_mutex);
 	pr_debug("Added clk_hw provider from %pOF\n", np);
 
+	ret = clk_pm_runtime_get_all();
+	if (ret) {
+		of_clk_del_provider(np);
+		return ret;
+	}
+
 	clk_core_reparent_orphans();
+
+	clk_pm_runtime_put_all();
 
 	ret = of_clk_set_defaults(np, true);
 	if (ret < 0)
