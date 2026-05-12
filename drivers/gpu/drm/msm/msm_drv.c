@@ -137,6 +137,15 @@ bool msm_separate_gpu_kms_components(void)
 	}
 }
 
+bool msm_gpu_use_separate_drm_dev(struct platform_device *pdev)
+{
+	if (!pdev)
+		return msm_separate_gpu_kms_components();
+
+	return of_device_is_compatible(pdev->dev.of_node, "amd,imageon") ||
+		(msm_separate_gpu_kms_components() && adreno_has_gpu(pdev->dev.of_node));
+}
+
 static int msm_drm_uninit(struct device *dev, const struct component_ops *gpu_ops)
 {
 	struct platform_device *pdev = to_platform_device(dev);
