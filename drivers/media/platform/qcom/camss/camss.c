@@ -6189,9 +6189,11 @@ static const struct camss_resources sm8750_resources = {
 	.pd_name = "top",
 	.csiphy_res = csiphy_res_kaanapali,
 	.csid_res = csid_res_sm8750,
+	.vfe_res = vfe_res_kaanapali,
 	.icc_res = icc_res_sm8750,
 	.csiphy_num = ARRAY_SIZE(csiphy_res_kaanapali),
 	.csid_num = ARRAY_SIZE(csid_res_sm8750),
+	.vfe_num = ARRAY_SIZE(vfe_res_kaanapali),
 	.icc_path_num = ARRAY_SIZE(icc_res_sm8750),
 };
 
