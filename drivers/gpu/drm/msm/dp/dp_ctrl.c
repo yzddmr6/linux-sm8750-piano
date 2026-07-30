@@ -2289,8 +2289,11 @@ static bool msm_dp_ctrl_channel_eq_ok(struct msm_dp_ctrl_private *ctrl)
 {
 	u8 link_status[DP_LINK_STATUS_SIZE];
 	int num_lanes = ctrl->link->link_params.num_lanes;
+	int ret;
 
-	drm_dp_dpcd_read_link_status(ctrl->aux, link_status);
+	ret = drm_dp_dpcd_read_link_status(ctrl->aux, link_status);
+	if (ret)
+		return false;
 
 	return drm_dp_channel_eq_ok(link_status, num_lanes);
 }
