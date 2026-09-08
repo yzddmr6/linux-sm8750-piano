@@ -1348,7 +1348,15 @@ static void ath12k_core_trigger_partner(struct ath12k_base *ab)
 int ath12k_core_qmi_firmware_ready(struct ath12k_base *ab)
 {
 	struct ath12k_hw_group *ag = ath12k_ab_to_ag(ab);
-	int ret, i;
+	int ret, i, gen;
+
+	/* firmware instance this bring-up belongs to */
+	gen = atomic_read(&ab->fw_generation);
+
+	if (!ab->hal.srng_config) {
+		ath12k_err(ab, "hal is not initialised, refusing firmware bring-up\n");
+		return -EINVAL;
+	}
 
 	ret = ath12k_core_start_firmware(ab, ab->fw_mode);
 	if (ret) {
@@ -1414,7 +1422,12 @@ err_deinit:
 	mutex_unlock(&ag->mutex);
 
 err_firmware_stop:
-	ath12k_qmi_firmware_stop(ab);
+	/* A crash mid bring-up swapped the target; do not stop the new instance. */
+	if (atomic_read(&ab->fw_generation) != gen)
+		ath12k_warn(ab, "firmware restarted during bring-up (gen %d -> %d), not stopping the new instance\n",
+			    gen, atomic_read(&ab->fw_generation));
+	else
+		ath12k_qmi_firmware_stop(ab);
 
 exit:
 	return ret;
@@ -1445,16 +1458,18 @@ static int ath12k_core_reconfigure_on_crash(struct ath12k_base *ab)
 	clear_bit(ATH12K_FLAG_CRASH_FLUSH, &ab->dev_flags);
 
 	ret = ath12k_core_qmi_firmware_ready(ab);
-	if (ret)
-		goto err_hal_srng_deinit;
+	if (ret) {
+		/* Keep the HAL: the next FW_READY retries through ath12k_ce_init_pipes(),
+		 * which needs it.
+		 */
+		ath12k_warn(ab, "crash recovery failed, keeping hal for retry: %d\n",
+			    ret);
+		return ret;
+	}
 
 	clear_bit(ATH12K_FLAG_RECOVERY, &ab->dev_flags);
 
 	return 0;
-
-err_hal_srng_deinit:
-	ath12k_hal_srng_deinit(ab);
-	return ret;
 }
 
 static void ath12k_rfkill_work(struct work_struct *work)

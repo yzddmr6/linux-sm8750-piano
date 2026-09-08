@@ -1059,6 +1059,9 @@ struct ath12k_base {
 	/* continuous recovery fail count */
 	atomic_t fail_cont_count;
 	unsigned long reset_fail_timeout;
+
+	/* bumped when the QMI server goes away */
+	atomic_t fw_generation;
 	struct work_struct update_11d_work;
 	u8 new_alpha2[2];
 	struct {

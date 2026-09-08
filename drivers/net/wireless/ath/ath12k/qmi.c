@@ -4221,6 +4221,10 @@ static void ath12k_qmi_ops_del_server(struct qmi_handle *qmi_hdl,
 	struct ath12k_base *ab = qmi->ab;
 
 	ath12k_dbg(ab, ATH12K_DBG_QMI, "qmi wifi fw del server\n");
+
+	/* in-flight bring-ups must not complete against the replacement */
+	atomic_inc(&ab->fw_generation);
+
 	ath12k_qmi_driver_event_post(qmi, ATH12K_QMI_EVENT_SERVER_EXIT, NULL);
 }
 
