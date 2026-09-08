@@ -260,6 +260,10 @@ static void ath12k_thermal_cleanup_radio(struct ath12k_base *ab, int i)
 	if (!ar)
 		return;
 
+	/* a failed recovery leaves this NULL for the next crash */
+	if (!ar->thermal.hwmon_dev)
+		return;
+
 	hwmon_device_unregister(ar->thermal.hwmon_dev);
 	ar->thermal.hwmon_dev = NULL;
 
