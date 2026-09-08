@@ -8,6 +8,19 @@
 #include "debug.h"
 #include "hif.h"
 
+/* false once ath12k_hal_srng_deinit() has freed the shadow pointers */
+static bool ath12k_ce_pipe_srng_alive(struct ath12k_base *ab,
+				      struct ath12k_ce_pipe *pipe)
+{
+	struct ath12k_ce_ring *ring;
+
+	ring = pipe->src_ring ? pipe->src_ring : pipe->dest_ring;
+	if (!ring)
+		return false;
+
+	return ab->hal.srng_list[ring->hal_ring_id].initialized;
+}
+
 static int ath12k_ce_rx_buf_enqueue_pipe(struct ath12k_ce_pipe *pipe,
 					 struct sk_buff *skb, dma_addr_t paddr)
 {
@@ -434,6 +447,10 @@ int ath12k_ce_send(struct ath12k_base *ab, struct sk_buff *skb, u8 pipe_id,
 	u8 byte_swap_data = 0;
 	int num_used;
 
+	/* a late transmit after the HAL is torn down would oops */
+	if (!ath12k_ce_pipe_srng_alive(ab, pipe))
+		return -ESHUTDOWN;
+
 	/* Check if some entries could be regained by handling tx completion if
 	 * the CE has interrupts disabled and the used entries is more than the
 	 * defined usage threshold.
@@ -532,6 +549,10 @@ void ath12k_ce_cleanup_pipes(struct ath12k_base *ab)
 
 	for (pipe_num = 0; pipe_num < ab->hw_params->ce_count; pipe_num++) {
 		pipe = &ab->ce.ce_pipe[pipe_num];
+
+		if (!ath12k_ce_pipe_srng_alive(ab, pipe))
+			continue;
+
 		ath12k_ce_rx_pipe_cleanup(pipe);
 
 		/* Cleanup any src CE's which have interrupts disabled */

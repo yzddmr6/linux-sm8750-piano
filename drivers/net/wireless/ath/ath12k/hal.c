@@ -764,6 +764,11 @@ err_hal:
 void ath12k_hal_srng_deinit(struct ath12k_base *ab)
 {
 	struct ath12k_hal *hal = &ab->hal;
+	int i;
+
+	/* Mark the rings dead before freeing what their shadow pointers reference. */
+	for (i = 0; i < HAL_SRNG_RING_ID_MAX; i++)
+		hal->srng_list[i].initialized = 0;
 
 	ath12k_hal_unregister_srng_lock_keys(hal);
 	ath12k_hal_free_cont_rdp(hal);
