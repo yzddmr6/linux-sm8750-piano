@@ -62,6 +62,10 @@ ath12k_dp_link_peer_find_by_addr(struct ath12k_dp *dp, const u8 *addr)
 {
 	lockdep_assert_held(&dp->dp_lock);
 
+	/* torn down by ath12k_dp_cleanup() on a crash */
+	if (!dp->rhead_peer_addr)
+		return NULL;
+
 	return rhashtable_lookup_fast(dp->rhead_peer_addr, addr,
 				      dp->rhash_peer_addr_param);
 }
@@ -274,14 +278,21 @@ int ath12k_dp_link_peer_rhash_tbl_init(struct ath12k_dp *dp)
 
 void ath12k_dp_link_peer_rhash_tbl_destroy(struct ath12k_dp *dp)
 {
+	struct rhashtable *tbl;
+
 	guard(mutex)(&dp->link_peer_rhash_tbl_lock);
 
-	if (!dp->rhead_peer_addr)
+	/* clear under dp_lock; rhashtable_destroy() sleeps */
+	scoped_guard(spinlock_bh, &dp->dp_lock) {
+		tbl = dp->rhead_peer_addr;
+		dp->rhead_peer_addr = NULL;
+	}
+
+	if (!tbl)
 		return;
 
-	rhashtable_destroy(dp->rhead_peer_addr);
-	kfree(dp->rhead_peer_addr);
-	dp->rhead_peer_addr = NULL;
+	rhashtable_destroy(tbl);
+	kfree(tbl);
 }
 
 static int ath12k_dp_link_peer_rhash_insert(struct ath12k_dp *dp,
@@ -290,6 +301,9 @@ static int ath12k_dp_link_peer_rhash_insert(struct ath12k_dp *dp,
 	struct ath12k_dp_link_peer *tmp;
 
 	lockdep_assert_held(&dp->dp_lock);
+
+	if (!dp->rhead_peer_addr)
+		return -ENOENT;
 
 	tmp = rhashtable_lookup_get_insert_fast(dp->rhead_peer_addr, &peer->rhash_addr,
 						dp->rhash_peer_addr_param);
@@ -307,6 +321,9 @@ static int ath12k_dp_link_peer_rhash_remove(struct ath12k_dp *dp,
 	int ret;
 
 	lockdep_assert_held(&dp->dp_lock);
+
+	if (!dp->rhead_peer_addr)
+		return 0;
 
 	ret = rhashtable_remove_fast(dp->rhead_peer_addr, &peer->rhash_addr,
 				     dp->rhash_peer_addr_param);
