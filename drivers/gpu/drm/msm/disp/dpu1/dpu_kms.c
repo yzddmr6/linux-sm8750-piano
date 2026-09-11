@@ -1275,11 +1275,29 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 	}
 
 
-	/* TODO: use the same max_freq as in dpu_kms_hw_init */
-	max_core_clk_rate = dpu_kms_get_clk_rate(dpu_kms, "core");
+	/*
+	 * The ceiling must reflect the clock hardware's capability, not the
+	 * rate the bootloader happened to leave behind: a low splash-screen
+	 * rate would otherwise reject modes the pipeline can sustain.
+	 */
+	max_core_clk_rate = 0;
+	{
+		struct clk *core_clk = msm_clk_bulk_get_clock(dpu_kms->clocks,
+							      dpu_kms->num_clocks,
+							      "core");
+		if (core_clk) {
+			long rate = clk_round_rate(core_clk, ULONG_MAX);
+
+			if (rate > 0)
+				max_core_clk_rate = rate;
+		}
+	}
 	if (!max_core_clk_rate) {
-		DPU_DEBUG("max core clk rate not determined, using default\n");
-		max_core_clk_rate = DPU_PERF_DEFAULT_MAX_CORE_CLK_RATE;
+		max_core_clk_rate = dpu_kms_get_clk_rate(dpu_kms, "core");
+		if (!max_core_clk_rate) {
+			DPU_DEBUG("max core clk rate not determined, using default\n");
+			max_core_clk_rate = DPU_PERF_DEFAULT_MAX_CORE_CLK_RATE;
+		}
 	}
 
 	rc = dpu_core_perf_init(&dpu_kms->perf, dpu_kms->catalog->perf, max_core_clk_rate,
