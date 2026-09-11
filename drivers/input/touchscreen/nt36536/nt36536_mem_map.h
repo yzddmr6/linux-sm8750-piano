@@ -55,12 +55,15 @@ struct nvt_ts_mem_map {
 	/* FW History */
 	uint32_t MMAP_HISTORY_EVENT0;
 	uint32_t MMAP_HISTORY_EVENT1;
+	uint32_t MMAP_HISTORY_EVENT2;
+	uint32_t MMAP_HISTORY_EVENT3;
 	/* START for flash FW update */
 	uint32_t READ_FLASH_CHECKSUM_ADDR;
 	uint32_t RW_FLASH_DATA_ADDR;
 	/* END for FW Update Use */
 	/* Phase 2 Host Download */
 	uint32_t BOOT_RDY_ADDR;
+	uint32_t ACI_ERR_CLR_ADDR;
 	uint32_t POR_CD_ADDR;
 	uint32_t TX_AUTO_COPY_EN;
 	uint32_t SPI_DMA_TX_INFO;
@@ -78,12 +81,14 @@ struct nvt_ts_mem_map {
 	uint32_t DMA_CRC_EN_ADDR;
 	uint32_t BLD_ILM_DLM_CRC_ADDR;
 	uint32_t DMA_CRC_FLAG_ADDR;
+	uint32_t DOZE_GM_S1D_SCAN_RAW_ADDR;
+	uint32_t DOZE_GM_BTN_SCAN_RAW_ADDR;
 };
 
 struct nvt_ts_hw_info {
 	uint8_t hw_crc;
 	uint8_t auto_copy;
-	bool use_gcm;
+	uint8_t bld_multi_header;
 	const struct nvt_ts_hw_reg_addr_info *hw_regs;
 };
 
@@ -98,6 +103,13 @@ typedef enum {
 	CHECK_SPI_DMA_TX_INFO = 0x01,
 	CHECK_TX_AUTO_COPY_EN = 0x02,
 } AUTOCOPYCheck;
+
+typedef enum {
+	BLDMHEADER_NOSUPPORT           = 0x00,
+	BLDMHEADER_SUPPORT             = 0x01,
+	BLDMHEADER_PH2FLASH_HEADER_ONE = 0x02,
+	BLDMHEADER_PH2FLASH_MULTI      = 0x03,
+} BLDMultiHeader;
 
 /* hw info reg*/
 struct nvt_ts_hw_reg_addr_info {
@@ -145,16 +157,17 @@ static const struct nvt_ts_mem_map NT36536_cascade_memory_map = {
 	.PEN_1D_DIFF_TIP_Y_ADDR   = 0x131DD0,
 	.PEN_1D_DIFF_RING_X_ADDR  = 0x131E60,
 	.PEN_1D_DIFF_RING_Y_ADDR  = 0x131EF0,
+	.DOZE_GM_S1D_SCAN_RAW_ADDR = 0x1126A0,
+	.DOZE_GM_BTN_SCAN_RAW_ADDR = 0,
 	.ENB_CASC_REG             = {.addr = 0x1FB12C, .mask = 0x01},
 	/* FW History */
 	.MMAP_HISTORY_EVENT0      = 0x124D7C,
 	.MMAP_HISTORY_EVENT1      = 0x124DBC,
-	/* START for flash FW update */
-	.READ_FLASH_CHECKSUM_ADDR = 0x124E00,
-	.RW_FLASH_DATA_ADDR       = 0x124E40,
+	.MMAP_HISTORY_EVENT2      = 0x124E00,
+	.MMAP_HISTORY_EVENT3      = 0x124E40,
 	/* Phase 2 Host Download */
 	.BOOT_RDY_ADDR            = 0x1FB50D,
-	.POR_CD_ADDR              = 0x1FB605,
+	.ACI_ERR_CLR_ADDR         = 0x1FB605,
 	.TX_AUTO_COPY_EN          = 0x1FC825,
 	.SPI_DMA_TX_INFO          = 0x1FC814,
 	/* BLD CRC */
@@ -201,16 +214,15 @@ static const struct nvt_ts_mem_map NT36536_single_memory_map = {
 	.PEN_1D_DIFF_TIP_Y_ADDR   = 0x130B90,
 	.PEN_1D_DIFF_RING_X_ADDR  = 0x130C20,
 	.PEN_1D_DIFF_RING_Y_ADDR  = 0x130CB0,
+	.DOZE_GM_S1D_SCAN_RAW_ADDR = 0x121750,
+	.DOZE_GM_BTN_SCAN_RAW_ADDR = 0,
 	.ENB_CASC_REG             = {.addr = 0x1FB12C, .mask = 0x01},
 	/* FW History */
 	.MMAP_HISTORY_EVENT0      = 0x12CB2C,
 	.MMAP_HISTORY_EVENT1      = 0x12CB6C,
-	/* START for flash FW update */
-	.READ_FLASH_CHECKSUM_ADDR = 0,
-	.RW_FLASH_DATA_ADDR       = 0,
 	/* Phase 2 Host Download */
 	.BOOT_RDY_ADDR            = 0x1FB50D,
-	.POR_CD_ADDR              = 0x1FB605,
+	.ACI_ERR_CLR_ADDR         = 0x1FB605,
 	.TX_AUTO_COPY_EN          = 0x1FC825,
 	.SPI_DMA_TX_INFO          = 0x1FC814,
 	/* BLD CRC */
@@ -258,12 +270,17 @@ static const struct nvt_ts_mem_map NT36532_cascade_memory_map = {
 	.PEN_1D_DIFF_TIP_Y_ADDR   = 0x127EC0,
 	.PEN_1D_DIFF_RING_X_ADDR  = 0x127F40,
 	.PEN_1D_DIFF_RING_Y_ADDR  = 0x127FC0,
+	.DOZE_GM_S1D_SCAN_RAW_ADDR = 0x10F940,
+	.DOZE_GM_BTN_SCAN_RAW_ADDR = 0,
 	.ENB_CASC_REG             = {.addr = 0x1FB12C, .mask = 0x01},
 	/* FW History */
 	.MMAP_HISTORY_EVENT0      = 0x121AFC,
 	.MMAP_HISTORY_EVENT1      = 0x121B3C,
+	.MMAP_HISTORY_EVENT2      = 0x121B80,
+	.MMAP_HISTORY_EVENT3      = 0x121BC0,
 	/* Phase 2 Host Download */
 	.BOOT_RDY_ADDR            = 0x1FB50D,
+	.ACI_ERR_CLR_ADDR         = 0x1FB605,
 	.TX_AUTO_COPY_EN          = 0x1FC925,
 	.SPI_DMA_TX_INFO          = 0x1FC914,
 	/* BLD CRC */
@@ -310,12 +327,15 @@ static const struct nvt_ts_mem_map NT36532_single_memory_map = {
 	.PEN_1D_DIFF_TIP_Y_ADDR   = 0x126A80,
 	.PEN_1D_DIFF_RING_X_ADDR  = 0x126B00,
 	.PEN_1D_DIFF_RING_Y_ADDR  = 0x126B80,
+	.DOZE_GM_S1D_SCAN_RAW_ADDR = 0x10ED2C,
+	.DOZE_GM_BTN_SCAN_RAW_ADDR = 0,
 	.ENB_CASC_REG             = {.addr = 0x1FB12C, .mask = 0x01},
 	/* FW History */
 	.MMAP_HISTORY_EVENT0      = 0x122930,
 	.MMAP_HISTORY_EVENT1      = 0x122970,
 	/* Phase 2 Host Download */
 	.BOOT_RDY_ADDR            = 0x1FB50D,
+	.ACI_ERR_CLR_ADDR         = 0x1FB605,
 	.TX_AUTO_COPY_EN          = 0x1FC925,
 	.SPI_DMA_TX_INFO          = 0x1FC914,
 	/* BLD CRC */
@@ -337,14 +357,14 @@ static const struct nvt_ts_mem_map NT36532_single_memory_map = {
 static struct nvt_ts_hw_info NT36536_hw_info = {
 	.hw_crc    = HWCRC_LEN_3Bytes,
 	.auto_copy = CHECK_TX_AUTO_COPY_EN,
-	.use_gcm   = 1,
+	.bld_multi_header = BLDMHEADER_SUPPORT,
 	.hw_regs   = &hw_reg_addr_info,
 };
 
 static struct nvt_ts_hw_info NT36532_hw_info = {
 	.hw_crc    = HWCRC_LEN_3Bytes,
 	.auto_copy = CHECK_TX_AUTO_COPY_EN,
-	.use_gcm   = 0,
+	.bld_multi_header = BLDMHEADER_NOSUPPORT,
 	.hw_regs   = &hw_reg_addr_info,
 };
 

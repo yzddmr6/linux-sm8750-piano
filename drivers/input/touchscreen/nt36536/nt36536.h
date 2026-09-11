@@ -139,7 +139,7 @@ struct nvt_ts_data {
 	struct mutex lock;
 	const struct nvt_ts_mem_map *mmap;
 	uint8_t hw_crc;
-	uint8_t use_gcm;
+	uint8_t bld_multi_header;
 	uint32_t crc_err_flag_addr;
 	uint16_t nvt_pid;
 	uint8_t *rbuf;

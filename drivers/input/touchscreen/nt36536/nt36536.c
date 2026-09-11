@@ -1126,7 +1126,8 @@ static int8_t nvt_ts_check_chip_ver_trim(void)
 	uint8_t i = 0;
 	int32_t list = 0;
 	int32_t retry = 0;
-	const int32_t retry_max = 6;
+	/* vendor module checks 5 times */
+	const int32_t retry_max = 5;
 	const struct nvt_ts_trim_id_table *entry = NULL;
 	uint32_t chip_ver_trim_addr = trim_id_table[0].hwinfo->hw_regs->chip_ver_trim_addr;
 
@@ -1177,7 +1178,7 @@ matched:
 
 	ts->hw_crc = entry->hwinfo->hw_crc;
 	ts->auto_copy = entry->hwinfo->auto_copy;
-	ts->use_gcm = entry->hwinfo->use_gcm;
+	ts->bld_multi_header = entry->hwinfo->bld_multi_header;
 	ts->crc_err_flag_addr = entry->hwinfo->hw_regs->crc_err_flag_addr;
 
 	//---detect single or cascade via ENB_CASC_REG, like the vendor module---

@@ -277,10 +277,12 @@ static int32_t nvt_bin_header_parser(const u8 *fwdata, size_t fwsize)
 			if (find_bin_header == 0) {
 				/* others partition located at 0x30 offset */
 				pos = 0x30 + (0x10 * (list - ilm_dlm_num));
-			} else if (cascade_2nd_header_info) {
-				/* cascade 2nd header info */
-				pos = ((info_end - 0x31) & ~0xF) + 0x40;
 			} else {
+				/*
+				 * cascade 2nd header info: the vendor parser
+				 * (nvt_drivers_nt36536_noflash.c) continues at
+				 * tmp_end - 0x10 after tmp_end was doubled.
+				 */
 				pos = casc_end - 0x10;
 			}
 
@@ -663,13 +665,29 @@ static void nvt_read_bld_hw_crc(void)
 	uint8_t buf[8] = {0};
 	uint32_t g_crc = 0, r_crc = 0;
 
-	/* CRC Flag */
+	/*
+	 * CRC flags.  The vendor module decodes this register pair
+	 * differently per bld_multi_header: chips without multi-header
+	 * support read one byte at BLD_ILM_DLM_CRC_ADDR and take
+	 * crc_done/ilm/dlm from bits 2/0/1, while supported chips
+	 * (NT36536) read two bytes and take crc_done from bit 3 of the
+	 * second byte and ilm/dlm from bits 4/5 of the first.
+	 */
 	nvt_set_page(ts->mmap->BLD_ILM_DLM_CRC_ADDR);
 	buf[0] = ts->mmap->BLD_ILM_DLM_CRC_ADDR & 0x7F;
 	buf[1] = 0x00;
-	CTP_SPI_READ(ts->client, buf, 2);
-	NVT_ERR("crc_done = %d, ilm_crc_flag = %d, dlm_crc_flag = %d\n",
-			(buf[1] >> 2) & 0x01, (buf[1] >> 0) & 0x01, (buf[1] >> 1) & 0x01);
+	buf[2] = 0x00;
+	if (ts->bld_multi_header >= BLDMHEADER_SUPPORT) {
+		CTP_SPI_READ(ts->client, buf, 3);
+		NVT_ERR("0x%02x 0x%02x, crc_done = %d, ilm_crc_flag = %d, dlm_crc_flag = %d\n",
+				buf[1], buf[2],
+				(buf[2] >> 3) & 0x01, (buf[1] >> 4) & 0x01, (buf[1] >> 5) & 0x01);
+	} else {
+		CTP_SPI_READ(ts->client, buf, 2);
+		NVT_ERR("0x%02x, crc_done = %d, ilm_crc_flag = %d, dlm_crc_flag = %d\n",
+				buf[1],
+				(buf[1] >> 2) & 0x01, (buf[1] >> 0) & 0x01, (buf[1] >> 1) & 0x01);
+	}
 
 	/* ILM CRC */
 	nvt_set_page(ts->mmap->G_ILM_CHECKSUM_ADDR);
