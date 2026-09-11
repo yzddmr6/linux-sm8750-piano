@@ -139,6 +139,7 @@ struct nvt_ts_data {
 	struct mutex lock;
 	const struct nvt_ts_mem_map *mmap;
 	uint8_t hw_crc;
+	uint32_t crc_err_flag_addr;
 	uint16_t nvt_pid;
 	uint8_t *rbuf;
 	uint8_t *xbuf;
@@ -202,6 +203,7 @@ typedef enum {
 
 //---extern structures---
 extern struct nvt_ts_data *ts;
+extern uint32_t SWRST_N8_ADDR;
 
 //---extern functions---
 int32_t CTP_SPI_READ(struct spi_device *client, uint8_t *buf, uint16_t len);

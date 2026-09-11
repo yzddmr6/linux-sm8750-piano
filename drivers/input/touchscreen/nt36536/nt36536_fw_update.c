@@ -720,6 +720,98 @@ static void nvt_read_bld_hw_crc(void)
 
 /*******************************************************
 Description:
+	Novatek touchscreen phase III detection and recovery.
+
+	The vendor module issues a "dummy read" after every failed download
+	round: two bytes from offset 0 of whatever page is active.  When the
+	read returns 0xFC the IC is still in phase III, i.e. an application
+	is running with CRC auto reboot armed, and no phase II host download
+	can finish until the auto reboot is disarmed and the IC is forced
+	back to the phase II bootloader.  The transaction sequence below is
+	byte-for-byte the vendor module's:
+
+	  sw reset idle (0xAA to SWRST_N8) twice, msleep(1), then write 0xA5
+	  to crc_err_flag and read it back, up to 5 attempts; then confirm
+	  the bootloader phase flag at 0x3F035 reads 0xA5, clear it, and
+	  confirm it reads back 0.
+
+return:
+	Executive outcomes. 0---IC was in phase III and was forced back to
+	phase II. 1---not in phase III. <0---recovery failed.
+*******************************************************/
+/* Bootloader phase flag the vendor module polls at a fixed address. */
+#define NVT_BLD_PHASE_FLAG_ADDR 0x3F035
+
+static int32_t nvt_phase3_dummy_recover(void)
+{
+	uint8_t buf[8] = {0};
+	int32_t ret;
+	int32_t i;
+
+	/* dummy read: two bytes from offset 0 of the current page */
+	buf[0] = 0x00;
+	buf[1] = 0x00;
+	ret = CTP_SPI_READ(ts->client, buf, 2);
+	NVT_ERR("dummy read = 0x%02X (ret=%d)\n", buf[1], ret);
+	if (ret || buf[1] != 0xFC)
+		return 1;
+
+	NVT_ERR("IC is in phase III, stop CRC auto reboot\n");
+
+	/* stop CRC auto reboot: sw reset idle, then 0xA5 at crc_err_flag */
+	for (i = 0; i < 5; i++) {
+		//---MCU idle cmds to SWRST_N8_ADDR, twice---
+		nvt_write_addr(SWRST_N8_ADDR, 0xAA);
+		nvt_write_addr(SWRST_N8_ADDR, 0xAA);
+
+		msleep(1);
+
+		//---arm crc error flag---
+		nvt_write_addr(ts->crc_err_flag_addr, 0xA5);
+
+		//---read back crc error flag---
+		nvt_set_page(ts->crc_err_flag_addr);
+		buf[0] = ts->crc_err_flag_addr & 0x7F;
+		buf[1] = 0x00;
+		CTP_SPI_READ(ts->client, buf, 2);
+		if (buf[1] == 0xA5)
+			break;
+	}
+
+	if (i >= 5) {
+		NVT_ERR("CRC auto reboot is not able to be stopped! buf[1]=0x%02X\n", buf[1]);
+		return -1;
+	}
+
+	/* confirm the bootloader phase flag */
+	nvt_set_page(NVT_BLD_PHASE_FLAG_ADDR);
+	buf[0] = NVT_BLD_PHASE_FLAG_ADDR & 0x7F;
+	buf[1] = 0x00;
+	CTP_SPI_READ(ts->client, buf, 2);
+	if (buf[1] != 0xA5) {
+		NVT_ERR("phase flag = 0x%02X, not in phase III\n", buf[1]);
+		return -1;
+	}
+
+	/* force IC to switch back to phase II */
+	nvt_write_addr(NVT_BLD_PHASE_FLAG_ADDR, 0x00);
+
+	nvt_set_page(NVT_BLD_PHASE_FLAG_ADDR);
+	buf[0] = NVT_BLD_PHASE_FLAG_ADDR & 0x7F;
+	buf[1] = 0x00;
+	CTP_SPI_READ(ts->client, buf, 2);
+	if (buf[1] != 0x00) {
+		NVT_ERR("Failed to switch back to phase II, buf[1]=0x%02X\n", buf[1]);
+		return -1;
+	}
+
+	NVT_ERR("Force IC to switch back to phase II OK.\n");
+
+	return 0;
+}
+
+/*******************************************************
+Description:
 	Novatek touchscreen Download_Firmware with HW CRC
 function. It's complete download firmware flow.
 
@@ -779,6 +871,12 @@ static int32_t nvt_download_firmware_hw_crc(void)
 		}
 
 fail:
+		/*
+		 * The vendor module probes for phase III after every failed
+		 * round and forces the IC back to phase II before retrying.
+		 */
+		nvt_phase3_dummy_recover();
+
 		retry++;
 		if(unlikely(retry > 2)) {
 			NVT_ERR("error, retry=%d\n", retry);

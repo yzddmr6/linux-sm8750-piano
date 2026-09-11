@@ -496,6 +496,9 @@ int32_t nvt_check_fw_reset_state(RST_COMPLETE_STATE check_reset_state)
 	nvt_set_page(ts->mmap->EVENT_BUF_ADDR | EVENT_MAP_RESET_COMPLETE);
 
 	while (1) {
+		/* vendor module sleeps 10ms before every poll */
+		usleep_range(10000, 10000);
+
 		//---read reset state---
 		buf[0] = EVENT_MAP_RESET_COMPLETE;
 		buf[1] = 0x00;
@@ -512,8 +515,6 @@ int32_t nvt_check_fw_reset_state(RST_COMPLETE_STATE check_reset_state)
 			ret = -1;
 			break;
 		}
-
-		usleep_range(10000, 10000);
 	}
 
 	return ret;
@@ -1177,6 +1178,7 @@ matched:
 
 	ts->hw_crc = entry->hwinfo->hw_crc;
 	ts->auto_copy = entry->hwinfo->auto_copy;
+	ts->crc_err_flag_addr = entry->hwinfo->hw_regs->crc_err_flag_addr;
 
 	//---detect single or cascade via ENB_CASC_REG, like the vendor module---
 	{
