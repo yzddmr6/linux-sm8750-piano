@@ -139,6 +139,7 @@ struct nvt_ts_data {
 	struct mutex lock;
 	const struct nvt_ts_mem_map *mmap;
 	uint8_t hw_crc;
+	uint8_t use_gcm;
 	uint32_t crc_err_flag_addr;
 	uint16_t nvt_pid;
 	uint8_t *rbuf;
@@ -195,6 +196,8 @@ typedef enum {
 /* Vendor module writes firmware to SRAM in 1 KiB chunks. */
 #define NVT_TRANSFER_LEN	(1*1024)
 #define NVT_READ_LEN		(2*1024)
+/* Vendor module always reads the full 121-byte report frame. */
+#define NVT_REPORT_LEN		121
 
 typedef enum {
 	NVTWRITE = 0,

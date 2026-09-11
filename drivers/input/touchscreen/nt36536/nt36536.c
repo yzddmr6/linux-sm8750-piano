@@ -860,7 +860,6 @@ static void nvt_esd_check_func(struct work_struct *work)
  * reads the full 121-byte frame on every interrupt.
  */
 #define POINT_DATA_LEN 65
-#define NVT_REPORT_LEN 121
 
 static uint8_t nvt_report_checksum(const uint8_t *data, size_t len)
 {
@@ -1178,6 +1177,7 @@ matched:
 
 	ts->hw_crc = entry->hwinfo->hw_crc;
 	ts->auto_copy = entry->hwinfo->auto_copy;
+	ts->use_gcm = entry->hwinfo->use_gcm;
 	ts->crc_err_flag_addr = entry->hwinfo->hw_regs->crc_err_flag_addr;
 
 	//---detect single or cascade via ENB_CASC_REG, like the vendor module---
@@ -2116,6 +2116,14 @@ static int32_t nvt_ts_resume(struct device *dev)
 	ts->resume_count++;
 	NVT_LOG("follower resume #%u start\n", ts->resume_count);
 	ts->ic_state = NVT_IC_RESUME_IN;
+
+	/*
+	 * The vendor core waits touchpanel,irq_need_dev_resume_time (500ms in
+	 * the stock dtsi) after resume before touching the IC, letting the
+	 * TDDI analog block (charge pump / AVDD) settle after the shared
+	 * panel reset.  Mirror that before the firmware download.
+	 */
+	msleep(500);
 
 	/*
 	 * The panel has already reset and initialized the shared TDDI.  A
