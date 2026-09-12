@@ -2140,11 +2140,12 @@ static int32_t nvt_ts_resume(struct device *dev)
 		goto resume_fail;
 	}
 
-	ret = nvt_check_fw_reset_state(RESET_STATE_REK);
-	if (ret) {
-		NVT_ERR("firmware did not reach ReK: %d\n", ret);
-		goto resume_fail;
-	}
+	/*
+	 * No RESET_STATE_REK wait here: the vendor resume path considers the
+	 * download complete at RESET_STATE_INIT (0xA0) and lets the app
+	 * advance through ReK asynchronously on display TE.  Waiting for ReK
+	 * on the host side just times out and shuts the IRQ off.
+	 */
 
 	if (ts->is_panel_follower && !nvt_panel_is_on(ts)) {
 		ret = -EHOSTDOWN;
