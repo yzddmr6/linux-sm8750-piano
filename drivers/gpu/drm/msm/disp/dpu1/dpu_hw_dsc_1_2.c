@@ -55,6 +55,8 @@
 /* DPU_DSC_CTL register offsets */
 #define DSC_CTL                    0x00
 #define DSC_CFG                    0x04
+#define DSC_4HS_MERGE_EN           0x10
+#define DSC_4HS_MERGE_CFG          0x14
 #define DSC_DATA_IN_SWAP           0x08
 #define DSC_CLK_CTRL               0x0C
 
@@ -240,6 +242,14 @@ static void dpu_hw_dsc_config_1_2(struct dpu_hw_dsc *hw_dsc,
 		data |= BIT(17);
 
 	DPU_REG_WRITE(hw, sblk->ctl.base + DSC_CFG, data);
+
+	/*
+	 * 4HS merge (four encoders into one interface) is not supported here;
+	 * clear its configuration explicitly rather than inheriting whatever
+	 * the bootloader left in the block.
+	 */
+	DPU_REG_WRITE(hw, sblk->ctl.base + DSC_4HS_MERGE_CFG, 0);
+	DPU_REG_WRITE(hw, sblk->ctl.base + DSC_4HS_MERGE_EN, 0);
 }
 
 static void dpu_hw_dsc_config_thresh_1_2(struct dpu_hw_dsc *hw_dsc,
