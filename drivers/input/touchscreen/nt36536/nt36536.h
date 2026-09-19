@@ -21,6 +21,7 @@
 
 #include <linux/delay.h>
 #include <linux/input.h>
+#include <linux/input/touchscreen.h>
 #include <linux/of.h>
 #include <linux/spi/spi.h>
 #include <linux/uaccess.h>
@@ -112,6 +113,7 @@ enum nvt_ic_state {
 struct nvt_ts_data {
 	struct spi_device *client;
 	struct input_dev *input_dev;
+	struct touchscreen_properties prop;
 	struct delayed_work nvt_fwu_work;
 	bool pen_is_charge;
 	uint16_t addr;

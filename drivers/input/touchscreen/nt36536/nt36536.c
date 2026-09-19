@@ -21,6 +21,7 @@
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/input/mt.h>
+#include <linux/input/touchscreen.h>
 #include <linux/of.h>
 
 #include "nt36536.h"
@@ -571,6 +572,8 @@ static void nvt_ts_set_touch_abs_params(void)
 
 	input_set_abs_params(ts->input_dev, ABS_MT_POSITION_X, 0, ts->abs_x_max - 1, 0, 0);
 	input_set_abs_params(ts->input_dev, ABS_MT_POSITION_Y, 0, ts->abs_y_max - 1, 0, 0);
+	/* touchscreen-size-*, -swapped-x-y, -inverted-* map the IC frame onto the display */
+	touchscreen_parse_properties(ts->input_dev, true, &ts->prop);
 }
 
 static void nvt_ts_set_pen_abs_params(void)
@@ -1000,8 +1003,7 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 			input_report_key(ts->input_dev, BTN_TOUCH, 1);
 #endif /* MT_PROTOCOL_B */
 
-			input_report_abs(ts->input_dev, ABS_MT_POSITION_X, input_x);
-			input_report_abs(ts->input_dev, ABS_MT_POSITION_Y, input_y);
+			touchscreen_report_pos(ts->input_dev, &ts->prop, input_x, input_y, true);
 			input_report_abs(ts->input_dev, ABS_MT_TOUCH_MAJOR, input_w);
 			input_report_abs(ts->input_dev, ABS_MT_PRESSURE, input_p);
 
