@@ -1608,6 +1608,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		ret = -ENOMEM;
 		goto err_input_dev_alloc_failed;
 	}
+	ts->input_dev->dev.parent = &ts->client->dev;
 
 	ts->max_touch_num = TOUCH_MAX_FINGER_NUM;
 
