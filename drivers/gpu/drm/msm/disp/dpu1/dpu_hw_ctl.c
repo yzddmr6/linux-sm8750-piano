@@ -27,6 +27,7 @@
 #define   CTL_START                     0x01C
 #define   CTL_PREPARE                   0x0d0
 #define   CTL_SW_RESET                  0x030
+#define   CTL_SW_RESET_OVERRIDE         0x060
 #define   CTL_LAYER_EXTN_OFFSET         0x40
 #define   CTL_MERGE_3D_ACTIVE           0x0E4
 #define   CTL_DSC_ACTIVE                0x0E8
@@ -438,6 +439,19 @@ static int dpu_hw_ctl_reset_control(struct dpu_hw_ctl *ctx)
 
 	pr_debug("issuing hw ctl reset for ctl:%d\n", ctx->idx);
 	DPU_REG_WRITE(c, CTL_SW_RESET, 0x1);
+	if (!dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US))
+		return 0;
+
+	/*
+	 * The soft reset can stay pending forever when the pipeline it waits
+	 * on is no longer clocked or is held by a hardware sequencer (the
+	 * CESTA SCC on newer DPUs); the downstream driver then forces every
+	 * component into reset through the override and releases it. A CTL
+	 * left with CTL_SW_RESET set never flushes again.
+	 */
+	pr_debug("ctl:%d soft reset did not complete, forcing\n", ctx->idx);
+	DPU_REG_WRITE(c, CTL_SW_RESET_OVERRIDE, 0x1);
+	DPU_REG_WRITE(c, CTL_SW_RESET_OVERRIDE, 0x0);
 	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US))
 		return -EINVAL;
 
