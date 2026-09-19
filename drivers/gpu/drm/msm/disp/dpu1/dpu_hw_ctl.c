@@ -449,11 +449,18 @@ static int dpu_hw_ctl_reset_control(struct dpu_hw_ctl *ctx)
 	 * component into reset through the override and releases it. A CTL
 	 * left with CTL_SW_RESET set never flushes again.
 	 */
-	pr_debug("ctl:%d soft reset did not complete, forcing\n", ctx->idx);
+	pr_info("TEMP ctl:%d soft reset did not complete, forcing (sw_reset=%x)\n",
+		ctx->idx, DPU_REG_READ(c, CTL_SW_RESET));
 	DPU_REG_WRITE(c, CTL_SW_RESET_OVERRIDE, 0x1);
+	/* the forced reset needs to be held; a back-to-back release is ignored */
+	usleep_range(100, 200);
 	DPU_REG_WRITE(c, CTL_SW_RESET_OVERRIDE, 0x0);
-	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US))
+	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US)) {
+		pr_info("TEMP ctl:%d forced reset still pending (sw_reset=%x)\n",
+			ctx->idx, DPU_REG_READ(c, CTL_SW_RESET));
 		return -EINVAL;
+	}
+	pr_info("TEMP ctl:%d forced reset completed\n", ctx->idx);
 
 	return 0;
 }
