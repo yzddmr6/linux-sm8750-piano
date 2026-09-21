@@ -433,6 +433,31 @@ static u32 dpu_hw_ctl_poll_reset_status(struct dpu_hw_ctl *ctx, u32 timeout_us)
 	return status;
 }
 
+/*
+ * A CTL soft reset can stay pending forever when the pipeline it waits on is
+ * no longer clocked or is held by a hardware sequencer (the CESTA SCC on
+ * newer DPUs), and a CTL left with CTL_SW_RESET set never flushes again.  The
+ * downstream driver's way out is to force every component of the CTL into
+ * reset through the override and then release it, which clears the pending
+ * soft reset immediately.  The release has to be a separate write after a
+ * short hold: a back-to-back assert and release is ignored.
+ */
+static int dpu_hw_ctl_force_reset(struct dpu_hw_ctl *ctx)
+{
+	struct dpu_hw_blk_reg_map *c = &ctx->hw;
+
+	DPU_REG_WRITE(c, CTL_SW_RESET_OVERRIDE, 0x1);
+	usleep_range(100, 200);
+	DPU_REG_WRITE(c, CTL_SW_RESET_OVERRIDE, 0x0);
+	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US)) {
+		pr_err("ctl:%d forced reset still pending (sw_reset=%x)\n",
+		       ctx->idx, DPU_REG_READ(c, CTL_SW_RESET));
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int dpu_hw_ctl_reset_control(struct dpu_hw_ctl *ctx)
 {
 	struct dpu_hw_blk_reg_map *c = &ctx->hw;
@@ -442,27 +467,9 @@ static int dpu_hw_ctl_reset_control(struct dpu_hw_ctl *ctx)
 	if (!dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US))
 		return 0;
 
-	/*
-	 * The soft reset can stay pending forever when the pipeline it waits
-	 * on is no longer clocked or is held by a hardware sequencer (the
-	 * CESTA SCC on newer DPUs); the downstream driver then forces every
-	 * component into reset through the override and releases it. A CTL
-	 * left with CTL_SW_RESET set never flushes again.
-	 */
-	pr_info("TEMP ctl:%d soft reset did not complete, forcing (sw_reset=%x)\n",
-		ctx->idx, DPU_REG_READ(c, CTL_SW_RESET));
-	DPU_REG_WRITE(c, CTL_SW_RESET_OVERRIDE, 0x1);
-	/* the forced reset needs to be held; a back-to-back release is ignored */
-	usleep_range(100, 200);
-	DPU_REG_WRITE(c, CTL_SW_RESET_OVERRIDE, 0x0);
-	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US)) {
-		pr_info("TEMP ctl:%d forced reset still pending (sw_reset=%x)\n",
-			ctx->idx, DPU_REG_READ(c, CTL_SW_RESET));
-		return -EINVAL;
-	}
-	pr_info("TEMP ctl:%d forced reset completed\n", ctx->idx);
+	pr_debug("ctl:%d soft reset did not complete, forcing\n", ctx->idx);
 
-	return 0;
+	return dpu_hw_ctl_force_reset(ctx);
 }
 
 static int dpu_hw_ctl_wait_reset_status(struct dpu_hw_ctl *ctx)
@@ -476,12 +483,17 @@ static int dpu_hw_ctl_wait_reset_status(struct dpu_hw_ctl *ctx)
 		return 0;
 
 	pr_debug("hw ctl reset is set for ctl:%d\n", ctx->idx);
-	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US)) {
-		pr_err("hw recovery is not complete for ctl:%d\n", ctx->idx);
-		return -EINVAL;
-	}
+	if (!dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US))
+		return 0;
 
-	return 0;
+	/*
+	 * A hardware-initiated reset gets stuck for the same reason a
+	 * driver-initiated one does, and the frame that is about to be
+	 * kicked off needs the CTL back either way.
+	 */
+	pr_debug("hw recovery is not complete for ctl:%d, forcing\n", ctx->idx);
+
+	return dpu_hw_ctl_force_reset(ctx);
 }
 
 static void dpu_hw_ctl_clear_all_blendstages(struct dpu_hw_ctl *ctx)
