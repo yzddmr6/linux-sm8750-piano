@@ -9,6 +9,58 @@
 #include "common.h"
 
 #define NAME_SIZE	32
+#define QCOM_SND_MAX_CODECS	8
+
+static bool qcom_snd_is_codec_node(const struct device_node *np)
+{
+	return of_node_name_eq(np, "codec") || strstarts(np->name, "codec-");
+}
+
+static void qcom_snd_put_codecs(void *data)
+{
+	snd_soc_of_put_dai_link_codecs(data);
+}
+
+static int qcom_snd_parse_codecs(struct device *dev, struct device_node *link_np,
+				struct snd_soc_dai_link *link)
+{
+	int count, total = 0, index = 0, ret;
+
+	for_each_available_child_of_node_scoped(link_np, np) {
+		if (!qcom_snd_is_codec_node(np))
+			continue;
+
+		count = of_count_phandle_with_args(np, "sound-dai", "#sound-dai-cells");
+		if (count <= 0)
+			return count ?: -EINVAL;
+		if (count > QCOM_SND_MAX_CODECS - total)
+			return -EINVAL;
+		total += count;
+	}
+	if (!total)
+		return 0;
+
+	link->codecs = devm_kcalloc(dev, total, sizeof(*link->codecs), GFP_KERNEL);
+	if (!link->codecs)
+		return -ENOMEM;
+	link->num_codecs = total;
+
+	for_each_available_child_of_node_scoped(link_np, np) {
+		if (!qcom_snd_is_codec_node(np))
+			continue;
+
+		count = of_count_phandle_with_args(np, "sound-dai", "#sound-dai-cells");
+		for (int i = 0; i < count; i++) {
+			ret = snd_soc_of_get_dlc(np, NULL, &link->codecs[index++], i);
+			if (ret) {
+				snd_soc_of_put_dai_link_codecs(link);
+				return ret;
+			}
+		}
+	}
+
+	return devm_add_action_or_reset(dev, qcom_snd_put_codecs, link);
+}
 
 static const struct snd_soc_dapm_widget qcom_jack_snd_widgets[] = {
 	SND_SOC_DAPM_HP("Headphone Jack", NULL),
@@ -67,30 +119,41 @@ static int qcom_snd_parse_tdm_slot(struct device_node *np,
 }
 
 static int qcom_snd_normalize_tdm_slots(struct qcom_snd_tdm_slot_cfg *cpu_cfg,
-					struct qcom_snd_tdm_slot_cfg *codec_cfg)
+					struct qcom_snd_tdm_slot_cfg *codec_cfg,
+					unsigned int num_codecs)
 {
-	unsigned int slots;
-	unsigned int slot_width;
+	unsigned int slots = cpu_cfg->slots, slot_width = cpu_cfg->slot_width;
+	unsigned int mask, i;
 
-	if (cpu_cfg->slots && codec_cfg->slots && cpu_cfg->slots != codec_cfg->slots)
-		return -EINVAL;
-
-	if (cpu_cfg->slot_width && codec_cfg->slot_width &&
-	    cpu_cfg->slot_width != codec_cfg->slot_width)
-		return -EINVAL;
-
-	slots = cpu_cfg->slots ?: codec_cfg->slots;
+	/* All endpoints share one frame, but each codec has its own slot masks. */
+	for (i = 0; i < num_codecs; i++) {
+		if (slots && codec_cfg[i].slots && slots != codec_cfg[i].slots)
+			return -EINVAL;
+		if (slot_width && codec_cfg[i].slot_width &&
+		    slot_width != codec_cfg[i].slot_width)
+			return -EINVAL;
+		slots = slots ?: codec_cfg[i].slots;
+		slot_width = slot_width ?: codec_cfg[i].slot_width;
+	}
 	if (!slots)
 		return 0;
-
-	slot_width = cpu_cfg->slot_width ?: codec_cfg->slot_width;
-	if (!slot_width)
+	if (slots > 32 || !slot_width)
 		return -EINVAL;
 
+	mask = GENMASK(slots - 1, 0);
+	if ((cpu_cfg->tx_mask | cpu_cfg->rx_mask) & ~mask)
+		return -EINVAL;
+	for (i = 0; i < num_codecs; i++) {
+		if ((codec_cfg[i].tx_mask | codec_cfg[i].rx_mask) & ~mask)
+			return -EINVAL;
+	}
+
 	cpu_cfg->slots = slots;
-	codec_cfg->slots = slots;
 	cpu_cfg->slot_width = slot_width;
-	codec_cfg->slot_width = slot_width;
+	for (i = 0; i < num_codecs; i++) {
+		codec_cfg[i].slots = slots;
+		codec_cfg[i].slot_width = slot_width;
+	}
 
 	return 0;
 }
@@ -100,23 +163,37 @@ static int qcom_snd_parse_dai_tdm_slots(struct snd_soc_pcm_runtime *rtd,
 					struct qcom_snd_tdm_slot_cfg *codec_cfg)
 {
 	struct device_node *link_np __free(device_node) = qcom_snd_get_link_node(rtd);
-	int ret;
+	unsigned int index = 0;
+	int ret, count;
 
 	if (!link_np)
 		return -ENOENT;
 
 	struct device_node *cpu_np __free(device_node) =
 		of_get_child_by_name(link_np, "cpu");
-	struct device_node *codec_np __free(device_node) =
-		of_get_child_by_name(link_np, "codec");
-	if (!cpu_np || !codec_np)
+	if (!cpu_np)
 		return -ENOENT;
 
 	ret = qcom_snd_parse_tdm_slot(cpu_np, cpu_cfg);
 	if (ret)
 		return ret;
 
-	return qcom_snd_parse_tdm_slot(codec_np, codec_cfg);
+	for_each_available_child_of_node_scoped(link_np, np) {
+		struct qcom_snd_tdm_slot_cfg cfg;
+
+		if (!qcom_snd_is_codec_node(np))
+			continue;
+		count = of_count_phandle_with_args(np, "sound-dai", "#sound-dai-cells");
+		if (count <= 0 || (unsigned int)count > rtd->dai_link->num_codecs - index)
+			return -EINVAL;
+		ret = qcom_snd_parse_tdm_slot(np, &cfg);
+		if (ret)
+			return ret;
+		for (int i = 0; i < count; i++)
+			codec_cfg[index++] = cfg;
+	}
+
+	return index == rtd->dai_link->num_codecs ? 0 : -EINVAL;
 }
 
 int qcom_snd_get_dai_tdm_slots(struct snd_soc_pcm_runtime *rtd,
@@ -129,7 +206,7 @@ int qcom_snd_get_dai_tdm_slots(struct snd_soc_pcm_runtime *rtd,
 	if (ret)
 		return ret;
 
-	return qcom_snd_normalize_tdm_slots(cpu_cfg, codec_cfg);
+	return qcom_snd_normalize_tdm_slots(cpu_cfg, codec_cfg, rtd->dai_link->num_codecs);
 }
 EXPORT_SYMBOL_GPL(qcom_snd_get_dai_tdm_slots);
 
@@ -152,10 +229,10 @@ int qcom_snd_apply_dai_tdm_slots_cfg(struct snd_soc_pcm_runtime *rtd,
 
 	for_each_rtd_codec_dais(rtd, i, codec_dai) {
 		ret = snd_soc_dai_set_tdm_slot(codec_dai,
-					       codec_cfg->tx_mask,
-					       codec_cfg->rx_mask,
-					       codec_cfg->slots,
-					       codec_cfg->slot_width);
+					       codec_cfg[i].tx_mask,
+					       codec_cfg[i].rx_mask,
+					       codec_cfg[i].slots,
+					       codec_cfg[i].slot_width);
 		if (ret)
 			return ret;
 	}
@@ -167,14 +244,17 @@ EXPORT_SYMBOL_GPL(qcom_snd_apply_dai_tdm_slots_cfg);
 int qcom_snd_apply_dai_tdm_slots(struct snd_soc_pcm_runtime *rtd)
 {
 	struct qcom_snd_tdm_slot_cfg cpu_cfg;
-	struct qcom_snd_tdm_slot_cfg codec_cfg;
+	struct qcom_snd_tdm_slot_cfg *codec_cfg __free(kfree) =
+		kcalloc(rtd->dai_link->num_codecs, sizeof(*codec_cfg), GFP_KERNEL);
 	int ret;
 
-	ret = qcom_snd_get_dai_tdm_slots(rtd, &cpu_cfg, &codec_cfg);
+	if (!codec_cfg)
+		return -ENOMEM;
+	ret = qcom_snd_get_dai_tdm_slots(rtd, &cpu_cfg, codec_cfg);
 	if (ret)
 		return ret == -ENOENT ? 0 : ret;
 
-	return qcom_snd_apply_dai_tdm_slots_cfg(rtd, &cpu_cfg, &codec_cfg);
+	return qcom_snd_apply_dai_tdm_slots_cfg(rtd, &cpu_cfg, codec_cfg);
 }
 EXPORT_SYMBOL_GPL(qcom_snd_apply_dai_tdm_slots);
 
@@ -254,8 +334,6 @@ int qcom_snd_parse_of(struct snd_soc_card *card)
 			of_get_child_by_name(np, "cpu");
 		struct device_node *platform __free(device_node) =
 			of_get_child_by_name(np, "platform");
-		struct device_node *codec __free(device_node) =
-			of_get_child_by_name(np, "codec");
 
 		if (!cpu) {
 			dev_err(dev, "%s: Can't find cpu DT node\n", link->name);
@@ -288,14 +366,11 @@ int qcom_snd_parse_of(struct snd_soc_card *card)
 			link->platforms->of_node = link->cpus->of_node;
 		}
 
-		if (codec) {
-			ret = snd_soc_of_get_dai_link_codecs(dev, codec, link);
-			if (ret < 0) {
-				dev_err_probe(dev, ret,
-					      "%s: codec dai not found\n", link->name);
-				return ret;
-			}
+		ret = qcom_snd_parse_codecs(dev, np, link);
+		if (ret)
+			return dev_err_probe(dev, ret, "%s: codec dai not found\n", link->name);
 
+		if (link->num_codecs) {
 			if (platform) {
 				/* DPCM backend */
 				link->no_pcm = 1;
@@ -308,7 +383,7 @@ int qcom_snd_parse_of(struct snd_soc_card *card)
 			link->dynamic = 1;
 		}
 
-		if (platform || !codec) {
+		if (platform || link->dynamic) {
 			/* DPCM */
 			link->ignore_suspend = 1;
 			link->nonatomic = 1;

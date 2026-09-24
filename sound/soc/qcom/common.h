@@ -17,6 +17,7 @@ struct qcom_snd_tdm_slot_cfg {
 };
 
 int qcom_snd_parse_of(struct snd_soc_card *card);
+/* codec_cfg contains one entry per dai_link codec, in the same order. */
 int qcom_snd_get_dai_tdm_slots(struct snd_soc_pcm_runtime *rtd,
 			       struct qcom_snd_tdm_slot_cfg *cpu_cfg,
 			       struct qcom_snd_tdm_slot_cfg *codec_cfg);
