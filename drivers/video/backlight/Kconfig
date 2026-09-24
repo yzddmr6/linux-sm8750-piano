@@ -215,6 +215,16 @@ config BACKLIGHT_SY7758
 	  Say Y to enable the backlight driver for the Silergy SY7758
 	  backlight controller found in Ayaneo Pocket S2.
 
+config BACKLIGHT_KTZ8866_KUNIT_TEST
+	bool "KUnit tests for KTZ8866" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && BACKLIGHT_KTZ8866=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test register errors and enable state transitions using a simulated
+	  regmap bus. Check that failed writes are reported and cannot enable
+	  stale brightness, without requiring a physical backlight.
+	  These tests do not validate board power or dual-chip synchronization.
+
 config BACKLIGHT_LM3533
 	tristate "Backlight Driver for LM3533"
 	depends on MFD_LM3533
