@@ -1402,6 +1402,28 @@ config TOUCHSCREEN_ZINITIX
 	  To compile this driver as a module, choose M here: the
 	  module will be called zinitix.
 
+config TOUCHSCREEN_NT36532E_THP_KUNIT_TEST
+	bool "NT36532E firmware tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && TOUCHSCREEN_NT36532E_THP=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test parsing and host download with a simulated register bus.
+	  The optional nt36532e/piano-test.bin fixture is user-supplied.
+
+config TOUCHSCREEN_NT36532E_THP
+	tristate "Novatek NT36532E host-processed touch transport"
+	depends on SPI
+	select REGMAP
+	select FW_LOADER
+	help
+	  Raw THP transport for the NT36532E cascade configuration. A separate
+	  userspace processor is required to report touch coordinates. Firmware
+	  download and capture begin when its exclusive read-only misc device
+	  is opened. Display power must already be supplied by the platform;
+	  native panel power management is not implemented yet.
+
+	  If unsure, say N.
+
 config TOUCHSCREEN_HIMAX_HX83112B
 	tristate "Himax hx83112b touchscreen driver"
 	depends on I2C
