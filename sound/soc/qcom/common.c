@@ -5,6 +5,8 @@
 #include <dt-bindings/sound/qcom,q6afe.h>
 #include <linux/module.h>
 #include <sound/jack.h>
+#include <sound/pcm_params.h>
+#include <sound/simple_card_utils.h>
 #include <linux/input-event-codes.h>
 #include "common.h"
 
@@ -117,6 +119,47 @@ static int qcom_snd_parse_tdm_slot(struct device_node *np,
 	return snd_soc_of_parse_tdm_slot(np, &cfg->tx_mask, &cfg->rx_mask,
 					 &cfg->slots, &cfg->slot_width);
 }
+
+int qcom_snd_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
+			      struct snd_pcm_hw_params *params)
+{
+	struct device_node *np __free(device_node) = qcom_snd_get_link_node(rtd);
+	struct snd_interval *rate = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
+	struct snd_interval *channels = hw_param_interval(params, SNDRV_PCM_HW_PARAM_CHANNELS);
+	struct snd_mask *mask = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
+	struct simple_util_data data = { };
+	int format = -EINVAL;
+
+	if (!np)
+		return 0;
+
+	simple_util_parse_convert(np, NULL, &data);
+	if (of_property_present(np, "convert-rate") &&
+	    (data.convert_rate < 8000 || data.convert_rate > 192000))
+		return -EINVAL;
+	if (of_property_present(np, "convert-channels") &&
+	    (!data.convert_channels || data.convert_channels > 32))
+		return -EINVAL;
+	if (of_property_present(np, "convert-sample-format")) {
+		if (!data.convert_sample_format)
+			return -EINVAL;
+		format = simple_util_get_sample_fmt(&data);
+		if (format < 0)
+			return format;
+	}
+
+	if (data.convert_rate)
+		rate->min = rate->max = data.convert_rate;
+	if (data.convert_channels)
+		channels->min = channels->max = data.convert_channels;
+	if (format >= 0) {
+		snd_mask_none(mask);
+		snd_mask_set(mask, format);
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(qcom_snd_be_hw_params_fixup);
 
 static int qcom_snd_normalize_tdm_slots(struct qcom_snd_tdm_slot_cfg *cpu_cfg,
 					struct qcom_snd_tdm_slot_cfg *codec_cfg,
@@ -328,6 +371,13 @@ int qcom_snd_parse_of(struct snd_soc_card *card)
 		if (ret) {
 			dev_err(dev, "error getting codec dai_link name\n");
 			return ret;
+		}
+
+		if (of_property_present(np, "dai-format")) {
+			link->dai_fmt = snd_soc_daifmt_parse_format(np, NULL);
+			if (!(link->dai_fmt & SND_SOC_DAIFMT_FORMAT_MASK))
+				return -EINVAL;
+			link->dai_fmt |= SND_SOC_DAIFMT_CBC_CFC;
 		}
 
 		struct device_node *cpu __free(device_node) =
