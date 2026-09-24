@@ -580,6 +580,23 @@ struct param_id_tdm_intf_cfg {
 
 #define PARAM_ID_AUDIO_IF_INTF_CFG	0x08001B11
 
+#define PARAM_ID_TDM_LANE_CFG		0x0800106A
+#define PARAM_ID_HW_INTF_CLK_CFG		0x0800113C
+
+/* Legacy SPF TDM ABI: no version word precedes the interface fields. */
+
+struct param_id_tdm_lane_cfg {
+	u16 lane_mask;
+	u16 reserved;
+} __packed;
+
+struct param_id_hw_intf_clk_cfg {
+	u32 clock_id;
+	u32 clock_freq;
+	u32 clock_attri;
+	u32 clock_root;
+} __packed;
+
 /*
  * struct param_id_audio_if_intf_cfg - Audio interface configuration
  * @qaif_type: Audio interface type (e.g. QAIF, QAIF_VA)
