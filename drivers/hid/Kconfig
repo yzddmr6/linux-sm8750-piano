@@ -854,6 +854,17 @@ config HID_MULTITOUCH
 	  To compile this driver as a module, choose M here: the
 	  module will be called hid-multitouch.
 
+config HID_NANOSIC_PROTOCOL_KUNIT_TEST
+	tristate "KUnit tests for Nanosic WN8030 protocol" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	select FW_LOADER
+	default KUNIT_ALL_TESTS
+	help
+	  Test firmware bounds, command encoding and piano report framing.
+	  Tests with the optional nanosic/piano-protocol-test.bin firmware
+	  fixture are skipped when it is absent. No firmware is bundled here.
+	  These tests do not access an I2C adapter or configure a device.
+
 config HID_NINTENDO
 	tristate "Nintendo Joy-Con, NSO, and Pro Controller support"
 	depends on NEW_LEDS
