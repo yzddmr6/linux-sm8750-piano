@@ -790,7 +790,7 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 {
 	struct snd_soc_component *component = dai->component;
 	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(component);
-	int chan;
+	unsigned int slot_num, bck;
 
 	switch (slots) {
 	case 0:
@@ -802,22 +802,22 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 		aw88261->rxr_slotvld_mask = 1 << AW88261_I2S_RXR_SLOTVLD_START_BIT;
 		return 0;
 	case 1:
-		aw88261->slot_num_value = AW88261_SLOT_NUM_TDM1S_VALUE;
+		slot_num = AW88261_SLOT_NUM_TDM1S_VALUE;
 		break;
 	case 2:
-		aw88261->slot_num_value = AW88261_SLOT_NUM_TDM2S_VALUE;
+		slot_num = AW88261_SLOT_NUM_TDM2S_VALUE;
 		break;
 	case 4:
-		aw88261->slot_num_value = AW88261_SLOT_NUM_TDM4S_VALUE;
+		slot_num = AW88261_SLOT_NUM_TDM4S_VALUE;
 		break;
 	case 6:
-		aw88261->slot_num_value = AW88261_SLOT_NUM_TDM6S_VALUE;
+		slot_num = AW88261_SLOT_NUM_TDM6S_VALUE;
 		break;
 	case 8:
-		aw88261->slot_num_value = AW88261_SLOT_NUM_TDM8S_VALUE;
+		slot_num = AW88261_SLOT_NUM_TDM8S_VALUE;
 		break;
 	case 16:
-		aw88261->slot_num_value = AW88261_SLOT_NUM_TDM16S_VALUE;
+		slot_num = AW88261_SLOT_NUM_TDM16S_VALUE;
 		break;
 	default:
 		dev_err(aw88261->aw_pa->dev, "unsupported slot count %d\n", slots);
@@ -826,14 +826,14 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 
 	switch (slot_width) {
 	case 16:
-		aw88261->tdm_bck_value = AW88261_I2SBCK_32FS_VALUE;
+		bck = AW88261_I2SBCK_32FS_VALUE;
 		break;
 	case 20:
 	case 24:
-		aw88261->tdm_bck_value = AW88261_I2SBCK_48FS_VALUE;
+		bck = AW88261_I2SBCK_48FS_VALUE;
 		break;
 	case 32:
-		aw88261->tdm_bck_value = AW88261_I2SBCK_64FS_VALUE;
+		bck = AW88261_I2SBCK_64FS_VALUE;
 		break;
 	default:
 		dev_err(aw88261->aw_pa->dev, "unsupported slot width %d\n",
@@ -841,25 +841,20 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 		return -EINVAL;
 	}
 
-	if (tx_mask != 0) {
-		if ((chan = __ffs(tx_mask)) > 16)
-			return -EINVAL;
+	if (((tx_mask | rx_mask) & ~GENMASK(slots - 1, 0)) ||
+	    hweight32(tx_mask) > 1 || hweight32(rx_mask) > 2)
+		return -EINVAL;
 
-		aw88261->tx_slotvld_mask = chan << AW88261_I2S_TX_SLOTVLD_START_BIT;
-	}
+	aw88261->slot_num_value = slot_num;
+	aw88261->tdm_bck_value = bck;
 
-	if (rx_mask != 0) {
-		if ((chan = __ffs(rx_mask)) > 16)
-			return -EINVAL;
+	if (tx_mask)
+		aw88261->tx_slotvld_mask = __ffs(tx_mask) << AW88261_I2S_TX_SLOTVLD_START_BIT;
 
-		aw88261->rxl_slotvld_mask = chan << AW88261_I2S_RXL_SLOTVLD_START_BIT;
-
-		if ((rx_mask & ~BIT(chan)) != 0) {
-			if ((chan = __ffs(rx_mask & ~BIT(chan))) > 16)
-				return -EINVAL;
-
-			aw88261->rxr_slotvld_mask = chan << AW88261_I2S_RXR_SLOTVLD_START_BIT;
-		}
+	if (rx_mask) {
+		aw88261->rxl_slotvld_mask = __ffs(rx_mask) << AW88261_I2S_RXL_SLOTVLD_START_BIT;
+		/* Mono must select the same slot on both input paths. */
+		aw88261->rxr_slotvld_mask = (fls(rx_mask) - 1) << AW88261_I2S_RXR_SLOTVLD_START_BIT;
 	}
 
 	return 0;
