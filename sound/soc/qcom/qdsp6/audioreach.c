@@ -10,6 +10,7 @@
 #include <sound/pcm_params.h>
 #include <dt-bindings/soc/qcom,gpr.h>
 #include "q6apm.h"
+#include "q6dsp-common.h"
 #include "audioreach.h"
 
 /* SubGraph Config */
@@ -327,19 +328,15 @@ void *audioreach_alloc_apm_cmd_pkt(int pkt_size, uint32_t opcode, uint32_t token
 }
 EXPORT_SYMBOL_GPL(audioreach_alloc_apm_cmd_pkt);
 
-void audioreach_set_default_channel_mapping(u8 *ch_map, int num_channels)
+int audioreach_set_default_channel_mapping(u8 *ch_map, int num_channels)
 {
-	if (num_channels == 1) {
-		ch_map[0] =  PCM_CHANNEL_FL;
-	} else if (num_channels == 2) {
-		ch_map[0] =  PCM_CHANNEL_FL;
-		ch_map[1] =  PCM_CHANNEL_FR;
-	} else if (num_channels == 4) {
-		ch_map[0] =  PCM_CHANNEL_FL;
-		ch_map[1] =  PCM_CHANNEL_FR;
-		ch_map[2] =  PCM_CHANNEL_LS;
-		ch_map[3] =  PCM_CHANNEL_RS;
-	}
+	int ret = q6dsp_map_channels(ch_map, num_channels);
+
+	/* Preserve the AudioReach mono convention used by existing topologies. */
+	if (!ret && num_channels == 1)
+		ch_map[0] = PCM_CHANNEL_FL;
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(audioreach_set_default_channel_mapping);
 
