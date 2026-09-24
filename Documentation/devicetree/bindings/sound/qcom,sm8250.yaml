@@ -125,8 +125,12 @@ patternProperties:
           sound-dai:
             maxItems: 1
 
-      codec:
-        description: Holds subnode which indicates codec dai.
+    patternProperties:
+      "^codec(-[0-9]+)?$":
+        description: |
+          Codec DAIs on this link. DAIs listed in one subnode share its TDM
+          slot configuration. Use separate numbered codec subnodes when
+          amplifiers on the same bus need different transmit or receive slots.
         type: object
         additionalProperties: false
 
@@ -148,6 +152,9 @@ patternProperties:
             $ref: /schemas/types.yaml#/definitions/uint32-array
             description: Slot mask for active TDM slots
 
+        required:
+          - sound-dai
+
     required:
       - link-name
       - cpu
@@ -161,6 +168,36 @@ required:
 additionalProperties: false
 
 examples:
+
+  - |
+    #include <dt-bindings/sound/qcom,q6afe.h>
+    sound {
+        compatible = "qcom,sm8750-sndcard", "qcom,sm8450-sndcard";
+        model = "Secondary TDM speakers";
+
+        secondary-tdm-dai-link {
+            link-name = "Secondary TDM Playback";
+            cpu {
+                sound-dai = <&q6apmdai SECONDARY_TDM_RX_0>;
+                dai-tdm-slot-num = <8>;
+                dai-tdm-slot-width = <32>;
+                dai-tdm-slot-rx-mask = <1 1 1 1 1 1 1 1>;
+            };
+            platform {
+                sound-dai = <&q6apm>;
+            };
+            codec-0 {
+                sound-dai = <&amplifier0>;
+                dai-tdm-slot-tx-mask = <1>;
+                dai-tdm-slot-rx-mask = <1>;
+            };
+            codec-1 {
+                sound-dai = <&amplifier1>;
+                dai-tdm-slot-tx-mask = <0 0 0 1>;
+                dai-tdm-slot-rx-mask = <0 0 0 1>;
+            };
+        };
+    };
 
   - |
     #include <dt-bindings/sound/qcom,q6afe.h>
