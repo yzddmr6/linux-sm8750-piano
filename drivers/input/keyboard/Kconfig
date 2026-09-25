@@ -476,6 +476,17 @@ config KEYBOARD_TEGRA
 	  To compile this driver as a module, choose M here: the
 	  module will be called tegra-kbc.
 
+config KEYBOARD_ONEPLUS_POGO
+	tristate "OnePlus Pad 2 Pro pogo pin keyboard"
+	depends on SERIAL_DEV_BUS
+	help
+	  Say Y here to enable the keyboard cover with touchpad that attaches
+	  to the OnePlus Pad 2 Pro and the OPPO Pad 4 Pro through their
+	  magnetic pogo pin connector.
+
+	  To compile this driver as a module, choose M here; the
+	  module will be called oneplus-pogo-keyboard.
+
 config KEYBOARD_OPENCORES
 	tristate "OpenCores Keyboard Controller"
 	depends on HAS_IOMEM

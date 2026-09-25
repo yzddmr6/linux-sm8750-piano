@@ -20884,6 +20884,13 @@ S:	Maintained
 F:	drivers/mtd/nand/onenand/
 F:	include/linux/mtd/onenand*.h
 
+ONEPLUS PAD 2 PRO POGO PIN KEYBOARD DRIVER
+M:	Erwin <yzddmr7@gmail.com>
+L:	linux-input@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/input/oneplus,pad2pro-pogo-keyboard.yaml
+F:	drivers/input/keyboard/oneplus-pogo-keyboard.c
+
 ONEXPLAYER HID DRIVER
 M:	Derek J. Clark <derekjohn.clark@gmail.com>
 L:	linux-input@vger.kernel.org
