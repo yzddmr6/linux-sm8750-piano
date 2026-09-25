@@ -24,6 +24,12 @@ int nvt_thp_parse_firmware(const u8 *data, size_t size,
 void nvt_thp_free_firmware(struct nvt_thp_firmware *image);
 int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
 			  const struct nvt_thp_firmware *image, u16 *payload_length);
-int nvt_thp_apply_host_commands(struct regmap *map);
+/* Last host command written and the command byte last read back. */
+struct nvt_thp_command_status {
+	u8 sub_command;
+	u8 status;
+};
+
+int nvt_thp_apply_host_commands(struct regmap *map, struct nvt_thp_command_status *last);
 
 #endif

@@ -32,10 +32,15 @@ of global state and proc controls. The frame length is read from firmware, not
 copied from another panel. SPI errors stop capture; there is no blind retry,
 automatic firmware reload, pen configuration or reference-board RAM write.
 
-After each download the transport sends the two host commands the piano stock
-stack sends after firmware boot and resume: idle-baseline update (``BF 19``,
-value 1) and op mode 2 (``BF 01``, value 2), each confirmed by the vendor's
-command-byte clear within 110 ms. A command that does not clear fails the open.
+After each download the transport enables the IRQ and waits up to 500 ms for
+the first valid frame. It then sends the two host commands the piano stock
+stack sends while frames flow: idle-baseline update (``BF 19``, value 1) and op
+mode 2 (``BF 01``, value 2), each confirmed by the vendor's command-byte clear
+within 110 ms. Sent before any frame, the first command did not clear on piano.
+A missing first frame or a command that does not clear stops the IRQ and fails
+the open; the log names the command and the byte last read. Frames read while
+the commands run stay queued. The stock stack repeats the pair on idle events;
+this transport sends it once per open.
 
 Stream contract
 ---------------
@@ -78,7 +83,8 @@ down the chip. Do not enable this driver in a default product yet.
 
 The optional KUnit suite uses a user-supplied ``nt36532e/piano-test.bin`` fixture
 through the firmware loader. It checks the piano layout, malformed inputs,
-byte-exact simulated SRAM writes, golden CRC setup, identity rejection,
-the two post-boot host commands and their timeout, and immediate propagation
-of each injected register-bus error. This does not test
-physical SPI, IRQs, panel power, live framing, or real gestures.
+byte-exact simulated SRAM writes, golden CRC setup, identity rejection, the two
+host commands, their timeout and the reported command byte, and immediate
+propagation of each injected register-bus error. This does not test physical
+SPI, IRQs, the first-frame wait in open, panel power, live framing, or real
+gestures.

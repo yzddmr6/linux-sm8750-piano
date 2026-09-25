@@ -234,33 +234,41 @@ int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
  * EVENT_MAP_HOST_CMD, then up to ten times sleep 10-11 ms and read the command
  * byte until the firmware clears it. The same budget is one bounded poll here.
  * The vendor rewrites the command if the byte reads neither 0xbf nor zero;
- * this transport does not, and reports a byte that does not clear as a timeout.
+ * this transport does not, and reports a byte that does not clear as a timeout
+ * together with the last value read.
  */
-static int nvt_extend_command(struct regmap *map, u8 sub_command, u16 value)
+static int nvt_extend_command(struct regmap *map, u8 sub_command, u16 value,
+			      struct nvt_thp_command_status *last)
 {
 	u8 command[] = { 0xbf, sub_command, 0x00, value & 0xff, value >> 8 };
-	unsigned int status;
+	unsigned int status = command[0];
 	int ret;
 
+	last->sub_command = sub_command;
+	last->status = status;
 	ret = regmap_bulk_write(map, NVT_HOST_COMMAND, command, sizeof(command));
 	if (ret)
 		return ret;
-	return regmap_read_poll_timeout(map, NVT_HOST_COMMAND, status, !status,
-					10000, 110000);
+	ret = regmap_read_poll_timeout(map, NVT_HOST_COMMAND, status, !status,
+				       10000, 110000);
+	last->status = status;
+	return ret;
 }
 
 /*
- * The piano stock stack sends these two commands after every firmware boot
- * and resume, idle-baseline update first:
+ * The piano stock stack sends these two commands, idle-baseline update first:
  * nvt_xm_htc_set_idle_baseline_update(), nt36xxx_ext_proc.c:4242-4255
  * (DATA_MODE_124, nt36xxx.c:4152), then nvt_xm_htc_set_op_mode(2),
  * nt36xxx_ext_proc.c:1137-1150 (DATA_MODE_53 idle, nt36xxx.c:4132-4133).
+ * Stock logs show them only while frames are being read, never earlier than
+ * about 425 ms after the firmware reset state is reached. The caller must
+ * therefore send them only once the firmware is streaming frames.
  */
-int nvt_thp_apply_host_commands(struct regmap *map)
+int nvt_thp_apply_host_commands(struct regmap *map, struct nvt_thp_command_status *last)
 {
-	int ret = nvt_extend_command(map, 0x19, 0x01);
+	int ret = nvt_extend_command(map, 0x19, 0x01, last);
 
 	if (ret)
 		return ret;
-	return nvt_extend_command(map, 0x01, 0x02);
+	return nvt_extend_command(map, 0x01, 0x02, last);
 }

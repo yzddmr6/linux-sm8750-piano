@@ -330,12 +330,15 @@ static void nvt_test_host_commands(struct kunit *test)
 		{ 0xbf, 0x01, 0x00, 0x02, 0x00 },	/* op mode 2 */
 	};
 	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
+	struct nvt_thp_command_status last;
 	struct regmap *map;
 	unsigned int calls, index;
 
 	KUNIT_ASSERT_NOT_NULL(test, mock);
 	map = nvt_mock_map(test, mock);
-	KUNIT_ASSERT_EQ(test, nvt_thp_apply_host_commands(map), 0);
+	KUNIT_ASSERT_EQ(test, nvt_thp_apply_host_commands(map, &last), 0);
+	KUNIT_EXPECT_EQ(test, last.sub_command, 0x01);
+	KUNIT_EXPECT_EQ(test, last.status, 0);
 	KUNIT_ASSERT_EQ(test, mock->host_commands, 2U);
 	KUNIT_EXPECT_MEMEQ(test, mock->host_command, expected, sizeof(expected));
 	/* Each command is polled while busy and once more after clearing. */
@@ -346,7 +349,7 @@ static void nvt_test_host_commands(struct kunit *test)
 	for (index = 1; index <= calls; ++index) {
 		mock->calls = 0;
 		mock->fail_call = index;
-		KUNIT_EXPECT_EQ_MSG(test, nvt_thp_apply_host_commands(map), -EREMOTEIO,
+		KUNIT_EXPECT_EQ_MSG(test, nvt_thp_apply_host_commands(map, &last), -EREMOTEIO,
 				    "bus call %u", index);
 		KUNIT_EXPECT_EQ(test, mock->calls, index);
 	}
@@ -356,12 +359,16 @@ static void nvt_test_host_command_timeout(struct kunit *test)
 {
 	static const u8 expected[5] = { 0xbf, 0x19, 0x00, 0x01, 0x00 };
 	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
+	struct nvt_thp_command_status last;
 	struct regmap *map;
 
 	KUNIT_ASSERT_NOT_NULL(test, mock);
 	map = nvt_mock_map(test, mock);
 	mock->stuck_command = true;
-	KUNIT_EXPECT_EQ(test, nvt_thp_apply_host_commands(map), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, nvt_thp_apply_host_commands(map, &last), -ETIMEDOUT);
+	/* The failing command and the byte it left behind are reported. */
+	KUNIT_EXPECT_EQ(test, last.sub_command, 0x19);
+	KUNIT_EXPECT_EQ(test, last.status, 0xbf);
 	/* The op-mode command is not sent after the first one fails. */
 	KUNIT_EXPECT_EQ(test, mock->host_commands, 1U);
 	KUNIT_EXPECT_MEMEQ(test, mock->host_command[0], expected, sizeof(expected));

@@ -31,6 +31,8 @@
 #define NVT_FRAME_VALID	BIT(0)
 #define NVT_FRAME_EPOCH	BIT(1)
 #define NVT_IRQ_ENABLED	0
+/* Vendor nvt_check_fw_reset_state() budget for post-INIT states: 50 x 10 ms. */
+#define NVT_FIRST_FRAME_MS	500
 
 struct nvt_stream_header {
 	__le32 magic;
@@ -206,7 +208,7 @@ static irqreturn_t nvt_irq(int irq, void *data)
 	if (kfifo_avail(&nvt->fifo) >= length) {
 		kfifo_in(&nvt->fifo, nvt->record, length);
 		if (valid)
-			nvt->epoch = false;
+			WRITE_ONCE(nvt->epoch, false);
 	}
 	wake_up_interruptible(&nvt->wait);
 	return IRQ_HANDLED;
@@ -225,8 +227,11 @@ static int nvt_open(struct inode *inode, struct file *file)
 {
 	struct nvt_thp *nvt = container_of(file->private_data, struct nvt_thp, misc);
 	const struct firmware *firmware;
+	struct nvt_thp_command_status last;
 	struct nvt_thp_firmware image;
+	s64 first_frame_ms;
 	u16 payload_length;
+	ktime_t start;
 	int ret;
 
 	if (file->f_mode & FMODE_WRITE)
@@ -254,26 +259,51 @@ static int nvt_open(struct inode *inode, struct file *file)
 		ret = -EMSGSIZE;
 		goto unlock;
 	}
-	ret = nvt_thp_apply_host_commands(nvt->map);
-	if (ret) {
-		dev_err(&nvt->spi->dev,
-			"THP idle-baseline update/op mode 2 command failed: %d\n", ret);
-		goto unlock;
-	}
-	dev_info(&nvt->spi->dev, "THP idle-baseline update and op mode 2 commands completed\n");
 	nvt->frame_length = NVT_FRAME_PREFIX + payload_length;
 	kfifo_reset(&nvt->fifo);
 	nvt->sequence = 0;
 	nvt->epoch = true;
-	nvt->opened = true;
 	WRITE_ONCE(nvt->error, 0);
 	WRITE_ONCE(nvt->running, true);
+	set_bit(NVT_IRQ_ENABLED, &nvt->flags);
+	enable_irq(nvt->spi->irq);
+	/*
+	 * Sent right after the boot reset state, the idle-baseline command did
+	 * not clear within its budget on piano. The stock stack sends it only
+	 * while frames flow, so wait for the first valid frame, which stays
+	 * queued for the reader.
+	 */
+	start = ktime_get();
+	ret = wait_event_interruptible_timeout(nvt->wait,
+					       !READ_ONCE(nvt->epoch) || READ_ONCE(nvt->error),
+					       msecs_to_jiffies(NVT_FIRST_FRAME_MS));
+	if (!ret)
+		ret = -ETIMEDOUT;
+	else if (ret > 0)
+		ret = READ_ONCE(nvt->error);
+	if (ret) {
+		dev_err(&nvt->spi->dev, "THP first valid frame not received: %d\n", ret);
+		goto stop;
+	}
+	first_frame_ms = ktime_ms_delta(ktime_get(), start);
+	ret = nvt_thp_apply_host_commands(nvt->map, &last);
+	if (ret) {
+		dev_err(&nvt->spi->dev,
+			"THP host command BF %02x failed: %d, command byte %#04x\n",
+			last.sub_command, ret, last.status);
+		goto stop;
+	}
+	dev_info(&nvt->spi->dev,
+		 "THP first frame after %lld ms; idle-baseline update and op mode 2 accepted\n",
+		 first_frame_ms);
+	nvt->opened = true;
 	kref_get(&nvt->ref);
 	file->private_data = nvt;
 	stream_open(inode, file);
-	set_bit(NVT_IRQ_ENABLED, &nvt->flags);
-	enable_irq(nvt->spi->irq);
 	dev_info(&nvt->spi->dev, "THP stream ready, payload %u bytes\n", payload_length);
+	goto unlock;
+stop:
+	nvt_stop_irq(nvt);
 unlock:
 	mutex_unlock(&nvt->lifecycle_lock);
 	return ret;
