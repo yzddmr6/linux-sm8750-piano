@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/oneplus,pad2pro-pogo-keyboard.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: OnePlus Pad 2 Pro pogo pin keyboard
+
+maintainers:
+  - Erwin <yzddmr7@gmail.com>
+
+description: |
+  The OnePlus Pad 2 Pro, and the OPPO Pad 4 Pro built on the same board,
+  accept a keyboard cover with a touchpad on a magnetic pogo pin connector.
+  The keyboard's microcontroller exchanges framed packets with the tablet
+  over one half-duplex data line: the transmit and receive pins of a tablet
+  UART meet on that line through a direction switch, which the tablet
+  enables only while it transmits, so the tablet receives its own
+  transmissions back as well.
+
+  The tablet switches the connector supply. While the supply is off, an
+  attached keyboard pulls a separate sense line low; the tablet samples that
+  line to decide when to power the connector, and learns from the silence of
+  the powered keyboard that it has been removed.
+
+  The touchpad coordinate range and resolution are fixed by the keyboard
+  firmware, identical for every keyboard this tablet accepts, and implied by
+  the compatible string; they are not board properties.
+
+allOf:
+  - $ref: /schemas/serial/serial-peripheral-props.yaml#
+
+properties:
+  compatible:
+    const: oneplus,pad2pro-pogo-keyboard
+
+  vdd-supply:
+    description: Switched supply of the pogo pin connector.
+
+  tx-enable-gpios:
+    maxItems: 1
+    description:
+      Direction switch of the data line. While asserted, the UART transmit
+      pin drives the line; while deasserted, the line belongs to the
+      keyboard.
+
+  detect-gpios:
+    maxItems: 1
+    description:
+      Attachment sense line, asserted while a keyboard is attached. Only
+      meaningful while vdd-supply is off.
+
+  interrupts:
+    maxItems: 1
+    description: Edge on the attachment sense line when a keyboard attaches.
+
+  wakeup-source: true
+
+  current-speed:
+    description: Line rate of the data line.
+    default: 921600
+
+required:
+  - compatible
+  - vdd-supply
+  - tx-enable-gpios
+  - detect-gpios
+  - interrupts
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    serial {
+        keyboard {
+            compatible = "oneplus,pad2pro-pogo-keyboard";
+            vdd-supply = <&pogo_vdd>;
+            tx-enable-gpios = <&tlmm 83 GPIO_ACTIVE_HIGH>;
+            detect-gpios = <&tlmm 96 GPIO_ACTIVE_LOW>;
+            interrupts-extended = <&tlmm 96 IRQ_TYPE_EDGE_FALLING>;
+            wakeup-source;
+        };
+    };
