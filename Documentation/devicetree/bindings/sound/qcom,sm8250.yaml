@@ -196,7 +196,7 @@ examples:
             convert-channels = <8>;
             convert-sample-format = "s32_le";
             cpu {
-                sound-dai = <&q6apmdai SECONDARY_TDM_RX_0>;
+                sound-dai = <&q6apmbedai SECONDARY_TDM_RX_0>;
                 dai-tdm-slot-num = <8>;
                 dai-tdm-slot-width = <32>;
                 dai-tdm-slot-rx-mask = <1 1 1 1 1 1 1 1>;
