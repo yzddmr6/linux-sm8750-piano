@@ -796,6 +796,7 @@ static const struct qcom_snd_soc_common sm8750_priv_data = {
 	.driver_name = "sm8750",
 	.dapm_widgets = sc8280xp_dapm_widgets,
 	.num_dapm_widgets = ARRAY_SIZE(sc8280xp_dapm_widgets),
+	.mi2s_bclk_enable = true,
 	.wcd_jack = true,
 };
 
