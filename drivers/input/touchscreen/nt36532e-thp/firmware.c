@@ -15,6 +15,7 @@
 
 #define NVT_ADDRESS_MAX		0x7fffff
 #define NVT_EVENT_BUF		0x11c400
+#define NVT_HOST_COMMAND	(NVT_EVENT_BUF + 0x50)	/* EVENT_MAP_HOST_CMD */
 #define NVT_AUTO_COPY		0x1fc925
 #define NVT_RESET		0x1fb43e
 #define NVT_BOOT_READY		0x1fb50d
@@ -204,7 +205,7 @@ int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
 	ret = regmap_bulk_write(map, NVT_EVENT_BUF + 0x60, zeros, sizeof(zeros));
 	if (ret)
 		return ret;
-	ret = regmap_bulk_write(map, NVT_EVENT_BUF + 0x50, crc_command, sizeof(crc_command));
+	ret = regmap_bulk_write(map, NVT_HOST_COMMAND, crc_command, sizeof(crc_command));
 	if (ret)
 		return ret;
 	ret = regmap_write(map, NVT_BOOT_READY, 1);
@@ -225,4 +226,41 @@ int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
 		return ret;
 	*payload_length = get_unaligned_le16(info + 2);
 	return 0;
+}
+
+/*
+ * Vendor nvt_set_extend_custom_cmd(), p81/nt36532/nt36xxx_ext_proc.c:999-1052:
+ * write 0xbf, sub-command, 0x00 (write), value low, value high at
+ * EVENT_MAP_HOST_CMD, then up to ten times sleep 10-11 ms and read the command
+ * byte until the firmware clears it. The same budget is one bounded poll here.
+ * The vendor rewrites the command if the byte reads neither 0xbf nor zero;
+ * this transport does not, and reports a byte that does not clear as a timeout.
+ */
+static int nvt_extend_command(struct regmap *map, u8 sub_command, u16 value)
+{
+	u8 command[] = { 0xbf, sub_command, 0x00, value & 0xff, value >> 8 };
+	unsigned int status;
+	int ret;
+
+	ret = regmap_bulk_write(map, NVT_HOST_COMMAND, command, sizeof(command));
+	if (ret)
+		return ret;
+	return regmap_read_poll_timeout(map, NVT_HOST_COMMAND, status, !status,
+					10000, 110000);
+}
+
+/*
+ * The piano stock stack sends these two commands after every firmware boot
+ * and resume, idle-baseline update first:
+ * nvt_xm_htc_set_idle_baseline_update(), nt36xxx_ext_proc.c:4242-4255
+ * (DATA_MODE_124, nt36xxx.c:4152), then nvt_xm_htc_set_op_mode(2),
+ * nt36xxx_ext_proc.c:1137-1150 (DATA_MODE_53 idle, nt36xxx.c:4132-4133).
+ */
+int nvt_thp_apply_host_commands(struct regmap *map)
+{
+	int ret = nvt_extend_command(map, 0x19, 0x01);
+
+	if (ret)
+		return ret;
+	return nvt_extend_command(map, 0x01, 0x02);
 }

@@ -24,5 +24,6 @@ int nvt_thp_parse_firmware(const u8 *data, size_t size,
 void nvt_thp_free_firmware(struct nvt_thp_firmware *image);
 int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
 			  const struct nvt_thp_firmware *image, u16 *payload_length);
+int nvt_thp_apply_host_commands(struct regmap *map);
 
 #endif

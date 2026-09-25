@@ -30,7 +30,12 @@ come from the firmware header, as in the piano vendor flow.
 The transport uses per-device state, regmap and an exclusive misc device instead
 of global state and proc controls. The frame length is read from firmware, not
 copied from another panel. SPI errors stop capture; there is no blind retry,
-automatic firmware reload, pen/doze configuration or reference-board RAM write.
+automatic firmware reload, pen configuration or reference-board RAM write.
+
+After each download the transport sends the two host commands the piano stock
+stack sends after firmware boot and resume: idle-baseline update (``BF 19``,
+value 1) and op mode 2 (``BF 01``, value 2), each confirmed by the vendor's
+command-byte clear within 110 ms. A command that does not clear fails the open.
 
 Stream contract
 ---------------
@@ -73,6 +78,7 @@ down the chip. Do not enable this driver in a default product yet.
 
 The optional KUnit suite uses a user-supplied ``nt36532e/piano-test.bin`` fixture
 through the firmware loader. It checks the piano layout, malformed inputs,
-byte-exact simulated SRAM writes, golden CRC setup, identity rejection and
-immediate propagation of each injected register-bus error. This does not test
+byte-exact simulated SRAM writes, golden CRC setup, identity rejection,
+the two post-boot host commands and their timeout, and immediate propagation
+of each injected register-bus error. This does not test
 physical SPI, IRQs, panel power, live framing, or real gestures.

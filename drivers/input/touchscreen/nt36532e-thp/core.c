@@ -254,6 +254,13 @@ static int nvt_open(struct inode *inode, struct file *file)
 		ret = -EMSGSIZE;
 		goto unlock;
 	}
+	ret = nvt_thp_apply_host_commands(nvt->map);
+	if (ret) {
+		dev_err(&nvt->spi->dev,
+			"THP idle-baseline update/op mode 2 command failed: %d\n", ret);
+		goto unlock;
+	}
+	dev_info(&nvt->spi->dev, "THP idle-baseline update and op mode 2 commands completed\n");
 	nvt->frame_length = NVT_FRAME_PREFIX + payload_length;
 	kfifo_reset(&nvt->fifo);
 	nvt->sequence = 0;

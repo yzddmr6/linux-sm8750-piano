@@ -12,7 +12,9 @@
 struct nvt_mock {
 	u8 *memory;
 	unsigned int calls, fail_call, uploaded, resets;
-	bool bad_id, bad_info, boot_ready;
+	unsigned int host_commands, host_polls, busy_reads;
+	u8 host_command[2][5];
+	bool bad_id, bad_info, boot_ready, stuck_command;
 };
 
 static void nvt_test_release(void *data)
@@ -69,6 +71,13 @@ static int nvt_mock_write(void *context, const void *data, size_t count)
 	if (address >= SZ_2M || size > SZ_2M - address)
 		return -EINVAL;
 	memcpy(mock->memory + address, value, size);
+	if (address == 0x11c450 && size == 5 && value[0] == 0xbf) {
+		if (mock->host_commands < ARRAY_SIZE(mock->host_command))
+			memcpy(mock->host_command[mock->host_commands], value, size);
+		mock->host_commands++;
+		/* Firmware reports the command busy once, then clears it. */
+		mock->busy_reads = 1;
+	}
 	if (address < 0x120000 && address != 0x11c460 && address != 0x11c450)
 		mock->uploaded += size;
 	if (address == 0x1fb43e)
@@ -101,6 +110,18 @@ static int nvt_mock_read(void *context, const void *reg, size_t reg_size,
 		break;
 	case 0x11c460:
 		value[0] = mock->boot_ready ? 0xa0 : 0;
+		break;
+	case 0x11c450:
+		if (size != 1)
+			return -EINVAL;
+		mock->host_polls++;
+		if (mock->stuck_command || mock->busy_reads) {
+			if (mock->busy_reads)
+				mock->busy_reads--;
+			value[0] = mock->memory[address];
+		} else {
+			mock->memory[address] = 0;
+		}
 		break;
 	case 0x11c478:
 		if (size != 38)
@@ -302,12 +323,60 @@ static void nvt_test_identity(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length), -EBADMSG);
 }
 
+static void nvt_test_host_commands(struct kunit *test)
+{
+	static const u8 expected[2][5] = {
+		{ 0xbf, 0x19, 0x00, 0x01, 0x00 },	/* idle-baseline update */
+		{ 0xbf, 0x01, 0x00, 0x02, 0x00 },	/* op mode 2 */
+	};
+	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
+	struct regmap *map;
+	unsigned int calls, index;
+
+	KUNIT_ASSERT_NOT_NULL(test, mock);
+	map = nvt_mock_map(test, mock);
+	KUNIT_ASSERT_EQ(test, nvt_thp_apply_host_commands(map), 0);
+	KUNIT_ASSERT_EQ(test, mock->host_commands, 2U);
+	KUNIT_EXPECT_MEMEQ(test, mock->host_command, expected, sizeof(expected));
+	/* Each command is polled while busy and once more after clearing. */
+	KUNIT_EXPECT_EQ(test, mock->host_polls, 4U);
+	KUNIT_EXPECT_EQ(test, mock->memory[0x11c450], 0);
+
+	calls = mock->calls;
+	for (index = 1; index <= calls; ++index) {
+		mock->calls = 0;
+		mock->fail_call = index;
+		KUNIT_EXPECT_EQ_MSG(test, nvt_thp_apply_host_commands(map), -EREMOTEIO,
+				    "bus call %u", index);
+		KUNIT_EXPECT_EQ(test, mock->calls, index);
+	}
+}
+
+static void nvt_test_host_command_timeout(struct kunit *test)
+{
+	static const u8 expected[5] = { 0xbf, 0x19, 0x00, 0x01, 0x00 };
+	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
+	struct regmap *map;
+
+	KUNIT_ASSERT_NOT_NULL(test, mock);
+	map = nvt_mock_map(test, mock);
+	mock->stuck_command = true;
+	KUNIT_EXPECT_EQ(test, nvt_thp_apply_host_commands(map), -ETIMEDOUT);
+	/* The op-mode command is not sent after the first one fails. */
+	KUNIT_EXPECT_EQ(test, mock->host_commands, 1U);
+	KUNIT_EXPECT_MEMEQ(test, mock->host_command[0], expected, sizeof(expected));
+	KUNIT_EXPECT_GE(test, mock->host_polls, 2U);
+	KUNIT_EXPECT_EQ(test, mock->memory[0x11c450], 0xbf);
+}
+
 static struct kunit_case nvt_cases[] = {
 	KUNIT_CASE(nvt_test_layout),
 	KUNIT_CASE(nvt_test_bad_layout),
 	KUNIT_CASE(nvt_test_upload),
 	KUNIT_CASE(nvt_test_io_errors),
 	KUNIT_CASE(nvt_test_identity),
+	KUNIT_CASE(nvt_test_host_commands),
+	KUNIT_CASE(nvt_test_host_command_timeout),
 	{}
 };
 
