@@ -91,13 +91,14 @@ static int nvt_transfer(struct nvt_thp *nvt, size_t size, bool read)
 		.len = size,
 	};
 	struct spi_message message;
-	int ret;
 
 	spi_message_init_with_transfers(&message, &transfer, 1);
-	ret = spi_sync(nvt->spi, &message);
-	if (ret)
-		return ret;
-	return message.actual_length == size ? 0 : -EIO;
+	/*
+	 * Only the spi_sync() status is meaningful: spi-geni-qcom's GPI DMA
+	 * callback sets cur_msg->status before finalizing the transfer, so the
+	 * SPI core never adds the transfer to actual_length on success.
+	 */
+	return spi_sync(nvt->spi, &message);
 }
 
 static int nvt_select_page(struct nvt_thp *nvt, u32 address)
