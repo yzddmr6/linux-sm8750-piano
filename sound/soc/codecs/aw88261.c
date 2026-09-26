@@ -860,10 +860,32 @@ static int aw88261_set_tdm_slot(struct snd_soc_dai *dai,
 	return 0;
 }
 
+/*
+ * The PLL lock check in aw88261_dev_start() needs BCK to be running, which
+ * some CPU DAIs only provide once they have been triggered. Start the
+ * amplifier when the stream is unmuted at trigger time, after the CPU DAI.
+ */
+static int aw88261_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
+{
+	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(dai->component);
+
+	mutex_lock(&aw88261->lock);
+	if (mute)
+		aw88261_dev_stop(aw88261->aw_pa);
+	else
+		aw88261_start(aw88261);
+	mutex_unlock(&aw88261->lock);
+
+	return 0;
+}
+
 static const struct snd_soc_dai_ops aw88261_dai_ops = {
 	.set_fmt = aw88261_set_fmt,
 	.hw_params = aw88261_hw_params,
 	.set_tdm_slot = aw88261_set_tdm_slot,
+	.mute_stream = aw88261_mute_stream,
+	.no_capture_mute = 1,
+	.mute_unmute_on_trigger = true,
 };
 
 static struct snd_soc_dai_driver aw88261_dai[] = {
@@ -1054,32 +1076,9 @@ static const struct snd_kcontrol_new aw88261_controls[] = {
 		aw88261_profile_get, aw88261_profile_set),
 };
 
-static int aw88261_playback_event(struct snd_soc_dapm_widget *w,
-				struct snd_kcontrol *k, int event)
-{
-	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
-	struct aw88261 *aw88261 = snd_soc_component_get_drvdata(component);
-
-	guard(mutex)(&aw88261->lock);
-	switch (event) {
-	case SND_SOC_DAPM_PRE_PMU:
-		aw88261_start(aw88261);
-		break;
-	case SND_SOC_DAPM_POST_PMD:
-		aw88261_dev_stop(aw88261->aw_pa);
-		break;
-	default:
-		break;
-	}
-
-	return 0;
-}
-
 static const struct snd_soc_dapm_widget aw88261_dapm_widgets[] = {
 	 /* playback */
-	SND_SOC_DAPM_AIF_IN_E("AIF_RX", "Speaker_Playback", 0, 0, 0, 0,
-					aw88261_playback_event,
-					SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+	SND_SOC_DAPM_AIF_IN("AIF_RX", "Speaker_Playback", 0, 0, 0, 0),
 	SND_SOC_DAPM_OUTPUT("DAC Output"),
 
 	/* capture */
