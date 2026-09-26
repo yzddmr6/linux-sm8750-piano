@@ -2480,6 +2480,9 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
 		if (pcie->use_pm_opp)
 			dev_pm_opp_set_opp(pcie->pci->dev, NULL);
 	} else {
+		/* The active controller still needs its power domain. */
+		device_set_awake_path(dev);
+
 		/*
 		 * Set minimum bandwidth required to keep data path
 		 * functional during suspend.

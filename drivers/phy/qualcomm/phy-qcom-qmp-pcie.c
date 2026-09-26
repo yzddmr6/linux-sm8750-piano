@@ -17,6 +17,7 @@
 #include <linux/phy/pcie.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
 #include <linux/reset.h>
@@ -6337,6 +6338,7 @@ static int qmp_pcie_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	qmp->dev = dev;
+	dev_set_drvdata(dev, qmp);
 
 	qmp->cfg = of_device_get_match_data(dev);
 	if (!qmp->cfg)
@@ -6550,11 +6552,27 @@ static const struct of_device_id qmp_pcie_of_match_table[] = {
 };
 MODULE_DEVICE_TABLE(of, qmp_pcie_of_match_table);
 
+static int qmp_pcie_suspend_noirq(struct device *dev)
+{
+	struct qmp_pcie *qmp = dev_get_drvdata(dev);
+
+	/* A retained link still needs its PHY power domain. */
+	if (qmp->phy->power_count)
+		device_set_awake_path(dev);
+
+	return 0;
+}
+
+static const struct dev_pm_ops qmp_pcie_pm_ops = {
+	.suspend_noirq = qmp_pcie_suspend_noirq,
+};
+
 static struct platform_driver qmp_pcie_driver = {
 	.probe		= qmp_pcie_probe,
 	.driver = {
 		.name	= "qcom-qmp-pcie-phy",
 		.of_match_table = qmp_pcie_of_match_table,
+		.pm = pm_ptr(&qmp_pcie_pm_ops),
 	},
 };
 
