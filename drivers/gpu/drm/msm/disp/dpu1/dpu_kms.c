@@ -1505,6 +1505,44 @@ static int __maybe_unused dpu_runtime_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * Disabling the last CRTC drops the core clock's performance vote through
+ * dev_pm_opp_set_rate(dev, 0), and the power domain restores exactly that
+ * on runtime resume. The clock keeps its rate though, and runs at it as
+ * soon as it is enabled below, well before the first CRTC update votes
+ * again. Put the vote for that rate back before the clock is enabled.
+ */
+static int dpu_kms_restore_core_clk_vote(struct dpu_kms *dpu_kms)
+{
+	struct clk *core_clk;
+	unsigned long rate;
+	int ret;
+
+	/*
+	 * The resume in dpu_kms_hw_init() comes before the perf limits are
+	 * known, but after dpu_kms_init() voted for the highest OPP.
+	 */
+	if (!dpu_kms->perf.max_opp_clk_rate)
+		return 0;
+
+	core_clk = msm_clk_bulk_get_clock(dpu_kms->clocks, dpu_kms->num_clocks,
+					  "core");
+	if (!core_clk)
+		return 0;
+
+	rate = clk_get_rate(core_clk);
+	if (!rate)
+		return 0;
+
+	rate = min_t(unsigned long, rate, dpu_kms->perf.max_opp_clk_rate);
+	ret = dev_pm_opp_set_rate(&dpu_kms->pdev->dev, rate);
+	if (ret)
+		DPU_ERROR("failed to vote for core clock rate %lu: %d\n",
+			  rate, ret);
+
+	return ret;
+}
+
 static int __maybe_unused dpu_runtime_resume(struct device *dev)
 {
 	int rc = -1;
@@ -1515,6 +1553,10 @@ static int __maybe_unused dpu_runtime_resume(struct device *dev)
 	struct drm_device *ddev;
 
 	ddev = dpu_kms->dev;
+
+	rc = dpu_kms_restore_core_clk_vote(dpu_kms);
+	if (rc)
+		return rc;
 
 	rc = clk_bulk_prepare_enable(dpu_kms->num_clocks, dpu_kms->clocks);
 	if (rc) {
