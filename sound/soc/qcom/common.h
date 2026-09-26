@@ -14,6 +14,7 @@ struct qcom_snd_tdm_slot_cfg {
 	unsigned int rx_mask;
 	unsigned int slots;
 	unsigned int slot_width;
+	bool bclk_inverted;
 };
 
 int qcom_snd_parse_of(struct snd_soc_card *card);

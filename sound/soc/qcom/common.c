@@ -232,6 +232,7 @@ static int qcom_snd_parse_dai_tdm_slots(struct snd_soc_pcm_runtime *rtd,
 		ret = qcom_snd_parse_tdm_slot(np, &cfg);
 		if (ret)
 			return ret;
+		cfg.bclk_inverted = of_property_read_bool(np, "bitclock-inversion");
 		for (int i = 0; i < count; i++)
 			codec_cfg[index++] = cfg;
 	}
@@ -243,13 +244,25 @@ int qcom_snd_get_dai_tdm_slots(struct snd_soc_pcm_runtime *rtd,
 			       struct qcom_snd_tdm_slot_cfg *cpu_cfg,
 			       struct qcom_snd_tdm_slot_cfg *codec_cfg)
 {
+	unsigned int i;
 	int ret;
 
 	ret = qcom_snd_parse_dai_tdm_slots(rtd, cpu_cfg, codec_cfg);
 	if (ret)
 		return ret;
 
-	return qcom_snd_normalize_tdm_slots(cpu_cfg, codec_cfg, rtd->dai_link->num_codecs);
+	ret = qcom_snd_normalize_tdm_slots(cpu_cfg, codec_cfg, rtd->dai_link->num_codecs);
+	if (ret)
+		return ret;
+
+	/* Bit clock inversion needs a TDM frame and a serial format to apply to. */
+	for (i = 0; i < rtd->dai_link->num_codecs; i++) {
+		if (codec_cfg[i].bclk_inverted &&
+		    (!cpu_cfg->slots || !(rtd->dai_link->dai_fmt & SND_SOC_DAIFMT_FORMAT_MASK)))
+			return -EINVAL;
+	}
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(qcom_snd_get_dai_tdm_slots);
 
@@ -258,6 +271,7 @@ int qcom_snd_apply_dai_tdm_slots_cfg(struct snd_soc_pcm_runtime *rtd,
 				     const struct qcom_snd_tdm_slot_cfg *codec_cfg)
 {
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	unsigned int fmt = rtd->dai_link->dai_fmt;
 	struct snd_soc_dai *codec_dai;
 	int i;
 	int ret;
@@ -276,6 +290,19 @@ int qcom_snd_apply_dai_tdm_slots_cfg(struct snd_soc_pcm_runtime *rtd,
 					       codec_cfg[i].rx_mask,
 					       codec_cfg[i].slots,
 					       codec_cfg[i].slot_width);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * The CPU DAI keeps its bit clock polarity. Codecs that latch data on
+	 * the other edge get the link format with the bit clock inverted.
+	 */
+	for_each_rtd_codec_dais(rtd, i, codec_dai) {
+		if (!codec_cfg[i].bclk_inverted)
+			continue;
+		ret = snd_soc_dai_set_fmt(codec_dai, (fmt & ~SND_SOC_DAIFMT_INV_MASK) |
+					  SND_SOC_DAIFMT_IB_NF);
 		if (ret)
 			return ret;
 	}
