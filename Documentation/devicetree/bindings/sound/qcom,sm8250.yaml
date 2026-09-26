@@ -161,6 +161,13 @@ patternProperties:
             $ref: /schemas/types.yaml#/definitions/uint32
             description: Width, in bits, of each slot
 
+          bitclock-inversion:
+            description:
+              The codec DAIs in this subnode latch data on the inverted bit
+              clock edge. The CPU DAI keeps its own bit clock polarity. Only
+              valid on TDM links that set dai-format.
+            $ref: /schemas/types.yaml#/definitions/flag
+
         patternProperties:
           '^dai-tdm-slot-[rt]x-mask$':
             $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -208,11 +215,13 @@ examples:
                 sound-dai = <&amplifier0>;
                 dai-tdm-slot-tx-mask = <1>;
                 dai-tdm-slot-rx-mask = <1>;
+                bitclock-inversion;
             };
             codec-1 {
                 sound-dai = <&amplifier1>;
                 dai-tdm-slot-tx-mask = <0 0 0 1>;
                 dai-tdm-slot-rx-mask = <0 0 0 1>;
+                bitclock-inversion;
             };
         };
     };
