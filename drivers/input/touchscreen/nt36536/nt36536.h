@@ -127,6 +127,8 @@ struct nvt_ts_data {
 	bool resources_ready;
 	bool stopping;
 	bool touch_awake;
+	/* chip id and memory map read; a follower does it on first prepare */
+	bool chip_identified;
 	const char *fw_name;
 	uint8_t fw_ver;
 	uint8_t x_num;

@@ -1581,24 +1581,28 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 	/*
 	 * A panel follower shares the TDDI die with the display.  It must not
-	 * issue an engineering reset before the panel owns and prepares that die.
-	 * The non-follower path is kept byte-for-byte equivalent to the known-good
-	 * cold boot sequence.  There is no host-owned reset line on this module:
-	 * the touch die is reset together with the panel.
+	 * access the die before the panel owns and prepares it: probe can run
+	 * before the panel is even registered, and the die does not answer
+	 * then.  A follower therefore identifies the chip on the first panel
+	 * prepare (see nvt_ts_resume()) and probe does not touch the hardware.
+	 * The non-follower path is kept byte-for-byte equivalent to the
+	 * known-good cold boot sequence.  There is no host-owned reset line on
+	 * this module: the touch die is reset together with the panel.
 	 */
 	if (!ts->is_panel_follower) {
 		WRITE_ONCE(ts->panel_on, true);
 		nvt_eng_reset();
 		/* need 10ms delay after POR (power-on reset) */
 		usleep_range(10000, 11000);
-	}
 
-	//---check chip version trim---
-	ret = nvt_ts_check_chip_ver_trim();
-	if (ret) {
-		NVT_ERR("chip is not identified\n");
-		ret = -EINVAL;
-		goto err_chipvertrim_failed;
+		//---check chip version trim---
+		ret = nvt_ts_check_chip_ver_trim();
+		if (ret) {
+			NVT_ERR("chip is not identified\n");
+			ret = -EINVAL;
+			goto err_chipvertrim_failed;
+		}
+		ts->chip_identified = true;
 	}
 
 	//---allocate input device---
@@ -1788,7 +1792,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	/*
 	 * Register only after every callback-visible resource exists.  If the
 	 * panel object is not registered yet, this is the sole allowed probe
-	 * defer and it occurs before any follower SPI write or reset.
+	 * defer; a follower has not accessed the die at this point.
 	 */
 	if (ts->is_panel_follower) {
 		ts->panel_follower.funcs = &nt36536_panel_follower_funcs;
@@ -2128,6 +2132,21 @@ static int32_t nvt_ts_resume(struct device *dev)
 	 * panel reset.  Mirror that before the firmware download.
 	 */
 	msleep(500);
+
+	/*
+	 * The first prepare is the first time a follower may access the die;
+	 * read the chip id and select the memory map now.  A failure leaves
+	 * the chip unidentified and is retried on the next prepare.
+	 */
+	if (!ts->chip_identified) {
+		ret = nvt_ts_check_chip_ver_trim();
+		if (ret) {
+			NVT_ERR("chip is not identified: %d\n", ret);
+			ret = -ENODEV;
+			goto resume_fail;
+		}
+		ts->chip_identified = true;
+	}
 
 	/*
 	 * The panel has already reset and initialized the shared TDDI.  A
