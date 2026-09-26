@@ -1609,6 +1609,9 @@ int audioreach_set_media_format(struct q6apm_graph *graph,
 		break;
 	case MODULE_ID_MFC:
 		rc = audioreach_mfc_set_media_format(graph, module, cfg);
+		/* e.g. channel mixer coefficients replacing the built-in ones */
+		if (!rc && module->data)
+			rc = audioreach_set_module_config(graph, module, cfg);
 		break;
 	case MODULE_ID_GAPLESS:
 		rc = audioreach_gapless_set_media_format(graph, module, cfg);
