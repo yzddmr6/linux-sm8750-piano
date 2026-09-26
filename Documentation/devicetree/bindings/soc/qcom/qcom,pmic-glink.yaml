@@ -62,6 +62,17 @@ properties:
           - const: qcom,sm8550-pmic-glink
           - const: qcom,pmic-glink
 
+      - description:
+          Devices whose battery manager firmware speaks the SoC protocol but
+          reports the battery current with the opposite sign (positive while
+          discharging) and fills the battery power slot with a value that
+          does not follow the battery power.
+        items:
+          - enum:
+              - oneplus,pad2pro-pmic-glink
+          - const: qcom,sm8750-pmic-glink
+          - const: qcom,sm8550-pmic-glink
+          - const: qcom,pmic-glink
   xiaomi,charge-pump:
     description: Charge pump cooperating with the Xiaomi MCA firmware for OTG.
     $ref: /schemas/types.yaml#/definitions/phandle
