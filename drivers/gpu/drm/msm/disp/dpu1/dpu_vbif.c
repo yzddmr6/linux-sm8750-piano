@@ -260,6 +260,42 @@ void dpu_vbif_init_memtypes(struct dpu_kms *dpu_kms)
 	}
 }
 
+/**
+ * dpu_vbif_axi_halt_request - halt the VBIF AXI ports before power collapse
+ * @dpu_kms:	DPU handler
+ *
+ * Requests the halt and waits for it for a bounded time.  A halt that is
+ * not acknowledged is reported but does not hold up the power collapse.
+ */
+void dpu_vbif_axi_halt_request(struct dpu_kms *dpu_kms)
+{
+	struct dpu_hw_vbif *vbif = dpu_kms->hw_vbif;
+
+	if (!vbif || !vbif->ops.set_axi_halt || !vbif->ops.get_axi_halt_status)
+		return;
+
+	vbif->ops.set_axi_halt(vbif, true);
+	if (vbif->ops.get_axi_halt_status(vbif))
+		DPU_ERROR("VBIF AXI ports did not halt before power collapse\n");
+}
+
+/**
+ * dpu_vbif_axi_halt_release - release the VBIF AXI ports after power up
+ * @dpu_kms:	DPU handler
+ *
+ * A power collapse clears the halt on its own; this releases it when the
+ * power domain stayed up.
+ */
+void dpu_vbif_axi_halt_release(struct dpu_kms *dpu_kms)
+{
+	struct dpu_hw_vbif *vbif = dpu_kms->hw_vbif;
+
+	if (!vbif || !vbif->ops.set_axi_halt)
+		return;
+
+	vbif->ops.set_axi_halt(vbif, false);
+}
+
 #ifdef CONFIG_DEBUG_FS
 
 void dpu_debugfs_vbif_init(struct dpu_kms *dpu_kms, struct dentry *debugfs_root)

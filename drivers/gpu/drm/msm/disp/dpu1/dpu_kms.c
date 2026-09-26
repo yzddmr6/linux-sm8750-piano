@@ -1476,6 +1476,12 @@ static int __maybe_unused dpu_runtime_suspend(struct device *dev)
 	if (!dpu_lutdma_idle(dpu_kms->lutdma))
 		return -EBUSY;
 
+	/*
+	 * The MDSS power domain may collapse as soon as the clocks are gone;
+	 * halt the VBIF AXI ports first where the hardware asks for it.
+	 */
+	dpu_vbif_axi_halt_request(dpu_kms);
+
 	clk_bulk_disable_unprepare(dpu_kms->num_clocks, dpu_kms->clocks);
 
 	for (i = 0; i < dpu_kms->num_paths; i++)
@@ -1501,6 +1507,7 @@ static int __maybe_unused dpu_runtime_resume(struct device *dev)
 		return rc;
 	}
 
+	dpu_vbif_axi_halt_release(dpu_kms);
 	dpu_vbif_init_memtypes(dpu_kms);
 
 	drm_for_each_encoder(encoder, ddev)

@@ -44,6 +44,10 @@ void dpu_vbif_clear_errors(struct dpu_kms *dpu_kms);
 
 void dpu_vbif_init_memtypes(struct dpu_kms *dpu_kms);
 
+void dpu_vbif_axi_halt_request(struct dpu_kms *dpu_kms);
+
+void dpu_vbif_axi_halt_release(struct dpu_kms *dpu_kms);
+
 void dpu_debugfs_vbif_init(struct dpu_kms *dpu_kms, struct dentry *debugfs_root);
 
 #endif /* __DPU_VBIF_H__ */
