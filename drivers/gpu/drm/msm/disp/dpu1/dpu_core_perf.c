@@ -393,7 +393,7 @@ int dpu_core_perf_crtc_update(struct drm_crtc *crtc,
 		if (!clk_rate)
 			return 0;
 
-		clk_rate = min(clk_rate, kms->perf.max_core_clk_rate);
+		clk_rate = min(clk_rate, kms->perf.max_opp_clk_rate);
 		ret = dev_pm_opp_set_rate(&kms->pdev->dev, clk_rate);
 		if (ret) {
 			DPU_ERROR("failed to set core clock rate %llu\n", clk_rate);
@@ -502,13 +502,25 @@ int dpu_core_perf_debugfs_init(struct dpu_kms *dpu_kms, struct dentry *parent)
  * @perf: Pointer to core performance context
  * @perf_cfg: Pointer to platform performance configuration
  * @max_core_clk_rate: Maximum core clock rate
+ * @max_opp_clk_rate: Highest core clock rate of the OPP table, 0 if none
  */
 int dpu_core_perf_init(struct dpu_core_perf *perf,
 		const struct dpu_perf_cfg *perf_cfg,
-		unsigned long max_core_clk_rate)
+		unsigned long max_core_clk_rate,
+		unsigned long max_opp_clk_rate)
 {
 	perf->perf_cfg = perf_cfg;
 	perf->max_core_clk_rate = max_core_clk_rate;
+	/*
+	 * dev_pm_opp_set_rate() fails with -ERANGE for a rate above the
+	 * highest OPP and leaves the performance vote as it was: none at
+	 * all once the CRTC has been disabled. The clock may round to rates
+	 * no OPP covers, so never request more than the table allows.
+	 */
+	perf->max_opp_clk_rate = max_core_clk_rate;
+	if (max_opp_clk_rate)
+		perf->max_opp_clk_rate = min(perf->max_opp_clk_rate,
+					     (u64)max_opp_clk_rate);
 
 	return 0;
 }

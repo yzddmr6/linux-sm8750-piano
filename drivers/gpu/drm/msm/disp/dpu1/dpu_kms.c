@@ -1143,6 +1143,20 @@ unsigned long dpu_kms_get_clk_rate(struct dpu_kms *dpu_kms, char *clock_name)
 	return clk_get_rate(clk);
 }
 
+static unsigned long dpu_kms_get_max_opp_rate(struct device *dev)
+{
+	unsigned long rate = ULONG_MAX;
+	struct dev_pm_opp *opp;
+
+	opp = dev_pm_opp_find_freq_floor(dev, &rate);
+	if (IS_ERR(opp))
+		return 0;
+
+	dev_pm_opp_put(opp);
+
+	return rate;
+}
+
 #define	DPU_PERF_DEFAULT_MAX_CORE_CLK_RATE	412500000
 
 static int dpu_kms_hw_init(struct msm_kms *kms)
@@ -1268,7 +1282,8 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 		max_core_clk_rate = DPU_PERF_DEFAULT_MAX_CORE_CLK_RATE;
 	}
 
-	rc = dpu_core_perf_init(&dpu_kms->perf, dpu_kms->catalog->perf, max_core_clk_rate);
+	rc = dpu_core_perf_init(&dpu_kms->perf, dpu_kms->catalog->perf, max_core_clk_rate,
+				dpu_kms_get_max_opp_rate(&dpu_kms->pdev->dev));
 	if (rc) {
 		DPU_ERROR("failed to init perf %d\n", rc);
 		goto err_pm_put;

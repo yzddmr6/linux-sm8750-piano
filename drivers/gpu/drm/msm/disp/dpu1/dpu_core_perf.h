@@ -37,6 +37,8 @@ struct dpu_core_perf_tune {
  * @perf_cfg: Platform-specific performance configuration
  * @core_clk_rate: current core clock rate
  * @max_core_clk_rate: maximum allowable core clock rate
+ * @max_opp_clk_rate: highest core clock rate that can be requested, i.e. the
+ *	highest OPP, never above @max_core_clk_rate
  * @perf_tune: debug control for performance tuning
  * @enable_bw_release: debug control for bandwidth release
  * @fix_core_clk_rate: fixed core clock request in Hz used in mode 2
@@ -47,6 +49,7 @@ struct dpu_core_perf {
 	const struct dpu_perf_cfg *perf_cfg;
 	u64 core_clk_rate;
 	u64 max_core_clk_rate;
+	u64 max_opp_clk_rate;
 	struct dpu_core_perf_tune perf_tune;
 	u32 enable_bw_release;
 	u64 fix_core_clk_rate;
@@ -67,7 +70,8 @@ void dpu_core_perf_crtc_release_bw(struct drm_crtc *crtc);
 
 int dpu_core_perf_init(struct dpu_core_perf *perf,
 		const struct dpu_perf_cfg *perf_cfg,
-		unsigned long max_core_clk_rate);
+		unsigned long max_core_clk_rate,
+		unsigned long max_opp_clk_rate);
 
 struct dpu_kms;
 
