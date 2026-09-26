@@ -55,6 +55,29 @@ struct dpu_hw_vbif_ops {
 			u32 xin_id);
 
 	/**
+	 * @set_axi_halt: request or release the halt of the AXI ports
+	 * @vbif: vbif context driver
+	 * @enable: true to request the halt, false to release it
+	 *
+	 * This halts the VBIF towards the bus as a whole, unlike
+	 * @set_halt_ctrl which halts a single client.  The VBIF clock is
+	 * forced on while the halt is requested and handed back to hardware
+	 * control when it is released.
+	 */
+	void (*set_axi_halt)(struct dpu_hw_vbif *vbif, bool enable);
+
+	/**
+	 * @get_axi_halt_status: wait for the AXI ports to halt
+	 * @vbif: vbif context driver
+	 *
+	 * Polls for the acknowledgment of a halt requested through
+	 * @set_axi_halt.  AXI ports that report idle when the wait runs out
+	 * count as halted, since they have nothing left in flight.
+	 * Returns: 0 if the AXI ports are halted, -ETIMEDOUT otherwise
+	 */
+	int (*get_axi_halt_status)(struct dpu_hw_vbif *vbif);
+
+	/**
 	 * @set_qos_remap: set QoS priority remap
 	 * @vbif: vbif context driver
 	 * @xin_id: client interface identifier

@@ -2,6 +2,8 @@
 /* Copyright (c) 2015-2018, The Linux Foundation. All rights reserved.
  */
 
+#include <linux/iopoll.h>
+
 #include <drm/drm_managed.h>
 
 #include "dpu_hwio.h"
@@ -9,6 +11,7 @@
 #include "dpu_hw_vbif.h"
 
 #define VBIF_VERSION			0x0000
+#define VBIF_CLKON			0x0004
 #define VBIF_CLK_FORCE_CTRL0		0x0008
 #define VBIF_CLK_FORCE_CTRL1		0x000C
 #define VBIF_QOS_REMAP_00		0x0020
@@ -31,8 +34,19 @@
 #define VBIF_XIN_CLR_ERR		0x019C
 #define VBIF_XIN_HALT_CTRL0		0x0200
 #define VBIF_XIN_HALT_CTRL1		0x0204
+#define VBIF_AXI_HALT_CTRL0		0x0208
+#define VBIF_AXI_HALT_CTRL1		0x020C
 #define VBIF_XINL_QOS_RP_REMAP_000	0x0550
 #define VBIF_XINL_QOS_LVL_REMAP_000(vbif)	(VBIF_XINL_QOS_RP_REMAP_000 + (vbif)->cap->qos_rp_remap_size)
+
+#define VBIF_CLKON_FORCE_ON		BIT(0)
+#define VBIF_AXI_HALT_REQ		BIT(0)
+#define VBIF_AXI_HALT_ACK		BIT(0)
+#define VBIF_AXI_PORT0_IDLE		BIT(4)
+#define VBIF_AXI_PORT1_IDLE		BIT(5)
+
+#define VBIF_AXI_HALT_POLL_US		100
+#define VBIF_AXI_HALT_TIMEOUT_US	4000
 
 static void dpu_hw_clear_errors(struct dpu_hw_vbif *vbif,
 		u32 *pnd_errors, u32 *src_errors)
@@ -154,6 +168,40 @@ static bool dpu_hw_get_halt_ctrl(struct dpu_hw_vbif *vbif,
 	return (reg_val & BIT(xin_id)) ? true : false;
 }
 
+static void dpu_hw_set_axi_halt(struct dpu_hw_vbif *vbif, bool enable)
+{
+	struct dpu_hw_blk_reg_map *c = &vbif->hw;
+	u32 clkon;
+
+	clkon = DPU_REG_READ(c, VBIF_CLKON);
+
+	if (enable) {
+		DPU_REG_WRITE(c, VBIF_CLKON, clkon | VBIF_CLKON_FORCE_ON);
+		DPU_REG_WRITE(c, VBIF_AXI_HALT_CTRL0, VBIF_AXI_HALT_REQ);
+		/* the request has to reach the VBIF before it is polled for */
+		wmb();
+	} else {
+		DPU_REG_WRITE(c, VBIF_AXI_HALT_CTRL0, 0);
+		DPU_REG_WRITE(c, VBIF_CLKON, clkon & ~VBIF_CLKON_FORCE_ON);
+	}
+}
+
+static int dpu_hw_get_axi_halt_status(struct dpu_hw_vbif *vbif)
+{
+	struct dpu_hw_blk_reg_map *c = &vbif->hw;
+	u32 status;
+	int ret;
+
+	ret = readl_poll_timeout(c->blk_addr + VBIF_AXI_HALT_CTRL1, status,
+				 status & VBIF_AXI_HALT_ACK,
+				 VBIF_AXI_HALT_POLL_US,
+				 VBIF_AXI_HALT_TIMEOUT_US);
+	if (ret && (status & (VBIF_AXI_PORT0_IDLE | VBIF_AXI_PORT1_IDLE)))
+		ret = 0;
+
+	return ret;
+}
+
 static void dpu_hw_set_qos_remap(struct dpu_hw_vbif *vbif,
 		u32 xin_id, u32 level, u32 remap_level)
 {
@@ -206,6 +254,10 @@ static void _setup_vbif_ops(struct dpu_hw_vbif_ops *ops,
 	ops->get_limit_conf = dpu_hw_get_limit_conf;
 	ops->set_halt_ctrl = dpu_hw_set_halt_ctrl;
 	ops->get_halt_ctrl = dpu_hw_get_halt_ctrl;
+	if (test_bit(DPU_VBIF_AXI_HALT, &cap)) {
+		ops->set_axi_halt = dpu_hw_set_axi_halt;
+		ops->get_axi_halt_status = dpu_hw_get_axi_halt_status;
+	}
 	if (test_bit(DPU_VBIF_QOS_REMAP, &cap))
 		ops->set_qos_remap = dpu_hw_set_qos_remap;
 	ops->set_mem_type = dpu_hw_set_mem_type;
