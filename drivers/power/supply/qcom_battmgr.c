@@ -33,6 +33,8 @@ enum qcom_battmgr_variant {
 #define QCOM_BATTMGR_QUIRK_BATT_CURRENT_INVERTED	BIT(0)
 /* BATT_POWER_NOW does not follow the battery power */
 #define QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW		BIT(1)
+/* The charge control opcode and properties mean something else */
+#define QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL		BIT(2)
 
 #define BATTMGR_BAT_STATUS		0x1
 
@@ -777,6 +779,11 @@ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *batt
 static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
 					 enum power_supply_property psp)
 {
+	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL)
+		return 0;
+
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
@@ -793,6 +800,9 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 					 const union power_supply_propval *pval)
 {
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL)
+		return -EOPNOTSUPP;
 
 	if (!battmgr->service_up)
 		return -EAGAIN;
@@ -1681,10 +1691,27 @@ static const struct of_device_id qcom_battmgr_of_quirks[] = {
 	{
 		.compatible = "oneplus,pad2pro-pmic-glink",
 		.data = (void *)(QCOM_BATTMGR_QUIRK_BATT_CURRENT_INVERTED |
-				 QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW),
+				 QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW |
+				 QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL),
 	},
 	{}
 };
+
+static bool qcom_battmgr_bat_prop_hidden(struct qcom_battmgr *battmgr,
+					 enum power_supply_property psp)
+{
+	switch (psp) {
+	/* Leave POWER_NOW out rather than report a value that is not one */
+	case POWER_SUPPLY_PROP_POWER_NOW:
+		return battmgr->quirks & QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW;
+	/* Never send a request that the firmware reads as another command */
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		return battmgr->quirks & QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL;
+	default:
+		return false;
+	}
+}
 
 static const struct power_supply_desc *
 qcom_battmgr_sm8350_bat_desc(struct qcom_battmgr *battmgr,
@@ -1694,10 +1721,10 @@ qcom_battmgr_sm8350_bat_desc(struct qcom_battmgr *battmgr,
 	struct power_supply_desc *copy;
 	size_t i, n = 0;
 
-	if (!(battmgr->quirks & QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW))
+	if (!(battmgr->quirks & (QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW |
+				 QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL)))
 		return desc;
 
-	/* Leave POWER_NOW out rather than report a value that is not one */
 	copy = devm_kmemdup(battmgr->dev, desc, sizeof(*desc), GFP_KERNEL);
 	props = devm_kcalloc(battmgr->dev, desc->num_properties, sizeof(*props),
 			     GFP_KERNEL);
@@ -1705,7 +1732,7 @@ qcom_battmgr_sm8350_bat_desc(struct qcom_battmgr *battmgr,
 		return NULL;
 
 	for (i = 0; i < desc->num_properties; i++)
-		if (desc->properties[i] != POWER_SUPPLY_PROP_POWER_NOW)
+		if (!qcom_battmgr_bat_prop_hidden(battmgr, desc->properties[i]))
 			props[n++] = desc->properties[i];
 
 	copy->properties = props;
