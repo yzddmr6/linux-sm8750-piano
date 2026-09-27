@@ -154,8 +154,6 @@ struct nvt_ts_data {
 	u32 eng_reset_count;
 	u32 resume_count;
 	u32 firmware_update_count;
-	bool point_data_attr_created;
-	bool touch_state_attr_created;
 	uint8_t report_format;
 	bool pen_support;
 	bool wgp_stylus;

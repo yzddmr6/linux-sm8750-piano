@@ -1307,115 +1307,6 @@ static void nvt_resume_work(struct work_struct *work)
 	nvt_ts_resume(&ts_core->client->dev);
 }
 
-static bool nvt_diagnostic_access_allowed(struct nvt_ts_data *ts_core)
-{
-	if (!ts_core->is_panel_follower)
-		return true;
-
-	return READ_ONCE(ts_core->panel_on) &&
-	       READ_ONCE(ts_core->touch_awake);
-}
-
-static ssize_t point_data_show(struct device *dev,
-				       struct device_attribute *attr, char *buf)
-{
-	struct nvt_ts_data *ts_core = dev_get_drvdata(dev);
-	u8 point_data[NVT_REPORT_LEN] = { 0 };
-	const size_t len = sizeof(point_data);
-	ssize_t count;
-	int i, ret;
-
-	if (!ts_core)
-		return -ENODEV;
-	if (!nvt_diagnostic_access_allowed(ts_core))
-		return -EHOSTDOWN;
-
-	mutex_lock(&ts_core->lock);
-	if (!nvt_diagnostic_access_allowed(ts_core)) {
-		mutex_unlock(&ts_core->lock);
-		return -EHOSTDOWN;
-	}
-	ret = CTP_SPI_READ(ts_core->client, point_data, len);
-	mutex_unlock(&ts_core->lock);
-
-	count = sysfs_emit(buf, "ret=%d len=%zu data=", ret, len);
-	for (i = 0; i < len; i++)
-		count += sysfs_emit_at(buf, count, "%02x", point_data[i]);
-	count += sysfs_emit_at(buf, count, "\n");
-
-	return count;
-}
-static DEVICE_ATTR_RO(point_data);
-
-static int nvt_read_event_bytes(struct nvt_ts_data *ts_core, u8 offset,
-				u8 *data, size_t len)
-{
-	int ret;
-
-	memset(data, 0, len);
-	ret = nvt_set_page(ts_core->mmap->EVENT_BUF_ADDR | offset);
-	if (ret)
-		return ret;
-
-	data[0] = offset;
-	return CTP_SPI_READ(ts_core->client, data, len);
-}
-
-static ssize_t touch_state_show(struct device *dev,
-					struct device_attribute *attr, char *buf)
-{
-	struct nvt_ts_data *ts_core = dev_get_drvdata(dev);
-	u8 host_cmd[2] = { 0 };
-	u8 handshake[2] = { 0 };
-	u8 reset_state[6] = { 0 };
-	u8 fw_info[39] = { 0 };
-	ssize_t count;
-	int host_ret, handshake_ret, reset_ret, fw_ret, restore_ret;
-	int i;
-
-	if (!ts_core)
-		return -ENODEV;
-	if (!nvt_diagnostic_access_allowed(ts_core))
-		return -EHOSTDOWN;
-
-	mutex_lock(&ts_core->lock);
-	if (!nvt_diagnostic_access_allowed(ts_core)) {
-		mutex_unlock(&ts_core->lock);
-		return -EHOSTDOWN;
-	}
-	host_ret = nvt_read_event_bytes(ts_core, EVENT_MAP_HOST_CMD,
-					host_cmd, sizeof(host_cmd));
-	handshake_ret = nvt_read_event_bytes(ts_core,
-					     EVENT_MAP_HANDSHAKING_or_SUB_CMD_BYTE,
-					     handshake, sizeof(handshake));
-	reset_ret = nvt_read_event_bytes(ts_core, EVENT_MAP_RESET_COMPLETE,
-					 reset_state, sizeof(reset_state));
-	fw_ret = nvt_read_event_bytes(ts_core, EVENT_MAP_FWINFO,
-				      fw_info, sizeof(fw_info));
-	restore_ret = nvt_set_page(ts_core->mmap->EVENT_BUF_ADDR);
-	mutex_unlock(&ts_core->lock);
-
-	count = sysfs_emit(buf,
-			   "host_ret=%d host=%02x handshake_ret=%d handshake=%02x ",
-			   host_ret, host_cmd[1], handshake_ret, handshake[1]);
-	count += sysfs_emit_at(buf, count, "reset_ret=%d reset=", reset_ret);
-	for (i = 1; i < sizeof(reset_state); i++)
-		count += sysfs_emit_at(buf, count, "%02x", reset_state[i]);
-	count += sysfs_emit_at(buf, count, " fw_ret=%d fwinfo=", fw_ret);
-	for (i = 1; i < sizeof(fw_info); i++)
-		count += sysfs_emit_at(buf, count, "%02x", fw_info[i]);
-	count += sysfs_emit_at(buf, count,
-			       " report_format=%u restore_ret=%d",
-			       ts_core->report_format, restore_ret);
-	count += sysfs_emit_at(buf, count,
-			       " eng_reset_count=%u resume_count=%u firmware_update_count=%u\n",
-			       ts_core->eng_reset_count, ts_core->resume_count,
-			       ts_core->firmware_update_count);
-
-	return count;
-}
-static DEVICE_ATTR_RO(touch_state);
-
 static bool nvt_panel_resume_allowed(struct nvt_ts_data *ts_core)
 {
 	unsigned long flags;
@@ -1835,20 +1726,6 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	NVT_LOG("probe complete: follower=%u panel_on=%u\n",
 		ts->is_panel_follower, READ_ONCE(ts->panel_on));
 
-	ret = device_create_file(&client->dev, &dev_attr_point_data);
-	if (ret)
-		dev_warn(&client->dev,
-			 "failed to create point_data diagnostic: %d\n", ret);
-	else
-		ts->point_data_attr_created = true;
-
-	ret = device_create_file(&client->dev, &dev_attr_touch_state);
-	if (ret)
-		dev_warn(&client->dev,
-			 "failed to create touch_state diagnostic: %d\n", ret);
-	else
-		ts->touch_state_attr_created = true;
-
 	return 0;
 
 err_register_panel_follower_failed:
@@ -1924,15 +1801,6 @@ return:
 static void nvt_ts_remove(struct spi_device *client)
 {
 	NVT_LOG("Removing driver...\n");
-	if (ts->touch_state_attr_created) {
-		device_remove_file(&client->dev, &dev_attr_touch_state);
-		ts->touch_state_attr_created = false;
-	}
-	if (ts->point_data_attr_created) {
-		device_remove_file(&client->dev, &dev_attr_point_data);
-		ts->point_data_attr_created = false;
-	}
-
 	nvt_unregister_panel_follower(ts);
 	nvt_irq_enable(false);
 	nvt_destroy_workqueues(ts);
@@ -1967,15 +1835,6 @@ static void nvt_ts_remove(struct spi_device *client)
 static void nvt_ts_shutdown(struct spi_device *client)
 {
 	NVT_LOG("Shutdown driver...\n");
-	if (ts->touch_state_attr_created) {
-		device_remove_file(&client->dev, &dev_attr_touch_state);
-		ts->touch_state_attr_created = false;
-	}
-	if (ts->point_data_attr_created) {
-		device_remove_file(&client->dev, &dev_attr_point_data);
-		ts->point_data_attr_created = false;
-	}
-
 	nvt_unregister_panel_follower(ts);
 	nvt_irq_enable(false);
 	nvt_destroy_workqueues(ts);
