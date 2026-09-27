@@ -3,6 +3,7 @@
 #
 config TOUCHSCREEN_NT36536_SPI
 	tristate "Novatek NT36536 no flash SPI driver"
+	depends on SPI
 	depends on DRM || DRM = n
 	default n
 	help
