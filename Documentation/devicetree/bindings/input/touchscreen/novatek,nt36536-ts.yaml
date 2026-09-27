@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/input/touchscreen/novatek,nt36536-ts.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Novatek NT36536 touchscreen controller
+
+maintainers:
+  - Erwin <yzddmr7@gmail.com>
+
+description:
+  The Novatek NT36536 is a touch and display driver integrated (TDDI)
+  controller. Its display half is a novatek,nt36536 panel on the DSI bus;
+  this binding describes its touch half, which is reached over SPI. The
+  touch half has no supply or reset line of its own and no flash for its
+  firmware. It is powered and reset together with the panel, and its
+  firmware has to be downloaded again every time the panel is powered up.
+  The panel node therefore owns the supplies and the reset line, and the
+  touchscreen refers to the panel it follows.
+
+allOf:
+  - $ref: touchscreen.yaml#
+  - $ref: /schemas/spi/spi-peripheral-props.yaml#
+
+properties:
+  compatible:
+    const: novatek,nt36536-ts
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  panel:
+    description:
+      The panel driven by the display half of the same controller.
+
+  firmware-name:
+    maxItems: 1
+    description:
+      Firmware image downloaded to the controller each time the panel is
+      powered up.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - panel
+  - touchscreen-size-x
+  - touchscreen-size-y
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    spi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        touchscreen@0 {
+            compatible = "novatek,nt36536-ts";
+            reg = <0>;
+            spi-max-frequency = <12000000>;
+            interrupt-parent = <&tlmm>;
+            interrupts = <162 IRQ_TYPE_EDGE_FALLING>;
+            panel = <&panel>;
+            firmware-name = "novatek/nt36536-xn242.bin";
+            touchscreen-size-x = <2400>;
+            touchscreen-size-y = <3392>;
+            touchscreen-swapped-x-y;
+            touchscreen-inverted-x;
+        };
+    };
+
+...
