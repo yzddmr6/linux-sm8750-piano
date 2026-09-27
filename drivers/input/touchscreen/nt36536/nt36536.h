@@ -70,14 +70,9 @@ extern const uint16_t touch_key_array[TOUCH_KEY_NUM];
 #endif
 #define TOUCH_FORCE_NUM 1000
 //---for Pen---
-#define PEN_PRESSURE_MAX (4095)
 #define PEN_DISTANCE_MAX (1)
 #define PEN_TILT_MIN (-60)
 #define PEN_TILT_MAX (60)
-
-//---for pen resolution---
-#define PANEL_DEFAULT_WIDTH_MM 168  // 168mm
-#define PANEL_DEFAULT_HEIGHT_MM 237 // 237mm
 
 /* This module has no host-wired tp reset pin; reset is shared with the panel. */
 
@@ -102,6 +97,16 @@ enum nvt_report_format {
 	NVT_REPORT_12BIT,
 };
 
+/*
+ * Pen report parameters that come with the controller firmware rather than
+ * with the board geometry.
+ */
+struct nvt_ts_variant {
+	/* pen report units per touchscreen-size unit (panel pixel) */
+	unsigned int pen_coord_scale;
+	unsigned int pen_pressure_max;
+};
+
 enum nvt_ic_state {
 	NVT_IC_SUSPEND_IN,
 	NVT_IC_SUSPEND_OUT,
@@ -114,6 +119,9 @@ struct nvt_ts_data {
 	struct spi_device *client;
 	struct input_dev *input_dev;
 	struct touchscreen_properties prop;
+	/* pen frame: prop scaled by variant->pen_coord_scale */
+	struct touchscreen_properties pen_prop;
+	const struct nvt_ts_variant *variant;
 	struct delayed_work nvt_fwu_work;
 	bool pen_is_charge;
 	uint16_t addr;
@@ -156,9 +164,6 @@ struct nvt_ts_data {
 	u32 firmware_update_count;
 	uint8_t report_format;
 	bool pen_support;
-	bool wgp_stylus;
-	/* Pen report scale, in firmware units per panel pixel. */
-	uint8_t pen_coord_scale;
 	uint8_t x_gang_num;
 	uint8_t y_gang_num;
 	struct input_dev *pen_input_dev;

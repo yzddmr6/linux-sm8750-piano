@@ -578,18 +578,37 @@ static void nvt_ts_set_touch_abs_params(void)
 	touchscreen_parse_properties(ts->input_dev, true, &ts->prop);
 }
 
+/*
+ * The pen block of the report uses the controller frame of the finger
+ * report on a grid pen_coord_scale times finer.  Keep that resolution and
+ * map it onto the display with the same inversion and swap as the fingers,
+ * which nvt_ts_set_touch_abs_params() has parsed into ts->prop already.
+ */
 static void nvt_ts_set_pen_abs_params(void)
 {
-	int32_t x_max = ts->abs_x_max - 1;
-	int32_t y_max = ts->abs_y_max - 1;
+	struct input_dev *pen = ts->pen_input_dev;
+	struct device *dev = &ts->client->dev;
+	unsigned int scale = ts->variant->pen_coord_scale;
+	unsigned int axis_x = ABS_X, axis_y = ABS_Y;
+	u32 mm;
 
-	if (!ts->pen_input_dev)
+	if (!pen)
 		return;
 
-	input_set_abs_params(ts->pen_input_dev, ABS_X, 0, x_max, 0, 0);
-	input_set_abs_params(ts->pen_input_dev, ABS_Y, 0, y_max, 0, 0);
-	input_abs_set_res(ts->pen_input_dev, ABS_X, x_max / PANEL_DEFAULT_WIDTH_MM);
-	input_abs_set_res(ts->pen_input_dev, ABS_Y, y_max / PANEL_DEFAULT_HEIGHT_MM);
+	ts->pen_prop = ts->prop;
+	ts->pen_prop.max_x = ts->abs_x_max * scale - 1;
+	ts->pen_prop.max_y = ts->abs_y_max * scale - 1;
+	if (ts->pen_prop.swap_x_y)
+		swap(axis_x, axis_y);
+
+	input_set_abs_params(pen, axis_x, 0, ts->pen_prop.max_x, 0, 0);
+	input_set_abs_params(pen, axis_y, 0, ts->pen_prop.max_y, 0, 0);
+
+	/* touchscreen-x/y-mm are the lengths of the controller axes */
+	if (!device_property_read_u32(dev, "touchscreen-x-mm", &mm) && mm)
+		input_abs_set_res(pen, axis_x, (ts->pen_prop.max_x + 1) / mm);
+	if (!device_property_read_u32(dev, "touchscreen-y-mm", &mm) && mm)
+		input_abs_set_res(pen, axis_y, (ts->pen_prop.max_y + 1) / mm);
 }
 
 /*******************************************************
@@ -665,13 +684,13 @@ info_retry:
 	return ret;
 }
 
+/*
+ * Leave the position and tilt where the pen was last seen: moving them to
+ * the origin in the proximity-out frame would move the pointer as well.
+ */
 static void release_pen_event(void) {
 	if (ts && ts->pen_input_dev) {
-		input_report_abs(ts->pen_input_dev, ABS_X, 0);
-		input_report_abs(ts->pen_input_dev, ABS_Y, 0);
 		input_report_abs(ts->pen_input_dev, ABS_PRESSURE, 0);
-		input_report_abs(ts->pen_input_dev, ABS_TILT_X, 0);
-		input_report_abs(ts->pen_input_dev, ABS_TILT_Y, 0);
 		input_report_abs(ts->pen_input_dev, ABS_DISTANCE, 0);
 		input_report_key(ts->pen_input_dev, BTN_TOUCH, 0);
 		input_report_key(ts->pen_input_dev, BTN_TOOL_PEN, 0);
@@ -705,26 +724,6 @@ static int32_t nvt_parse_dt(struct device *dev)
 
 	ts->pen_support = device_property_read_bool(dev, "novatek,pen-support");
 	NVT_LOG("novatek,pen-support=%d\n", ts->pen_support);
-
-	ts->wgp_stylus = device_property_read_bool(dev, "novatek,wgp-stylus");
-	NVT_LOG("novatek,wgp-stylus=%d\n", ts->wgp_stylus);
-
-	/*
-	 * The pen half of the report is sampled on a finer grid than the panel,
-	 * and the vendor trees name two different factors for it in the two
-	 * boards that carry this controller family: one sets novatek,wgp-stylus,
-	 * which this driver has always treated as ten firmware units per pixel,
-	 * and another sets novatek,stylus-resol-double, which is two. Neither
-	 * changes the finger scale. With no property the pen reports panel
-	 * pixels like the touch half does.
-	 */
-	if (ts->wgp_stylus)
-		ts->pen_coord_scale = 10;
-	else if (device_property_read_bool(dev, "novatek,stylus-resol-double"))
-		ts->pen_coord_scale = 2;
-	else
-		ts->pen_coord_scale = 1;
-	NVT_LOG("pen_coord_scale=%d\n", ts->pen_coord_scale);
 
 	SWRST_N8_ADDR = trim_id_table[0].hwinfo->hw_regs->swrst_sif_addr;
 
@@ -1009,23 +1008,20 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 				// report pen data
 				pen_x = (uint32_t)(point_data[67] << 8) + (uint32_t)(point_data[68]);
 				pen_y = (uint32_t)(point_data[69] << 8) + (uint32_t)(point_data[70]);
-				pen_x /= ts->pen_coord_scale;
-				pen_y /= ts->pen_coord_scale;
-				if (pen_x > ts->abs_x_max - 1) {
-					pen_x = ts->abs_x_max - 1;
-				}
-				if (pen_y > ts->abs_y_max - 1) {
-					pen_y = ts->abs_y_max - 1;
-				}
+				pen_x = min(pen_x, ts->pen_prop.max_x);
+				pen_y = min(pen_y, ts->pen_prop.max_y);
 				pen_pressure = (uint32_t)(point_data[71] << 8) + (uint32_t)(point_data[72]);
+				pen_pressure = min(pen_pressure,
+						   ts->variant->pen_pressure_max);
 				pen_tilt_x = (int32_t)point_data[73];
 				pen_tilt_y = (int32_t)point_data[74];
 				pen_distance = (uint32_t)(point_data[75] << 8) + (uint32_t)(point_data[76]);
 				pen_btn1 = (uint32_t)(point_data[77] & 0x01);
 				pen_btn2 = (uint32_t)((point_data[77] >> 1) & 0x01);
 
-				input_report_abs(ts->pen_input_dev, ABS_X, pen_x);
-				input_report_abs(ts->pen_input_dev, ABS_Y, pen_y);
+				touchscreen_report_pos(ts->pen_input_dev,
+						       &ts->pen_prop, pen_x,
+						       pen_y, false);
 				input_report_abs(ts->pen_input_dev, ABS_PRESSURE, pen_pressure);
 				input_report_key(ts->pen_input_dev, BTN_TOUCH, !!pen_pressure);
 				input_report_abs(ts->pen_input_dev, ABS_TILT_X, pen_tilt_x);
@@ -1387,6 +1383,12 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	ts->client = client;
 	spi_set_drvdata(client, ts);
 
+	ts->variant = spi_get_device_match_data(client);
+	if (!ts->variant) {
+		ret = -ENODEV;
+		goto err_ckeck_full_duplex;
+	}
+
 	//---prepare for spi parameter---
 	if (ts->client->controller->flags & SPI_CONTROLLER_HALF_DUPLEX) {
 		NVT_ERR("Full duplex not supported by master\n");
@@ -1567,6 +1569,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 			ret = -ENOMEM;
 			goto err_unregister_input;
 		}
+		ts->pen_input_dev->dev.parent = &ts->client->dev;
 
 		//---set pen input device info.---
 		ts->pen_input_dev->evbit[0] = BIT_MASK(EV_SYN) | BIT_MASK(EV_KEY) | BIT_MASK(EV_ABS);
@@ -1579,7 +1582,8 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 		nvt_ts_set_pen_abs_params();
 
-		input_set_abs_params(ts->pen_input_dev, ABS_PRESSURE, 0, PEN_PRESSURE_MAX, 0, 0);
+		input_set_abs_params(ts->pen_input_dev, ABS_PRESSURE, 0,
+				     ts->variant->pen_pressure_max, 0, 0);
 		input_set_abs_params(ts->pen_input_dev, ABS_DISTANCE, 0, PEN_DISTANCE_MAX, 0, 0);
 		input_set_abs_params(ts->pen_input_dev, ABS_TILT_X, PEN_TILT_MIN, PEN_TILT_MAX, 0, 0);
 		input_set_abs_params(ts->pen_input_dev, ABS_TILT_Y, PEN_TILT_MIN, PEN_TILT_MAX, 0, 0);
@@ -2086,15 +2090,27 @@ static struct drm_panel_follower_funcs nt36536_panel_follower_funcs = {
 	.panel_unpreparing = panel_unpreparing,
 };
 
+/*
+ * The OnePlus Pad 2 Pro devicetree describes the pen frame of this firmware
+ * as 24000x33920 for a 2400x3392 display frame (touchscreen,pen-panel-coords
+ * against touchscreen,display-coords), the same tenth-of-a-pixel grid as the
+ * 16-bit finger report, and a pen pressure range of 16384
+ * (touchscreen,pen-max-pressure).
+ */
+static const struct nvt_ts_variant nt36536_variant = {
+	.pen_coord_scale = 10,
+	.pen_pressure_max = 16384,
+};
+
 static const struct spi_device_id nvt_ts_id[] = {
-	{ "nt36536-ts", 0 },
+	{ "nt36536-ts", (kernel_ulong_t)&nt36536_variant },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, nvt_ts_id);
 
 #ifdef CONFIG_OF
 static const struct of_device_id nt36536_of_match[] = {
-	{ .compatible = "novatek,nt36536-ts" },
+	{ .compatible = "novatek,nt36536-ts", .data = &nt36536_variant },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, nt36536_of_match);
