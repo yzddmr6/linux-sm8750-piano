@@ -168,7 +168,6 @@ struct nvt_ts_data {
 	struct work_struct resume_work;
 	uint32_t spi_max_freq;
 	int db_wakeup;
-	bool fw_debug;
 	bool dev_pm_suspend;
 	struct completion dev_pm_suspend_completion;
 	int gesture_command_delayed;
@@ -221,7 +220,6 @@ void nvt_sw_reset_idle(void);
 void nvt_boot_ready(void);
 void nvt_fw_crc_enable(void);
 void nvt_tx_auto_copy_mode(void);
-void nvt_set_dbgfw_status(bool enable);
 int32_t nvt_update_firmware(const char *firmware_name);
 int32_t nvt_update_firmware_no_eng_reset(const char *firmware_name);
 void Boot_Update_Firmware(struct work_struct *work);
@@ -234,7 +232,6 @@ int32_t nvt_check_tx_auto_copy(void);
 int32_t nvt_read_pid(void);
 int32_t nvt_set_page(uint32_t addr);
 int32_t nvt_write_addr(uint32_t addr, uint8_t data);
-bool nvt_get_dbgfw_status(void);
 int32_t nvt_wait_auto_copy(void);
 int32_t disable_pen_input_device(bool disable);
 #if NVT_TOUCH_ESD_PROTECT

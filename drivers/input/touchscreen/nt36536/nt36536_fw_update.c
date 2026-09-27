@@ -26,7 +26,6 @@
 #define FLASH_SECTOR_SIZE SIZE_4KB
 #define FW_BIN_VER_OFFSET (fw_need_write_size - SIZE_4KB)
 #define FW_BIN_VER_BAR_OFFSET (FW_BIN_VER_OFFSET + 1)
-#define DEFAULT_DEBUG_FW_NAME     "novatek_debug_fw.bin"
 static ktime_t start, end;
 const struct firmware *fw_entry = NULL;
 static size_t fw_need_write_size = 0;
@@ -1058,15 +1057,7 @@ void Boot_Update_Firmware(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&ts->lock);
-	if (nvt_get_dbgfw_status()) {
-		ret = nvt_update_firmware(DEFAULT_DEBUG_FW_NAME);
-		if (ret < 0) {
-			NVT_ERR("use built-in fw");
-			ret = nvt_update_firmware(ts->fw_name);
-		}
-	} else {
-		ret = nvt_update_firmware(ts->fw_name);
-	}
+	ret = nvt_update_firmware(ts->fw_name);
 	if (ret < 0)
 		goto out;
 

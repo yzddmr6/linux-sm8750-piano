@@ -798,16 +798,6 @@ static uint8_t nvt_fw_recovery(uint8_t *point_data)
 	return detected;
 }
 
-void nvt_set_dbgfw_status(bool enable)
-{
-	ts->fw_debug = enable;
-}
-
-bool nvt_get_dbgfw_status(void)
-{
-	return ts->fw_debug;
-}
-
 #if NVT_TOUCH_ESD_PROTECT
 void nvt_esd_check_enable(uint8_t enable)
 {
@@ -1643,7 +1633,6 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	ts->dev_pm_suspend = false;
 	ts->gesture_command_delayed = -1;
 	init_completion(&ts->dev_pm_suspend_completion);
-	ts->fw_debug = false;
 
 	ts->pen_input_dev_enable = 1;
 
