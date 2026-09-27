@@ -43,6 +43,13 @@ properties:
       Firmware image downloaded to the controller each time the panel is
       powered up.
 
+  novatek,pen-support:
+    type: boolean
+    description:
+      The sensor and the controller firmware also track an active stylus.
+      The pen is reported in the same frame as touchscreen-size-x and
+      touchscreen-size-y describe, with the same axis swap and inversion.
+
 required:
   - compatible
   - reg
@@ -69,6 +76,7 @@ examples:
             interrupts = <162 IRQ_TYPE_EDGE_FALLING>;
             panel = <&panel>;
             firmware-name = "novatek/nt36536-xn242.bin";
+            novatek,pen-support;
             touchscreen-size-x = <2400>;
             touchscreen-size-y = <3392>;
             touchscreen-swapped-x-y;
