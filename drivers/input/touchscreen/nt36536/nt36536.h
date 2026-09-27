@@ -166,7 +166,6 @@ struct nvt_ts_data {
 	int8_t pen_phys[32];
 	struct workqueue_struct *event_wq;
 	struct work_struct resume_work;
-	uint32_t spi_max_freq;
 	int db_wakeup;
 	bool dev_pm_suspend;
 	struct completion dev_pm_suspend_completion;

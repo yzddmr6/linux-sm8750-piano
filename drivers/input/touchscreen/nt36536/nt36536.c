@@ -23,6 +23,7 @@
 #include <linux/input/mt.h>
 #include <linux/input/touchscreen.h>
 #include <linux/of.h>
+#include <linux/property.h>
 
 #include "nt36536.h"
 
@@ -51,7 +52,8 @@ static void nvt_set_touch_awake_state(struct nvt_ts_data *ts_core,
 				      bool awake);
 
 uint32_t ENG_RST_ADDR  = 0x7FFF80;
-uint32_t SWRST_N8_ADDR = 0; //read from dtsi
+/* Set from the trim table in nvt_parse_dt(). */
+uint32_t SWRST_N8_ADDR;
 
 #if TOUCH_KEY_NUM > 0
 const uint16_t touch_key_array[TOUCH_KEY_NUM] = {
@@ -681,41 +683,30 @@ static void release_pen_event(void) {
 
 /*******************************************************
 Description:
-	Novatek touchscreen parse device tree function.
+	Novatek touchscreen parse device properties function.
+
+	The software reset register is a property of the controller,
+	not of the board: every supported trim revision shares one
+	register block, so it comes from the driver's table.  The
+	report frame of the controller is described by the generic
+	touchscreen-size-x/y properties, which also bound the reported
+	coordinates.  The interrupt and its trigger type come from the
+	interrupts property (see nvt_ts_probe()).
 
 return:
 	n.a.
 *******************************************************/
-#ifdef CONFIG_OF
 static int32_t nvt_parse_dt(struct device *dev)
 {
-	struct device_node *np = dev->of_node;
-	struct of_phandle_args args;
-	uint32_t coords[2] = {0};
+	u32 size;
 	int32_t ret = 0;
 
-	/*
-	 * The interrupt itself comes from the node's standard interrupts
-	 * property (the SPI core maps it into client->irq).  The vendor-style
-	 * novatek,irq-gpio specifier is honored as the trigger-type fallback.
-	 */
-	ts->int_trigger_type = 0;
-	ret = of_parse_phandle_with_args(np, "novatek,irq-gpio", "#gpio-cells",
-					 0, &args);
-	if (!ret) {
-		ts->int_trigger_type = args.args[1] & IRQD_TRIGGER_MASK;
-		of_node_put(args.np);
-	}
-	if (!ts->int_trigger_type) {
-		NVT_LOG("no trigger type in DT, use default 0x%08X\n",
-			INT_TRIGGER_TYPE);
-		ts->int_trigger_type = INT_TRIGGER_TYPE;
-	}
+	ts->int_trigger_type = INT_TRIGGER_TYPE;
 
-	ts->pen_support = of_property_read_bool(np, "novatek,pen-support");
+	ts->pen_support = device_property_read_bool(dev, "novatek,pen-support");
 	NVT_LOG("novatek,pen-support=%d\n", ts->pen_support);
 
-	ts->wgp_stylus = of_property_read_bool(np, "novatek,wgp-stylus");
+	ts->wgp_stylus = device_property_read_bool(dev, "novatek,wgp-stylus");
 	NVT_LOG("novatek,wgp-stylus=%d\n", ts->wgp_stylus);
 
 	/*
@@ -729,58 +720,30 @@ static int32_t nvt_parse_dt(struct device *dev)
 	 */
 	if (ts->wgp_stylus)
 		ts->pen_coord_scale = 10;
-	else if (of_property_read_bool(np, "novatek,stylus-resol-double"))
+	else if (device_property_read_bool(dev, "novatek,stylus-resol-double"))
 		ts->pen_coord_scale = 2;
 	else
 		ts->pen_coord_scale = 1;
 	NVT_LOG("pen_coord_scale=%d\n", ts->pen_coord_scale);
 
-	ret = of_property_read_u32(np, "novatek,swrst-n8-addr", &SWRST_N8_ADDR);
-	if (ret) {
-		NVT_ERR("error reading novatek,swrst-n8-addr. ret=%d\n", ret);
-		return ret;
-	} else {
-		NVT_LOG("SWRST_N8_ADDR=0x%06X\n", SWRST_N8_ADDR);
-	}
+	SWRST_N8_ADDR = trim_id_table[0].hwinfo->hw_regs->swrst_sif_addr;
 
-	ret = of_property_read_string(np, "firmware-name", &ts->fw_name);
+	ret = device_property_read_string(dev, "firmware-name", &ts->fw_name);
 	if (ret) {
 		NVT_LOG("Unable to get touchscreen firmware name\n");
 		ts->fw_name = DEFAULT_BOOT_UPDATE_FIRMWARE_NAME;
 	}
 
-	ret = of_property_read_u32_array(np, "novatek,display-coords", coords, 2);
-	if (ret) {
-		NVT_LOG("novatek,display-coords not set, use defaults %dx%d\n",
-			TOUCH_DEFAULT_MAX_WIDTH, TOUCH_DEFAULT_MAX_HEIGHT);
-		ts->abs_x_max = TOUCH_DEFAULT_MAX_WIDTH;
-		ts->abs_y_max = TOUCH_DEFAULT_MAX_HEIGHT;
-	} else {
-		ts->abs_x_max = coords[0];
-		ts->abs_y_max = coords[1];
-	}
-	NVT_LOG("display coords: %dx%d\n", ts->abs_x_max, ts->abs_y_max);
-
-	ret = of_property_read_u32(np, "spi-max-frequency", &ts->spi_max_freq);
-	if (ret) {
-		NVT_LOG("Unable to get spi freq\n");
-		return ret;
-	} else {
-		NVT_LOG("spi-max-frequency: %u\n", ts->spi_max_freq);
-	}
-
-	return 0;
-}
-#else
-static int32_t nvt_parse_dt(struct device *dev)
-{
-	ts->pen_coord_scale = 1;
-	ts->int_trigger_type = INT_TRIGGER_TYPE;
 	ts->abs_x_max = TOUCH_DEFAULT_MAX_WIDTH;
+	if (!device_property_read_u32(dev, "touchscreen-size-x", &size))
+		ts->abs_x_max = size;
 	ts->abs_y_max = TOUCH_DEFAULT_MAX_HEIGHT;
+	if (!device_property_read_u32(dev, "touchscreen-size-y", &size))
+		ts->abs_y_max = size;
+	NVT_LOG("touch frame: %dx%d\n", ts->abs_x_max, ts->abs_y_max);
+
 	return 0;
 }
-#endif
 
 static uint8_t nvt_fw_recovery(uint8_t *point_data)
 {
@@ -1646,8 +1609,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	/*
 	 * The SPI core has already mapped client->irq from the node's
 	 * interrupts property.  The trigger type comes from that mapping;
-	 * if the domain left it unspecified, fall back to the type carried
-	 * by novatek,irq-gpio, then to the driver default.
+	 * if the domain left it unspecified, fall back to the driver default.
 	 */
 	if (client->irq <= 0) {
 		NVT_ERR("no irq mapped from DT\n");
