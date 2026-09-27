@@ -20,6 +20,8 @@ properties:
     items:
       - enum:
           - csot,ppc100hb1-1
+          - xiaomi,piano-boe-nt36532
+          - xiaomi,piano-csot-nt36532
       - const: novatek,nt36532
 
   reg:
@@ -32,6 +34,12 @@ properties:
   vddio-supply:
     description: regulator that supplies the I/O voltage
 
+  avdd-supply:
+    description: positive LCD bias supply
+
+  avee-supply:
+    description: negative LCD bias supply
+
   ports: true
 
 required:
@@ -40,6 +48,22 @@ required:
   - vddio-supply
   - reset-gpios
   - ports
+
+if:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - xiaomi,piano-boe-nt36532
+          - xiaomi,piano-csot-nt36532
+then:
+  required:
+    - avdd-supply
+    - avee-supply
+else:
+  properties:
+    avdd-supply: false
+    avee-supply: false
 
 unevaluatedProperties: false
 

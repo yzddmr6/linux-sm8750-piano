@@ -178,6 +178,9 @@ static const struct of_device_id qcom_ubwc_configs[] __maybe_unused = {
 	{ .compatible = "qcom,sm8750", .data = &ubwc_5_0_hbb16, },
 	{ .compatible = "qcom,x1e80100", .data = &ubwc_4_0_hbb16, },
 	{ .compatible = "qcom,x1p42100", .data = &ubwc_4_0_hbb16, },
+	/* Bootloader machine names for SM8750. */
+	{ .compatible = "qcom,sun", .data = &ubwc_5_0_hbb16, },
+	{ .compatible = "qcom,sunp", .data = &ubwc_5_0_hbb16, },
 	{ }
 };
 
