@@ -776,8 +776,6 @@ static void nvt_esd_check_func(struct work_struct *work)
 {
 	unsigned int timer = jiffies_to_msecs(jiffies - irq_timer);
 
-	//NVT_LOG("esd_check = %d (retry %d)\n", esd_check, esd_retry);	//DEBUG
-
 	if ((timer > NVT_TOUCH_ESD_CHECK_PERIOD) && esd_check) {
 		/*
 		 * A follower may only recover after the panel has re-established
@@ -859,7 +857,6 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 	int8_t pen_tilt_y = 0;
 	uint32_t pen_btn1 = 0;
 	uint32_t pen_btn2 = 0;
-	uint32_t pen_battery = 0;
 
 	mutex_lock(&ts->lock);
 
@@ -1026,7 +1023,6 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 				pen_distance = (uint32_t)(point_data[75] << 8) + (uint32_t)(point_data[76]);
 				pen_btn1 = (uint32_t)(point_data[77] & 0x01);
 				pen_btn2 = (uint32_t)((point_data[77] >> 1) & 0x01);
-				pen_battery = (uint32_t)point_data[78];
 
 				input_report_abs(ts->pen_input_dev, ABS_X, pen_x);
 				input_report_abs(ts->pen_input_dev, ABS_Y, pen_y);
@@ -1039,8 +1035,6 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 				input_report_key(ts->pen_input_dev, BTN_STYLUS, pen_btn1);
 				input_report_key(ts->pen_input_dev, BTN_STYLUS2, pen_btn2);
 				input_sync(ts->pen_input_dev);
-				// TBD: pen battery event report
-				// NVT_LOG("pen_battery=%d\n", pen_battery);
 			} else if (pen_format_id == 0xF0) {
 				// report Pen ID
 			} else {
