@@ -168,6 +168,8 @@ struct nvt_ts_data {
 	uint8_t y_gang_num;
 	struct input_dev *pen_input_dev;
 	bool pen_input_dev_enable;
+	/* pen scanning requested through sysfs; protected by lock */
+	bool pen_scan;
 	int8_t pen_phys[32];
 	struct workqueue_struct *event_wq;
 	struct work_struct resume_work;
@@ -192,6 +194,14 @@ typedef enum {
 	EVENT_MAP_FWINFO                        = 0x78,
 	EVENT_MAP_PROJECTID                     = 0x9A,
 } SPI_EVENT_MAP;
+
+/*
+ * Extended host command and the pen scan sub-commands of the vendor module
+ * (EVENTBUFFER_EXT_CMD, EVENTBUFFER_EXT_PEN_MODE_ON/OFF).
+ */
+#define NVT_CMD_EXT		0x7F
+#define NVT_EXT_PEN_SCAN_ON	0x10
+#define NVT_EXT_PEN_SCAN_OFF	0x11
 
 //---SPI READ/WRITE---
 #define SPI_WRITE_MASK(a)	(a | 0x80)

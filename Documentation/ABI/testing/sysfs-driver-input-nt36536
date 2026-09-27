@@ -1,0 +1,18 @@
+What:		/sys/bus/spi/devices/spi<bus>.<cs>/pen_scan
+Date:		September 2026
+KernelVersion:	7.2
+Contact:	linux-input@vger.kernel.org
+Description:
+		Reading returns whether the NT36536 touchscreen controller
+		has been asked to scan for an active pen, 0 or 1.  Writing a
+		boolean turns pen scanning on or off.  The default is off:
+		scanning costs power and the controller does not report the
+		pen without it.  The setting survives the firmware reload
+		that follows every panel power up.
+
+		The attribute only exists when the devicetree declares
+		novatek,pen-support.
+
+		Access: Read, Write
+
+		Valid values: Boolean

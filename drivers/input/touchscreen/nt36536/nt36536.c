@@ -50,6 +50,7 @@ static int32_t nvt_ts_suspend(struct device *dev);
 static int32_t nvt_ts_resume(struct device *dev);
 static void nvt_set_touch_awake_state(struct nvt_ts_data *ts_core,
 				      bool awake);
+static void nvt_restore_pen_scan(void);
 
 uint32_t ENG_RST_ADDR  = 0x7FFF80;
 /* Set from the trim table in nvt_parse_dt(). */
@@ -791,7 +792,8 @@ static void nvt_esd_check_func(struct work_struct *work)
 		mutex_lock(&ts->lock);
 		NVT_ERR("do ESD recovery, timer = %d, retry = %d\n", timer, esd_retry);
 		/* do esd recovery, reload fw */
-		nvt_update_firmware(ts->fw_name);
+		if (!nvt_update_firmware(ts->fw_name))
+			nvt_restore_pen_scan();
 		mutex_unlock(&ts->lock);
 		/* update interrupt timer */
 		irq_timer = jiffies;
@@ -1243,6 +1245,128 @@ int32_t disable_pen_input_device(bool disable)
 
 	return __nvt_set_pen_state(disable);
 }
+
+/*
+ * Send an extended host command the way the vendor module does: write the
+ * command and its sub-command to the host command byte of the event buffer,
+ * rewrite them while the firmware has not picked them up, and wait for the
+ * firmware to clear the byte.  The caller holds ts->lock and the firmware is
+ * running.
+ */
+static int nvt_ext_cmd(u8 sub_cmd)
+{
+	u8 buf[4] = {0};
+	int ret;
+	int i;
+
+	ret = nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < 5; i++) {
+		if (buf[1] != NVT_CMD_EXT) {
+			buf[0] = EVENT_MAP_HOST_CMD;
+			buf[1] = NVT_CMD_EXT;
+			buf[2] = sub_cmd;
+			ret = CTP_SPI_WRITE(ts->client, buf, 3);
+			if (ret)
+				return ret;
+		}
+
+		msleep(20);
+
+		buf[0] = EVENT_MAP_HOST_CMD;
+		buf[1] = 0xFF;
+		buf[2] = 0xFF;
+		ret = CTP_SPI_READ(ts->client, buf, 3);
+		if (ret)
+			return ret;
+		if (buf[1] == 0x00)
+			return 0;
+	}
+
+	return -ETIMEDOUT;
+}
+
+/*
+ * The vendor stack sends the pen scan command only once a pen has connected
+ * over Bluetooth, and turns it off again when the pen goes away, so the
+ * firmware is not expected to report a pen before it.  Here the decision is
+ * left to userspace through the pen_scan attribute, off by default so the
+ * sensor does not spend power on a pen that is not there.  A downloaded
+ * firmware starts with scanning off, so the setting is restored after each
+ * download.  Called with ts->lock held.
+ */
+static int nvt_set_pen_scan(bool enable)
+{
+	int ret;
+
+	ret = nvt_ext_cmd(enable ? NVT_EXT_PEN_SCAN_ON : NVT_EXT_PEN_SCAN_OFF);
+	if (ret)
+		NVT_ERR("failed to turn pen scan %s: %d\n",
+			enable ? "on" : "off", ret);
+	else
+		NVT_LOG("pen scan %s\n", enable ? "on" : "off");
+
+	return ret;
+}
+
+static void nvt_restore_pen_scan(void)
+{
+	if (ts->pen_input_dev && ts->pen_scan)
+		nvt_set_pen_scan(true);
+}
+
+static ssize_t pen_scan_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct nvt_ts_data *ts_core = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%d\n", READ_ONCE(ts_core->pen_scan));
+}
+
+static ssize_t pen_scan_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct nvt_ts_data *ts_core = dev_get_drvdata(dev);
+	bool enable;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+
+	mutex_lock(&ts_core->lock);
+	/* touch_awake only changes under ts->lock */
+	if (enable != ts_core->pen_scan && READ_ONCE(ts_core->touch_awake))
+		ret = nvt_set_pen_scan(enable);
+	if (!ret)
+		WRITE_ONCE(ts_core->pen_scan, enable);
+	mutex_unlock(&ts_core->lock);
+
+	return ret ?: count;
+}
+static DEVICE_ATTR_RW(pen_scan);
+
+static struct attribute *nvt_ts_attrs[] = {
+	&dev_attr_pen_scan.attr,
+	NULL
+};
+
+static umode_t nvt_ts_attr_is_visible(struct kobject *kobj,
+				      struct attribute *attr, int n)
+{
+	struct nvt_ts_data *ts_core = dev_get_drvdata(kobj_to_dev(kobj));
+
+	return ts_core && ts_core->pen_input_dev ? attr->mode : 0;
+}
+
+static const struct attribute_group nvt_ts_group = {
+	.attrs = nvt_ts_attrs,
+	.is_visible = nvt_ts_attr_is_visible,
+};
+__ATTRIBUTE_GROUPS(nvt_ts);
 
 static void nvt_resume_work(struct work_struct *work)
 {
@@ -1969,6 +2093,9 @@ static int32_t nvt_ts_resume(struct device *dev)
 		goto resume_fail;
 	}
 
+	/* a pen scan failure is logged and does not stop touch */
+	nvt_restore_pen_scan();
+
 	if (ts->is_panel_follower && !nvt_commit_follower_awake(ts)) {
 		ret = -EHOSTDOWN;
 		goto resume_fail;
@@ -2127,6 +2254,7 @@ static struct spi_driver nvt_spi_driver = {
 #ifdef CONFIG_PM
 		.pm = &nvt_dev_pm_ops,
 #endif
+		.dev_groups = nvt_ts_groups,
 #ifdef CONFIG_OF
 		.of_match_table = nt36536_of_match
 #endif
