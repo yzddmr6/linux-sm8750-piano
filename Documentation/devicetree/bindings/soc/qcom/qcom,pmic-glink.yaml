@@ -65,8 +65,9 @@ properties:
       - description:
           Devices whose battery manager firmware speaks the SoC protocol but
           reports the battery current with the opposite sign (positive while
-          discharging) and fills the battery power slot with a value that
-          does not follow the battery power.
+          discharging), fills the battery power slot with a value that does
+          not follow the battery power, and assigns the charge control
+          request and threshold properties to vendor commands.
         items:
           - enum:
               - oneplus,pad2pro-pmic-glink
