@@ -1486,12 +1486,64 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		ts->chip_identified = true;
 	}
 
+#if BOOT_UPDATE_FIRMWARE
+	if (!ts->is_panel_follower) {
+		nvt_fwu_wq = alloc_workqueue("nvt_fwu_wq",
+					     WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+		if (!nvt_fwu_wq) {
+			NVT_ERR("nvt_fwu_wq create workqueue failed\n");
+			ret = -ENOMEM;
+			goto err_destroy_workqueues;
+		}
+		INIT_DELAYED_WORK(&ts->nvt_fwu_work, Boot_Update_Firmware);
+	}
+#endif
+
+	NVT_LOG("NVT_TOUCH_ESD_PROTECT is %d\n", NVT_TOUCH_ESD_PROTECT);
+#if NVT_TOUCH_ESD_PROTECT
+	INIT_DELAYED_WORK(&nvt_esd_check_work, nvt_esd_check_func);
+	nvt_esd_check_wq = alloc_workqueue("nvt_esd_check_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+	if (!nvt_esd_check_wq) {
+		NVT_ERR("nvt_esd_check_wq create workqueue failed\n");
+		ret = -ENOMEM;
+		goto err_destroy_workqueues;
+	}
+#endif /* #if NVT_TOUCH_ESD_PROTECT */
+
+	ts->event_wq = alloc_workqueue("nvt-event-queue",
+		WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE, 1);
+	if (!ts->event_wq) {
+		NVT_ERR("Can not create work thread for suspend/resume!!");
+		ret = -ENOMEM;
+		goto err_destroy_workqueues;
+	}
+	INIT_WORK(&ts->resume_work, nvt_resume_work);
+
+	/*
+	 * Add the follower before any input device exists.  If the panel is
+	 * not registered yet this defers the probe, and an early probe then
+	 * leaves nothing behind: no input device is registered and removed
+	 * again, so the input device numbers do not depend on probe order.
+	 * The callbacks only record the panel state until resources_ready is
+	 * set below, and a follower has not accessed the die at this point.
+	 */
+	if (ts->is_panel_follower) {
+		ts->panel_follower.funcs = &nt36536_panel_follower_funcs;
+		ret = drm_panel_add_follower(&client->dev,
+					     &ts->panel_follower);
+		if (ret) {
+			NVT_ERR("failed to add panel follower: %d\n", ret);
+			goto err_destroy_workqueues;
+		}
+		ts->panel_follower_registered = true;
+	}
+
 	//---allocate input device---
 	ts->input_dev = input_allocate_device();
 	if (ts->input_dev == NULL) {
 		NVT_ERR("allocate input device failed\n");
 		ret = -ENOMEM;
-		goto err_input_dev_alloc_failed;
+		goto err_remove_follower;
 	}
 	ts->input_dev->dev.parent = &ts->client->dev;
 
@@ -1547,7 +1599,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	ret = input_register_device(ts->input_dev);
 	if (ret) {
 		NVT_ERR("register input device (%s) failed. ret=%d\n", ts->input_dev->name, ret);
-		goto err_input_register_device_failed;
+		goto err_free_input;
 	}
 
 	if (ts->pen_support) {
@@ -1556,7 +1608,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		if (ts->pen_input_dev == NULL) {
 			NVT_ERR("allocate pen input device failed\n");
 			ret = -ENOMEM;
-			goto err_pen_input_dev_alloc_failed;
+			goto err_unregister_input;
 		}
 
 		//---set pen input device info.---
@@ -1584,7 +1636,9 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 		ret = input_register_device(ts->pen_input_dev);
 		if (ret) {
 			NVT_ERR("register pen input device (%s) failed. ret=%d\n", ts->pen_input_dev->name, ret);
-			goto err_pen_input_register_device_failed;
+			input_free_device(ts->pen_input_dev);
+			ts->pen_input_dev = NULL;
+			goto err_unregister_input;
 		}
 	} /* if (ts->pen_support) */
 
@@ -1598,7 +1652,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	if (client->irq <= 0) {
 		NVT_ERR("no irq mapped from DT\n");
 		ret = -EINVAL;
-		goto err_int_request_failed;
+		goto err_unregister_pen;
 	}
 	{
 		u32 irq_type = irqd_get_trigger_type(irq_get_irq_data(client->irq));
@@ -1615,7 +1669,7 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 				   NVT_SPI_NAME, ts);
 	if (ret != 0) {
 		NVT_ERR("request irq failed. ret=%d\n", ret);
-		goto err_int_request_failed;
+		goto err_unregister_pen;
 	}
 	ts->irq_requested = true;
 	if (!ts->is_panel_follower)
@@ -1635,55 +1689,6 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 	init_completion(&ts->dev_pm_suspend_completion);
 
 	ts->pen_input_dev_enable = 1;
-
-#if BOOT_UPDATE_FIRMWARE
-	if (!ts->is_panel_follower) {
-		nvt_fwu_wq = alloc_workqueue("nvt_fwu_wq",
-					     WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
-		if (!nvt_fwu_wq) {
-			NVT_ERR("nvt_fwu_wq create workqueue failed\n");
-			ret = -ENOMEM;
-			goto err_create_nvt_fwu_wq_failed;
-		}
-		INIT_DELAYED_WORK(&ts->nvt_fwu_work, Boot_Update_Firmware);
-	}
-#endif
-
-	NVT_LOG("NVT_TOUCH_ESD_PROTECT is %d\n", NVT_TOUCH_ESD_PROTECT);
-#if NVT_TOUCH_ESD_PROTECT
-	INIT_DELAYED_WORK(&nvt_esd_check_work, nvt_esd_check_func);
-	nvt_esd_check_wq = alloc_workqueue("nvt_esd_check_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
-	if (!nvt_esd_check_wq) {
-		NVT_ERR("nvt_esd_check_wq create workqueue failed\n");
-		ret = -ENOMEM;
-		goto err_create_nvt_esd_check_wq_failed;
-	}
-#endif /* #if NVT_TOUCH_ESD_PROTECT */
-
-	ts->event_wq = alloc_workqueue("nvt-event-queue",
-		WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE, 1);
-	if (!ts->event_wq) {
-		NVT_ERR("Can not create work thread for suspend/resume!!");
-		ret = -ENOMEM;
-		goto err_alloc_work_thread_failed;
-	}
-	INIT_WORK(&ts->resume_work, nvt_resume_work);
-
-	/*
-	 * Register only after every callback-visible resource exists.  If the
-	 * panel object is not registered yet, this is the sole allowed probe
-	 * defer; a follower has not accessed the die at this point.
-	 */
-	if (ts->is_panel_follower) {
-		ts->panel_follower.funcs = &nt36536_panel_follower_funcs;
-		ret = drm_panel_add_follower(&client->dev,
-					     &ts->panel_follower);
-		if (ret) {
-			NVT_ERR("failed to add panel follower: %d\n", ret);
-			goto err_register_panel_follower_failed;
-		}
-		ts->panel_follower_registered = true;
-	}
 
 	{
 		unsigned long flags;
@@ -1717,47 +1722,23 @@ static int32_t nvt_ts_probe(struct spi_device *client)
 
 	return 0;
 
-err_register_panel_follower_failed:
-err_alloc_work_thread_failed:
-#if NVT_TOUCH_ESD_PROTECT
-err_create_nvt_esd_check_wq_failed:
-#endif
-#if BOOT_UPDATE_FIRMWARE
-err_create_nvt_fwu_wq_failed:
-#endif
-	nvt_unregister_panel_follower(ts);
-	nvt_destroy_workqueues(ts);
-	if (ts->irq_requested) {
-		free_irq(client->irq, ts);
-		ts->irq_requested = false;
-	}
-err_int_request_failed:
-	nvt_unregister_panel_follower(ts);
-	if (ts->pen_support) {
+err_unregister_pen:
+	if (ts->pen_input_dev) {
 		input_unregister_device(ts->pen_input_dev);
 		ts->pen_input_dev = NULL;
 	}
-err_pen_input_register_device_failed:
-	nvt_unregister_panel_follower(ts);
-	if (ts->pen_support) {
-		if (ts->pen_input_dev) {
-			input_free_device(ts->pen_input_dev);
-			ts->pen_input_dev = NULL;
-		}
-	}
-err_pen_input_dev_alloc_failed:
-	nvt_unregister_panel_follower(ts);
+err_unregister_input:
 	input_unregister_device(ts->input_dev);
 	ts->input_dev = NULL;
-err_input_register_device_failed:
+err_free_input:
+	/* NULL once unregistered; input_free_device() ignores NULL */
+	input_free_device(ts->input_dev);
+	ts->input_dev = NULL;
+err_remove_follower:
 	nvt_unregister_panel_follower(ts);
-	if (ts->input_dev) {
-		input_free_device(ts->input_dev);
-		ts->input_dev = NULL;
-	}
-err_input_dev_alloc_failed:
+err_destroy_workqueues:
+	nvt_destroy_workqueues(ts);
 err_chipvertrim_failed:
-	nvt_unregister_panel_follower(ts);
 	mutex_destroy(&ts->xbuf_lock);
 	mutex_destroy(&ts->lock);
 err_spi_setup:
