@@ -2093,14 +2093,14 @@ static struct drm_panel_follower_funcs nt36536_panel_follower_funcs = {
 };
 
 static const struct spi_device_id nvt_ts_id[] = {
-	{ NVT_SPI_NAME, 0 },
+	{ "nt36536-ts", 0 },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, nvt_ts_id);
 
 #ifdef CONFIG_OF
 static const struct of_device_id nt36536_of_match[] = {
-	{ .compatible = "novatek,nt36536",},
+	{ .compatible = "novatek,nt36536-ts" },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, nt36536_of_match);
