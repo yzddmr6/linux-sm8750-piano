@@ -42,14 +42,21 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
 	sz = size_add(struct_size(submit, bos, nr_bos),
 		      array_size(sizeof(submit->cmd[0]), nr_cmds));
 
-	submit = kzalloc(sz, GFP_KERNEL | __GFP_NOWARN);
+	/* We previously allocated submit with kmalloc(), but that's
+	 * problematic on low-memory boards with high fragmentation. Now
+	 * vmalloc can be used so we retain the previous implicit sz limit.
+	 */
+	if (sz > KMALLOC_MAX_SIZE)
+		return ERR_PTR(-ENOMEM);
+
+	submit = kvzalloc(sz, GFP_KERNEL | __GFP_NOWARN);
 	if (!submit)
 		return ERR_PTR(-ENOMEM);
 
 	submit->hw_fence = msm_fence_alloc();
 	if (IS_ERR(submit->hw_fence)) {
 		ret = PTR_ERR(submit->hw_fence);
-		kfree(submit);
+		kvfree(submit);
 		return ERR_PTR(ret);
 	}
 
@@ -57,7 +64,7 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
 				 drm_client_id);
 	if (ret) {
 		kfree(submit->hw_fence);
-		kfree(submit);
+		kvfree(submit);
 		return ERR_PTR(ret);
 	}
 
@@ -121,7 +128,7 @@ void __msm_gem_submit_destroy(struct kref *kref)
 	for (i = 0; i < submit->nr_cmds; i++)
 		kfree(submit->cmd[i].relocs);
 
-	kfree(submit);
+	kvfree(submit);
 }
 
 static int submit_lookup_objects(struct msm_gem_submit *submit,
