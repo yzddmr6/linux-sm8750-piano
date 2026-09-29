@@ -34,11 +34,10 @@
 #define S5KJN1_EXPOSURE_STEP		1
 
 #define S5KJN1_REG_AGAIN		CCI_REG16(0x0204)
-#define S5KJN1_AGAIN_MIN		1
-#define S5KJN1_AGAIN_MAX		64
+#define S5KJN1_AGAIN_MIN		32
+#define S5KJN1_AGAIN_MAX		2048
 #define S5KJN1_AGAIN_STEP		1
-#define S5KJN1_AGAIN_DEFAULT		6
-#define S5KJN1_AGAIN_SHIFT		5
+#define S5KJN1_AGAIN_DEFAULT		192
 
 #define S5KJN1_REG_VTS			CCI_REG16(0x0340)
 #define S5KJN1_VTS_MAX			0xffff
@@ -776,7 +775,7 @@ static int s5kjn1_set_ctrl(struct v4l2_ctrl *ctrl)
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
 		ret = cci_write(s5kjn1->regmap, S5KJN1_REG_AGAIN,
-				ctrl->val << S5KJN1_AGAIN_SHIFT, NULL);
+				ctrl->val, NULL);
 		break;
 	case V4L2_CID_EXPOSURE:
 		ret = cci_write(s5kjn1->regmap, S5KJN1_REG_EXPOSURE,
