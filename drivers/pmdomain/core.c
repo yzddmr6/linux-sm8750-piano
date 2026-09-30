@@ -586,11 +586,13 @@ static int genpd_drop_performance_state(struct device *dev)
 	return 0;
 }
 
-static void genpd_restore_performance_state(struct device *dev,
-					    unsigned int state)
+static int genpd_restore_performance_state(struct device *dev,
+					   unsigned int state)
 {
 	if (state)
-		genpd_set_performance_state(dev, state);
+		return genpd_set_performance_state(dev, state);
+
+	return 0;
 }
 
 static int genpd_dev_pm_set_performance_state(struct device *dev,
@@ -1420,8 +1422,12 @@ static int genpd_runtime_resume(struct device *dev)
 		goto out;
 
 	genpd_lock(genpd);
-	genpd_restore_performance_state(dev, gpd_data->rpm_pstate);
-	ret = genpd_power_on(genpd, dev, 0);
+	ret = genpd_restore_performance_state(dev, gpd_data->rpm_pstate);
+	if (!ret) {
+		ret = genpd_power_on(genpd, dev, 0);
+		if (ret)
+			genpd_drop_performance_state(dev);
+	}
 	genpd_unlock(genpd);
 
 	if (ret)
