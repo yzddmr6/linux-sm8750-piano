@@ -81,6 +81,17 @@ config SND_SOC_QCOM_QAIF
 	  subsystem that moves PCM data between memory and external serial
 	  audio interfaces (AIF) and internal codec interfaces (CIF).
 
+config SND_SOC_QCOM_SDW_KUNIT_TEST
+	tristate "KUnit tests for Qualcomm SoundWire stream lifecycle" if !KUNIT_ALL_TESTS
+	depends on KUNIT && SOUNDWIRE && TRACEPOINTS
+	select SND_SOC_QCOM_SDW
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise stream startup/shutdown with synthetic codec DAIs, including
+	  direct digital microphone links with no SoundWire participant.
+	  Slab tracepoints check allocation balance without touching hardware.
+	  This does not emulate physical audio traffic, clocks or a DSP.
+
 config SND_SOC_QDSP6_COMMON
 	tristate
 

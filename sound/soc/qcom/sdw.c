@@ -66,19 +66,26 @@ int qcom_snd_sdw_startup(struct snd_pcm_substream *substream)
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	u32 rx_ch[SDW_MAX_PORTS], tx_ch[SDW_MAX_PORTS];
-	struct sdw_stream_runtime *sruntime;
+	struct sdw_stream_runtime *sruntime = NULL;
 	struct snd_soc_dai *codec_dai;
+	bool stream_set = false;
 	u32 rx_ch_cnt = 0, tx_ch_cnt = 0;
 	int ret, i, j;
 
 	if (!qcom_snd_is_sdw_dai(cpu_dai->id))
 		return 0;
 
-	sruntime = sdw_alloc_stream(cpu_dai->name, SDW_STREAM_PCM);
-	if (!sruntime)
-		return -ENOMEM;
-
 	for_each_rtd_codec_dais(rtd, i, codec_dai) {
+		/* Direct DMIC links can use a TX port without any SoundWire DAI. */
+		if (!codec_dai->driver->ops->set_stream)
+			continue;
+
+		if (!sruntime) {
+			sruntime = sdw_alloc_stream(cpu_dai->name, SDW_STREAM_PCM);
+			if (!sruntime)
+				return -ENOMEM;
+		}
+
 		ret = snd_soc_dai_set_stream(codec_dai, sruntime,
 					     substream->stream);
 		if (ret < 0 && ret != -ENOTSUPP) {
@@ -89,6 +96,7 @@ int qcom_snd_sdw_startup(struct snd_pcm_substream *substream)
 			continue;
 		}
 
+		stream_set = true;
 		ret = snd_soc_dai_get_channel_map(codec_dai, &tx_ch_cnt, tx_ch,
 						  &rx_ch_cnt, rx_ch);
 		if (ret != 0 && ret != -ENOTSUPP) {
@@ -113,6 +121,10 @@ int qcom_snd_sdw_startup(struct snd_pcm_substream *substream)
 			}
 		}
 	}
+
+	/* A callback may reject this direction with -ENOTSUPP. */
+	if (!stream_set)
+		sdw_release_stream(sruntime);
 
 	return 0;
 

@@ -45,6 +45,8 @@ obj-$(CONFIG_SND_SOC_QCOM_SDW) += snd-soc-qcom-sdw.o
 obj-$(CONFIG_SND_SOC_X1E80100) += snd-soc-x1e80100.o
 obj-$(CONFIG_SND_SOC_QCOM_OFFLOAD_UTILS) += snd-soc-qcom-offload-utils.o
 
+obj-$(CONFIG_SND_SOC_QCOM_SDW_KUNIT_TEST) += sdw-test.o
+
 #DSP lib
 obj-$(CONFIG_SND_SOC_QDSP6) += qdsp6/
 
