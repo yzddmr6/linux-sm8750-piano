@@ -22,6 +22,8 @@ struct q6apm_graph;
 #define MODULE_ID_PLACEHOLDER_DECODER	0x07001009
 #define MODULE_ID_I2S_SINK		0x0700100A
 #define MODULE_ID_I2S_SOURCE		0x0700100B
+#define MODULE_ID_TDM_SINK		0x0700100E
+#define MODULE_ID_TDM_SOURCE		0x0700100F
 #define MODULE_ID_SAL			0x07001010
 #define MODULE_ID_MFC			0x07001015
 #define MODULE_ID_DATA_LOGGING		0x0700101A
@@ -545,6 +547,36 @@ struct param_id_i2s_intf_cfg {
 #define PORT_ID_I2S_INPUT		2
 #define PORT_ID_I2S_OUPUT		1
 #define I2S_STACK_SIZE			2048
+
+#define PARAM_ID_TDM_INTF_CFG		0x0800101B
+
+/*
+ * struct param_id_tdm_intf_cfg - LPAIF TDM interface configuration
+ * @lpaif_type: LPAIF block (LPAIF, LPAIF_RXTX, LPAIF_WSA, LPAIF_VA, LPAIF_AXI)
+ * @intf_idx: TDM interface (primary, secondary, ...)
+ * @sync_src: frame sync source (external or internal)
+ * @ctrl_data_out_enable: share the data-out line with other masters
+ * @slot_mask: active slots
+ * @nslots_per_frame: number of slots per frame
+ * @slot_width: slot width in bits (16, 24 or 32)
+ * @sync_mode: short (bit or slot) or long frame sync
+ * @ctrl_invert_sync_pulse: invert the frame sync
+ * @ctrl_sync_data_delay: data delay after frame sync in bit clocks
+ * @reserved: must be zero
+ */
+struct param_id_tdm_intf_cfg {
+	uint32_t lpaif_type;
+	uint32_t intf_idx;
+	uint16_t sync_src;
+	uint16_t ctrl_data_out_enable;
+	uint32_t slot_mask;
+	uint16_t nslots_per_frame;
+	uint16_t slot_width;
+	uint16_t sync_mode;
+	uint16_t ctrl_invert_sync_pulse;
+	uint16_t ctrl_sync_data_delay;
+	uint16_t reserved;
+} __packed;
 
 #define PARAM_ID_AUDIO_IF_INTF_CFG	0x08001B11
 

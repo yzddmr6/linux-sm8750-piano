@@ -792,6 +792,9 @@ static int audioreach_widget_audio_if_module_load(struct audioreach_module *mod,
 		case AR_TKN_U32_MODULE_FMT_DATA:
 			mod->data_format = val;
 			break;
+		case AR_TKN_U32_MODULE_HW_IF_TYPE:
+			mod->hw_interface_type = val;
+			break;
 		case AR_TKN_U16_MODULE_SYNC_SRC:
 			if (val > U16_MAX)
 				return -EINVAL;
@@ -926,6 +929,8 @@ static int audioreach_widget_load_buffer(struct snd_soc_component *component,
 		break;
 	case MODULE_ID_AUDIO_IF_SINK:
 	case MODULE_ID_AUDIO_IF_SOURCE:
+	case MODULE_ID_TDM_SINK:
+	case MODULE_ID_TDM_SOURCE:
 		ret = audioreach_widget_audio_if_module_load(mod, mod_array);
 		if (ret)
 			return ret;
