@@ -11,6 +11,7 @@ struct tx_macro_test {
 	struct snd_soc_component_driver component_driver;
 	struct snd_soc_dapm_widget widgets[3 + NUM_DECIMATORS];
 	struct snd_soc_dapm_route routes[3 * NUM_DECIMATORS];
+	char input_names[NUM_DECIMATORS][24];
 	u32 regs[0x1000 / sizeof(u32)];
 };
 
@@ -79,10 +80,9 @@ static int tx_test_init(struct kunit *test)
 	memcpy(ctx->widgets, &tx_macro_dapm_widgets[3],
 	       3 * sizeof(ctx->widgets[0]));
 	for (i = 0; i < NUM_DECIMATORS; i++) {
-		const char *name = kunit_kasprintf(test, GFP_KERNEL, "Synthetic DEC%d", i);
+		char *name = ctx->input_names[i];
 
-		if (!name)
-			return -ENOMEM;
+		snprintf(name, sizeof(ctx->input_names[i]), "Synthetic DEC%d", i);
 		ctx->widgets[3 + i] = (struct snd_soc_dapm_widget)SND_SOC_DAPM_INPUT(name);
 		for (j = 0; j < 3; j++) {
 			struct snd_soc_dapm_route *route = &ctx->routes[j * NUM_DECIMATORS + i];
