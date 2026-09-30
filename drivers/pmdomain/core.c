@@ -3464,9 +3464,14 @@ static int genpd_set_required_opp(struct device *dev, unsigned int index)
 		ret = pstate;
 		goto err;
 	} else if (pstate > 0) {
-		ret = dev_pm_genpd_set_performance_state(dev, pstate);
-		if (ret)
-			goto err;
+		/* Virtual devices start suspended with runtime PM still disabled. */
+		if (dev->bus == &genpd_bus_type) {
+			dev_gpd_data(dev)->rpm_pstate = pstate;
+		} else {
+			ret = dev_pm_genpd_set_performance_state(dev, pstate);
+			if (ret)
+				goto err;
+		}
 		dev_gpd_data(dev)->default_pstate = pstate;
 	}
 
