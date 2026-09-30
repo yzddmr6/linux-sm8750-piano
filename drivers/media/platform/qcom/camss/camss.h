@@ -110,6 +110,7 @@ struct camss_resources {
 	enum camss_version version;
 	const char *pd_name;
 	const char *pm_clks[CAMSS_RES_MAX];
+	const struct dev_pm_domain_attach_data *perf_domains;
 	const struct camss_subdev_resources *csiphy_res;
 	const struct camss_subdev_resources *tpg_res;
 	const struct camss_subdev_resources *csid_res;

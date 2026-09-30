@@ -5632,6 +5632,17 @@ static const struct media_device_ops camss_media_ops = {
 	.link_notify = v4l2_pipeline_link_notify,
 };
 
+static int camss_configure_perf_domains(struct camss *camss)
+{
+	struct dev_pm_domain_list *pd_list;
+
+	if (!camss->res->perf_domains)
+		return 0;
+
+	return devm_pm_domain_attach_list(camss->dev, camss->res->perf_domains,
+					 &pd_list);
+}
+
 static int camss_configure_pd(struct camss *camss)
 {
 	const struct camss_resources *res = camss->res;
@@ -5839,6 +5850,10 @@ static int camss_probe(struct platform_device *pdev)
 	ret = camss_icc_get(camss);
 	if (ret < 0)
 		return ret;
+
+	ret = camss_configure_perf_domains(camss);
+	if (ret < 0)
+		return dev_err_probe(dev, ret, "Failed to attach performance domains\n");
 
 	ret = camss_configure_pd(camss);
 	if (ret < 0) {
@@ -6184,8 +6199,16 @@ static const struct camss_resources sm8650_resources = {
 	.vfe_num = ARRAY_SIZE(vfe_res_sm8650),
 };
 
+static const char * const sm8750_perf_domain_names[] = { "mmcx", "mx", "mxc" };
+
+static const struct dev_pm_domain_attach_data sm8750_perf_domains = {
+	.pd_names = sm8750_perf_domain_names,
+	.num_pd_names = ARRAY_SIZE(sm8750_perf_domain_names),
+};
+
 static const struct camss_resources sm8750_resources = {
 	.version = CAMSS_8750,
+	.perf_domains = &sm8750_perf_domains,
 	.pd_name = "top",
 	.csiphy_res = csiphy_res_kaanapali,
 	.tpg_res = tpg_res_x1e80100,
