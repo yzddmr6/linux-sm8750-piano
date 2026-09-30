@@ -103,6 +103,9 @@ properties:
           IFE2 GDSC - Global Distributed Switch Controller for IFE2.
       - description:
           Titan GDSC - Global Distributed Switch Controller for the entire camss.
+      - description: MMCX performance domain.
+      - description: MX performance domain for the CSI receiver clocks.
+      - description: MXC performance domain.
 
   power-domain-names:
     items:
@@ -110,6 +113,26 @@ properties:
       - const: ife1
       - const: ife2
       - const: top
+      - const: mmcx
+      - const: mx
+      - const: mxc
+
+  required-opps:
+    description:
+      Minimum performance states while CAMSS is active. The first four entries
+      are empty because the GDSCs do not have performance states.
+    items:
+      - items:
+          - const: 0
+      - items:
+          - const: 0
+      - items:
+          - const: 0
+      - items:
+          - const: 0
+      - description: MMCX performance state.
+      - description: MX performance state.
+      - description: MXC performance state.
 
   ports:
     $ref: /schemas/graph.yaml#/properties/ports
@@ -159,6 +182,7 @@ required:
   - iommus
   - power-domains
   - power-domain-names
+  - required-opps
   - ports
 
 additionalProperties: false
@@ -292,11 +316,21 @@ examples:
             power-domains = <&camcc CAM_CC_TFE_0_GDSC>,
                             <&camcc CAM_CC_TFE_1_GDSC>,
                             <&camcc CAM_CC_TFE_2_GDSC>,
-                            <&camcc CAM_CC_TITAN_TOP_GDSC>;
+                            <&camcc CAM_CC_TITAN_TOP_GDSC>,
+                            <&rpmhpd RPMHPD_MMCX>,
+                            <&rpmhpd RPMHPD_MX>,
+                            <&rpmhpd RPMHPD_MXC>;
             power-domain-names = "ife0",
                                  "ife1",
                                  "ife2",
-                                 "top";
+                                 "top",
+                                 "mmcx",
+                                 "mx",
+                                 "mxc";
+            required-opps = <0>, <0>, <0>, <0>,
+                            <&rpmhpd_opp_nom>,
+                            <&rpmhpd_opp_svs>,
+                            <&rpmhpd_opp_nom>;
 
             ports {
                 #address-cells = <1>;
