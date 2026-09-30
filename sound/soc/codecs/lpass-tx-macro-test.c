@@ -9,6 +9,8 @@ struct tx_macro_test {
 	struct snd_soc_card card;
 	struct snd_soc_aux_dev aux;
 	struct snd_soc_component_driver component_driver;
+	struct snd_soc_dapm_widget widgets[3 + NUM_DECIMATORS];
+	struct snd_soc_dapm_route routes[3 * NUM_DECIMATORS];
 	u32 regs[0x1000 / sizeof(u32)];
 };
 
@@ -55,7 +57,7 @@ static int tx_test_init(struct kunit *test)
 {
 	struct tx_macro_test *ctx;
 	struct device *dev;
-	int i, ret;
+	int i, j, ret;
 
 	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
@@ -73,11 +75,30 @@ static int tx_test_init(struct kunit *test)
 	if (IS_ERR(ctx->tx.regmap))
 		return PTR_ERR(ctx->tx.regmap);
 
-	/* Bind only the three real AIF mixer widgets; no codec power events. */
+	/* Real AIF mixer widgets need paths to instantiate their controls. */
+	memcpy(ctx->widgets, &tx_macro_dapm_widgets[3],
+	       3 * sizeof(ctx->widgets[0]));
+	for (i = 0; i < NUM_DECIMATORS; i++) {
+		const char *name = kunit_kasprintf(test, GFP_KERNEL, "Synthetic DEC%d", i);
+
+		if (!name)
+			return -ENOMEM;
+		ctx->widgets[3 + i] = (struct snd_soc_dapm_widget)SND_SOC_DAPM_INPUT(name);
+		for (j = 0; j < 3; j++) {
+			struct snd_soc_dapm_route *route = &ctx->routes[j * NUM_DECIMATORS + i];
+
+			route->sink = ctx->widgets[j].name;
+			route->control = tx_aif1_cap_mixer[i].name;
+			route->source = name;
+		}
+	}
+	/* No physical codec power events or DSP endpoints are registered. */
 	ctx->component_driver.name = "lpass-tx-control-test";
 	ctx->component_driver.probe = tx_test_component_probe;
-	ctx->component_driver.dapm_widgets = &tx_macro_dapm_widgets[3];
-	ctx->component_driver.num_dapm_widgets = 3;
+	ctx->component_driver.dapm_widgets = ctx->widgets;
+	ctx->component_driver.num_dapm_widgets = ARRAY_SIZE(ctx->widgets);
+	ctx->component_driver.dapm_routes = ctx->routes;
+	ctx->component_driver.num_dapm_routes = ARRAY_SIZE(ctx->routes);
 	ret = devm_snd_soc_register_component(dev, &ctx->component_driver, NULL, 0);
 	if (ret)
 		return ret;
@@ -101,7 +122,7 @@ static int tx_test_put(struct kunit *test, unsigned int dai, unsigned int dec,
 	struct snd_kcontrol *control;
 	char name[48];
 
-	snprintf(name, sizeof(name), "TX_AIF%u_CAP Mixer DEC%u", dai, dec);
+	snprintf(name, sizeof(name), "TX_AIF%u_CAP Mixer DEC%u", dai + 1, dec);
 	control = snd_soc_card_get_kcontrol(&ctx->card, name);
 	if (!control)
 		return -ENOENT;
