@@ -451,4 +451,3 @@ const struct csid_hw_ops csid_ops_980 = {
 	.subdev_init = csid_subdev_init,
 	.reg_update = csid_subdev_reg_update,
 };
-
