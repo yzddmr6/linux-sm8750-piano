@@ -12,6 +12,8 @@
 struct soc_card_test_priv {
 	struct device *card_dev;
 	struct snd_soc_card *card;
+	u8 capture_events[8];
+	unsigned int capture_event_count;
 };
 
 static const struct snd_kcontrol_new test_card_controls[] = {
@@ -67,6 +69,68 @@ static void test_snd_soc_card_get_kcontrol(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, kc);
 }
 
+/* Verify an input-to-input capture route retains an upstream clock gate. */
+static int test_capture_event(struct snd_soc_dapm_widget *w,
+			      struct snd_kcontrol *control, int event)
+{
+	struct snd_soc_card *card = snd_soc_dapm_to_card(w->dapm);
+	struct soc_card_test_priv *priv = snd_soc_card_get_drvdata(card);
+	u8 code = w->id == snd_soc_dapm_supply ? 1 : 2;
+
+	if (event == SND_SOC_DAPM_POST_PMD)
+		code += 2;
+	if (priv->capture_event_count < ARRAY_SIZE(priv->capture_events))
+		priv->capture_events[priv->capture_event_count++] = code;
+	return 0;
+}
+
+static const struct snd_soc_dapm_widget test_capture_widgets[] = {
+	SND_SOC_DAPM_INPUT("Physical input"),
+	SND_SOC_DAPM_SUPPLY_S("Shared clock", -1, SND_SOC_NOPM, 0, 0,
+			      test_capture_event,
+			      SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+	SND_SOC_DAPM_ADC_E("Input gate", NULL, SND_SOC_NOPM, 0, 0,
+			   test_capture_event,
+			   SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMD),
+	SND_SOC_DAPM_INPUT("Capture input"),
+	SND_SOC_DAPM_OUTPUT("Capture endpoint"),
+};
+
+static const struct snd_soc_dapm_route test_capture_routes[] = {
+	{ "Input gate", NULL, "Physical input" },
+	{ "Input gate", NULL, "Shared clock" },
+	{ "Capture input", NULL, "Input gate" },
+	{ "Capture endpoint", NULL, "Capture input" },
+};
+
+static void test_capture_upstream_clock_lifecycle(struct kunit *test)
+{
+	struct soc_card_test_priv *priv = test->priv;
+	struct snd_soc_dapm_context *dapm = snd_soc_card_to_dapm(priv->card);
+	static const u8 expected[] = { 1, 2, 4, 3, 1, 2, 4, 3 };
+	int i;
+
+	snd_soc_card_set_drvdata(priv->card, priv);
+	KUNIT_ASSERT_EQ(test, snd_soc_dapm_new_controls(dapm, test_capture_widgets,
+					      ARRAY_SIZE(test_capture_widgets)), 0);
+	KUNIT_ASSERT_EQ(test, snd_soc_dapm_add_routes(dapm, test_capture_routes,
+					    ARRAY_SIZE(test_capture_routes)), 0);
+	KUNIT_ASSERT_EQ(test, snd_soc_dapm_disable_pin(dapm, "Capture endpoint"), 0);
+	KUNIT_ASSERT_EQ(test, snd_soc_dapm_new_widgets(priv->card), 0);
+	KUNIT_ASSERT_EQ(test, snd_soc_dapm_sync(dapm), 0);
+	KUNIT_EXPECT_EQ(test, priv->capture_event_count, 0);
+
+	for (i = 0; i < 2; i++) {
+		KUNIT_ASSERT_EQ(test, snd_soc_dapm_enable_pin(dapm, "Capture endpoint"), 0);
+		KUNIT_ASSERT_EQ(test, snd_soc_dapm_sync(dapm), 0);
+		KUNIT_EXPECT_EQ(test, priv->capture_event_count, 4 * i + 2);
+		KUNIT_ASSERT_EQ(test, snd_soc_dapm_disable_pin(dapm, "Capture endpoint"), 0);
+		KUNIT_ASSERT_EQ(test, snd_soc_dapm_sync(dapm), 0);
+	}
+	KUNIT_EXPECT_EQ(test, priv->capture_event_count, ARRAY_SIZE(expected));
+	KUNIT_EXPECT_MEMEQ(test, priv->capture_events, expected, sizeof(expected));
+}
+
 static int soc_card_test_case_init(struct kunit *test)
 {
 	struct soc_card_test_priv *priv;
@@ -116,6 +180,7 @@ static void soc_card_test_case_exit(struct kunit *test)
 
 static struct kunit_case soc_card_test_cases[] = {
 	KUNIT_CASE(test_snd_soc_card_get_kcontrol),
+	KUNIT_CASE(test_capture_upstream_clock_lifecycle),
 	{}
 };
 
