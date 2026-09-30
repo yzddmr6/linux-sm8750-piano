@@ -32,6 +32,10 @@ properties:
               - qcom,sm8650-sndcard
               - qcom,sm8750-sndcard
           - const: qcom,sm8450-sndcard
+      - items:
+          - const: xiaomi,piano-sndcard
+          - const: qcom,sm8750-sndcard
+          - const: qcom,sm8450-sndcard
       - enum:
           - ayaneo,pocket-s2-sndcard
           - fairphone,fp4-sndcard
