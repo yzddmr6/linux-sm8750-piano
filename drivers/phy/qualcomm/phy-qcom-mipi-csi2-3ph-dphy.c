@@ -405,3 +405,26 @@ const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_3nm_kaanapali = {
 	.genpds = x1e_genpds,
 	.num_genpds = ARRAY_SIZE(x1e_genpds),
 };
+
+static struct mipi_csi2_genpd sm8750_genpds[] = {
+	{ .name = "top", .scaled = false },
+	{ .name = "mmcx", .scaled = true },
+	{ .name = "mx", .scaled = true },
+	{ .name = "mxc", .scaled = true },
+};
+
+const struct mipi_csi2phy_soc_cfg mipi_csi2_dphy_3nm_sm8750 = {
+	.ops = &phy_qcom_mipi_csi2_ops_3ph_1_0,
+	.reg_info = {
+		.init_seq = lane_regs_x1e80100,
+		.lane_array_size = ARRAY_SIZE(lane_regs_x1e80100),
+		.common_regs_offset = 0x1000,
+		.common_status_offset = 0x138,
+	},
+	.supply_names = (const char **)x1e_supplies,
+	.num_supplies = ARRAY_SIZE(x1e_supplies),
+	.clk_names = (const char **)x1e_clks,
+	.num_clk = ARRAY_SIZE(x1e_clks),
+	.genpds = sm8750_genpds,
+	.num_genpds = ARRAY_SIZE(sm8750_genpds),
+};
