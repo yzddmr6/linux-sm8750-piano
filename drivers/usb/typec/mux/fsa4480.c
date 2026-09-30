@@ -49,8 +49,21 @@
 
 #define FSA4480_ENABLE_AUTO_JACK_DETECT	BIT(0)
 
+#define DIO4485_DEVICE_ID			0xf6
+#define DIO4485_DELAY_L			0x21
+#define DIO4485_ENABLE_SLOW_TURN_ON	BIT(3)
+
+struct fsa4480_chip_data {
+	const struct reg_sequence *init_regs;
+	const struct regmap_config *regmap_config;
+	unsigned int num_init_regs;
+	u8 device_id;
+	u8 function_enable;
+};
+
 struct fsa4480 {
 	struct i2c_client *client;
+	const struct fsa4480_chip_data *data;
 
 	/* used to serialize concurrent change requests */
 	struct mutex lock;
@@ -76,23 +89,31 @@ static const struct regmap_config fsa4480_regmap_config = {
 	.disable_locking = true,
 };
 
-static int fsa4480_set(struct fsa4480 *fsa)
+static const struct regmap_config dio4485_regmap_config = {
+	.reg_bits = 8,
+	.val_bits = 8,
+	.max_register = DIO4485_DELAY_L,
+	.disable_locking = true,
+};
+
+static int fsa4480_set(struct fsa4480 *fsa, enum typec_orientation orientation,
+		       unsigned long mode, unsigned int svid)
 {
-	bool reverse = (fsa->orientation == TYPEC_ORIENTATION_REVERSE);
+	bool reverse = (orientation == TYPEC_ORIENTATION_REVERSE);
 	u8 enable = FSA4480_ENABLE_DEVICE;
 	u8 sel = 0;
+	int ret;
 
 	if (fsa->swap_sbu_lanes)
 		reverse = !reverse;
 
 	/* USB Mode */
-	if (fsa->mode < TYPEC_STATE_MODAL ||
-	    (!fsa->svid && (fsa->mode == TYPEC_MODE_USB2 ||
-			    fsa->mode == TYPEC_MODE_USB3))) {
+	if (mode < TYPEC_STATE_MODAL ||
+	    (!svid && (mode == TYPEC_MODE_USB2 || mode == TYPEC_MODE_USB3))) {
 		enable |= FSA4480_ENABLE_USB;
 		sel = FSA4480_SEL_USB;
-	} else if (fsa->svid) {
-		switch (fsa->mode) {
+	} else if (svid) {
+		switch (mode) {
 		/* DP Only */
 		case TYPEC_DP_STATE_C:
 		case TYPEC_DP_STATE_E:
@@ -113,7 +134,7 @@ static int fsa4480_set(struct fsa4480 *fsa)
 		default:
 			return -EOPNOTSUPP;
 		}
-	} else if (fsa->mode == TYPEC_MODE_AUDIO) {
+	} else if (mode == TYPEC_MODE_AUDIO) {
 		/* Audio Accessory Mode, setup to auto Jack Detection */
 		enable |= FSA4480_ENABLE_USB | FSA4480_ENABLE_AGND;
 	} else
@@ -121,20 +142,30 @@ static int fsa4480_set(struct fsa4480 *fsa)
 
 	if (fsa->cur_enable & FSA4480_ENABLE_SBU) {
 		/* Disable SBU output while re-configuring the switch */
-		regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE,
-			     fsa->cur_enable & ~FSA4480_ENABLE_SBU);
+		ret = regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE,
+				   fsa->cur_enable & ~FSA4480_ENABLE_SBU);
+		if (ret)
+			return ret;
 
 		/* 35us to allow the SBU switch to turn off */
 		usleep_range(35, 1000);
 	}
 
-	regmap_write(fsa->regmap, FSA4480_SWITCH_SELECT, sel);
-	regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, enable);
+	ret = regmap_write(fsa->regmap, FSA4480_SWITCH_SELECT, sel);
+	if (ret)
+		return ret;
+	ret = regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, enable);
+	if (ret)
+		return ret;
 
 	/* Start AUDIO JACK DETECTION to setup MIC, AGND & Sense muxes */
-	if (enable & FSA4480_ENABLE_AGND)
-		regmap_write(fsa->regmap, FSA4480_FUNCTION_ENABLE,
-			     FSA4480_ENABLE_AUTO_JACK_DETECT);
+	if (enable & FSA4480_ENABLE_AGND) {
+		ret = regmap_write(fsa->regmap, FSA4480_FUNCTION_ENABLE,
+				   fsa->data->function_enable |
+				   FSA4480_ENABLE_AUTO_JACK_DETECT);
+		if (ret)
+			return ret;
+	}
 
 	if (enable & FSA4480_ENABLE_SBU) {
 		/* 15us to allow the SBU switch to turn on again */
@@ -155,9 +186,9 @@ static int fsa4480_switch_set(struct typec_switch_dev *sw,
 	mutex_lock(&fsa->lock);
 
 	if (fsa->orientation != orientation) {
-		fsa->orientation = orientation;
-
-		ret = fsa4480_set(fsa);
+		ret = fsa4480_set(fsa, orientation, fsa->mode, fsa->svid);
+		if (!ret)
+			fsa->orientation = orientation;
 	}
 
 	mutex_unlock(&fsa->lock);
@@ -168,19 +199,17 @@ static int fsa4480_switch_set(struct typec_switch_dev *sw,
 static int fsa4480_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
 {
 	struct fsa4480 *fsa = typec_mux_get_drvdata(mux);
+	unsigned int svid = state->alt ? state->alt->svid : 0;
 	int ret = 0;
 
 	mutex_lock(&fsa->lock);
 
-	if (fsa->mode != state->mode) {
-		fsa->mode = state->mode;
-
-		if (state->alt)
-			fsa->svid = state->alt->svid;
-		else
-			fsa->svid = 0; // No SVID
-
-		ret = fsa4480_set(fsa);
+	if (fsa->mode != state->mode || fsa->svid != svid) {
+		ret = fsa4480_set(fsa, fsa->orientation, state->mode, svid);
+		if (!ret) {
+			fsa->mode = state->mode;
+			fsa->svid = svid;
+		}
 	}
 
 	mutex_unlock(&fsa->lock);
@@ -250,27 +279,76 @@ out_error:
 	return ret;
 }
 
+static const struct reg_sequence fsa4480_init_regs[] = {
+	{ FSA4480_SLOW_L, 0x00 },
+	{ FSA4480_SLOW_R, 0x00 },
+	{ FSA4480_SLOW_MIC, 0x00 },
+	{ FSA4480_SLOW_SENSE, 0x00 },
+	{ FSA4480_SLOW_GND, 0x00 },
+	{ FSA4480_DELAY_L_R, 0x00 },
+	{ FSA4480_DELAY_L_MIC, 0x00 },
+	{ FSA4480_DELAY_L_SENSE, 0x00 },
+	{ FSA4480_DELAY_L_AGND, 0x09 },
+	{ FSA4480_SWITCH_SELECT, FSA4480_SEL_USB },
+	{ FSA4480_SWITCH_ENABLE, FSA4480_ENABLE_DEVICE | FSA4480_ENABLE_USB },
+};
+
+static const struct fsa4480_chip_data fsa4480_data = {
+	.init_regs = fsa4480_init_regs,
+	.regmap_config = &fsa4480_regmap_config,
+	.num_init_regs = ARRAY_SIZE(fsa4480_init_regs),
+};
+
+/*
+ * DIO4485 initialization adapted from the vendor driver:
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ * It has independent L/R delays and an explicit slow-turn-on enable.
+ */
+static const struct reg_sequence dio4485_init_regs[] = {
+	{ FSA4480_DELAY_L_SENSE, 0x00 },
+	{ FSA4480_DELAY_L_AGND, 0x00 },
+	{ FSA4480_DELAY_L_MIC, 0x0b },
+	{ FSA4480_DELAY_L_R, 0x0f },
+	{ DIO4485_DELAY_L, 0x0f },
+	{ FSA4480_FUNCTION_ENABLE, DIO4485_ENABLE_SLOW_TURN_ON },
+	{ FSA4480_SWITCH_SELECT, FSA4480_SEL_USB },
+	{ FSA4480_SWITCH_ENABLE, FSA4480_ENABLE_DEVICE | FSA4480_ENABLE_USB },
+};
+
+static const struct fsa4480_chip_data dio4485_data = {
+	.init_regs = dio4485_init_regs,
+	.regmap_config = &dio4485_regmap_config,
+	.num_init_regs = ARRAY_SIZE(dio4485_init_regs),
+	.device_id = DIO4485_DEVICE_ID,
+	.function_enable = DIO4485_ENABLE_SLOW_TURN_ON,
+};
+
 static int fsa4480_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
+	const struct fsa4480_chip_data *data = i2c_get_match_data(client);
 	struct typec_switch_desc sw_desc = { };
 	struct typec_mux_desc mux_desc = { };
 	struct fsa4480 *fsa;
 	int val = 0;
 	int ret;
 
+	if (!data)
+		return -ENODEV;
+
 	fsa = devm_kzalloc(dev, sizeof(*fsa), GFP_KERNEL);
 	if (!fsa)
 		return -ENOMEM;
 
 	fsa->client = client;
+	fsa->data = data;
 	mutex_init(&fsa->lock);
 
 	ret = fsa4480_parse_data_lanes_mapping(fsa);
 	if (ret)
 		return ret;
 
-	fsa->regmap = devm_regmap_init_i2c(client, &fsa4480_regmap_config);
+	fsa->regmap = devm_regmap_init_i2c(client, data->regmap_config);
 	if (IS_ERR(fsa->regmap))
 		return dev_err_probe(dev, PTR_ERR(fsa->regmap), "failed to initialize regmap\n");
 
@@ -280,9 +358,11 @@ static int fsa4480_probe(struct i2c_client *client)
 
 	ret = regmap_read(fsa->regmap, FSA4480_DEVICE_ID, &val);
 	if (ret)
-		return dev_err_probe(dev, -ENODEV, "FSA4480 not found\n");
+		return dev_err_probe(dev, ret, "failed to read device ID\n");
+	if (data->device_id && val != data->device_id)
+		return dev_err_probe(dev, -ENODEV, "unexpected device ID %#x\n", val);
 
-	dev_dbg(dev, "Found FSA4480 v%lu.%lu (Vendor ID = %lu)\n",
+	dev_dbg(dev, "Found analog switch v%lu.%lu (Vendor ID = %lu)\n",
 		FIELD_GET(FSA4480_DEVICE_ID_VERSION_ID, val),
 		FIELD_GET(FSA4480_DEVICE_ID_REV_ID, val),
 		FIELD_GET(FSA4480_DEVICE_ID_VENDOR_ID, val));
@@ -292,18 +372,9 @@ static int fsa4480_probe(struct i2c_client *client)
 	fsa->mode = TYPEC_STATE_SAFE;
 	fsa->orientation = TYPEC_ORIENTATION_NONE;
 
-	/* set default settings */
-	regmap_write(fsa->regmap, FSA4480_SLOW_L, 0x00);
-	regmap_write(fsa->regmap, FSA4480_SLOW_R, 0x00);
-	regmap_write(fsa->regmap, FSA4480_SLOW_MIC, 0x00);
-	regmap_write(fsa->regmap, FSA4480_SLOW_SENSE, 0x00);
-	regmap_write(fsa->regmap, FSA4480_SLOW_GND, 0x00);
-	regmap_write(fsa->regmap, FSA4480_DELAY_L_R, 0x00);
-	regmap_write(fsa->regmap, FSA4480_DELAY_L_MIC, 0x00);
-	regmap_write(fsa->regmap, FSA4480_DELAY_L_SENSE, 0x00);
-	regmap_write(fsa->regmap, FSA4480_DELAY_L_AGND, 0x09);
-	regmap_write(fsa->regmap, FSA4480_SWITCH_SELECT, FSA4480_SEL_USB);
-	regmap_write(fsa->regmap, FSA4480_SWITCH_ENABLE, fsa->cur_enable);
+	ret = regmap_multi_reg_write(fsa->regmap, data->init_regs, data->num_init_regs);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to initialize switch\n");
 
 	sw_desc.drvdata = fsa;
 	sw_desc.fwnode = dev_fwnode(dev);
@@ -336,13 +407,15 @@ static void fsa4480_remove(struct i2c_client *client)
 }
 
 static const struct i2c_device_id fsa4480_table[] = {
-	{ .name = "fsa4480" },
+	{ "fsa4480", (kernel_ulong_t)&fsa4480_data },
+	{ "dio4485", (kernel_ulong_t)&dio4485_data },
 	{ }
 };
 MODULE_DEVICE_TABLE(i2c, fsa4480_table);
 
 static const struct of_device_id fsa4480_of_table[] = {
-	{ .compatible = "fcs,fsa4480" },
+	{ .compatible = "fcs,fsa4480", .data = &fsa4480_data },
+	{ .compatible = "dioo,dio4485", .data = &dio4485_data },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, fsa4480_of_table);
@@ -358,5 +431,5 @@ static struct i2c_driver fsa4480_driver = {
 };
 module_i2c_driver(fsa4480_driver);
 
-MODULE_DESCRIPTION("ON Semiconductor FSA4480 driver");
+MODULE_DESCRIPTION("FSA4480 and DIO4485 analog switch driver");
 MODULE_LICENSE("GPL v2");

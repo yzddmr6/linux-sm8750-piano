@@ -3,14 +3,24 @@
 menu "USB Type-C Multiplexer/DeMultiplexer Switch support"
 
 config TYPEC_MUX_FSA4480
-	tristate "ON Semi FSA4480 Analog Audio Switch driver"
+	tristate "FSA4480 / DIO4485 Analog Audio Switch driver"
 	depends on I2C
 	select REGMAP_I2C
 	help
-	  Driver for the ON Semiconductor FSA4480 Analog Audio Switch, which
+	  Driver for the ON Semiconductor FSA4480 and DIOO DIO4485 switches, which
 	  provides support for muxing analog audio and sideband signals on a
 	  common USB Type-C connector.
 	  If compiled as a module, the module will be named fsa4480.
+
+config TYPEC_MUX_FSA4480_KUNIT_TEST
+	tristate "FSA4480 family register and lifecycle tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT && TYPEC_MUX_FSA4480
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise the real driver and Type-C APIs on a synthetic I2C bus.
+	  Verify initialization, USB/DP/audio routing and propagation of
+	  transport errors, including subsequent requests after failures.
+	  No physical USB connector or switch is accessed.
 
 config TYPEC_MUX_GPIO_SBU
 	tristate "Generic GPIO based SBU mux for USB Type-C applications"
