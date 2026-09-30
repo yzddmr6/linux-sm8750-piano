@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/usb/fcs,fsa4480.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: ON Semiconductor Analog Audio Switch
+title: FSA4480 and DIO4485 analog audio and SBU switches
 
 maintainers:
   - Bjorn Andersson <bjorn.andersson@linaro.org>
@@ -12,7 +12,9 @@ maintainers:
 properties:
   compatible:
     oneOf:
-      - const: fcs,fsa4480
+      - enum:
+          - fcs,fsa4480
+          - dioo,dio4485
       - items:
           - enum:
               - ocs,ocp96011
