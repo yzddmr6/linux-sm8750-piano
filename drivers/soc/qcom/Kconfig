@@ -121,6 +121,16 @@ config QCOM_PMIC_GLINK
 	  Say yes here to support USB-C and battery status on modern Qualcomm
 	  platforms.
 
+config QCOM_PMIC_GLINK_ALTMODE_KUNIT_TEST
+	bool "PMIC GLINK DisplayPort notification tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && QCOM_PMIC_GLINK=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test the DP state sent by the real AltMode helper to Type-C mux
+	  and retimer consumers registered on synthetic software nodes.
+	  Cover pin assignments, status bits, invalid inputs and errors.
+	  No PMIC GLINK transport or physical connector is accessed.
+
 config QCOM_RAMP_CTRL
 	tristate "Qualcomm Ramp Controller driver"
 	help

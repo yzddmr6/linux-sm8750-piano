@@ -23,6 +23,10 @@
 
 #include <linux/soc/qcom/pmic_glink.h>
 
+#if IS_ENABLED(CONFIG_QCOM_PMIC_GLINK_ALTMODE_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 #define PMIC_GLINK_MAX_PORTS	3
 
 #define USBC_SC8180X_NOTIFY_IND	0x13
@@ -147,6 +151,10 @@ static int pmic_glink_altmode_request(struct pmic_glink_altmode *altmode, u32 cm
 	unsigned long left;
 	int ret;
 
+#if IS_ENABLED(CONFIG_QCOM_PMIC_GLINK_ALTMODE_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(pmic_glink_altmode_request, altmode, cmd, arg);
+#endif
+
 	/*
 	 * The USBC_CMD_WRITE_REQ ack doesn't identify the request, so wait for
 	 * one ack at a time.
@@ -174,28 +182,34 @@ static int pmic_glink_altmode_request(struct pmic_glink_altmode *altmode, u32 cm
 	return 0;
 }
 
-static void pmic_glink_altmode_enable_dp(struct pmic_glink_altmode *altmode,
-					 struct pmic_glink_altmode_port *port,
-					 u8 mode, bool hpd_state,
-					 bool hpd_irq)
+static int pmic_glink_altmode_enable_dp(struct pmic_glink_altmode *altmode,
+				      struct pmic_glink_altmode_port *port,
+				      u8 mode, bool hpd_state, bool hpd_irq)
 {
 	struct typec_displayport_data dp_data = {};
 	int ret;
+
+	if (mode > DP_PIN_ASSIGN_F) {
+		dev_err(altmode->dev, "invalid DP pin assignment index: %u\n", mode);
+		return -EINVAL;
+	}
 
 	dp_data.status = DP_STATUS_ENABLED;
 	if (hpd_state)
 		dp_data.status |= DP_STATUS_HPD_STATE;
 	if (hpd_irq)
 		dp_data.status |= DP_STATUS_IRQ_HPD;
-	dp_data.conf = DP_CONF_SET_PIN_ASSIGN(mode);
+	dp_data.conf = DP_CONF_SET_PIN_ASSIGN(BIT(mode));
 
 	port->state.alt = &port->dp_alt;
 	port->state.data = &dp_data;
 	port->state.mode = TYPEC_MODAL_STATE(mode);
 
 	ret = typec_mux_set(port->typec_mux, &port->state);
-	if (ret)
+	if (ret) {
 		dev_err(altmode->dev, "failed to switch mux to DP: %d\n", ret);
+		return ret;
+	}
 
 	port->retimer_state.alt = &port->dp_alt;
 	port->retimer_state.data = &dp_data;
@@ -204,6 +218,8 @@ static void pmic_glink_altmode_enable_dp(struct pmic_glink_altmode *altmode,
 	ret = typec_retimer_set(port->typec_retimer, &port->retimer_state);
 	if (ret)
 		dev_err(altmode->dev, "failed to setup retimer to DP: %d\n", ret);
+
+	return ret;
 }
 
 static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
@@ -351,8 +367,11 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
 	struct pmic_glink_altmode *altmode = alt_port->altmode;
 	enum drm_connector_status conn_status;
+	int ret;
 
-	typec_switch_set(alt_port->typec_switch, alt_port->orientation);
+	ret = typec_switch_set(alt_port->typec_switch, alt_port->orientation);
+	if (ret)
+		dev_err(altmode->dev, "failed to set orientation: %d\n", ret);
 
 	/*
 	 * MUX_CTRL_STATE_DP4LN/USB3_DP may only be set if SVID=DP, but we need
@@ -362,12 +381,16 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 	if (alt_port->svid == USB_TYPEC_DP_SID) {
 		if (alt_port->mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
 			pmic_glink_altmode_safe(altmode, alt_port);
-		} else {
-			pmic_glink_altmode_enable_dp(altmode, alt_port,
-						     alt_port->mode,
-						     alt_port->hpd_state,
-						     alt_port->hpd_irq);
+		} else if (!ret) {
+			ret = pmic_glink_altmode_enable_dp(altmode, alt_port,
+							 alt_port->mode,
+							 alt_port->hpd_state,
+							 alt_port->hpd_irq);
 		}
+
+		/* Preserve disconnect notification even if routing cleanup failed. */
+		if (ret && alt_port->hpd_state)
+			goto out_ack;
 
 		if (alt_port->hpd_state)
 			conn_status = connector_status_connected;
@@ -375,6 +398,8 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 			conn_status = connector_status_disconnected;
 
 		drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
+	} else if (ret) {
+		goto out_ack;
 	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
 		if (alt_port->svid == USB_TYPEC_TBT_SID)
 			pmic_glink_altmode_enable_tbt(altmode, alt_port);
@@ -390,6 +415,7 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 		pmic_glink_altmode_safe(altmode, alt_port);
 	}
 
+out_ack:
 	pmic_glink_altmode_request(altmode, ALTMODE_PAN_ACK, alt_port->index);
 }
 
@@ -716,3 +742,7 @@ module_auxiliary_driver(pmic_glink_altmode_driver);
 
 MODULE_DESCRIPTION("Qualcomm PMIC GLINK Altmode driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_QCOM_PMIC_GLINK_ALTMODE_KUNIT_TEST)
+#include "pmic_glink_altmode_test.c"
+#endif
