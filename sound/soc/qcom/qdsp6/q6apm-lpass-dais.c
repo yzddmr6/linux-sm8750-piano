@@ -74,6 +74,8 @@ static int q6dma_set_channel_map(struct snd_soc_dai *dai,
 
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
 	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
+	const unsigned int *ch_mask;
+	unsigned int num;
 	int i;
 
 	switch (dai->id) {
@@ -125,6 +127,18 @@ static int q6dma_set_channel_map(struct snd_soc_dai *dai,
 		}
 		for (i = 0; i < rx_num; i++)
 			cfg->channel_map[i] = rx_ch_mask[i];
+
+		break;
+	case PRIMARY_TDM_RX_0 ... QUINARY_TDM_TX_7:
+		num = (dai->id & 0x1) ? tx_num : rx_num;
+		ch_mask = (dai->id & 0x1) ? tx_ch_mask : rx_ch_mask;
+		if (!ch_mask || num > AR_PCM_MAX_NUM_CHANNEL) {
+			dev_err(dai->dev, "invalid channel map for dai id 0x%x\n", dai->id);
+			return -EINVAL;
+		}
+		memset(cfg->channel_map, 0, sizeof(cfg->channel_map));
+		for (i = 0; i < num; i++)
+			cfg->channel_map[i] = ch_mask[i];
 
 		break;
 	default:
@@ -440,6 +454,7 @@ static const struct snd_soc_dai_ops q6tdm_ops = {
 	.startup	= q6apm_lpass_dai_startup,
 	.shutdown	= q6i2s_lpass_dai_shutdown,
 	.set_tdm_slot	= q6tdm_set_tdm_slot,
+	.set_channel_map  = q6dma_set_channel_map,
 	.hw_params	= q6dma_hw_params,
 	.set_fmt	= q6i2s_set_fmt,
 	.set_sysclk	= q6i2s_set_sysclk,
