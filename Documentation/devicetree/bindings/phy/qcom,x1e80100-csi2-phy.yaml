@@ -19,13 +19,11 @@ properties:
     oneOf:
       - enum:
           - qcom,kaanapali-csi2-phy
+          - qcom,sm8750-csi2-phy
           - qcom,x1e80100-csi2-phy
       - items:
           - const: qcom,glymur-csi2-phy
           - const: qcom,x1e80100-csi2-phy
-      - items:
-          - const: qcom,sm8750-csi2-phy
-          - const: qcom,kaanapali-csi2-phy
 
   reg:
     maxItems: 1
@@ -48,16 +46,20 @@ properties:
     type: object
 
   power-domains:
+    minItems: 3
     items:
       - description: Titan Top GDSC - Titan ISP Block, Global Distributed Switch Controller.
       - description: MMCX voltage rail
-      - description: MXC or MXA voltage rail
+      - description: MX voltage rail on SM8750, MXC or MXA on other SoCs
+      - description: MXC voltage rail on SM8750
 
   power-domain-names:
+    minItems: 3
     items:
       - const: top
       - const: mmcx
       - const: mx
+      - const: mxc
 
   vdda-0p9-supply:
     description: Phandle to a 0.9V regulator supply to a PHY.
@@ -136,6 +138,24 @@ properties:
     required:
       - port@0
       - port@1
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: qcom,sm8750-csi2-phy
+    then:
+      properties:
+        power-domains:
+          minItems: 4
+        power-domain-names:
+          minItems: 4
+    else:
+      properties:
+        power-domains:
+          maxItems: 3
+        power-domain-names:
+          maxItems: 3
 
 required:
   - compatible

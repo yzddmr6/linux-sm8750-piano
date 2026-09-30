@@ -315,8 +315,7 @@ examples:
         };
 
         csiphy0: phy@ada9000 {
-            compatible = "qcom,sm8750-csi2-phy",
-                         "qcom,kaanapali-csi2-phy";
+            compatible = "qcom,sm8750-csi2-phy";
             reg = <0x0 0x0ada9000 0x0 0x2000>;
 
             clocks = <&camcc CAM_CC_CSIPHY0_CLK>,
@@ -328,14 +327,16 @@ examples:
 
             interrupts = <GIC_SPI 477 IRQ_TYPE_EDGE_RISING>;
 
-            operating-points-v2 = <&csiphy_mxc_opp_table>;
+            operating-points-v2 = <&csiphy_opp_table>;
 
             power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
                             <&rpmhpd RPMHPD_MMCX>,
+                            <&rpmhpd RPMHPD_MX>,
                             <&rpmhpd RPMHPD_MXC>;
             power-domain-names = "top",
                                  "mmcx",
-                                 "mx";
+                                 "mx",
+                                 "mxc";
 
             vdda-0p9-supply = <&vreg_0p9_supply>;
             vdda-1p2-supply = <&vreg_1p2_supply>;
@@ -362,12 +363,13 @@ examples:
                 };
             };
 
-            csiphy_mxc_opp_table: opp-table {
+            csiphy_opp_table: opp-table {
                 compatible = "operating-points-v2";
 
-                opp-300000000 {
-                    opp-hz = /bits/ 64 <300000000>;
+                opp-266666667 {
+                    opp-hz = /bits/ 64 <266666667>;
                     required-opps = <&rpmhpd_opp_low_svs_d1>,
+                                    <&rpmhpd_opp_low_svs_d1>,
                                     <&rpmhpd_opp_low_svs_d1>;
                 };
             };
