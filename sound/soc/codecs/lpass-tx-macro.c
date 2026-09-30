@@ -2527,3 +2527,7 @@ module_platform_driver(tx_macro_driver);
 
 MODULE_DESCRIPTION("TX macro driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_SND_SOC_LPASS_TX_MACRO_KUNIT_TEST)
+#include "lpass-tx-macro-test.c"
+#endif

@@ -2998,4 +2998,13 @@ config SND_SOC_LPASS_TX_MACRO
 	select SND_SOC_LPASS_MACRO_COMMON
 	tristate "Qualcomm TX Macro in LPASS(Low Power Audio SubSystem)"
 
+config SND_SOC_LPASS_TX_MACRO_KUNIT_TEST
+	bool "KUnit tests for LPASS TX mixer channel state" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && SND_SOC_LPASS_TX_MACRO=y
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise the real mixer controls, channel map and mute callbacks
+	  with an ALSA auxiliary component and a memory-backed register map.
+	  No physical LPASS hardware or DSP service is required.
+
 endmenu
