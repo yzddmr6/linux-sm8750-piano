@@ -696,44 +696,28 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
 
 		ret = pm_runtime_resume_and_get(dev);
 		if (ret < 0)
-			return ret;
+			goto err_put_parent;
 
 		ret = regulator_bulk_enable(csid->num_supplies,
 					    csid->supplies);
-		if (ret < 0) {
-			pm_runtime_put_sync(dev);
-			return ret;
-		}
+		if (ret < 0)
+			goto err_put_runtime;
 
 		ret = csid_set_clock_rates(csid);
-		if (ret < 0) {
-			regulator_bulk_disable(csid->num_supplies,
-					       csid->supplies);
-			pm_runtime_put_sync(dev);
-			return ret;
-		}
+		if (ret < 0)
+			goto err_disable_regulators;
 
 		ret = camss_enable_clocks(csid->nclocks, csid->clock, dev);
-		if (ret < 0) {
-			regulator_bulk_disable(csid->num_supplies,
-					       csid->supplies);
-			pm_runtime_put_sync(dev);
-			return ret;
-		}
+		if (ret < 0)
+			goto err_disable_regulators;
 
 		csid->phy.need_vc_update = true;
 
 		enable_irq(csid->irq);
 
 		ret = csid->res->hw_ops->reset(csid);
-		if (ret < 0) {
-			disable_irq(csid->irq);
-			camss_disable_clocks(csid->nclocks, csid->clock);
-			regulator_bulk_disable(csid->num_supplies,
-					       csid->supplies);
-			pm_runtime_put_sync(dev);
-			return ret;
-		}
+		if (ret < 0)
+			goto err_disable_irq;
 
 		csid->res->hw_ops->hw_version(csid);
 	} else {
@@ -744,6 +728,18 @@ static int csid_set_power(struct v4l2_subdev *sd, int on)
 		pm_runtime_put_sync(dev);
 		csid->res->parent_dev_ops->put(camss, csid->id);
 	}
+
+	return ret;
+
+err_disable_irq:
+	disable_irq(csid->irq);
+	camss_disable_clocks(csid->nclocks, csid->clock);
+err_disable_regulators:
+	regulator_bulk_disable(csid->num_supplies, csid->supplies);
+err_put_runtime:
+	pm_runtime_put_sync(dev);
+err_put_parent:
+	csid->res->parent_dev_ops->put(camss, csid->id);
 
 	return ret;
 }
