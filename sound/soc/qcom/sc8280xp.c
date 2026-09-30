@@ -97,6 +97,9 @@ struct qcom_snd_soc_common {
 	const struct sc8280xp_dai_data *dai_data;
 	size_t num_dai_data;
 	int (*snd_init)(struct snd_soc_pcm_runtime *rtd);
+	/* TDM backend channels and sample format, if not stereo S16_LE */
+	unsigned int tdm_channels;
+	snd_pcm_format_t tdm_format;
 	int (*snd_prepare)(struct snd_pcm_substream *substream);
 };
 
@@ -291,6 +294,7 @@ static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
 static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 				     struct snd_pcm_hw_params *params)
 {
+	struct sc8280xp_snd_data *data = snd_soc_card_get_drvdata(rtd->card);
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
 	struct snd_interval *rate = hw_param_interval(params,
 					SNDRV_PCM_HW_PARAM_RATE);
@@ -308,6 +312,14 @@ static int sc8280xp_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	case TX_CODEC_DMA_TX_2:
 	case TX_CODEC_DMA_TX_3:
 		channels->min = 1;
+		break;
+	case PRIMARY_TDM_RX_0 ... QUINARY_TDM_TX_7:
+		if (data->priv->tdm_channels) {
+			channels->min = data->priv->tdm_channels;
+			channels->max = data->priv->tdm_channels;
+			snd_mask_none(fmt);
+			snd_mask_set_format(fmt, data->priv->tdm_format);
+		}
 		break;
 	default:
 		break;
@@ -458,6 +470,34 @@ static int ayaneo_ps2_snd_prepare(struct snd_pcm_substream *substream)
 	return snd_soc_dai_set_channel_map(cpu_dai, 0, NULL,
 					   ARRAY_SIZE(ayaneo_ps2_channels_mapping),
 					   ayaneo_ps2_channels_mapping);
+}
+
+/*
+ * The four speaker amplifiers take TDM slots 0-3 (preset data). Seen in
+ * the landscape orientation with the front camera at the top, these are
+ * top left, top right, bottom left and bottom right.  Give each slot a
+ * channel type so that the MFC in front of the port routes a stereo
+ * stream to the top pair and a four-channel (FL, FR, LS, RS) stream to
+ * all four speakers.
+ */
+static const unsigned int xiaomi_piano_speaker_channels_mapping[] = {
+	PCM_CHANNEL_FL,		/* top left */
+	PCM_CHANNEL_FR,		/* top right */
+	PCM_CHANNEL_LS,		/* bottom left */
+	PCM_CHANNEL_RS,		/* bottom right */
+};
+
+static int xiaomi_piano_snd_prepare(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+
+	if (cpu_dai->id != SECONDARY_TDM_RX_0)
+		return 0;
+
+	return snd_soc_dai_set_channel_map(cpu_dai, 0, NULL,
+					   ARRAY_SIZE(xiaomi_piano_speaker_channels_mapping),
+					   xiaomi_piano_speaker_channels_mapping);
 }
 
 static int sc8280xp_snd_prepare(struct snd_pcm_substream *substream)
@@ -730,6 +770,21 @@ static const struct qcom_snd_soc_common sm8750_priv_data = {
 	.wcd_jack = true,
 };
 
+static const struct qcom_snd_soc_common xiaomi_piano_priv_data = {
+	.driver_name = "sm8750",
+	.dapm_widgets = sc8280xp_dapm_widgets,
+	.num_dapm_widgets = ARRAY_SIZE(sc8280xp_dapm_widgets),
+	/* Speaker amplifiers on TDM, clocked from the bit clock */
+	.mi2s_bclk_enable = true,
+	.codec_sysclk_set = true,
+	.codec_dai_fmt = SND_SOC_DAIFMT_BC_FC |
+			 SND_SOC_DAIFMT_NB_NF |
+			 SND_SOC_DAIFMT_DSP_A,
+	.tdm_channels = 4,
+	.tdm_format = SNDRV_PCM_FORMAT_S32_LE,
+	.snd_prepare = xiaomi_piano_snd_prepare,
+};
+
 static const struct of_device_id snd_sc8280xp_dt_match[] = {
 	{ .compatible = "ayaneo,pocket-s2-sndcard", .data = &ayaneo_ps2_priv_data },
 	{ .compatible = "qcom,eliza-sndcard", .data = &eliza_priv_data },
@@ -750,6 +805,7 @@ static const struct of_device_id snd_sc8280xp_dt_match[] = {
 	{ .compatible = "qcom,sm8550-sndcard", .data = &sm8550_priv_data },
 	{ .compatible = "qcom,sm8650-sndcard", .data = &sm8650_priv_data },
 	{ .compatible = "qcom,sm8750-sndcard", .data = &sm8750_priv_data },
+	{ .compatible = "xiaomi,piano-sndcard", .data = &xiaomi_piano_priv_data },
 	{}
 };
 
