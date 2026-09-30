@@ -271,8 +271,6 @@ struct tx_macro {
 	struct hpf_work tx_hpf_work[NUM_DECIMATORS];
 	struct tx_mute_work tx_mute_dwork[NUM_DECIMATORS];
 	unsigned long active_ch_mask[TX_MACRO_MAX_DAIS];
-	unsigned long active_ch_cnt[TX_MACRO_MAX_DAIS];
-	int active_decimator[TX_MACRO_MAX_DAIS];
 	struct regmap *regmap;
 	struct clk *mclk;
 	struct clk *npl;
@@ -888,21 +886,13 @@ static int tx_macro_tx_mixer_put(struct snd_kcontrol *kcontrol,
 	u32 enable = ucontrol->value.integer.value[0];
 	struct tx_macro *tx = snd_soc_component_get_drvdata(component);
 
-	if (enable) {
-		if (tx->active_decimator[dai_id] == dec_id)
-			return 0;
+	if (test_bit(dec_id, &tx->active_ch_mask[dai_id]) == !!enable)
+		return 0;
 
+	if (enable)
 		set_bit(dec_id, &tx->active_ch_mask[dai_id]);
-		tx->active_ch_cnt[dai_id]++;
-		tx->active_decimator[dai_id] = dec_id;
-	} else {
-		if (tx->active_decimator[dai_id] == -1)
-			return 0;
-
-		tx->active_ch_cnt[dai_id]--;
+	else
 		clear_bit(dec_id, &tx->active_ch_mask[dai_id]);
-		tx->active_decimator[dai_id] = -1;
-	}
 	snd_soc_dapm_mixer_update_power(widget->dapm, kcontrol, enable, update);
 
 	return 1;
@@ -1180,7 +1170,7 @@ static int tx_macro_get_channel_map(const struct snd_soc_dai *dai,
 	case TX_MACRO_AIF2_CAP:
 	case TX_MACRO_AIF3_CAP:
 		*tx_slot = tx->active_ch_mask[dai->id];
-		*tx_num = tx->active_ch_cnt[dai->id];
+		*tx_num = hweight_long(tx->active_ch_mask[dai->id]);
 		break;
 	default:
 		break;
@@ -1192,22 +1182,13 @@ static int tx_macro_digital_mute(struct snd_soc_dai *dai, int mute, int stream)
 {
 	struct snd_soc_component *component = dai->component;
 	struct tx_macro *tx = snd_soc_component_get_drvdata(component);
-	u8 decimator;
+	unsigned long decimator;
 
-	/* active decimator not set yet */
-	if (tx->active_decimator[dai->id] == -1)
-		return 0;
-
-	decimator = tx->active_decimator[dai->id];
-
-	if (mute)
-		snd_soc_component_write_field(component,
-					      CDC_TXn_TX_PATH_CTL(decimator),
-					      CDC_TXn_PGA_MUTE_MASK, 0x1);
-	else
+	for_each_set_bit(decimator, &tx->active_ch_mask[dai->id], TX_MACRO_DEC_MAX)
 		snd_soc_component_update_bits(component,
 					      CDC_TXn_TX_PATH_CTL(decimator),
-					      CDC_TXn_PGA_MUTE_MASK, 0x0);
+					      CDC_TXn_PGA_MUTE_MASK,
+					      mute ? CDC_TXn_PGA_MUTE_MASK : 0);
 
 	return 0;
 }
@@ -2313,11 +2294,6 @@ static int tx_macro_probe(struct platform_device *pdev)
 	dev_set_drvdata(dev, tx);
 
 	tx->dev = dev;
-
-	/* Set active_decimator default value */
-	tx->active_decimator[TX_MACRO_AIF1_CAP] = -1;
-	tx->active_decimator[TX_MACRO_AIF2_CAP] = -1;
-	tx->active_decimator[TX_MACRO_AIF3_CAP] = -1;
 
 	/* set MCLK and NPL rates */
 	ret = clk_set_rate(tx->mclk, MCLK_FREQ);

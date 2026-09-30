@@ -69,9 +69,6 @@ static int tx_test_init(struct kunit *test)
 		return PTR_ERR(dev);
 	ctx->tx.dev = dev;
 	dev_set_drvdata(dev, &ctx->tx);
-	/* Match the driver's cold probe state for the unfixed implementation. */
-	for (i = TX_MACRO_AIF1_CAP; i < TX_MACRO_MAX_DAIS; i++)
-		ctx->tx.active_decimator[i] = -1;
 	ctx->tx.regmap = devm_regmap_init(dev, NULL, ctx, &tx_test_regmap);
 	if (IS_ERR(ctx->tx.regmap))
 		return PTR_ERR(ctx->tx.regmap);
@@ -104,6 +101,7 @@ static int tx_test_init(struct kunit *test)
 		return ret;
 	ctx->aux.dlc.name = dev_name(dev);
 	ctx->card.name = "lpass-tx-control-test";
+	ctx->card.driver_name = "lpass-tx-test";
 	/* Card registration owns its device drvdata independently of the codec. */
 	ctx->card.dev = kunit_device_register(test, "lpass-tx-test-card");
 	if (IS_ERR(ctx->card.dev))
