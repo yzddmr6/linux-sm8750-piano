@@ -104,14 +104,24 @@ static int tx_test_init(struct kunit *test)
 		return ret;
 	ctx->aux.dlc.name = dev_name(dev);
 	ctx->card.name = "lpass-tx-control-test";
-	ctx->card.dev = dev;
+	/* Card registration owns its device drvdata independently of the codec. */
+	ctx->card.dev = kunit_device_register(test, "lpass-tx-test-card");
+	if (IS_ERR(ctx->card.dev))
+		return PTR_ERR(ctx->card.dev);
 	ctx->card.owner = THIS_MODULE;
 	ctx->card.aux_dev = &ctx->aux;
 	ctx->card.num_aux_devs = 1;
 	ret = snd_soc_register_card(&ctx->card);
 	if (ret)
 		return ret;
-	return kunit_add_action_or_reset(test, tx_test_unregister_card, &ctx->card);
+	ret = kunit_add_action_or_reset(test, tx_test_unregister_card, &ctx->card);
+	if (ret)
+		return ret;
+	if (!ctx->tx.component ||
+	    snd_soc_component_get_drvdata(ctx->tx.component) != &ctx->tx ||
+	    !snd_soc_card_get_kcontrol(&ctx->card, "TX_AIF1_CAP Mixer DEC0"))
+		return -EINVAL;
+	return 0;
 }
 
 static int tx_test_put(struct kunit *test, unsigned int dai, unsigned int dec,
