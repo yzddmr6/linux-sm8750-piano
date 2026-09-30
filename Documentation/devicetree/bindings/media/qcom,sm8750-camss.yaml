@@ -16,14 +16,6 @@ properties:
   compatible:
     const: qcom,sm8750-camss
 
-  "#address-cells":
-    const: 2
-
-  "#size-cells":
-    const: 2
-
-  ranges: true
-
   reg:
     maxItems: 13
 
@@ -88,19 +80,6 @@ properties:
       - const: vfe_lite0
       - const: vfe_lite1
 
-  phys:
-    maxItems: 6
-    description: CSIPHY 0-5 PHYs used by the CSID controllers.
-
-  phy-names:
-    items:
-      - const: csiphy0
-      - const: csiphy1
-      - const: csiphy2
-      - const: csiphy3
-      - const: csiphy4
-      - const: csiphy5
-
   interconnects:
     maxItems: 4
 
@@ -136,8 +115,8 @@ properties:
     $ref: /schemas/graph.yaml#/properties/ports
 
     description:
-      CSI input ports, one per CSID. Each port receives the CSI data
-      decoded by the matching CSIPHY.
+      CSI input ports, one per CSIPHY. Each port connects to the output
+      endpoint of a standalone CSI2 PHY provider.
 
     patternProperties:
       "^port@[0-5]$":
@@ -155,6 +134,9 @@ properties:
               data-lanes:
                 minItems: 1
                 maxItems: 4
+                items:
+                  minimum: 1
+                  maximum: 4
 
               bus-type:
                 enum:
@@ -163,16 +145,6 @@ properties:
 
             required:
               - data-lanes
-
-patternProperties:
-  "^phy@[0-9a-f]+$":
-    $ref: /schemas/phy/qcom,x1e80100-csi2-phy.yaml#
-    unevaluatedProperties: false
-    description:
-      CSIPHY blocks decoding the incoming MIPI CSI2 sensor streams.
-
-  "^opp-table(-.*)?$":
-    type: object
 
 required:
   - compatible
@@ -187,8 +159,7 @@ required:
   - iommus
   - power-domains
   - power-domain-names
-  - phys
-  - phy-names
+  - ports
 
 additionalProperties: false
 
@@ -199,7 +170,6 @@ examples:
     #include <dt-bindings/interconnect/qcom,icc.h>
     #include <dt-bindings/interconnect/qcom,sm8750-rpmh.h>
     #include <dt-bindings/interrupt-controller/arm-gic.h>
-    #include <dt-bindings/phy/phy.h>
     #include <dt-bindings/power/qcom,rpmhpd.h>
 
     soc {
@@ -208,10 +178,6 @@ examples:
 
         isp@ad27000 {
             compatible = "qcom,sm8750-camss";
-
-            #address-cells = <2>;
-            #size-cells = <2>;
-            ranges;
 
             reg = <0x0 0x0ad27000 0x0 0x2b00>,
                   <0x0 0x0ad2a000 0x0 0x2b00>,
@@ -332,18 +298,47 @@ examples:
                                  "ife2",
                                  "top";
 
-            phys = <&csiphy0 PHY_TYPE_DPHY>,
-                   <&csiphy1 PHY_TYPE_DPHY>,
-                   <&csiphy2 PHY_TYPE_DPHY>,
-                   <&csiphy3 PHY_TYPE_DPHY>,
-                   <&csiphy4 PHY_TYPE_DPHY>,
-                   <&csiphy5 PHY_TYPE_DPHY>;
-            phy-names = "csiphy0",
-                        "csiphy1",
-                        "csiphy2",
-                        "csiphy3",
-                        "csiphy4",
-                        "csiphy5";
+            ports {
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                port@0 {
+                    reg = <0>;
+
+                    camss_csiphy0_inep0: endpoint {
+                        data-lanes = <1 2 3 4>;
+                        remote-endpoint = <&csiphy0_out>;
+                    };
+                };
+            };
+
+        };
+
+        csiphy0: phy@ada9000 {
+            compatible = "qcom,sm8750-csi2-phy",
+                         "qcom,kaanapali-csi2-phy";
+            reg = <0x0 0x0ada9000 0x0 0x2000>;
+
+            clocks = <&camcc CAM_CC_CSIPHY0_CLK>,
+                     <&camcc CAM_CC_CSI0PHYTIMER_CLK>,
+                     <&camcc CAM_CC_CORE_AHB_CLK>;
+            clock-names = "core",
+                          "timer",
+                          "ahb";
+
+            interrupts = <GIC_SPI 477 IRQ_TYPE_EDGE_RISING>;
+
+            operating-points-v2 = <&csiphy_mxc_opp_table>;
+
+            power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
+                            <&rpmhpd RPMHPD_MMCX>,
+                            <&rpmhpd RPMHPD_MXC>;
+            power-domain-names = "top",
+                                 "mmcx",
+                                 "mx";
+
+            vdda-0p9-supply = <&vreg_0p9_supply>;
+            vdda-1p2-supply = <&vreg_1p2_supply>;
 
             ports {
                 #address-cells = <1>;
@@ -351,76 +346,29 @@ examples:
 
                 port@0 {
                     reg = <0>;
-                    #address-cells = <1>;
-                    #size-cells = <0>;
 
-                    camss_csiphy0_inep0: endpoint@0 {
-                        reg = <0>;
-                        data-lanes = <0 1 2 3>;
-                        remote-endpoint = <&csiphy0_out>;
+                    csiphy0_in: endpoint {
+                        data-lanes = <1 2 3 4>;
+                        remote-endpoint = <&sensor_out>;
+                    };
+                };
+
+                port@1 {
+                    reg = <1>;
+
+                    csiphy0_out: endpoint {
+                        remote-endpoint = <&camss_csiphy0_inep0>;
                     };
                 };
             };
 
-            csiphy0: phy@ada9000 {
-                compatible = "qcom,sm8750-csi2-phy",
-                             "qcom,kaanapali-csi2-phy";
-                reg = <0x0 0x0ada9000 0x0 0x2000>;
+            csiphy_mxc_opp_table: opp-table {
+                compatible = "operating-points-v2";
 
-                clocks = <&camcc CAM_CC_CSIPHY0_CLK>,
-                         <&camcc CAM_CC_CSI0PHYTIMER_CLK>,
-                         <&camcc CAM_CC_CORE_AHB_CLK>;
-                clock-names = "core",
-                              "timer",
-                              "ahb";
-
-                interrupts = <GIC_SPI 477 IRQ_TYPE_EDGE_RISING>;
-
-                operating-points-v2 = <&csiphy_mxc_opp_table>;
-
-                power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>,
-                                <&rpmhpd RPMHPD_MMCX>,
-                                <&rpmhpd RPMHPD_MXC>;
-                power-domain-names = "top",
-                                     "mmcx",
-                                     "mx";
-
-                vdda-0p9-supply = <&vreg_0p9_supply>;
-                vdda-1p2-supply = <&vreg_1p2_supply>;
-
-                #phy-cells = <1>;
-
-                ports {
-                    #address-cells = <1>;
-                    #size-cells = <0>;
-
-                    port@0 {
-                        reg = <0>;
-
-                        csiphy0_in: endpoint {
-                            data-lanes = <0 1 2 3>;
-                            clock-lanes = <7>;
-                            remote-endpoint = <&sensor_out>;
-                        };
-                    };
-
-                    port@1 {
-                        reg = <1>;
-
-                        csiphy0_out: endpoint {
-                            remote-endpoint = <&camss_csiphy0_inep0>;
-                        };
-                    };
-                };
-
-                csiphy_mxc_opp_table: opp-table {
-                    compatible = "operating-points-v2";
-
-                    opp-300000000 {
-                        opp-hz = /bits/ 64 <300000000>;
-                        required-opps = <&rpmhpd_opp_low_svs_d1>,
-                                        <&rpmhpd_opp_low_svs_d1>;
-                    };
+                opp-300000000 {
+                    opp-hz = /bits/ 64 <300000000>;
+                    required-opps = <&rpmhpd_opp_low_svs_d1>,
+                                    <&rpmhpd_opp_low_svs_d1>;
                 };
             };
         };
