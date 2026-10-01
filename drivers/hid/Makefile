@@ -96,6 +96,7 @@ obj-$(CONFIG_HID_MSI)		+= hid-msi.o
 obj-$(CONFIG_HID_MULTITOUCH)	+= hid-multitouch.o
 obj-$(CONFIG_HID_NANOSIC)		+= hid-nanosic.o
 obj-$(CONFIG_HID_NANOSIC_PROTOCOL_KUNIT_TEST) += hid-nanosic-protocol-test.o
+obj-$(CONFIG_HID_NANOSIC_WN8030)	+= hid-nanosic-wn8030.o
 obj-$(CONFIG_HID_NINTENDO)	+= hid-nintendo.o
 obj-$(CONFIG_NINTENDO_SWITCH2_USB)	+= hid-nintendo-switch2-usb.o
 obj-$(CONFIG_HID_NTI)			+= hid-nti.o
