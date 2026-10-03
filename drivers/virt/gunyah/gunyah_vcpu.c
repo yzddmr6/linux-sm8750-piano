@@ -17,7 +17,7 @@
 #include "vm_mgr.h"
 
 #include <uapi/linux/gunyah.h>
-#include <trace/hooks/gunyah.h>
+#include "gunyah_vendor_hooks.h"
 
 #define CREATE_TRACE_POINTS
 #include "trace_vcpu.h"

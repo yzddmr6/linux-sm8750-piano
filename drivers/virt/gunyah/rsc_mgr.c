@@ -980,7 +980,7 @@ static int __init gunyah_rm_init(void)
 	}
 	of_node_put(of_root);
 
-	rm->parent_fwnode = of_node_to_fwnode(parent_irq_node);
+	rm->parent_fwnode = of_fwnode_handle(parent_irq_node);
 	if (!rm->parent_fwnode) {
 		pr_err("Failed to find interrupt parent domain of resource manager\n");
 		return -ENODEV;

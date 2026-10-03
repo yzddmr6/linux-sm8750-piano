@@ -8,7 +8,12 @@
 #include <linux/gunyah.h>
 #include <linux/notifier.h>
 #include <linux/types.h>
+#if __has_include(<linux/android_kabi.h>)
 #include <linux/android_kabi.h>
+#else
+/* Android-only ABI-checker annotation; a no-op on mainline. */
+#define ANDROID_KABI_ENUMERATOR_IGNORE(_enum, _value) static_assert(1)
+#endif
 
 #define GUNYAH_VMID_INVAL U16_MAX
 #define GUNYAH_MEM_HANDLE_INVAL U32_MAX
