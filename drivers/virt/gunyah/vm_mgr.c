@@ -13,7 +13,7 @@
 #include <linux/xarray.h>
 
 #include <uapi/linux/gunyah.h>
-#include <trace/hooks/gunyah.h>
+#include "gunyah_vendor_hooks.h"
 
 #include "rsc_mgr.h"
 #include "vm_mgr.h"

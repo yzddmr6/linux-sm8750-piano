@@ -183,6 +183,31 @@ static bool folio_mmapped(struct folio *folio)
 }
 
 /**
+ * gunyah_folio_set_direct_map() - Toggle the kernel linear-map entries of a folio
+ * @folio: Folio to update
+ * @valid: true restores the default mapping, false invalidates it
+ *
+ * Mainline arm64 does not export set_direct_map_{invalid,default}_noflush()
+ * to modules, so this is a no-op when gunyah_rsc_mgr is built as a module.
+ * Lent memory is still protected by the hypervisor's stage-2 unmap; only the
+ * defence against accidental host-side accesses through the linear map is
+ * lost.
+ */
+static inline void gunyah_folio_set_direct_map(struct folio *folio, bool valid)
+{
+#ifndef MODULE
+	long i;
+
+	for (i = 0; i < folio_nr_pages(folio); i++) {
+		if (valid)
+			set_direct_map_default_noflush(folio_page(folio, i));
+		else
+			set_direct_map_invalid_noflush(folio_page(folio, i));
+	}
+#endif
+}
+
+/**
  * gunyah_folio_lend_safe() - Returns true if folio is ready to be lent to guest
  * @folio: Folio to prepare
  *
@@ -194,13 +219,10 @@ static bool folio_mmapped(struct folio *folio)
  */
 static inline bool gunyah_folio_lend_safe(struct folio *folio)
 {
-	long i;
-
 	if (folio_mapped(folio) || folio_mmapped(folio))
 		return false;
 
-	for (i = 0; i < folio_nr_pages(folio); i++)
-		set_direct_map_invalid_noflush(folio_page(folio, i));
+	gunyah_folio_set_direct_map(folio, false);
 	/**
 	 * No need to flush tlb on armv8/9: hypervisor will flush when it
 	 * removes from our stage 2
@@ -216,9 +238,7 @@ static inline bool gunyah_folio_lend_safe(struct folio *folio)
  */
 static inline void gunyah_folio_host_reclaim(struct folio *folio)
 {
-	long i;
-	for (i = 0; i < folio_nr_pages(folio); i++)
-		set_direct_map_default_noflush(folio_page(folio, i));
+	gunyah_folio_set_direct_map(folio, true);
 }
 
 int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
