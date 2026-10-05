@@ -15,6 +15,7 @@
 #include "camss.h"
 #include "camss-csid.h"
 #include "camss-csid-gen3.h"
+#include "camss-isp-debug.h"
 
 /* Reset and Command Registers */
 #define CSID_RST_CFG				0xC
@@ -117,6 +118,47 @@
 #define		RDI_PIX_STORE_CFG0_EN			BIT(0)
 #define		RDI_PIX_STORE_CFG0_MIN_HBI		1
 
+/*
+ * IPP (pixel path) of the full CSIDs, fed to the TFE pixel pipeline.  The
+ * fourth CSID source pad (port 3) drives the IPP, linked to the VFE PIX
+ * line; RDI3 is not exposed.  The TFE pixel pipeline is multi-context;
+ * everything here runs in hardware context 0.  CTXT_CFG selects the
+ * context whose banked registers (0x1800...) the following writes reach,
+ * and CAMIF_FRAME_CFG[4:0] tags the frames with their context; both take a
+ * context index, while the IRQ composition takes context masks.
+ * CAMIF_FRAME_CFG[26:24] tells the TFE the Bayer order of the frames.
+ */
+#define CSID_IPP_PORT				3
+#define CSID_IPP_CFG0				0x600
+#define CSID_IPP_CTRL				0x604
+#define CSID_IPP_CAMIF_FRAME_CFG		0x638
+#define		CAMIF_FRAME_CFG_CTXT			0
+#define		CAMIF_FRAME_CFG_CFA			24
+#define			IPP_CFA_RGGB				0
+#define			IPP_CFA_GRBG				1
+#define			IPP_CFA_BGGR				2
+#define			IPP_CFA_GBRG				3
+#define CSID_IPP_IRQ_SUBSAMPLE_PATTERN		0x688
+#define CSID_IPP_IRQ_SUBSAMPLE_PERIOD		0x68C
+#define CSID_IPP_CTXT_CFG			0x3F0
+#define CSID_IPP_CFG1				0x1800
+#define CSID_IPP_PIX_STORE_CFG			0x1804
+#define		IPP_PIX_STORE_EN			BIT(0)
+#define		IPP_PIX_STORE_MIN_HBI			1
+#define CSID_IPP_IRQ_COMP_CFG0			0x178
+#define		IPP_SRC_CTXT_MASK_SHIFT			4
+#define		IPP_DST_CTXT_MASK_SHIFT			0
+#define CSID_IPP_IRQ_STATUS			0xD4
+#define CSID_IPP_IRQ_MASK			0xD8
+#define CSID_IPP_IRQ_CLEAR			0xDC
+#define CSID_RUP_AUP_IPP			BIT(0)
+#define		IPP_CTXT_ID				0
+/* TFE bus composite group 1 (FD_Y + FD_C) done, in CSID_BUF_DONE_IRQ_* */
+#define BUF_DONE_IRQ_STATUS_IPP_FD		BIT(3)
+
+#define csid_port_is_ipp(csid, port) \
+	(!csid_is_lite(csid) && (port) == CSID_IPP_PORT)
+
 /* RDI IRQ Status in wrapper */
 #define CSID_CSI2_RDIN_IRQ_STATUS(rdi) \
 	(csid_is_lite(csid) ? 0xEC : 0x114 + 0x10 * (rdi))
@@ -143,7 +185,8 @@ static void __csid_aup_update(struct csid_device *csid, int port_id)
 		csid->reg_update |= CSID_LITE_AUP_RDI(port_id);
 		writel(csid->reg_update, csid->base + CSID_LITE_RUP_AUP_CMD);
 	} else {
-		csid->aup_update |= CSID_RUP_AUP_RDI(port_id);
+		csid->aup_update |= csid_port_is_ipp(csid, port_id) ?
+				    CSID_RUP_AUP_IPP : CSID_RUP_AUP_RDI(port_id);
 		writel(csid->aup_update, csid->base + CSID_AUP_CMD);
 
 		/* CSID Fulls in v980 split AUP and RUP commands, which requires
@@ -163,7 +206,8 @@ static void __csid_rup_update(struct csid_device *csid, int port_id)
 		csid->reg_update |= CSID_LITE_RUP_RDI(port_id);
 		writel(csid->reg_update, csid->base + CSID_LITE_RUP_AUP_CMD);
 	} else {
-		csid->rup_update |= CSID_RUP_AUP_RDI(port_id);
+		csid->rup_update |= csid_port_is_ipp(csid, port_id) ?
+				    CSID_RUP_AUP_IPP : CSID_RUP_AUP_RDI(port_id);
 		writel(csid->rup_update, csid->base + CSID_RUP_CMD);
 
 		/* CSID Fulls in v980 split AUP and RUP commands, which requires
@@ -181,8 +225,11 @@ static void __csid_aup_rup_clear(struct csid_device *csid, int port_id)
 		csid->reg_update &= ~CSID_LITE_RUP_RDI(port_id);
 		csid->reg_update &= ~CSID_LITE_AUP_RDI(port_id);
 	} else {
-		csid->aup_update &= ~CSID_RUP_AUP_RDI(port_id);
-		csid->rup_update &= ~CSID_RUP_AUP_RDI(port_id);
+		u32 bit = csid_port_is_ipp(csid, port_id) ?
+			  CSID_RUP_AUP_IPP : CSID_RUP_AUP_RDI(port_id);
+
+		csid->aup_update &= ~bit;
+		csid->rup_update &= ~bit;
 	}
 }
 
@@ -325,6 +372,83 @@ static void __csid_frame_sync_irq(struct csid_device *csid, u8 enable, u8 rdi)
 	writel(top, csid->base + CSID_TOP_IRQ_MASK);
 }
 
+/* Bayer order the TFE demosaic works on, from the media bus code */
+static u32 __csid_ipp_cfa(u32 code)
+{
+	switch (code) {
+	case MEDIA_BUS_FMT_SGRBG8_1X8:
+	case MEDIA_BUS_FMT_SGRBG10_1X10:
+	case MEDIA_BUS_FMT_SGRBG12_1X12:
+	case MEDIA_BUS_FMT_SGRBG14_1X14:
+		return IPP_CFA_GRBG;
+	case MEDIA_BUS_FMT_SBGGR8_1X8:
+	case MEDIA_BUS_FMT_SBGGR10_1X10:
+	case MEDIA_BUS_FMT_SBGGR12_1X12:
+	case MEDIA_BUS_FMT_SBGGR14_1X14:
+		return IPP_CFA_BGGR;
+	case MEDIA_BUS_FMT_SGBRG8_1X8:
+	case MEDIA_BUS_FMT_SGBRG10_1X10:
+	case MEDIA_BUS_FMT_SGBRG12_1X12:
+	case MEDIA_BUS_FMT_SGBRG14_1X14:
+		return IPP_CFA_GBRG;
+	default:
+		return IPP_CFA_RGGB;
+	}
+}
+
+static void __csid_configure_ipp_stream(struct csid_device *csid, u8 enable,
+					u8 vc)
+{
+	struct v4l2_mbus_framefmt *input_format =
+		&csid->fmt[MSM_CSID_PAD_FIRST_SRC + CSID_IPP_PORT];
+	const struct csid_format_info *format =
+		csid_get_fmt_entry(csid->res->formats->formats,
+				   csid->res->formats->nformats,
+				   input_format->code);
+	u32 val;
+
+	writel(0, csid->base + CSID_IPP_CTRL);
+
+	if (!enable) {
+		camss_isp_set_live(CAMSS_ISP_CSID, NULL);
+		val = readl(csid->base + CSID_IPP_CFG0) & ~RDI_CFG0_EN;
+		writel(val, csid->base + CSID_IPP_CFG0);
+		return;
+	}
+
+	val = RDI_CFG0_TIMESTAMP_EN | RDI_CFG0_TIMESTAMP_STB_SEL;
+	val |= RDI_CFG0_RETIME_BS;	/* SOF retiming off, as downstream */
+	val |= format->decode_format << RDI_CFG0_DECODE_FORMAT;
+	val |= vc << RDI_CFG0_VC;
+	val |= format->data_type << RDI_CFG0_DT;
+	val |= (vc & 0x03) << RDI_CFG0_DT_ID;
+	writel(val, csid->base + CSID_IPP_CFG0);
+
+	/* no crop/drop/binning; pixel store absorbs horizontal blanking */
+	writel(0, csid->base + CSID_IPP_CFG1);
+	writel((4 << IPP_PIX_STORE_MIN_HBI) | IPP_PIX_STORE_EN,
+	       csid->base + CSID_IPP_PIX_STORE_CFG);
+
+	/* frames go to hardware context 0 of the TFE pixel pipeline */
+	writel(IPP_CTXT_ID, csid->base + CSID_IPP_CTXT_CFG);
+	writel((IPP_CTXT_ID << CAMIF_FRAME_CFG_CTXT) |
+	       (__csid_ipp_cfa(input_format->code) << CAMIF_FRAME_CFG_CFA),
+	       csid->base + CSID_IPP_CAMIF_FRAME_CFG);
+	writel((BIT(IPP_CTXT_ID) << IPP_SRC_CTXT_MASK_SHIFT) |
+	       (BIT(IPP_CTXT_ID) << IPP_DST_CTXT_MASK_SHIFT),
+	       csid->base + CSID_IPP_IRQ_COMP_CFG0);
+	writel(1, csid->base + CSID_IPP_IRQ_SUBSAMPLE_PATTERN);
+	writel(0, csid->base + CSID_IPP_IRQ_SUBSAMPLE_PERIOD);
+	writel(INFO_RUP_DONE, csid->base + CSID_IPP_IRQ_MASK);
+
+	camss_isp_apply_script(CAMSS_ISP_CSID, csid->base);
+
+	val = readl(csid->base + CSID_IPP_CFG0) | RDI_CFG0_EN;
+	writel(val, csid->base + CSID_IPP_CFG0);
+
+	camss_isp_set_live(CAMSS_ISP_CSID, csid->base);
+}
+
 static void csid_configure_stream(struct csid_device *csid, u8 enable)
 {
 	u8 i, k;
@@ -333,8 +457,12 @@ static void csid_configure_stream(struct csid_device *csid, u8 enable)
 
 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS_980; i++) {
 		if (csid->phy.en_vc & BIT(i)) {
-			__csid_frame_sync_irq(csid, enable, i);
-			__csid_configure_rdi_stream(csid, enable, i, 0);
+			if (csid_port_is_ipp(csid, i)) {
+				__csid_configure_ipp_stream(csid, enable, 0);
+			} else {
+				__csid_frame_sync_irq(csid, enable, i);
+				__csid_configure_rdi_stream(csid, enable, i, 0);
+			}
 			__csid_configure_rx_vc(csid, 0);
 
 			for (k = 0; k < CAMSS_INIT_BUF_COUNT; k++) {
@@ -342,7 +470,11 @@ static void csid_configure_stream(struct csid_device *csid, u8 enable)
 				__csid_rup_update(csid, i);
 			}
 
-			__csid_ctrl_rdi(csid, enable, i);
+			if (csid_port_is_ipp(csid, i))
+				writel(enable ? RDI_CTRL_START_CMD : 0,
+				       csid->base + CSID_IPP_CTRL);
+			else
+				__csid_ctrl_rdi(csid, enable, i);
 		}
 	}
 }
@@ -355,10 +487,15 @@ static int csid_configure_testgen_pattern(struct csid_device *csid, s32 val)
 static void csid_subdev_reg_update(struct csid_device *csid, int port_id,
 				   bool clear)
 {
-	if (clear)
+	if (clear) {
 		__csid_aup_rup_clear(csid, port_id);
-	else
-		__csid_aup_update(csid, port_id);
+		return;
+	}
+
+	__csid_aup_update(csid, port_id);
+	/* IPP: latch the TFE IQ settings along with the buffer addresses */
+	if (csid_port_is_ipp(csid, port_id))
+		__csid_rup_update(csid, port_id);
 }
 
 /**
@@ -384,7 +521,16 @@ static irqreturn_t csid_isr(int irq, void *dev)
 	writel(buf_done_val, csid->base + CSID_BUF_DONE_IRQ_CLEAR);
 
 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS_980; i++) {
-		if (csid->phy.en_vc & BIT(i)) {
+		if (csid->phy.en_vc & BIT(i) && csid_port_is_ipp(csid, i)) {
+			val = readl(csid->base + CSID_IPP_IRQ_STATUS);
+			writel(val, csid->base + CSID_IPP_IRQ_CLEAR);
+
+			if (val & INFO_RUP_DONE)
+				csid_subdev_reg_update(csid, i, true);
+
+			if (buf_done_val & BUF_DONE_IRQ_STATUS_IPP_FD)
+				camss_buf_done(csid->camss, csid->id, i);
+		} else if (csid->phy.en_vc & BIT(i)) {
 			val = readl(csid->base + CSID_CSI2_RDIN_IRQ_STATUS(i));
 			writel(val, csid->base + CSID_CSI2_RDIN_IRQ_CLEAR(i));
 
@@ -435,7 +581,10 @@ static int csid_reset(struct csid_device *csid)
 			 * RUP done IRQ status will be cleared once isr
 			 * strobe generated by CSID_RST_CMD
 			 */
-			val |= BIT(BUF_DONE_IRQ_STATUS_RDI_OFFSET + i);
+			if (csid_port_is_ipp(csid, i))
+				val |= BUF_DONE_IRQ_STATUS_IPP_FD;
+			else
+				val |= BIT(BUF_DONE_IRQ_STATUS_RDI_OFFSET + i);
 		}
 	}
 	writel(val, csid->base + CSID_BUF_DONE_IRQ_CLEAR);
