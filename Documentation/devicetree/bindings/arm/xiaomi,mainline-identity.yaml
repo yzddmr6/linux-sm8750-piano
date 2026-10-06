@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/arm/xiaomi,mainline-identity.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Root identity copy restored after Qualcomm ABL
+
+maintainers:
+  - Erwin <yzddmr7@gmail.com>
+
+description:
+  When Qualcomm ABL applies the stock DTBO of some Xiaomi boards, it copies
+  the overlay's root model and compatible over those of the booted DTB. The
+  board DTB keeps its own values in these root properties, which the DTBO
+  does not carry, so that the OS can restore them early in boot.
+
+select:
+  properties:
+    $nodename:
+      const: '/'
+  required:
+    - xiaomi,mainline-compatible
+
+properties:
+  $nodename:
+    const: '/'
+
+  xiaomi,mainline-compatible:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description: Copy of the root compatible defined by this DTB.
+
+  xiaomi,mainline-model:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Copy of the root model defined by this DTB.
+
+required:
+  - xiaomi,mainline-compatible
+
+additionalProperties: true
