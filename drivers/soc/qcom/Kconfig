@@ -15,6 +15,27 @@ menuconfig QCOM_SOC
 
 if QCOM_SOC
 
+config QCOM_ABL_ROOT_IDENTITY
+	bool "Restore the DT root identity replaced by Qualcomm ABL"
+	depends on ARCH_QCOM || COMPILE_TEST
+	depends on OF
+	help
+	  Some Qualcomm ABL builds copy the root "model" and "compatible" of
+	  the vendor DTBO they apply over those of the booted DTB, so root
+	  match tables no longer recognise the SoC. If the DTB keeps its own
+	  values in the root properties "xiaomi,mainline-model" and
+	  "xiaomi,mainline-compatible", put them back before core initcalls.
+	  DTBs without those properties are left alone.
+
+config QCOM_ABL_ROOT_IDENTITY_KUNIT_TEST
+	bool "ABL root identity restore tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && QCOM_ABL_ROOT_IDENTITY
+	default KUNIT_ALL_TESTS
+	help
+	  Check the restore decision on synthetic, unattached nodes: replaced,
+	  missing, matching, absent and malformed values. The live tree is
+	  not modified.
+
 config QCOM_AOSS_QMP
 	tristate "Qualcomm AOSS Driver"
 	depends on MAILBOX
