@@ -2,6 +2,7 @@
 
 #include <linux/aperture.h>
 #include <linux/clk.h>
+#include <linux/interconnect.h>
 #include <linux/minmax.h>
 #include <linux/of_address.h>
 #include <linux/of_clk.h>
@@ -256,6 +257,58 @@ struct simpledrm_device {
 /*
  * Hardware
  */
+
+static void simpledrm_release_interconnect(void *data)
+{
+	icc_set_bw(data, 0, 0);
+}
+
+static int simpledrm_device_init_interconnect(struct simpledrm_device *sdev)
+{
+	struct device *dev = sdev->sysfb.dev.dev;
+	struct device_node *np = dev->of_node;
+	struct icc_path *path;
+	bool has_path, has_bw;
+	u32 bw[2];
+	int ret;
+
+	if (!np)
+		return 0;
+
+	has_path = of_property_present(np, "interconnects");
+	has_bw = of_property_present(np, "qcom,boot-bandwidth-kBps");
+	if (!has_path && !has_bw)
+		return 0;
+	if (!has_path || !has_bw)
+		return dev_err_probe(dev, -EINVAL,
+			"interconnects and boot bandwidth must be specified together\n");
+	if (!IS_ENABLED(CONFIG_INTERCONNECT))
+		return dev_err_probe(dev, -EOPNOTSUPP,
+			"boot bandwidth requires interconnect support\n");
+	if (of_count_phandle_with_args(np, "interconnects", "#interconnect-cells") != 2 ||
+	    of_property_count_u32_elems(np, "qcom,boot-bandwidth-kBps") != 2)
+		return dev_err_probe(dev, -EINVAL,
+			"expected one memory path and average/peak boot bandwidth\n");
+
+	ret = of_property_read_u32_array(np, "qcom,boot-bandwidth-kBps", bw, 2);
+	if (ret)
+		return ret;
+	if (!bw[1] || bw[0] > bw[1])
+		return dev_err_probe(dev, -EINVAL, "invalid boot bandwidth\n");
+
+	path = devm_of_icc_get(dev, NULL);
+	if (IS_ERR(path))
+		return dev_err_probe(dev, PTR_ERR(path), "failed to get memory path\n");
+	if (!path)
+		return dev_err_probe(dev, -ENODEV, "missing memory path\n");
+
+	/* Keep firmware scanout supplied until the native display driver takes over. */
+	ret = icc_set_bw(path, bw[0], bw[1]);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to vote boot bandwidth\n");
+
+	return devm_add_action_or_reset(dev, simpledrm_release_interconnect, path);
+}
 
 #if defined CONFIG_OF && defined CONFIG_COMMON_CLK
 /*
@@ -647,13 +700,17 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 	 * Hardware settings
 	 */
 
-	ret = simpledrm_device_init_clocks(sdev);
+	ret = simpledrm_device_init_interconnect(sdev);
 	if (ret)
 		return ERR_PTR(ret);
 	ret = simpledrm_device_init_regulators(sdev);
 	if (ret)
 		return ERR_PTR(ret);
 	ret = simpledrm_device_attach_genpd(sdev);
+	if (ret)
+		return ERR_PTR(ret);
+	/* Clock gates may require their power domain to be active. */
+	ret = simpledrm_device_init_clocks(sdev);
 	if (ret)
 		return ERR_PTR(ret);
 

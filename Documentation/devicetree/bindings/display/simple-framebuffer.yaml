@@ -76,8 +76,28 @@ properties:
   clocks:
     description: List of clocks used by the framebuffer.
 
+  interconnects:
+    maxItems: 1
+    description: Memory path used by firmware scanout.
+
+  qcom,boot-bandwidth-kBps:
+    description:
+      Explicit average and peak memory bandwidth in kilobytes per second to
+      preserve firmware scanout until a native display driver takes over.
+      This temporary Qualcomm handoff property does not describe an operating
+      point for native display operation.
+    items:
+      - description: Average bandwidth
+      - description: Peak bandwidth
+        minimum: 1
+
   power-domains:
     description: List of power domains used by the framebuffer.
+
+  required-opps:
+    description:
+      Minimum performance states needed to preserve firmware scanout,
+      in the same order as power-domains.
 
   width:
     $ref: /schemas/types.yaml#/definitions/uint32
@@ -159,6 +179,12 @@ required:
   # The binding requires also reg, width, height, stride and format,
   # but usually they will be filled by the bootloader.
   - compatible
+
+dependencies:
+  interconnects:
+    - qcom,boot-bandwidth-kBps
+  qcom,boot-bandwidth-kBps:
+    - interconnects
 
 allOf:
   - if:
