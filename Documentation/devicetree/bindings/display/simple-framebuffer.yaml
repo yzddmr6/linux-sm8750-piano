@@ -77,19 +77,21 @@ properties:
     description: List of clocks used by the framebuffer.
 
   interconnects:
-    maxItems: 1
-    description: Memory path used by firmware scanout.
-
-  qcom,boot-bandwidth-kBps:
     description:
-      Explicit average and peak memory bandwidth in kilobytes per second to
-      preserve firmware scanout until a native display driver takes over.
-      This temporary Qualcomm handoff property does not describe an operating
-      point for native display operation.
-    items:
-      - description: Average bandwidth
-      - description: Peak bandwidth
-        minimum: 1
+      Memory paths used by the display hardware to scan out the framebuffer.
+
+  interconnect-names:
+    description: Names of the memory paths, in the same order as interconnects.
+
+  operating-points-v2:
+    description:
+      Bandwidth that the scanout set up by the firmware needs on the paths
+      given by interconnects, until a driver for the display hardware takes
+      over. The operating point with the highest opp-peak-kBps on the first
+      path is used.
+
+  opp-table:
+    type: object
 
   power-domains:
     description: List of power domains used by the framebuffer.
@@ -181,9 +183,7 @@ required:
   - compatible
 
 dependencies:
-  interconnects:
-    - qcom,boot-bandwidth-kBps
-  qcom,boot-bandwidth-kBps:
+  operating-points-v2:
     - interconnects
 
 allOf:

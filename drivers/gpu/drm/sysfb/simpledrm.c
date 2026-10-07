@@ -2,7 +2,6 @@
 
 #include <linux/aperture.h>
 #include <linux/clk.h>
-#include <linux/interconnect.h>
 #include <linux/minmax.h>
 #include <linux/of_address.h>
 #include <linux/of_clk.h>
@@ -12,6 +11,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_opp.h>
 #include <linux/regulator/consumer.h>
 
 #include <drm/clients/drm_client_setup.h>
@@ -258,57 +258,101 @@ struct simpledrm_device {
  * Hardware
  */
 
-static void simpledrm_release_interconnect(void *data)
+#if defined CONFIG_OF && defined CONFIG_PM_OPP
+/*
+ * Operating point handling code.
+ *
+ * Here we handle the operating-points-v2 property of our "simple-framebuffer"
+ * dt node. The scanout that the bootloader set up may need a minimum memory
+ * bandwidth on the interconnect paths given by the node's interconnects
+ * property. The OPP table describes that bandwidth, and the OPP core votes
+ * it on those paths, so that it stays in place for the life of the simpledrm
+ * driver.
+ *
+ * Only bandwidth is taken from the OPP. The performance states of the power
+ * domains are given by the node's required-opps property and are applied
+ * when the domains are attached. The clocks are kept running at the rates
+ * the bootloader left them; it is not up to us to change them.
+ *
+ * When the driver unloads, we drop the bandwidth vote and release the table.
+ *
+ * As for clocks and regulators, we only complain about errors other than
+ * probe deferral and carry on without the vote.
+ */
+
+static int simpledrm_opp_config_clks_nop(struct device *dev,
+					 struct opp_table *opp_table,
+					 struct dev_pm_opp *opp, void *data,
+					 bool scaling_down)
 {
-	icc_set_bw(data, 0, 0);
+	/* Keep dev_pm_opp_set_opp() from setting a clock rate. */
+	return 0;
 }
 
-static int simpledrm_device_init_interconnect(struct simpledrm_device *sdev)
+static void simpledrm_device_release_opp(void *res)
 {
-	struct device *dev = sdev->sysfb.dev.dev;
-	struct device_node *np = dev->of_node;
-	struct icc_path *path;
-	bool has_path, has_bw;
-	u32 bw[2];
+	dev_pm_opp_set_opp(res, NULL);
+}
+
+static int simpledrm_device_init_opp(struct simpledrm_device *sdev)
+{
+	static const char * const clk_names[] = { NULL, NULL };
+	struct dev_pm_opp_config config = {
+		.clk_names = clk_names,
+		.config_clks = simpledrm_opp_config_clks_nop,
+	};
+	struct drm_device *drm = &sdev->sysfb.dev;
+	struct device *dev = drm->dev;
+	struct dev_pm_opp *opp;
+	unsigned int bw = UINT_MAX;
 	int ret;
 
-	if (!np)
+	if (dev_get_platdata(dev) || !dev->of_node ||
+	    !of_property_present(dev->of_node, "operating-points-v2"))
 		return 0;
 
-	has_path = of_property_present(np, "interconnects");
-	has_bw = of_property_present(np, "qcom,boot-bandwidth-kBps");
-	if (!has_path && !has_bw)
-		return 0;
-	if (!has_path || !has_bw)
-		return dev_err_probe(dev, -EINVAL,
-			"interconnects and boot bandwidth must be specified together\n");
-	if (!IS_ENABLED(CONFIG_INTERCONNECT))
-		return dev_err_probe(dev, -EOPNOTSUPP,
-			"boot bandwidth requires interconnect support\n");
-	if (of_count_phandle_with_args(np, "interconnects", "#interconnect-cells") != 2 ||
-	    of_property_count_u32_elems(np, "qcom,boot-bandwidth-kBps") != 2)
-		return dev_err_probe(dev, -EINVAL,
-			"expected one memory path and average/peak boot bandwidth\n");
+	/*
+	 * The OPP core takes the first clock of the node and would set it to
+	 * the rate of the selected OPP. Hand it that clock (unnamed, hence the
+	 * NULL connection id) with a callback that leaves the rate alone. A
+	 * node without clocks leaves the OPP core no clock to manage.
+	 */
+	if (of_property_present(dev->of_node, "clocks")) {
+		ret = devm_pm_opp_set_config(dev, &config);
+		if (ret < 0)
+			goto err;
+	}
 
-	ret = of_property_read_u32_array(np, "qcom,boot-bandwidth-kBps", bw, 2);
+	ret = devm_pm_opp_of_add_table(dev);
 	if (ret)
+		goto err;
+
+	/* Select the operating point with the highest bandwidth. */
+	opp = dev_pm_opp_find_bw_floor(dev, &bw, 0);
+	if (IS_ERR(opp)) {
+		ret = PTR_ERR(opp);
+		goto err;
+	}
+
+	ret = dev_pm_opp_set_opp(dev, opp);
+	dev_pm_opp_put(opp);
+	if (ret)
+		goto err;
+
+	return devm_add_action_or_reset(dev, simpledrm_device_release_opp, dev);
+
+err:
+	if (ret == -EPROBE_DEFER)
 		return ret;
-	if (!bw[1] || bw[0] > bw[1])
-		return dev_err_probe(dev, -EINVAL, "invalid boot bandwidth\n");
-
-	path = devm_of_icc_get(dev, NULL);
-	if (IS_ERR(path))
-		return dev_err_probe(dev, PTR_ERR(path), "failed to get memory path\n");
-	if (!path)
-		return dev_err_probe(dev, -ENODEV, "missing memory path\n");
-
-	/* Keep firmware scanout supplied until the native display driver takes over. */
-	ret = icc_set_bw(path, bw[0], bw[1]);
-	if (ret)
-		return dev_err_probe(dev, ret, "failed to vote boot bandwidth\n");
-
-	return devm_add_action_or_reset(dev, simpledrm_release_interconnect, path);
+	drm_err(drm, "failed to set operating point: %d\n", ret);
+	return 0;
 }
+#else
+static int simpledrm_device_init_opp(struct simpledrm_device *sdev)
+{
+	return 0;
+}
+#endif
 
 #if defined CONFIG_OF && defined CONFIG_COMMON_CLK
 /*
@@ -700,7 +744,7 @@ static struct simpledrm_device *simpledrm_device_create(struct drm_driver *drv,
 	 * Hardware settings
 	 */
 
-	ret = simpledrm_device_init_interconnect(sdev);
+	ret = simpledrm_device_init_opp(sdev);
 	if (ret)
 		return ERR_PTR(ret);
 	ret = simpledrm_device_init_regulators(sdev);
