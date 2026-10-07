@@ -17,6 +17,7 @@ properties:
   compatible:
     enum:
       - pci17cb,1107  # WCN7850
+      - pci17cb,110e  # WCN7860
 
   reg:
     maxItems: 1
@@ -48,11 +49,23 @@ properties:
   vddrfa1p8-supply:
     description: VDD_RFA_1P8 supply regulator handle
 
+  vddrfa0p9-supply:
+    description: VDD_RFA_0P9 supply regulator handle
+
+  vddrfa1p3-supply:
+    description: VDD_RFA_1P3 supply regulator handle
+
+  vddrfa1p9-supply:
+    description: VDD_RFA_1P9 supply regulator handle
+
   vddpcie0p9-supply:
     description: VDD_PCIE_0P9 supply regulator handle
 
   vddpcie1p8-supply:
     description: VDD_PCIE_1P8 supply regulator handle
+
+  vddpcie1p2-supply:
+    description: VDD_PCIE_1P2 supply regulator handle
 
 required:
   - compatible
@@ -60,12 +73,44 @@ required:
   - vddaon-supply
   - vddwlcx-supply
   - vddwlmx-supply
-  - vddrfacmn-supply
-  - vddrfa0p8-supply
-  - vddrfa1p2-supply
-  - vddrfa1p8-supply
   - vddpcie0p9-supply
-  - vddpcie1p8-supply
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: pci17cb,1107
+    then:
+      properties:
+        vddrfa0p9-supply: false
+        vddrfa1p3-supply: false
+        vddrfa1p9-supply: false
+        vddpcie1p2-supply: false
+      required:
+        - vddrfacmn-supply
+        - vddrfa0p8-supply
+        - vddrfa1p2-supply
+        - vddrfa1p8-supply
+        - vddpcie1p8-supply
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: pci17cb,110e
+    then:
+      properties:
+        vddrfacmn-supply: false
+        vddrfa0p8-supply: false
+        vddrfa1p2-supply: false
+        vddrfa1p8-supply: false
+        vddpcie1p8-supply: false
+      required:
+        - vddrfa0p9-supply
+        - vddrfa1p3-supply
+        - vddrfa1p9-supply
+        - vddpcie1p2-supply
 
 additionalProperties: false
 
@@ -99,6 +144,36 @@ examples:
                 vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
                 vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
                 vddpcie1p8-supply = <&vreg_pmu_pcie_1p8>;
+            };
+        };
+    };
+
+  - |
+    pcie {
+        #address-cells = <3>;
+        #size-cells = <2>;
+
+        pcie@0 {
+            device_type = "pci";
+            reg = <0x0 0x0 0x0 0x0 0x0>;
+            #address-cells = <3>;
+            #size-cells = <2>;
+            ranges;
+
+            bus-range = <0x01 0xff>;
+
+            wifi@0 {
+                compatible = "pci17cb,110e";
+                reg = <0x10000 0x0 0x0 0x0 0x0>;
+
+                vddaon-supply = <&vreg_pmu_aon_0p9>;
+                vddwlcx-supply = <&vreg_pmu_wlcx_0p9>;
+                vddwlmx-supply = <&vreg_pmu_wlmx_0p9>;
+                vddrfa0p9-supply = <&vreg_pmu_rfa_0p9>;
+                vddrfa1p3-supply = <&vreg_pmu_rfa_1p3>;
+                vddrfa1p9-supply = <&vreg_pmu_rfa_1p9>;
+                vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
+                vddpcie1p2-supply = <&vreg_pmu_pcie_1p2>;
             };
         };
     };
