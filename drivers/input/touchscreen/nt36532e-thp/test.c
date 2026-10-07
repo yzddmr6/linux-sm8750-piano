@@ -13,7 +13,7 @@ struct nvt_mock {
 	u8 *memory;
 	unsigned int calls, fail_call, uploaded, resets;
 	unsigned int host_commands, host_polls, busy_reads;
-	u8 host_command[2][5];
+	u8 host_command[3][5];
 	bool bad_id, bad_info, boot_ready, stuck_command;
 };
 
@@ -325,7 +325,8 @@ static void nvt_test_identity(struct kunit *test)
 
 static void nvt_test_host_commands(struct kunit *test)
 {
-	static const u8 expected[2][5] = {
+	static const u8 expected[3][5] = {
+		{ 0xbf, 0x04, 0x00, 0x00, 0x00 },	/* no pen consumer: stock stylus disable */
 		{ 0xbf, 0x19, 0x00, 0x01, 0x00 },	/* idle-baseline update */
 		{ 0xbf, 0x01, 0x00, 0x02, 0x00 },	/* op mode 2 */
 	};
@@ -339,10 +340,10 @@ static void nvt_test_host_commands(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, nvt_thp_apply_host_commands(map, &last), 0);
 	KUNIT_EXPECT_EQ(test, last.sub_command, 0x01);
 	KUNIT_EXPECT_EQ(test, last.status, 0);
-	KUNIT_ASSERT_EQ(test, mock->host_commands, 2U);
+	KUNIT_ASSERT_EQ(test, mock->host_commands, 3U);
 	KUNIT_EXPECT_MEMEQ(test, mock->host_command, expected, sizeof(expected));
 	/* Each command is polled while busy and once more after clearing. */
-	KUNIT_EXPECT_EQ(test, mock->host_polls, 4U);
+	KUNIT_EXPECT_EQ(test, mock->host_polls, 6U);
 	KUNIT_EXPECT_EQ(test, mock->memory[0x11c450], 0);
 
 	calls = mock->calls;
@@ -357,7 +358,7 @@ static void nvt_test_host_commands(struct kunit *test)
 
 static void nvt_test_host_command_timeout(struct kunit *test)
 {
-	static const u8 expected[5] = { 0xbf, 0x19, 0x00, 0x01, 0x00 };
+	static const u8 expected[5] = { 0xbf, 0x04, 0x00, 0x00, 0x00 };
 	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
 	struct nvt_thp_command_status last;
 	struct regmap *map;
@@ -367,9 +368,9 @@ static void nvt_test_host_command_timeout(struct kunit *test)
 	mock->stuck_command = true;
 	KUNIT_EXPECT_EQ(test, nvt_thp_apply_host_commands(map, &last), -ETIMEDOUT);
 	/* The failing command and the byte it left behind are reported. */
-	KUNIT_EXPECT_EQ(test, last.sub_command, 0x19);
+	KUNIT_EXPECT_EQ(test, last.sub_command, 0x04);
 	KUNIT_EXPECT_EQ(test, last.status, 0xbf);
-	/* The op-mode command is not sent after the first one fails. */
+	/* No later command is sent after the first one fails. */
 	KUNIT_EXPECT_EQ(test, mock->host_commands, 1U);
 	KUNIT_EXPECT_MEMEQ(test, mock->host_command[0], expected, sizeof(expected));
 	KUNIT_EXPECT_GE(test, mock->host_polls, 2U);

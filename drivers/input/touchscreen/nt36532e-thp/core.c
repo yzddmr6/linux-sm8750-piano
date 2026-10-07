@@ -294,7 +294,7 @@ static int nvt_open(struct inode *inode, struct file *file)
 		goto stop;
 	}
 	dev_info(&nvt->spi->dev,
-		 "THP first frame after %lld ms; idle-baseline update and op mode 2 accepted\n",
+		 "THP first frame after %lld ms; stylus disabled, idle-baseline update and op mode 2 accepted\n",
 		 first_frame_ms);
 	nvt->opened = true;
 	kref_get(&nvt->ref);

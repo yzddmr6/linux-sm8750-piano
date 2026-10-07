@@ -256,17 +256,28 @@ static int nvt_extend_command(struct regmap *map, u8 sub_command, u16 value,
 }
 
 /*
- * The piano stock stack sends these two commands, idle-baseline update first:
+ * The piano stock stack first disables stylus scanning when no pen consumer
+ * is connected (update_pen_status()/nvt_xm_htc_set_stylus_enable(), sub-command
+ * 0x04). This transport currently exposes fingers only; do not leave the
+ * freshly loaded firmware's pen state implicit. A pen input implementation
+ * must manage that state explicitly when it is added.
+ *
+ * Then stock updates the idle baseline and selects idle operation:
  * nvt_xm_htc_set_idle_baseline_update(), nt36xxx_ext_proc.c:4242-4255
  * (DATA_MODE_124, nt36xxx.c:4152), then nvt_xm_htc_set_op_mode(2),
  * nt36xxx_ext_proc.c:1137-1150 (DATA_MODE_53 idle, nt36xxx.c:4132-4133).
- * Stock logs show them only while frames are being read, never earlier than
- * about 425 ms after the firmware reset state is reached. The caller must
- * therefore send them only once the firmware is streaming frames.
+ * Stock logs show the latter two only while frames are being read, never
+ * earlier than about 425 ms after the firmware reset state is reached. Pen
+ * disable is earlier in stock. The caller keeps the established first-frame
+ * admission for this sequence, without introducing a guessed delay.
  */
 int nvt_thp_apply_host_commands(struct regmap *map, struct nvt_thp_command_status *last)
 {
-	int ret = nvt_extend_command(map, 0x19, 0x01, last);
+	int ret = nvt_extend_command(map, 0x04, 0x00, last);
+
+	if (ret)
+		return ret;
+	ret = nvt_extend_command(map, 0x19, 0x01, last);
 
 	if (ret)
 		return ret;
