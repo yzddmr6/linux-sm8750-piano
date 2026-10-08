@@ -251,6 +251,16 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 	if (is_bonded_dsi && msm_dsi1)
 		msm_dsi_phy_reset_clk_en_sel(msm_dsi1->phy);
 
+	/* OEM bonded-video prepare resets both controllers after PHY resync. */
+	if (is_bonded_dsi && msm_dsi1) {
+		ret = msm_dsi_host_reset_after_phy_sync(host);
+		if (ret)
+			goto host_sync_fail;
+		ret = msm_dsi_host_reset_after_phy_sync(msm_dsi1->host);
+		if (ret)
+			goto host_sync_fail;
+	}
+
 	/*
 	 * Enable before preparing the panel, disable after unpreparing, so
 	 * that the panel can communicate over the DSI link.
@@ -261,6 +271,8 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 
 	return 0;
 
+host_sync_fail:
+	msm_dsi_host_power_off(msm_dsi1->host);
 host1_on_fail:
 	msm_dsi_host_power_off(host);
 host_on_fail:
