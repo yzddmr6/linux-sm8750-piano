@@ -222,6 +222,8 @@ void msm_drm_kms_unregister(struct device *dev)
 	struct msm_drm_private *priv = platform_get_drvdata(pdev);
 	struct drm_device *ddev = priv->dev;
 
+	if (priv->kms->funcs && priv->kms->funcs->quiesce)
+		priv->kms->funcs->quiesce(priv->kms);
 	drm_atomic_helper_shutdown(ddev);
 }
 
@@ -234,6 +236,9 @@ void msm_drm_kms_uninit(struct device *dev)
 	int i;
 
 	BUG_ON(!kms);
+
+	if (kms->funcs && kms->funcs->quiesce)
+		kms->funcs->quiesce(kms);
 
 	/* We must cancel and cleanup any pending vblank enable/disable
 	 * work before msm_irq_uninstall() to avoid work re-enabling an
@@ -373,8 +378,12 @@ void msm_kms_shutdown(struct platform_device *pdev)
 	 * msm_drm_init, drm_dev->registered is used as an indicator that the
 	 * shutdown will be successful.
 	 */
-	if (drm && drm->registered && priv->kms)
+	if (drm && drm->registered && priv->kms) {
+		/* Do not proceed to other devices' shutdown with owned DMA active. */
+		if (priv->kms->funcs && priv->kms->funcs->quiesce)
+			priv->kms->funcs->quiesce(priv->kms);
 		drm_atomic_helper_shutdown(drm);
+	}
 }
 
 void msm_drm_kms_post_init(struct device *dev)

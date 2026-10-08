@@ -19,6 +19,16 @@ static const struct dpu_caps sm8750_dpu_caps = {
 	.pixel_ram_size = DEFAULT_PIXEL_RAM_SIZE,
 };
 
+/* REGDMA3 DB block and client policy from the SM8750 hardware layout. */
+static const struct dpu_lutdma_cfg sm8750_lutdma = {
+	.version = 0x30000,
+	.db_base = 0,
+	.xin_id = 7,
+	.clk_ctrl = DPU_CLK_CTRL_REG_DMA,
+	.read_ot_limit = 40,
+	.qos = { 4, 4, 4, 4, 5, 5, 5, 5 },
+};
+
 static const struct dpu_mdp_cfg sm8750_mdp = {
 	.name = "top_0",
 	.base = 0, .len = 0x494,
@@ -464,6 +474,7 @@ const struct dpu_mdss_cfg dpu_sm8750_cfg = {
 	.mdss_ver = &sm8750_mdss_ver,
 	.caps = &sm8750_dpu_caps,
 	.mdp = &sm8750_mdp,
+	.lutdma = &sm8750_lutdma,
 	.cdm = &dpu_cdm_5_x,
 	.ctl_count = ARRAY_SIZE(sm8750_ctl),
 	.ctl = sm8750_ctl,

@@ -104,6 +104,10 @@ struct msm_kms_funcs {
 	/* misc: */
 	long (*round_pixclk)(struct msm_kms *kms, unsigned long rate,
 			struct drm_encoder *encoder);
+	/* Called in process context before KMS uninit or machine shutdown.
+	 * Must return only after device DMA no longer accesses its buffers.
+	 */
+	void (*quiesce)(struct msm_kms *kms);
 	/* cleanup: */
 	void (*destroy)(struct msm_kms *kms);
 

@@ -24,6 +24,7 @@
 #include <drm/drm_self_refresh_helper.h>
 
 #include "dpu_kms.h"
+#include "dpu_lutdma.h"
 #include "dpu_hw_lm.h"
 #include "dpu_hw_ctl.h"
 #include "dpu_hw_dspp.h"
@@ -853,11 +854,42 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	struct dpu_hw_gc_lut *gc_lut;
 	struct dpu_hw_ctl *ctl;
 	struct dpu_hw_dspp *dspp;
-	int i;
+	struct dpu_hw_dspp *gc_master = NULL;
+	u32 gc_mask = 0;
+	int i, ret, gc_mixers = 0, gcv2_ret = 0;
 
 
 	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state))
 		return;
+
+	/* GC2 uses the downstream broadcast programming model: submit once
+	 * for every assigned DSPP, then stage both flushes only after success.
+	 * Independent submissions could leave split-display halves unequal.
+	 */
+	for (i = 0; i < cstate->num_mixers; i++) {
+		dspp = mixer[i].hw_dspp;
+		if (dspp && dspp->lutdma && dspp->ops.setup_gc) {
+			if (!gc_master)
+				gc_master = dspp;
+			gc_mask |= BIT(17 + dspp->idx - DSPP_0);
+			gc_mixers++;
+		}
+	}
+	if (gc_master) {
+		gc_lut = NULL;
+		if (gc_mixers != cstate->num_mixers) {
+			gcv2_ret = -EINVAL;
+		} else if (state->gamma_lut) {
+			gc_lut = kzalloc_obj(*gc_lut);
+			if (!gc_lut)
+				gcv2_ret = -ENOMEM;
+			else
+				_dpu_crtc_get_gc_lut(state, gc_lut);
+		}
+		if (!gcv2_ret)
+			gcv2_ret = gc_master->ops.setup_gc(gc_master, gc_lut, mixer[0].lm_ctl, gc_mask);
+		kfree(gc_lut);
+	}
 
 	for (i = 0; i < cstate->num_mixers; i++) {
 		ctl = mixer[i].lm_ctl;
@@ -880,15 +912,24 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 		}
 
 		if (dspp->ops.setup_gc) {
-			if (!state->gamma_lut) {
-				dspp->ops.setup_gc(dspp, NULL);
+			if (dspp->lutdma) {
+				ret = gcv2_ret;
+			} else if (!state->gamma_lut) {
+				ret = dspp->ops.setup_gc(dspp, NULL, ctl, 0);
 			} else {
 				gc_lut = kzalloc_obj(*gc_lut);
 				if (!gc_lut)
 					continue;
 				_dpu_crtc_get_gc_lut(state, gc_lut);
-				dspp->ops.setup_gc(dspp, gc_lut);
+				ret = dspp->ops.setup_gc(dspp, gc_lut, ctl, 0);
 				kfree(gc_lut);
+			}
+
+			if (ret) {
+				drm_err(crtc->dev, "GC programming failed on DSPP%u: %d\n", dspp->idx, ret);
+				if (state->event && state->event->base.fence)
+					dma_fence_set_error(state->event->base.fence, ret);
+				continue;
 			}
 
 			/* stage config flush mask */
@@ -1533,6 +1574,15 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
 	int rc = 0;
 
 	bool needs_dirtyfb = dpu_crtc_needs_dirtyfb(crtc_state);
+	struct dpu_kms *kms = _dpu_crtc_get_kms(crtc);
+
+	/* A hardware failure latches the engine unusable. Do not accept a
+	 * later gamma update as though its transport were still initialized.
+	 */
+	if (crtc_state->color_mgmt_changed && kms->lutdma &&
+	    !dpu_lutdma_ready(kms->lutdma))
+		return -EIO;
+
 
 	/* don't reallocate resources if only ACTIVE has beeen changed */
 	if (crtc_state->mode_changed || crtc_state->connectors_changed ||
@@ -1920,9 +1970,13 @@ struct drm_crtc *dpu_crtc_init(struct drm_device *dev, struct drm_plane *plane,
 	drm_crtc_helper_add(crtc, &dpu_crtc_helper_funcs);
 
 	if (dpu_kms->catalog->dspp_count) {
-		const struct dpu_dspp_cfg *dspp = &dpu_kms->catalog->dspp[0];
+		struct dpu_hw_blk *block = dpu_kms->rm.dspp_blks[0];
+		struct dpu_hw_dspp *dspp = block ? to_dpu_hw_dspp(block) : NULL;
 
-		if (dspp->sblk->gc.base) {
+		/* Publish the standard property only with an initialized backend.
+		 * A GC v2 catalog entry alone does not provide gamma programming.
+		 */
+		if (dspp && dspp->ops.setup_gc) {
 			drm_mode_crtc_set_gamma_size(crtc, DPU_GAMMA_LUT_SIZE);
 			drm_crtc_enable_color_mgmt(crtc, 0, true, DPU_GAMMA_LUT_SIZE);
 		} else {

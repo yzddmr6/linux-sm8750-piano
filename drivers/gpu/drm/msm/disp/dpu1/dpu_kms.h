@@ -56,6 +56,8 @@
 
 extern bool dpu_use_virtual_planes;
 
+struct dpu_lutdma;
+
 struct dpu_kms {
 	struct msm_kms base;
 	struct drm_device *dev;
@@ -64,6 +66,7 @@ struct dpu_kms {
 
 	/* io/register spaces: */
 	void __iomem *mmio, *vbif;
+	struct dpu_lutdma *lutdma;
 
 	struct regulator *vdd;
 	struct regulator *mmagic;

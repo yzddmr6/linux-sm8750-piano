@@ -33,6 +33,8 @@
 #include "dpu_formats.h"
 #include "dpu_hw_vbif.h"
 #include "dpu_kms.h"
+#include "dpu_hw_dspp.h"
+#include "dpu_lutdma.h"
 #include "dpu_plane.h"
 #include "dpu_vbif.h"
 #include "dpu_writeback.h"
@@ -888,6 +890,8 @@ static int _dpu_kms_drm_obj_init(struct dpu_kms *dpu_kms)
 
 static void _dpu_kms_hw_destroy(struct dpu_kms *dpu_kms)
 {
+	dpu_lutdma_destroy(dpu_kms->lutdma);
+	dpu_kms->lutdma = NULL;
 	dpu_kms->hw_intr = NULL;
 
 	/* safe to call these more than once during shutdown */
@@ -1066,6 +1070,11 @@ static void dpu_kms_mdp_snapshot(struct msm_disp_state *disp_state, struct msm_k
 	pm_runtime_put_sync(&dpu_kms->pdev->dev);
 }
 
+static void dpu_kms_quiesce(struct msm_kms *kms)
+{
+	dpu_lutdma_quiesce(to_dpu_kms(kms)->lutdma);
+}
+
 static const struct msm_kms_funcs kms_funcs = {
 	.hw_init         = dpu_kms_hw_init,
 	.irq_preinstall  = dpu_core_irq_preinstall,
@@ -1080,6 +1089,7 @@ static const struct msm_kms_funcs kms_funcs = {
 	.complete_commit = dpu_kms_complete_commit,
 	.enable_vblank   = dpu_kms_enable_vblank,
 	.disable_vblank  = dpu_kms_disable_vblank,
+	.quiesce         = dpu_kms_quiesce,
 	.destroy         = dpu_kms_destroy,
 	.snapshot        = dpu_kms_mdp_snapshot,
 #ifdef CONFIG_DEBUG_FS
@@ -1225,6 +1235,31 @@ static int dpu_kms_hw_init(struct msm_kms *kms)
 	}
 
 	dpu_kms->hw_vbif = hw;
+
+	/* Only initialize when a GC2 catalog entry requests this backend.
+	 * No resource or no acknowledged reset means no GC2 op/property.
+	 */
+	for (int i = 0; i < dpu_kms->catalog->dspp_count; i++) {
+		const struct dpu_dspp_cfg *dspp = &dpu_kms->catalog->dspp[i];
+
+		if (!dspp->sblk->gc.base || dspp->sblk->gc.version != 0x20000)
+			continue;
+		dpu_kms->lutdma = dpu_lutdma_init(dpu_kms);
+		if (IS_ERR(dpu_kms->lutdma)) {
+			drm_warn(dev, "GC2 REGDMA initialization failed: %ld\n",
+				 PTR_ERR(dpu_kms->lutdma));
+			dpu_kms->lutdma = NULL;
+		}
+		break;
+	}
+	if (dpu_lutdma_ready(dpu_kms->lutdma)) {
+		for (int i = 0; i < ARRAY_SIZE(dpu_kms->rm.dspp_blks); i++) {
+			if (dpu_kms->rm.dspp_blks[i])
+				dpu_hw_dspp_bind_regdma(to_dpu_hw_dspp(dpu_kms->rm.dspp_blks[i]),
+							dpu_kms->lutdma);
+		}
+	}
+
 
 	/* TODO: use the same max_freq as in dpu_kms_hw_init */
 	max_core_clk_rate = dpu_kms_get_clk_rate(dpu_kms, "core");
@@ -1437,6 +1472,9 @@ static int __maybe_unused dpu_runtime_suspend(struct device *dev)
 	struct platform_device *pdev = to_platform_device(dev);
 	struct msm_drm_private *priv = platform_get_drvdata(pdev);
 	struct dpu_kms *dpu_kms = to_dpu_kms(priv->kms);
+
+	if (!dpu_lutdma_idle(dpu_kms->lutdma))
+		return -EBUSY;
 
 	clk_bulk_disable_unprepare(dpu_kms->num_clocks, dpu_kms->clocks);
 

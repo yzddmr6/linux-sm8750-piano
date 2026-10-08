@@ -9,6 +9,7 @@
 #include "dpu_hw_lm.h"
 #include "dpu_hw_dspp.h"
 #include "dpu_kms.h"
+#include "dpu_lutdma.h"
 
 
 /* DSPP_PCC */
@@ -75,28 +76,29 @@ static void dpu_setup_dspp_pcc(struct dpu_hw_dspp *ctx,
 	DPU_REG_WRITE(&ctx->hw, base, PCC_EN);
 }
 
-static void dpu_setup_dspp_gc(struct dpu_hw_dspp *ctx,
-		struct dpu_hw_gc_lut *gc_lut)
+static int dpu_setup_dspp_gc(struct dpu_hw_dspp *ctx,
+		struct dpu_hw_gc_lut *gc_lut,
+		struct dpu_hw_ctl *ctl, u32 dspp_mask)
 {
 	int i = 0;
 	u32 base, reg;
 
 	if (!ctx) {
 		DRM_ERROR("invalid ctx\n");
-		return;
+		return -EINVAL;
 	}
 
 	base = ctx->cap->sblk->gc.base;
 
 	if (!base) {
 		DRM_ERROR("invalid ctx %p gc base\n", ctx);
-		return;
+		return -EINVAL;
 	}
 
 	if (!gc_lut) {
 		DRM_DEBUG_DRIVER("disable gc feature\n");
 		DPU_REG_WRITE(&ctx->hw, base, GC_DIS);
-		return;
+		return 0;
 	}
 
 	DPU_REG_WRITE(&ctx->hw, base + GC_C0_INDEX_OFF, 0);
@@ -113,6 +115,22 @@ static void dpu_setup_dspp_gc(struct dpu_hw_dspp *ctx,
 
 	reg = GC_EN | ((gc_lut->flags & PGC_8B_ROUND) ? GC_8B_ROUND_EN : 0);
 	DPU_REG_WRITE(&ctx->hw, base, reg);
+	return 0;
+}
+
+static int dpu_setup_dspp_gcv2(struct dpu_hw_dspp *ctx,
+		struct dpu_hw_gc_lut *lut, struct dpu_hw_ctl *ctl, u32 dspp_mask)
+{
+	return dpu_lutdma_submit_gc(ctx->lutdma, ctl, dspp_mask, lut);
+}
+
+void dpu_hw_dspp_bind_regdma(struct dpu_hw_dspp *ctx, struct dpu_lutdma *dma)
+{
+	if (ctx->cap->sblk->gc.version != 0x20000 ||
+	    ctx->cap->sblk->gc.base != 0x17c0 || !dpu_lutdma_ready(dma))
+		return;
+	ctx->lutdma = dma;
+	ctx->ops.setup_gc = dpu_setup_dspp_gcv2;
 }
 
 /**
@@ -144,7 +162,12 @@ struct dpu_hw_dspp *dpu_hw_dspp_init(struct drm_device *dev,
 	c->cap = cfg;
 	if (c->cap->sblk->pcc.base)
 		c->ops.setup_pcc = dpu_setup_dspp_pcc;
-	if (c->cap->sblk->gc.base)
+	/* GC v2 requires REGDMA; do not bind the legacy AHB implementation
+	 * merely because the catalog describes a nonzero register offset.
+	 */
+	if (c->cap->sblk->gc.base &&
+	    (c->cap->sblk->gc.version == 0x10007 ||
+	     c->cap->sblk->gc.version == 0x10008))
 		c->ops.setup_gc = dpu_setup_dspp_gc;
 
 	return c;

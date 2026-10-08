@@ -6,6 +6,8 @@
 #define _DPU_HW_DSPP_H
 
 struct dpu_hw_dspp;
+struct dpu_hw_ctl;
+struct dpu_lutdma;
 
 /**
  * struct dpu_hw_pcc_coeff - PCC coefficient structure for each color
@@ -70,7 +72,8 @@ struct dpu_hw_dspp_ops {
 	 * @ctx: Pointer to dspp context
 	 * @gc_lut: Pointer to lut content
 	 */
-	void (*setup_gc)(struct dpu_hw_dspp *ctx, struct dpu_hw_gc_lut *gc_lut);
+	int (*setup_gc)(struct dpu_hw_dspp *ctx, struct dpu_hw_gc_lut *gc_lut,
+			struct dpu_hw_ctl *ctl, u32 dspp_mask);
 
 };
 
@@ -92,6 +95,7 @@ struct dpu_hw_dspp {
 
 	/* Ops */
 	struct dpu_hw_dspp_ops ops;
+	struct dpu_lutdma *lutdma;
 };
 
 /**
@@ -107,6 +111,8 @@ static inline struct dpu_hw_dspp *to_dpu_hw_dspp(struct dpu_hw_blk *hw)
 struct dpu_hw_dspp *dpu_hw_dspp_init(struct drm_device *dev,
 				     const struct dpu_dspp_cfg *cfg,
 				     void __iomem *addr);
+
+void dpu_hw_dspp_bind_regdma(struct dpu_hw_dspp *ctx, struct dpu_lutdma *dma);
 
 #endif /*_DPU_HW_DSPP_H */
 
