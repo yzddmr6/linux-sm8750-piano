@@ -25,6 +25,18 @@ properties:
     enum:
       - privacy
 
+  privacy-led-brightness:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 2
+    maxItems: 2
+    description: |
+      Indicator brightness as a numerator and full-scale denominator. Both
+      values must be nonzero and the numerator must not exceed the denominator.
+      The consumer scales this fraction to the LED provider's real range.
+      Consumers sharing a physical indicator must request identical levels.
+      If absent, the provider's maximum is used. This is a SunUEFI proposed
+      extension, not an existing upstream binding.
+
   lens-focus:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:

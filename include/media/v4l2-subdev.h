@@ -1054,6 +1054,8 @@ struct v4l2_subdev_platform_data {
  *		driver. This is	optional. If NULL, each state instance will get
  *		a lock of its own.
  * @privacy_led: Optional pointer to a LED classdev for the privacy LED for sensors.
+ * @privacy_led_active: This sensor owns a shared indicator reference.
+ * @privacy_led_quiesced: Reset/clock-off confirmed after the last ownership.
  * @active_state: Active state for the subdev (NULL for subdevs tracking the
  *		  state internally). Initialized by calling
  *		  v4l2_subdev_init_finalize().
@@ -1101,6 +1103,8 @@ struct v4l2_subdev {
 	 */
 
 	struct led_classdev *privacy_led;
+	bool privacy_led_active;
+	bool privacy_led_quiesced;
 
 	/*
 	 * TODO: active_state should most likely be changed from a pointer to an
@@ -1926,6 +1930,28 @@ v4l2_subdev_lock_and_get_active_state(struct v4l2_subdev *sd)
 		v4l2_subdev_lock_state(sd->active_state);
 	return sd->active_state;
 }
+
+/**
+ * v4l2_subdev_enable_privacy_led - acquire the shared indicator before capture
+ * @sd: sensor subdevice
+ *
+ * Sensor drivers call after acquiring their runtime PM reference and before
+ * writing stream-on. This avoids a previous autosuspend callback releasing a
+ * newly acquired owner while pm_runtime_resume_and_get() waits for it.
+ * Returns: 0 or the real LED provider error.
+ */
+int v4l2_subdev_enable_privacy_led(struct v4l2_subdev *sd);
+
+/**
+ * v4l2_subdev_privacy_led_quiesced - release indicator after physical quiesce
+ * @sd: sensor subdevice
+ *
+ * A sensor driver may call this after holding reset asserted and disabling
+ * its capture clock, including failed stream-stop and driver-remove paths.
+ * It records physical quiesce. Stale media stream state is cleared at the
+ * next enable under the normal stream lock; this callback takes no state lock.
+ */
+void v4l2_subdev_privacy_led_quiesced(struct v4l2_subdev *sd);
 
 /**
  * v4l2_subdev_init - initializes the sub-device struct

@@ -14,6 +14,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/overflow.h>
+#include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -170,22 +171,107 @@ static int subdev_close(struct file *file)
 }
 #endif /* CONFIG_VIDEO_V4L2_SUBDEV_API */
 
-static void v4l2_subdev_enable_privacy_led(struct v4l2_subdev *sd)
+#if IS_REACHABLE(CONFIG_LEDS_CLASS)
+/* One physical indicator can be shared by multiple sensor subdevs. */
+struct v4l2_privacy_led {
+	struct list_head list;
+	struct led_classdev *led;
+	unsigned int registrations;
+	unsigned int active;
+	unsigned int brightness;
+	u32 numerator;
+	u32 denominator;
+};
+
+static LIST_HEAD(v4l2_privacy_leds);
+static DEFINE_MUTEX(v4l2_privacy_led_lock);
+
+static struct v4l2_privacy_led *v4l2_privacy_led_find(struct led_classdev *led)
+{
+	struct v4l2_privacy_led *entry;
+
+	list_for_each_entry(entry, &v4l2_privacy_leds, list)
+		if (entry->led == led)
+			return entry;
+	return NULL;
+}
+#endif
+
+int v4l2_subdev_enable_privacy_led(struct v4l2_subdev *sd)
 {
 #if IS_REACHABLE(CONFIG_LEDS_CLASS)
-	if (!IS_ERR_OR_NULL(sd->privacy_led))
-		led_set_brightness(sd->privacy_led,
-				   sd->privacy_led->max_brightness);
+	struct v4l2_privacy_led *entry;
+	int ret = 0;
+
+	if (IS_ERR_OR_NULL(sd->privacy_led))
+		return 0;
+
+	mutex_lock(&v4l2_privacy_led_lock);
+	entry = v4l2_privacy_led_find(sd->privacy_led);
+	if (WARN_ON(!entry)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (sd->privacy_led_active)
+		goto out;
+
+	if (!entry->active) {
+		/* led_set_brightness_sync() otherwise returns 0 while suspended. */
+		if (entry->led->flags & LED_SUSPENDED) {
+			ret = -EAGAIN;
+			goto out;
+		}
+		ret = led_set_brightness_sync(entry->led, entry->brightness);
+		if (ret)
+			goto out;
+	}
+	entry->active++;
+	sd->privacy_led_active = true;
+	WRITE_ONCE(sd->privacy_led_quiesced, false);
+out:
+	mutex_unlock(&v4l2_privacy_led_lock);
+	return ret;
+#else
+	return 0;
 #endif
 }
+
+EXPORT_SYMBOL_GPL(v4l2_subdev_enable_privacy_led);
 
 static void v4l2_subdev_disable_privacy_led(struct v4l2_subdev *sd)
 {
 #if IS_REACHABLE(CONFIG_LEDS_CLASS)
-	if (!IS_ERR_OR_NULL(sd->privacy_led))
-		led_set_brightness(sd->privacy_led, 0);
+	struct v4l2_privacy_led *entry;
+	int ret;
+
+	if (IS_ERR_OR_NULL(sd->privacy_led))
+		return;
+
+	mutex_lock(&v4l2_privacy_led_lock);
+	entry = v4l2_privacy_led_find(sd->privacy_led);
+	if (WARN_ON(!entry) || !sd->privacy_led_active)
+		goto out;
+	if (WARN_ON(!entry->active))
+		goto out;
+	if (entry->active == 1) {
+		ret = led_set_brightness_sync(entry->led, LED_OFF);
+		if (ret)
+			dev_warn(sd->dev, "privacy LED off failed: %d\n", ret);
+	}
+	entry->active--;
+	sd->privacy_led_active = false;
+out:
+	mutex_unlock(&v4l2_privacy_led_lock);
 #endif
 }
+
+void v4l2_subdev_privacy_led_quiesced(struct v4l2_subdev *sd)
+{
+	/* Called only after the sensor is held in reset and its clock is off. */
+	WRITE_ONCE(sd->privacy_led_quiesced, true);
+	v4l2_subdev_disable_privacy_led(sd);
+}
+EXPORT_SYMBOL_GPL(v4l2_subdev_privacy_led_quiesced);
 
 static inline int check_which(u32 which)
 {
@@ -513,12 +599,16 @@ static int call_s_stream(struct v4l2_subdev *sd, int enable)
 	 * already started or stopped subdev. Catch offenders but don't return
 	 * an error yet to avoid regressions.
 	 */
+	if (!IS_ERR_OR_NULL(sd->privacy_led) &&
+	    READ_ONCE(sd->privacy_led_quiesced))
+		sd->s_stream_enabled = false;
+
 	if (WARN_ON(sd->s_stream_enabled == !!enable))
-		return 0;
+		return enable && !IS_ERR_OR_NULL(sd->privacy_led) ? -EALREADY : 0;
 
 	ret = sd->ops->video->s_stream(sd, enable);
 
-	if (!enable && ret < 0) {
+	if (!enable && ret < 0 && IS_ERR_OR_NULL(sd->privacy_led)) {
 		dev_warn(sd->dev, "disabling streaming failed (%d)\n", ret);
 		ret = 0;
 	}
@@ -2302,6 +2392,21 @@ out:
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_routing_validate);
 
+static void v4l2_subdev_clear_quiesced_streams(struct v4l2_subdev *sd,
+					    struct v4l2_subdev_state *state)
+{
+	if (IS_ERR_OR_NULL(sd->privacy_led) ||
+	    !READ_ONCE(sd->privacy_led_quiesced))
+		return;
+
+	/* Actual reset/clock-off has made every old sensor stream impossible. */
+	sd->enabled_pads = 0;
+	sd->s_stream_enabled = false;
+	if (state)
+		for (unsigned int i = 0; i < state->stream_configs.num_configs; i++)
+			state->stream_configs.configs[i].enabled = false;
+}
+
 static void v4l2_subdev_collect_streams(struct v4l2_subdev *sd,
 					struct v4l2_subdev_state *state,
 					u32 pad, u64 streams_mask,
@@ -2398,6 +2503,8 @@ int v4l2_subdev_enable_streams(struct v4l2_subdev *sd, u32 pad,
 		state = v4l2_subdev_lock_and_get_active_state(sd);
 	else
 		state = NULL;
+
+	v4l2_subdev_clear_quiesced_streams(sd, state);
 
 	/*
 	 * Verify that the requested streams exist and that they are not
@@ -2743,6 +2850,8 @@ void v4l2_subdev_init(struct v4l2_subdev *sd, const struct v4l2_subdev_ops *ops)
 	sd->dev_priv = NULL;
 	sd->host_priv = NULL;
 	sd->privacy_led = NULL;
+	sd->privacy_led_active = false;
+	sd->privacy_led_quiesced = true;
 	INIT_LIST_HEAD(&sd->async_subdev_endpoint_list);
 #if defined(CONFIG_MEDIA_CONTROLLER)
 	sd->entity.name = sd->name;
@@ -2788,32 +2897,110 @@ EXPORT_SYMBOL_GPL(v4l2_subdev_is_streaming);
 int v4l2_subdev_get_privacy_led(struct v4l2_subdev *sd)
 {
 #if IS_REACHABLE(CONFIG_LEDS_CLASS)
+	struct v4l2_privacy_led *entry;
+	u32 level[2] = { 1, 1 };
+	unsigned int brightness;
+	int ret = 0;
+
 	sd->privacy_led = led_get(sd->dev, "privacy");
-	if (IS_ERR(sd->privacy_led) && PTR_ERR(sd->privacy_led) != -ENOENT)
+	if (IS_ERR(sd->privacy_led)) {
+		if (PTR_ERR(sd->privacy_led) == -ENOENT)
+			return 0;
 		return dev_err_probe(sd->dev, PTR_ERR(sd->privacy_led),
 				     "getting privacy LED\n");
-
-	if (!IS_ERR_OR_NULL(sd->privacy_led)) {
-		mutex_lock(&sd->privacy_led->led_access);
-		led_sysfs_disable(sd->privacy_led);
-		led_trigger_remove(sd->privacy_led);
-		led_set_brightness(sd->privacy_led, 0);
-		mutex_unlock(&sd->privacy_led->led_access);
 	}
-#endif
+	if (!sd->privacy_led)
+		return 0;
+
+	brightness = sd->privacy_led->max_brightness;
+	if (device_property_present(sd->dev, "privacy-led-brightness")) {
+		ret = device_property_read_u32_array(sd->dev,
+				"privacy-led-brightness", level, ARRAY_SIZE(level));
+		if (ret || !level[0] || !level[1] || level[0] > level[1]) {
+			ret = dev_err_probe(sd->dev, -EINVAL,
+					    "invalid privacy LED brightness fraction\n");
+			goto put_led;
+		}
+		brightness = DIV_ROUND_CLOSEST_ULL((u64)brightness * level[0],
+						 level[1]);
+		if (!brightness) {
+			ret = -ERANGE;
+			goto put_led;
+		}
+	}
+
+	mutex_lock(&v4l2_privacy_led_lock);
+	entry = v4l2_privacy_led_find(sd->privacy_led);
+	if (entry) {
+		if ((u64)entry->numerator * level[1] !=
+		    (u64)level[0] * entry->denominator) {
+			ret = dev_err_probe(sd->dev, -EINVAL,
+				"shared privacy LED consumers request different brightness\n");
+			goto unlock;
+		}
+		entry->registrations++;
+		goto unlock;
+	}
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
+	entry->led = sd->privacy_led;
+	entry->brightness = brightness;
+	entry->numerator = level[0];
+	entry->denominator = level[1];
+	entry->registrations = 1;
+	mutex_lock(&entry->led->led_access);
+	led_sysfs_disable(entry->led);
+	led_trigger_remove(entry->led);
+	ret = led_set_brightness_sync(entry->led, LED_OFF);
+	if (ret)
+		led_sysfs_enable(entry->led);
+	mutex_unlock(&entry->led->led_access);
+	if (ret)
+		kfree(entry);
+	else
+		list_add(&entry->list, &v4l2_privacy_leds);
+unlock:
+	mutex_unlock(&v4l2_privacy_led_lock);
+	if (!ret)
+		return 0;
+put_led:
+	led_put(sd->privacy_led);
+	sd->privacy_led = NULL;
+	return ret;
+#else
 	return 0;
+#endif
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_get_privacy_led);
 
 void v4l2_subdev_put_privacy_led(struct v4l2_subdev *sd)
 {
 #if IS_REACHABLE(CONFIG_LEDS_CLASS)
-	if (!IS_ERR_OR_NULL(sd->privacy_led)) {
-		mutex_lock(&sd->privacy_led->led_access);
-		led_sysfs_enable(sd->privacy_led);
-		mutex_unlock(&sd->privacy_led->led_access);
-		led_put(sd->privacy_led);
+	struct v4l2_privacy_led *entry;
+
+	if (IS_ERR_OR_NULL(sd->privacy_led))
+		return;
+
+	mutex_lock(&v4l2_privacy_led_lock);
+	entry = v4l2_privacy_led_find(sd->privacy_led);
+	if (WARN_ON(!entry) || WARN_ON(sd->privacy_led_active)) {
+		/* Do not claim privacy-off or drop the provider while unsafe. */
+		mutex_unlock(&v4l2_privacy_led_lock);
+		return;
 	}
+	if (!--entry->registrations) {
+		mutex_lock(&entry->led->led_access);
+		led_sysfs_enable(entry->led);
+		mutex_unlock(&entry->led->led_access);
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	mutex_unlock(&v4l2_privacy_led_lock);
+	led_put(sd->privacy_led);
+	sd->privacy_led = NULL;
 #endif
 }
 EXPORT_SYMBOL_GPL(v4l2_subdev_put_privacy_led);

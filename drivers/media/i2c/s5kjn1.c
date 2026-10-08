@@ -118,6 +118,7 @@ struct s5kjn1 {
 	struct v4l2_ctrl *hflip;
 
 	const struct s5kjn1_mode *mode;
+	bool stream_pm_held;	/* The one reference acquired for privacy capture. */
 };
 
 static const struct cci_reg_sequence init_array_setting[] = {
@@ -901,11 +902,24 @@ static int s5kjn1_enable_streams(struct v4l2_subdev *sd,
 {
 	struct s5kjn1 *s5kjn1 = to_s5kjn1(sd);
 	const struct s5kjn1_reg_list *reg_list = &s5kjn1->mode->reg_list;
+	bool privacy = !IS_ERR_OR_NULL(sd->privacy_led);
 	int ret;
+
+	if (privacy && READ_ONCE(s5kjn1->stream_pm_held))
+		return -EALREADY;
+	if (privacy && READ_ONCE(sd->privacy_led_active) &&
+	    !READ_ONCE(sd->privacy_led_quiesced))
+		return -EAGAIN;
 
 	ret = pm_runtime_resume_and_get(s5kjn1->dev);
 	if (ret)
 		return ret;
+	if (privacy)
+		WRITE_ONCE(s5kjn1->stream_pm_held, true);
+
+	ret = v4l2_subdev_enable_privacy_led(sd);
+	if (ret)
+		goto error;
 
 	/* Page pointer */
 	cci_write(s5kjn1->regmap, CCI_REG16(0x6028), 0x4000, &ret);
@@ -946,7 +960,8 @@ static int s5kjn1_enable_streams(struct v4l2_subdev *sd,
 
 error:
 	dev_err(s5kjn1->dev, "failed to start streaming: %d\n", ret);
-	pm_runtime_put_autosuspend(s5kjn1->dev);
+	if (!privacy || xchg(&s5kjn1->stream_pm_held, false))
+		pm_runtime_put_autosuspend(s5kjn1->dev);
 
 	return ret;
 }
@@ -956,13 +971,19 @@ static int s5kjn1_disable_streams(struct v4l2_subdev *sd,
 				  u64 streams_mask)
 {
 	struct s5kjn1 *s5kjn1 = to_s5kjn1(sd);
+	bool privacy = !IS_ERR_OR_NULL(sd->privacy_led);
 	int ret;
+
+	/* Do not retry CCI or put a reference already consumed by failed stop. */
+	if (privacy && !READ_ONCE(s5kjn1->stream_pm_held))
+		return READ_ONCE(sd->privacy_led_quiesced) ? 0 : -EAGAIN;
 
 	ret = cci_write(s5kjn1->regmap, S5KJN1_REG_CTRL_MODE, 0x0, NULL);
 	if (ret)
 		dev_err(s5kjn1->dev, "failed to stop streaming: %d\n", ret);
 
-	pm_runtime_put_autosuspend(s5kjn1->dev);
+	if (!privacy || xchg(&s5kjn1->stream_pm_held, false))
+		pm_runtime_put_autosuspend(s5kjn1->dev);
 
 	return ret;
 }
@@ -1280,6 +1301,10 @@ static int s5kjn1_power_off(struct device *dev)
 	gpiod_set_value_cansleep(s5kjn1->reset_gpio, 1);
 
 	clk_disable_unprepare(s5kjn1->mclk);
+	if (!IS_ERR_OR_NULL(sd->privacy_led) &&
+	    xchg(&s5kjn1->stream_pm_held, false))
+		pm_runtime_put_noidle(dev);
+	v4l2_subdev_privacy_led_quiesced(sd);
 
 	if (s5kjn1->afvdd)
 		regulator_disable(s5kjn1->afvdd);
@@ -1458,16 +1483,25 @@ static void s5kjn1_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct s5kjn1 *s5kjn1 = to_s5kjn1(sd);
+	bool privacy = !IS_ERR_OR_NULL(sd->privacy_led);
 
+	if (privacy) {
+		pm_runtime_disable(s5kjn1->dev);
+		if (!pm_runtime_status_suspended(s5kjn1->dev))
+			s5kjn1_power_off(s5kjn1->dev);
+		pm_runtime_set_suspended(s5kjn1->dev);
+	}
 	v4l2_async_unregister_subdev(sd);
 	v4l2_subdev_cleanup(sd);
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(sd->ctrl_handler);
-	pm_runtime_disable(s5kjn1->dev);
+	if (!privacy) {
+		pm_runtime_disable(s5kjn1->dev);
 
-	if (!pm_runtime_status_suspended(s5kjn1->dev)) {
-		s5kjn1_power_off(s5kjn1->dev);
-		pm_runtime_set_suspended(s5kjn1->dev);
+		if (!pm_runtime_status_suspended(s5kjn1->dev)) {
+			s5kjn1_power_off(s5kjn1->dev);
+			pm_runtime_set_suspended(s5kjn1->dev);
+		}
 	}
 }
 

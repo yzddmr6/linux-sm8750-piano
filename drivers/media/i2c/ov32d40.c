@@ -83,6 +83,7 @@ struct ov32d40 {
 	struct regmap *regmap;
 
 	bool streaming;
+	bool stream_pm_held;	/* The one reference acquired for privacy capture. */
 	bool identified;
 
 	/*
@@ -1295,19 +1296,33 @@ static int ov32d40_s_stream(struct v4l2_subdev *sd, int on)
 {
 	struct ov32d40 *ov32d40 = to_ov32d40(sd);
 	struct i2c_client *client = v4l2_get_subdevdata(&ov32d40->subdev);
+	bool privacy = !IS_ERR_OR_NULL(sd->privacy_led);
 	int ret;
 
 	mutex_lock(&ov32d40->mutex);
 
-	if (ov32d40->streaming == on) {
-		ret = 0;
+	if (READ_ONCE(ov32d40->streaming) == on) {
+		ret = on && privacy && !READ_ONCE(ov32d40->stream_pm_held) ?
+			-EAGAIN : 0;
 		goto unlock_and_return;
 	}
 
 	if (on) {
+		if (privacy && READ_ONCE(sd->privacy_led_active) &&
+		    !READ_ONCE(sd->privacy_led_quiesced) &&
+		    !READ_ONCE(ov32d40->stream_pm_held)) {
+			ret = -EAGAIN;
+			goto unlock_and_return;
+		}
 		ret = pm_runtime_resume_and_get(&client->dev);
 		if (ret < 0)
 			goto unlock_and_return;
+		if (privacy)
+			WRITE_ONCE(ov32d40->stream_pm_held, true);
+
+		ret = v4l2_subdev_enable_privacy_led(sd);
+		if (ret)
+			goto err_rpm_put;
 
 		ret = __ov32d40_start_stream(ov32d40);
 		if (ret) {
@@ -1316,10 +1331,21 @@ static int ov32d40_s_stream(struct v4l2_subdev *sd, int on)
 			goto err_rpm_put;
 		}
 	} else {
-		__ov32d40_stop_stream(ov32d40);
+		/* A failed stop already dropped this stream's PM reference. */
+		if (privacy && !READ_ONCE(ov32d40->stream_pm_held)) {
+			ret = READ_ONCE(sd->privacy_led_quiesced) ? 0 : -EAGAIN;
+			if (!ret)
+				ov32d40->streaming = false;
+			goto unlock_and_return;
+		}
+		ret = __ov32d40_stop_stream(ov32d40);
 		pm_runtime_mark_last_busy(&client->dev);
-		pm_runtime_put_autosuspend(&client->dev);
+		if (!privacy || xchg(&ov32d40->stream_pm_held, false))
+			pm_runtime_put_autosuspend(&client->dev);
 	}
+
+	if (!on && ret && !IS_ERR_OR_NULL(sd->privacy_led))
+		goto unlock_and_return;
 
 	ov32d40->streaming = on;
 	mutex_unlock(&ov32d40->mutex);
@@ -1327,7 +1353,8 @@ static int ov32d40_s_stream(struct v4l2_subdev *sd, int on)
 	return 0;
 
 err_rpm_put:
-	pm_runtime_put_autosuspend(&client->dev);
+	if (!privacy || xchg(&ov32d40->stream_pm_held, false))
+		pm_runtime_put_autosuspend(&client->dev);
 unlock_and_return:
 	mutex_unlock(&ov32d40->mutex);
 
@@ -1730,6 +1757,13 @@ static int ov32d40_power_off(struct device *dev)
 	clk_disable_unprepare(ov32d40->mclk);
 	regulator_bulk_disable(ARRAY_SIZE(ov32d40_supply_names),
 			       ov32d40->supplies);
+	if (!IS_ERR_OR_NULL(sd->privacy_led)) {
+		WRITE_ONCE(ov32d40->streaming, false);
+		/* Force-suspend/remove can quiesce a still-owned capture. */
+		if (xchg(&ov32d40->stream_pm_held, false))
+			pm_runtime_put_noidle(dev);
+	}
+	v4l2_subdev_privacy_led_quiesced(sd);
 
 	return 0;
 }
@@ -1844,16 +1878,25 @@ static void ov32d40_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct ov32d40 *ov32d40 = to_ov32d40(sd);
+	bool privacy = !IS_ERR_OR_NULL(sd->privacy_led);
 
+	if (privacy) {
+		pm_runtime_disable(&client->dev);
+		if (!pm_runtime_status_suspended(&client->dev))
+			ov32d40_power_off(&client->dev);
+		pm_runtime_set_suspended(&client->dev);
+	}
 	v4l2_async_unregister_subdev(sd);
 	media_entity_cleanup(&sd->entity);
 	v4l2_ctrl_handler_free(sd->ctrl_handler);
 
-	pm_runtime_disable(&client->dev);
-	if (!pm_runtime_status_suspended(&client->dev))
-		ov32d40_power_off(&client->dev);
+	if (!privacy) {
+		pm_runtime_disable(&client->dev);
+		if (!pm_runtime_status_suspended(&client->dev))
+			ov32d40_power_off(&client->dev);
 
-	pm_runtime_set_suspended(&client->dev);
+		pm_runtime_set_suspended(&client->dev);
+	}
 
 	mutex_destroy(&ov32d40->mutex);
 }
