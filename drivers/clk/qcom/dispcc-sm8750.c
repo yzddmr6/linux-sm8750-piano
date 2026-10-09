@@ -697,7 +697,7 @@ static struct clk_rcg2 disp_cc_mdss_mdp_clk_src = {
 		 * It is not clear whether such approach should be taken instead
 		 * of manual control.
 		 */
-		.ops = &clk_rcg2_shared_ops,
+		.ops = &clk_rcg2_shared_no_init_park_ops,
 	},
 };
 
