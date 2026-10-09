@@ -100,6 +100,9 @@ struct qcom_snd_soc_common {
 	/* TDM backend channels and sample format, if not stereo S16_LE */
 	unsigned int tdm_channels;
 	snd_pcm_format_t tdm_format;
+	/* Controls to cap until speaker protection runs, NULL-terminated */
+	const char * const *speaker_volume_controls;
+	int speaker_volume_max;
 	int (*snd_prepare)(struct snd_pcm_substream *substream);
 };
 
@@ -232,7 +235,7 @@ static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
 	struct snd_soc_card *card = rtd->card;
 	struct snd_soc_jack *dp_jack  = NULL;
 	int dp_pcm_id = 0;
-	int ret;
+	int ret, i;
 
 	dai_data = sc8280xp_get_dai_data(data->priv, cpu_dai->id);
 
@@ -241,6 +244,11 @@ static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
 		if (ret)
 			return ret;
 	}
+
+	for (i = 0; data->priv->speaker_volume_controls &&
+		    data->priv->speaker_volume_controls[i]; i++)
+		snd_soc_limit_volume(card, data->priv->speaker_volume_controls[i],
+				     data->priv->speaker_volume_max);
 
 	switch (cpu_dai->id) {
 	case WSA_CODEC_DMA_RX_0:
@@ -499,6 +507,20 @@ static int xiaomi_piano_snd_prepare(struct snd_pcm_substream *substream)
 					   ARRAY_SIZE(xiaomi_piano_speaker_channels_mapping),
 					   xiaomi_piano_speaker_channels_mapping);
 }
+
+/*
+ * The FS19xx amplifiers run without the speaker protection stock has on the
+ * ADSP (VI feedback on the secondary TDM TX port). Cap their gain at -15 dB
+ * (215 of 255 steps of 0.375 dB); stock Android runs 235-243 with
+ * protection.
+ */
+static const char * const xiaomi_piano_speaker_volume_controls[] = {
+	"Top Left Amp Volume",
+	"Top Right Amp Volume",
+	"Bottom Left Amp Volume",
+	"Bottom Right Amp Volume",
+	NULL
+};
 
 static int sc8280xp_snd_prepare(struct snd_pcm_substream *substream)
 {
@@ -782,6 +804,8 @@ static const struct qcom_snd_soc_common xiaomi_piano_priv_data = {
 			 SND_SOC_DAIFMT_DSP_A,
 	.tdm_channels = 4,
 	.tdm_format = SNDRV_PCM_FORMAT_S32_LE,
+	.speaker_volume_controls = xiaomi_piano_speaker_volume_controls,
+	.speaker_volume_max = 215,
 	.snd_prepare = xiaomi_piano_snd_prepare,
 };
 
