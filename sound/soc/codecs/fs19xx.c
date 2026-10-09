@@ -565,11 +565,13 @@ static int fs19xx_volume_get(struct snd_kcontrol *kc, struct snd_ctl_elem_value 
 
 static int fs19xx_volume_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value *uc)
 {
+	struct soc_mixer_control *mc = (struct soc_mixer_control *)kc->private_value;
 	struct snd_soc_component *cmpnt = snd_kcontrol_chip(kc);
 	struct fs19xx_priv *fs = snd_soc_component_get_drvdata(cmpnt);
 	long vol = uc->value.integer.value[0];
 
-	if (vol < 0 || vol > FS19XX_VOLUME_MAX)
+	/* A machine driver may lower the maximum with snd_soc_limit_volume() */
+	if (vol < 0 || vol > (mc->platform_max ?: FS19XX_VOLUME_MAX))
 		return -EINVAL;
 
 	mutex_lock(&fs->lock);
@@ -584,7 +586,13 @@ static int fs19xx_volume_put(struct snd_kcontrol *kc, struct snd_ctl_elem_value 
 	return 1;
 }
 
-static const DECLARE_TLV_DB_MINMAX(fs19xx_volume_tlv, -9563, 0);
+/*
+ * The ranged form keeps the dB scale tied to raw 0..255, so it stays right
+ * when snd_soc_limit_volume() lowers the reported maximum.
+ */
+static const DECLARE_TLV_DB_RANGE(fs19xx_volume_tlv,
+	0, FS19XX_VOLUME_MAX, TLV_DB_MINMAX_ITEM(-9563, 0)
+);
 
 static const struct snd_kcontrol_new fs19xx_controls[] = {
 	SOC_SINGLE_EXT_TLV("Amp Volume", SND_SOC_NOPM, 0, FS19XX_VOLUME_MAX, 0,
