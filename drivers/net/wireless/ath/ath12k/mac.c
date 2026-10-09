@@ -14857,7 +14857,8 @@ static int ath12k_mac_setup_register(struct ath12k *ar,
 
 /* Some devices have no usable address in their OTP and report an all-zero
  * one in WMI_READY; the platform then provides it through system firmware,
- * e.g. the devicetree node of the PCI function.
+ * e.g. the devicetree node of the PCI function. If it does not, use a random
+ * address so that the interface can still be brought up.
  */
 static void ath12k_mac_get_fw_mac_addr(struct ath12k_base *ab)
 {
@@ -14867,8 +14868,11 @@ static void ath12k_mac_get_fw_mac_addr(struct ath12k_base *ab)
 		return;
 
 	if (device_get_mac_address(ab->dev, mac_addr) ||
-	    !is_valid_ether_addr(mac_addr))
+	    !is_valid_ether_addr(mac_addr)) {
+		ath12k_warn(ab, "no valid MAC address from device or system firmware, using a random one\n");
+		eth_random_addr(ab->mac_addr);
 		return;
+	}
 
 	ath12k_dbg(ab, ATH12K_DBG_BOOT, "using mac address %pM from system firmware\n",
 		   mac_addr);
