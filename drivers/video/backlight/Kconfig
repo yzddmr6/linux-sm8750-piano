@@ -220,10 +220,11 @@ config BACKLIGHT_KTZ8866_KUNIT_TEST
 	depends on KUNIT=y && BACKLIGHT_KTZ8866=y
 	default KUNIT_ALL_TESTS
 	help
-	  Test register errors and enable state transitions using a simulated
-	  regmap bus. Check that failed writes are reported and cannot enable
-	  stale brightness, without requiring a physical backlight.
-	  These tests do not validate board power or dual-chip synchronization.
+	  Test register errors, enable state transitions, the boot brightness
+	  and a secondary chip using simulated regmap buses. Check that failed
+	  writes are reported and cannot enable stale brightness, without
+	  requiring a physical backlight. These tests do not validate board
+	  power, I2C, HWEN or probe ordering.
 
 config BACKLIGHT_LM3533
 	tristate "Backlight Driver for LM3533"
