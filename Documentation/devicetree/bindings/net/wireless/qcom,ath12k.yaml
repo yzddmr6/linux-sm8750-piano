@@ -28,6 +28,10 @@ properties:
       If present, a board or platform specific string used to lookup
       usecase-specific firmware files for the device.
 
+  local-mac-address: true
+
+  mac-address: true
+
   vddaon-supply:
     description: VDD_AON supply regulator handle
 
