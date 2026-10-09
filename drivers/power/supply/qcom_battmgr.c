@@ -5,6 +5,7 @@
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/auxiliary_bus.h>
+#include <linux/cleanup.h>
 #include <linux/devm-helpers.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -14,6 +15,7 @@
 #include <linux/property.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
+#include <linux/spinlock.h>
 #include <linux/math.h>
 #include <linux/units.h>
 
@@ -339,6 +341,13 @@ struct qcom_battmgr {
 	 * firmware, as it then stops responding.
 	 */
 	struct mutex lock;
+
+	/*
+	 * @notify_lock orders @removing against the PMIC GLINK callbacks, which
+	 * may still run while the power supplies and @enable_work are torn down.
+	 */
+	spinlock_t notify_lock;
+	bool removing;
 };
 
 static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
@@ -1602,13 +1611,16 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 	struct qcom_battmgr *battmgr = priv;
 	unsigned int opcode = le32_to_cpu(hdr->opcode);
 
-	if (opcode == BATTMGR_NOTIFICATION)
-		qcom_battmgr_notification(battmgr, data, len);
-	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
-		 battmgr->variant == QCOM_BATTMGR_X1E80100)
+	if (opcode == BATTMGR_NOTIFICATION) {
+		guard(spinlock_irqsave)(&battmgr->notify_lock);
+		if (!battmgr->removing)
+			qcom_battmgr_notification(battmgr, data, len);
+	} else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+		   battmgr->variant == QCOM_BATTMGR_X1E80100) {
 		qcom_battmgr_sc8280xp_callback(battmgr, data, len);
-	else
+	} else {
 		qcom_battmgr_sm8350_callback(battmgr, data, len);
+	}
 }
 
 static void qcom_battmgr_enable_worker(struct work_struct *work)
@@ -1630,6 +1642,10 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 {
 	struct qcom_battmgr *battmgr = priv;
 
+	guard(spinlock_irqsave)(&battmgr->notify_lock);
+	if (battmgr->removing)
+		return;
+
 	if (state == SERVREG_SERVICE_STATE_UP) {
 		battmgr->service_up = true;
 		schedule_work(&battmgr->enable_work);
@@ -1650,6 +1666,14 @@ static const struct of_device_id qcom_battmgr_of_variants[] = {
 };
 
 static char *qcom_battmgr_battery[] = { "battery" };
+
+static void qcom_battmgr_stop_notifications(void *data)
+{
+	struct qcom_battmgr *battmgr = data;
+
+	guard(spinlock_irqsave)(&battmgr->notify_lock);
+	battmgr->removing = true;
+}
 
 static int qcom_battmgr_probe(struct auxiliary_device *adev,
 			      const struct auxiliary_device_id *id)
@@ -1677,6 +1701,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.num_supplicants = 1;
 
 	mutex_init(&battmgr->lock);
+	spin_lock_init(&battmgr->notify_lock);
 	init_completion(&battmgr->ack);
 
 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);
@@ -1689,6 +1714,17 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	if (ret < 0)
 		return dev_err_probe(dev, ret,
 				     "failed to init battery charge control thresholds\n");
+
+	/*
+	 * The client must outlive the power supplies and enable_work, which
+	 * both send requests through it: devres releases it after them.
+	 */
+	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
+						       qcom_battmgr_callback,
+						       qcom_battmgr_pdr_notify,
+						       battmgr);
+	if (IS_ERR(battmgr->client))
+		return PTR_ERR(battmgr->client);
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
 	    battmgr->variant == QCOM_BATTMGR_X1E80100) {
@@ -1743,12 +1779,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	if (ret)
 		return ret;
 
-	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
-						       qcom_battmgr_callback,
-						       qcom_battmgr_pdr_notify,
-						       battmgr);
-	if (IS_ERR(battmgr->client))
-		return PTR_ERR(battmgr->client);
+	/* Released first: no notification may touch the supplies or the work. */
+	ret = devm_add_action_or_reset(dev, qcom_battmgr_stop_notifications, battmgr);
+	if (ret)
+		return ret;
 
 	pmic_glink_client_register(battmgr->client);
 
