@@ -21,6 +21,7 @@ enum {
 	PMIC_GLINK_CLIENT_BATT = 0,
 	PMIC_GLINK_CLIENT_ALTMODE,
 	PMIC_GLINK_CLIENT_UCSI,
+	PMIC_GLINK_CLIENT_XIAOMI_MCA,
 };
 
 struct pmic_glink_data {
@@ -40,6 +41,7 @@ struct pmic_glink {
 	struct auxiliary_device altmode_aux;
 	struct auxiliary_device ps_aux;
 	struct auxiliary_device ucsi_aux;
+	struct auxiliary_device xiaomi_mca_aux;
 
 	/* serializing client_state and pdr_state updates */
 	struct mutex state_lock;
@@ -341,6 +343,11 @@ static int pmic_glink_probe(struct platform_device *pdev)
 		if (ret)
 			goto out_release_altmode_aux;
 	}
+	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_XIAOMI_MCA)) {
+		ret = pmic_glink_add_aux_device(pg, &pg->xiaomi_mca_aux, "xiaomi-mca");
+		if (ret)
+			goto out_release_ps_aux;
+	}
 
 	if (pg->data->charger_pdr_service_name && pg->data->charger_pdr_service_path) {
 		service = pdr_add_lookup(pg->pdr, pg->data->charger_pdr_service_name,
@@ -359,6 +366,9 @@ static int pmic_glink_probe(struct platform_device *pdev)
 	return 0;
 
 out_release_aux_devices:
+	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_XIAOMI_MCA))
+		pmic_glink_del_aux_device(pg, &pg->xiaomi_mca_aux);
+out_release_ps_aux:
 	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_BATT))
 		pmic_glink_del_aux_device(pg, &pg->ps_aux);
 out_release_altmode_aux:
@@ -379,6 +389,8 @@ static void pmic_glink_remove(struct platform_device *pdev)
 
 	pdr_handle_release(pg->pdr);
 
+	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_XIAOMI_MCA))
+		pmic_glink_del_aux_device(pg, &pg->xiaomi_mca_aux);
 	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_BATT))
 		pmic_glink_del_aux_device(pg, &pg->ps_aux);
 	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_ALTMODE))
@@ -404,10 +416,23 @@ static const struct pmic_glink_data pmic_glink_soccp_data = {
 		       BIT(PMIC_GLINK_CLIENT_UCSI),
 };
 
+/*
+ * Xiaomi's charger firmware answers the battery manager owner with its own
+ * MCA property protocol instead of the battery manager service.
+ */
+static const struct pmic_glink_data pmic_glink_xiaomi_mca_data = {
+	.client_mask = BIT(PMIC_GLINK_CLIENT_ALTMODE) |
+		       BIT(PMIC_GLINK_CLIENT_UCSI) |
+		       BIT(PMIC_GLINK_CLIENT_XIAOMI_MCA),
+	.charger_pdr_service_name = "tms/servreg",
+	.charger_pdr_service_path = "msm/adsp/charger_pd",
+};
+
 static const struct of_device_id pmic_glink_of_match[] = {
 	{ .compatible = "qcom,glymur-pmic-glink", .data = &pmic_glink_soccp_data },
 	{ .compatible = "qcom,kaanapali-pmic-glink", .data = &pmic_glink_soccp_data },
 	{ .compatible = "qcom,pmic-glink", .data = &pmic_glink_adsp_data },
+	{ .compatible = "xiaomi,piano-pmic-glink", .data = &pmic_glink_xiaomi_mca_data },
 	{}
 };
 MODULE_DEVICE_TABLE(of, pmic_glink_of_match);
