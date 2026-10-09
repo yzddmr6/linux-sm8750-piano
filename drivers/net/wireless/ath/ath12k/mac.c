@@ -14855,6 +14855,26 @@ static int ath12k_mac_setup_register(struct ath12k *ar,
 	return 0;
 }
 
+/* Some devices have no usable address in their OTP and report an all-zero
+ * one in WMI_READY; the platform then provides it through system firmware,
+ * e.g. the devicetree node of the PCI function.
+ */
+static void ath12k_mac_get_fw_mac_addr(struct ath12k_base *ab)
+{
+	u8 mac_addr[ETH_ALEN] = {};
+
+	if (is_valid_ether_addr(ab->mac_addr))
+		return;
+
+	if (device_get_mac_address(ab->dev, mac_addr) ||
+	    !is_valid_ether_addr(mac_addr))
+		return;
+
+	ath12k_dbg(ab, ATH12K_DBG_BOOT, "using mac address %pM from system firmware\n",
+		   mac_addr);
+	ether_addr_copy(ab->mac_addr, mac_addr);
+}
+
 static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 {
 	struct ieee80211_hw *hw = ah->hw;
@@ -14889,6 +14909,7 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 		if (ar->ab->pdevs_macaddr_valid) {
 			ether_addr_copy(ar->mac_addr, pdev->mac_addr);
 		} else {
+			ath12k_mac_get_fw_mac_addr(ar->ab);
 			ether_addr_copy(ar->mac_addr, ar->ab->mac_addr);
 			ar->mac_addr[4] += ar->pdev_idx;
 		}
