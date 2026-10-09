@@ -9,10 +9,14 @@
  * property and carries a sequence number, the reply echoes both and adds a
  * firmware return code.
  *
- * This driver only reads. It reports the USB input as a power supply and a
- * few charger properties in debugfs. It never sends a write and does not
- * request notifications, so charging stays under the firmware's own policy.
- * The battery is reported by the fuel gauges on I2C.
+ * This driver reports the USB input as a power supply and a few charger
+ * properties in debugfs. Two settings can be written through the power
+ * supply: the input current limit and the battery charge current, each only
+ * up to the value Xiaomi's own charging stack uses for the charger type the
+ * firmware detected. Nothing else is written; float voltage, termination,
+ * temperature limits and enabling charging stay with the firmware. The
+ * driver does not request notifications. The battery is reported by the
+ * fuel gauges on I2C.
  *
  * The firmware sends no message on its own and refuses the battery manager
  * notification request, so the input state is polled to notice changes.
@@ -37,6 +41,7 @@
 #include <linux/workqueue.h>
 
 #define MCA_OPCODE_READ			1
+#define MCA_OPCODE_WRITE		2
 
 /* Charger (buck) properties, currents in mA */
 #define MCA_PROP_CHGR_STATUS		0x2001
@@ -52,7 +57,29 @@
 #define MCA_PROP_USB_CURRENT_NOW	0x20004
 #define MCA_PROP_USB_REAL_TYPE		0x2000c
 
+/* USB real type: enum xm_charger_type of Xiaomi's downstream MCA stack */
 #define MCA_USB_REAL_TYPE_SDP		1
+#define MCA_USB_REAL_TYPE_CDP		2
+#define MCA_USB_REAL_TYPE_DCP		3
+#define MCA_USB_REAL_TYPE_FLOAT		4
+#define MCA_USB_REAL_TYPE_HVDCP2	5
+#define MCA_USB_REAL_TYPE_HVDCP3	6
+#define MCA_USB_REAL_TYPE_HVDCP3_B	7
+#define MCA_USB_REAL_TYPE_HVDCP3P5	8
+#define MCA_USB_REAL_TYPE_TYPEC		9
+#define MCA_USB_REAL_TYPE_PD		10
+#define MCA_USB_REAL_TYPE_PD_VERIFY	11
+#define MCA_USB_REAL_TYPE_PPS		12
+#define MCA_USB_REAL_TYPE_OCP		15
+
+/*
+ * The lowest value written. The firmware starts with an input current limit
+ * of 100 mA, and the downstream stack puts 100 mA back when the source goes
+ * away (strategy_buckchg_reset_charge_para()); it also votes 100 mA for the
+ * charge current there.
+ */
+#define MCA_CURRENT_MIN_MA		100
+#define MCA_ICL_DEFAULT_MA		100
 
 #define MCA_DATA_LEN			256
 #define MCA_REQUEST_TIMEOUT		HZ
@@ -91,6 +118,7 @@ enum xiaomi_mca_usb_index {
 	MCA_USB_CURRENT_NOW,
 	MCA_USB_INPUT_CURRENT_LIMIT,
 	MCA_USB_REAL_TYPE,
+	MCA_USB_CHARGE_CURRENT,
 	MCA_USB_COUNT,
 };
 
@@ -104,6 +132,40 @@ static const u32 xiaomi_mca_usb_property[MCA_USB_COUNT] = {
 	 */
 	[MCA_USB_INPUT_CURRENT_LIMIT] = MCA_PROP_INPUT_CURRENT_LIMIT,
 	[MCA_USB_REAL_TYPE] = MCA_PROP_USB_REAL_TYPE,
+	/* Reads 0 until a charge current is written. */
+	[MCA_USB_CHARGE_CURRENT] = MCA_PROP_CHARGE_CURRENT,
+};
+
+struct xiaomi_mca_limits {
+	u32 input_current_ma;
+	u32 charge_current_ma;
+};
+
+/*
+ * The highest values written, in mA, by USB real type: the input limits
+ * (in_*) and charge currents (chg_*) of the stock strategy_buckchg node of
+ * the Xiaomi Pad 8 Pro, picked per type as the downstream strategy_buckchg
+ * does. That stack raises QC and PD sources to 9 V first; this driver never
+ * asks for more than 5 V, so those types are held to the 5 V DCP values
+ * (in_dcp 1500, chg_dcp 2000) where their own are higher. Types not listed
+ * get the SDP values, as downstream.
+ */
+static const struct xiaomi_mca_limits xiaomi_mca_sdp_limits = { 500, 500 };
+
+static const struct xiaomi_mca_limits xiaomi_mca_type_limits[] = {
+	[MCA_USB_REAL_TYPE_SDP] = { 500, 500 },
+	[MCA_USB_REAL_TYPE_CDP] = { 900, 900 },
+	[MCA_USB_REAL_TYPE_DCP] = { 1500, 2000 },
+	[MCA_USB_REAL_TYPE_FLOAT] = { 1000, 1000 },
+	[MCA_USB_REAL_TYPE_HVDCP2] = { 1200, 2000 },
+	[MCA_USB_REAL_TYPE_HVDCP3] = { 1500, 2000 },
+	[MCA_USB_REAL_TYPE_HVDCP3_B] = { 1500, 2000 },
+	[MCA_USB_REAL_TYPE_HVDCP3P5] = { 1500, 2000 },
+	[MCA_USB_REAL_TYPE_TYPEC] = { 1500, 2000 },
+	[MCA_USB_REAL_TYPE_PD] = { 1500, 2000 },
+	[MCA_USB_REAL_TYPE_PD_VERIFY] = { 1500, 2000 },
+	[MCA_USB_REAL_TYPE_PPS] = { 1500, 2000 },
+	[MCA_USB_REAL_TYPE_OCP] = { 1000, 1000 },
 };
 
 struct xiaomi_mca_cached {
@@ -120,8 +182,8 @@ struct xiaomi_mca_state {
 };
 
 struct xiaomi_mca_stats {
-	/* every request is a read */
-	u64 requests;
+	u64 reads;
+	u64 writes;
 	u64 replies;
 	u64 errors;
 	u64 malformed;
@@ -144,6 +206,9 @@ struct xiaomi_mca {
 	struct xiaomi_mca_cached cache[MCA_USB_COUNT];
 	struct xiaomi_mca_state last;
 	bool last_valid;
+	/* an input current limit was written for the source in @icl_source */
+	bool icl_written;
+	struct xiaomi_mca_state icl_source;
 
 	struct delayed_work poll_work;
 
@@ -152,6 +217,7 @@ struct xiaomi_mca {
 	bool service_up;
 	bool pending;
 	bool answered;
+	u32 pending_opcode;
 	u32 pending_property;
 	u32 pending_seq;
 	int result;
@@ -161,23 +227,28 @@ struct xiaomi_mca {
 	struct xiaomi_mca_stats stats;
 };
 
-static void xiaomi_mca_build_read(struct xiaomi_mca_request *req, u32 property, u32 seq)
+/* A write carries @value in the first four bytes of the data area, a read nothing. */
+static void xiaomi_mca_build_request(struct xiaomi_mca_request *req, u32 opcode,
+				     u32 property, u32 seq, u32 value)
 {
 	memset(req, 0, sizeof(*req));
 	req->hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR);
 	req->hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP);
-	req->hdr.opcode = cpu_to_le32(MCA_OPCODE_READ);
+	req->hdr.opcode = cpu_to_le32(opcode);
 	req->property = cpu_to_le32(property);
 	req->seq = cpu_to_le32(seq);
+	if (opcode == MCA_OPCODE_WRITE)
+		put_unaligned_le32(value, req->data);
 }
 
 /*
- * Return 0 and the value if @data is the reply to the read of @property with
- * sequence number @seq, -EIO if the firmware failed that read, -EPROTO if the
- * reply to it is malformed, and -ENOMSG if @data answers no such request.
+ * Return 0 and the first data word if @data is the reply to the request
+ * @opcode for @property with sequence number @seq, -EIO if the firmware
+ * failed that request, -EPROTO if the reply to it is malformed, and -ENOMSG
+ * if @data answers no such request.
  */
-static int xiaomi_mca_parse_read_reply(const void *data, size_t len, u32 property,
-				       u32 seq, u32 *value)
+static int xiaomi_mca_parse_reply(const void *data, size_t len, u32 opcode, u32 property,
+				  u32 seq, u32 *value)
 {
 	const struct xiaomi_mca_reply *reply = data;
 
@@ -185,7 +256,7 @@ static int xiaomi_mca_parse_read_reply(const void *data, size_t len, u32 propert
 		return -ENOMSG;
 
 	if (le32_to_cpu(reply->hdr.type) != PMIC_GLINK_REQ_RESP ||
-	    le32_to_cpu(reply->hdr.opcode) != MCA_OPCODE_READ ||
+	    le32_to_cpu(reply->hdr.opcode) != opcode ||
 	    le32_to_cpu(reply->seq) != seq)
 		return -ENOMSG;
 
@@ -208,12 +279,51 @@ static int xiaomi_mca_usb_type(u32 real_type)
 	return POWER_SUPPLY_USB_TYPE_UNKNOWN;
 }
 
+static const struct xiaomi_mca_limits *xiaomi_mca_limits(u32 real_type)
+{
+	if (real_type < ARRAY_SIZE(xiaomi_mca_type_limits) &&
+	    xiaomi_mca_type_limits[real_type].input_current_ma)
+		return &xiaomi_mca_type_limits[real_type];
+
+	return &xiaomi_mca_sdp_limits;
+}
+
+/*
+ * Return 0 and the value in mA to write for @psp set to @ua with a source of
+ * type @real_type attached, or -EINVAL if that is out of range.
+ */
+static int xiaomi_mca_current_ma(enum power_supply_property psp, u32 real_type, int ua,
+				 u32 *ma)
+{
+	const struct xiaomi_mca_limits *limits = xiaomi_mca_limits(real_type);
+	u32 max;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		max = limits->input_current_ma;
+		break;
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		max = limits->charge_current_ma;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (ua < 0 || ua < MCA_CURRENT_MIN_MA * MILLI || ua > max * MILLI)
+		return -EINVAL;
+
+	*ma = ua / MILLI;
+
+	return 0;
+}
+
 static int xiaomi_mca_usb_propval(enum xiaomi_mca_usb_index index, u32 value)
 {
 	switch (index) {
 	case MCA_USB_ONLINE:
 		return !!value;
 	case MCA_USB_INPUT_CURRENT_LIMIT:
+	case MCA_USB_CHARGE_CURRENT:
 		return value * MILLI;
 	case MCA_USB_REAL_TYPE:
 		return xiaomi_mca_usb_type(value);
@@ -222,13 +332,14 @@ static int xiaomi_mca_usb_propval(enum xiaomi_mca_usb_index index, u32 value)
 	}
 }
 
-static int xiaomi_mca_read(struct xiaomi_mca *mca, u32 property, u32 *value)
+static int xiaomi_mca_transfer(struct xiaomi_mca *mca, u32 opcode, u32 property,
+			       u32 *value)
 {
 	int ret;
 
 	lockdep_assert_held(&mca->lock);
 
-	xiaomi_mca_build_read(&mca->req, property, ++mca->seq);
+	xiaomi_mca_build_request(&mca->req, opcode, property, ++mca->seq, *value);
 	reinit_completion(&mca->ack);
 
 	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
@@ -237,9 +348,13 @@ static int xiaomi_mca_read(struct xiaomi_mca *mca, u32 property, u32 *value)
 
 		mca->pending = true;
 		mca->answered = false;
+		mca->pending_opcode = opcode;
 		mca->pending_property = property;
 		mca->pending_seq = mca->seq;
-		mca->stats.requests++;
+		if (opcode == MCA_OPCODE_WRITE)
+			mca->stats.writes++;
+		else
+			mca->stats.reads++;
 	}
 
 	ret = pmic_glink_send(mca->client, &mca->req, sizeof(mca->req));
@@ -253,7 +368,8 @@ static int xiaomi_mca_read(struct xiaomi_mca *mca, u32 property, u32 *value)
 
 	if (!mca->answered) {
 		mca->stats.timeouts++;
-		dev_err_ratelimited(mca->dev, "no reply to the read of %#x\n", property);
+		dev_err_ratelimited(mca->dev, "no reply to the %s of %#x\n",
+				    opcode == MCA_OPCODE_WRITE ? "write" : "read", property);
 		return -ETIMEDOUT;
 	}
 
@@ -263,6 +379,76 @@ static int xiaomi_mca_read(struct xiaomi_mca *mca, u32 property, u32 *value)
 	*value = mca->value;
 
 	return 0;
+}
+
+static int xiaomi_mca_read(struct xiaomi_mca *mca, u32 property, u32 *value)
+{
+	*value = 0;
+
+	return xiaomi_mca_transfer(mca, MCA_OPCODE_READ, property, value);
+}
+
+static void xiaomi_mca_invalidate(struct xiaomi_mca *mca)
+{
+	unsigned int i;
+
+	lockdep_assert_held(&mca->lock);
+
+	for (i = 0; i < MCA_USB_COUNT; i++)
+		mca->cache[i].valid = false;
+}
+
+/*
+ * Write @value to @property and read it back. The firmware acknowledges a
+ * write with a return code only, so the value it then reports is checked.
+ */
+static int xiaomi_mca_write(struct xiaomi_mca *mca, u32 property, u32 value)
+{
+	u32 data = value;
+	int ret;
+
+	ret = xiaomi_mca_transfer(mca, MCA_OPCODE_WRITE, property, &data);
+	/* Whatever the outcome, cached values may be stale now. */
+	xiaomi_mca_invalidate(mca);
+	if (ret)
+		return ret;
+
+	ret = xiaomi_mca_read(mca, property, &data);
+	if (ret)
+		return ret;
+
+	if (data != value) {
+		dev_warn(mca->dev, "%#x reads %u after writing %u\n", property, data, value);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/*
+ * The firmware keeps the input current limit when the source changes, and
+ * the limit written may be too high for the next one. Put back the value the
+ * firmware starts with, as the downstream stack does on detach. On failure
+ * the next poll tries again.
+ */
+static void xiaomi_mca_restore_icl(struct xiaomi_mca *mca)
+{
+	int ret;
+
+	lockdep_assert_held(&mca->lock);
+
+	if (!mca->icl_written)
+		return;
+
+	ret = xiaomi_mca_write(mca, MCA_PROP_INPUT_CURRENT_LIMIT, MCA_ICL_DEFAULT_MA);
+	if (ret) {
+		dev_warn_ratelimited(mca->dev,
+				     "failed to restore the input current limit: %d\n", ret);
+		return;
+	}
+
+	mca->icl_written = false;
+	dev_info(mca->dev, "input current limit restored to %u mA\n", MCA_ICL_DEFAULT_MA);
 }
 
 static int xiaomi_mca_read_usb(struct xiaomi_mca *mca, enum xiaomi_mca_usb_index index,
@@ -313,6 +499,9 @@ static int xiaomi_mca_usb_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		index = MCA_USB_REAL_TYPE;
 		break;
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		index = MCA_USB_CHARGE_CURRENT;
+		break;
 	default:
 		return -EINVAL;
 	}
@@ -326,12 +515,77 @@ static int xiaomi_mca_usb_get_property(struct power_supply *psy,
 	return 0;
 }
 
+static int xiaomi_mca_usb_set_property(struct power_supply *psy,
+				       enum power_supply_property psp,
+				       const union power_supply_propval *val)
+{
+	struct xiaomi_mca *mca = power_supply_get_drvdata(psy);
+	struct xiaomi_mca_state source = {};
+	const char *name;
+	u32 property, ma;
+	int ret;
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		property = MCA_PROP_INPUT_CURRENT_LIMIT;
+		name = "input current limit";
+		break;
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		property = MCA_PROP_CHARGE_CURRENT;
+		name = "charge current";
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	guard(mutex)(&mca->lock);
+
+	/* The limits depend on the source attached now. */
+	ret = xiaomi_mca_read(mca, MCA_PROP_USB_ONLINE, &source.online);
+	if (!ret)
+		ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &source.real_type);
+	if (ret)
+		return ret;
+
+	if (!source.online)
+		return -ENODEV;
+
+	ret = xiaomi_mca_current_ma(psp, source.real_type, val->intval, &ma);
+	if (ret)
+		return ret;
+
+	/* Restored on a change of source even if this write fails half way. */
+	if (property == MCA_PROP_INPUT_CURRENT_LIMIT) {
+		mca->icl_written = true;
+		mca->icl_source = source;
+	}
+
+	ret = xiaomi_mca_write(mca, property, ma);
+	if (ret) {
+		dev_warn(mca->dev, "failed to set the %s to %u mA: %d\n", name, ma, ret);
+		return ret;
+	}
+
+	dev_info(mca->dev, "%s set to %u mA (USB real type %u)\n", name, ma,
+		 source.real_type);
+
+	return 0;
+}
+
+static int xiaomi_mca_usb_property_is_writeable(struct power_supply *psy,
+						enum power_supply_property psp)
+{
+	return psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT ||
+	       psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT;
+}
+
 static const enum power_supply_property xiaomi_mca_usb_props[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	POWER_SUPPLY_PROP_USB_TYPE,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
 };
 
 static const struct power_supply_desc xiaomi_mca_usb_psy_desc = {
@@ -340,6 +594,8 @@ static const struct power_supply_desc xiaomi_mca_usb_psy_desc = {
 	.properties = xiaomi_mca_usb_props,
 	.num_properties = ARRAY_SIZE(xiaomi_mca_usb_props),
 	.get_property = xiaomi_mca_usb_get_property,
+	.set_property = xiaomi_mca_usb_set_property,
+	.property_is_writeable = xiaomi_mca_usb_property_is_writeable,
 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
 		     BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
 };
@@ -363,8 +619,8 @@ static void xiaomi_mca_callback(const void *data, size_t len, void *priv)
 		return;
 	}
 
-	ret = xiaomi_mca_parse_read_reply(data, len, mca->pending_property,
-					  mca->pending_seq, &value);
+	ret = xiaomi_mca_parse_reply(data, len, mca->pending_opcode, mca->pending_property,
+				     mca->pending_seq, &value);
 	if (ret == -ENOMSG) {
 		mca->stats.unmatched++;
 		return;
@@ -404,7 +660,6 @@ static void xiaomi_mca_poll(struct work_struct *work)
 					      poll_work);
 	struct xiaomi_mca_state now;
 	bool changed = false;
-	unsigned int i;
 
 	scoped_guard(mutex, &mca->lock) {
 		if (xiaomi_mca_read(mca, MCA_PROP_USB_ONLINE, &now.online) ||
@@ -415,12 +670,15 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			changed = !mca->last_valid || memcmp(&now, &mca->last, sizeof(now));
 			mca->last = now;
 			mca->last_valid = true;
+
+			if (now.online != mca->icl_source.online ||
+			    now.real_type != mca->icl_source.real_type)
+				xiaomi_mca_restore_icl(mca);
 		}
 
 		/* The uevent must not report what was cached before the change. */
 		if (changed)
-			for (i = 0; i < MCA_USB_COUNT; i++)
-				mca->cache[i].valid = false;
+			xiaomi_mca_invalidate(mca);
 	}
 
 	if (changed)
@@ -482,7 +740,8 @@ static int xiaomi_mca_stats_show(struct seq_file *s, void *unused)
 	}
 
 	seq_printf(s, "service_up %d\n", service_up);
-	seq_printf(s, "read_requests %llu\n", stats.requests);
+	seq_printf(s, "read_requests %llu\n", stats.reads);
+	seq_printf(s, "write_requests %llu\n", stats.writes);
 	seq_printf(s, "replies %llu\n", stats.replies);
 	seq_printf(s, "firmware_errors %llu\n", stats.errors);
 	seq_printf(s, "malformed_replies %llu\n", stats.malformed);
@@ -524,6 +783,15 @@ static void xiaomi_mca_debugfs_remove(void *data)
 	debugfs_remove_recursive(data);
 }
 
+/* The next driver, or none, must not inherit a limit set for this source. */
+static void xiaomi_mca_unbind_restore(void *data)
+{
+	struct xiaomi_mca *mca = data;
+
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_restore_icl(mca);
+}
+
 static int xiaomi_mca_probe(struct auxiliary_device *adev,
 			    const struct auxiliary_device_id *id)
 {
@@ -552,6 +820,14 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 						   xiaomi_mca_pdr_notify, mca);
 	if (IS_ERR(mca->client))
 		return PTR_ERR(mca->client);
+
+	/*
+	 * Released after the power supply, debugfs and polling, which can no
+	 * longer write then, and before the client it sends through.
+	 */
+	ret = devm_add_action(dev, xiaomi_mca_unbind_restore, mca);
+	if (ret)
+		return ret;
 
 	psy_cfg.drv_data = mca;
 	psy_cfg.fwnode = dev_fwnode(dev);

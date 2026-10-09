@@ -6,7 +6,10 @@
  * Pro (7.2.6, 2026-10-09) and logged by a diagnostic battery manager build:
  * the GLINK header of each reply and its 268-byte payload as hex words. Only
  * the first four payload words are listed here; in all 121 logged read
- * replies the remaining 63 words were zero.
+ * replies the remaining 63 words were zero. The one write request, of the
+ * input current limit, was logged as its first eight words with the note
+ * that the rest of the 256-byte data area is zero; its reply as the 67
+ * payload words, all zero after the fourth.
  */
 #include <kunit/test.h>
 
@@ -77,6 +80,12 @@ static void *mca_test_reply(struct kunit *test, const struct xiaomi_mca_test_fra
 	return w;
 }
 
+static int mca_test_parse_read(const void *reply, size_t len, u32 property, u32 seq,
+			       u32 *value)
+{
+	return xiaomi_mca_parse_reply(reply, len, MCA_OPCODE_READ, property, seq, value);
+}
+
 /* The read request the diagnostic build sent first: property 0x2008, sequence 1. */
 static void xiaomi_mca_test_build_read(struct kunit *test)
 {
@@ -89,32 +98,59 @@ static void xiaomi_mca_test_build_read(struct kunit *test)
 		w[i] = cpu_to_le32(sent[i]);
 
 	memset(&req, 0xa5, sizeof(req));
-	xiaomi_mca_build_read(&req, 0x2008, 1);
+	xiaomi_mca_build_request(&req, MCA_OPCODE_READ, 0x2008, 1, 0);
 
 	KUNIT_EXPECT_EQ(test, sizeof(req), 276);
 	KUNIT_EXPECT_MEMEQ(test, &req, &expected, sizeof(req));
 }
 
 /*
- * The one write the firmware accepted, in the format of the stock driver. Its
- * property, sequence number and value must sit where the request structure
- * puts them, as reads use the same layout.
+ * The one write the firmware accepted, in the format of the stock driver:
+ * input current limit 500 mA, sequence number 34. The encoder must reproduce
+ * all 276 bytes of it.
  */
-static void xiaomi_mca_test_request_layout(struct kunit *test)
+static void xiaomi_mca_test_build_write(struct kunit *test)
 {
 	static const u32 sent[] = { 0x800a, 1, 2, 0x2008, 0x22, 0x1f4, 0, 0 };
-	struct xiaomi_mca_request req = {};
-	__le32 *w = (__le32 *)&req;
+	struct xiaomi_mca_request req, expected = {};
+	__le32 *w = (__le32 *)&expected;
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(sent); i++)
 		w[i] = cpu_to_le32(sent[i]);
 
-	KUNIT_EXPECT_EQ(test, le32_to_cpu(req.hdr.owner), PMIC_GLINK_OWNER_BATTMGR);
-	KUNIT_EXPECT_EQ(test, le32_to_cpu(req.hdr.opcode), 2);
-	KUNIT_EXPECT_EQ(test, le32_to_cpu(req.property), 0x2008);
-	KUNIT_EXPECT_EQ(test, le32_to_cpu(req.seq), 34);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(req.data), 500);
+	memset(&req, 0xa5, sizeof(req));
+	xiaomi_mca_build_request(&req, MCA_OPCODE_WRITE, 0x2008, 34, 500);
+
+	KUNIT_EXPECT_MEMEQ(test, &req, &expected, sizeof(req));
+}
+
+/* The firmware's reply to that write: return code 0 and a first data word of 1. */
+static void xiaomi_mca_test_write_reply(struct kunit *test)
+{
+	void *reply = mca_test_reply(test, &mca_test_write_seq34);
+	u32 value = 0xdeadbeef;
+
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_reply(reply, 280, MCA_OPCODE_WRITE, 0x2008, 34,
+						     &value), 0);
+	KUNIT_EXPECT_EQ(test, value, 1);
+
+	/* not the reply to another write, nor to the read-back that follows */
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_reply(reply, 280, MCA_OPCODE_WRITE, 0x2008, 35,
+						     &value), -ENOMSG);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_reply(reply, 280, MCA_OPCODE_WRITE, 0x2005, 34,
+						     &value), -EPROTO);
+
+	reply = mca_test_reply(test, &mca_test_icl_seq41);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_reply(reply, 280, MCA_OPCODE_WRITE, 0x2008, 41,
+						     &value), -ENOMSG);
+
+	reply = mca_test_reply(test, &mca_test_write_seq34);
+	((__le32 *)reply)[4] = cpu_to_le32(1);
+	value = 0xdeadbeef;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_reply(reply, 280, MCA_OPCODE_WRITE, 0x2008, 34,
+						     &value), -EIO);
+	KUNIT_EXPECT_EQ(test, value, 0xdeadbeef);
 }
 
 static void xiaomi_mca_test_read_replies(struct kunit *test)
@@ -133,8 +169,8 @@ static void xiaomi_mca_test_read_replies(struct kunit *test)
 		void *reply = mca_test_reply(test, f);
 		u32 value = 0xdeadbeef;
 
-		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_parse_read_reply(reply, 280, f->payload[0],
-								      f->payload[2], &value),
+		KUNIT_EXPECT_EQ_MSG(test, mca_test_parse_read(reply, 280, f->payload[0],
+							      f->payload[2], &value),
 				    0, "%s", f->name);
 		KUNIT_EXPECT_EQ_MSG(test, value, f->payload[3], "%s", f->name);
 	}
@@ -146,10 +182,10 @@ static void xiaomi_mca_test_other_request(struct kunit *test)
 	u32 value = 0xdeadbeef;
 
 	/* a late reply to an earlier read is not the answer */
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_read_reply(reply, 280, 0x20002, 11, &value),
+	KUNIT_EXPECT_EQ(test, mca_test_parse_read(reply, 280, 0x20002, 11, &value),
 			-ENOMSG);
 	/* the right sequence number but another property */
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_read_reply(reply, 280, 0x20004, 10, &value),
+	KUNIT_EXPECT_EQ(test, mca_test_parse_read(reply, 280, 0x20004, 10, &value),
 			-EPROTO);
 	KUNIT_EXPECT_EQ(test, value, 0xdeadbeef);
 }
@@ -166,8 +202,8 @@ static void xiaomi_mca_test_not_a_read(struct kunit *test)
 		void *reply = mca_test_reply(test, f);
 		u32 value = 0xdeadbeef;
 
-		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_parse_read_reply(reply, 280, f->payload[0],
-								      f->payload[2], &value),
+		KUNIT_EXPECT_EQ_MSG(test, mca_test_parse_read(reply, 280, f->payload[0],
+							      f->payload[2], &value),
 				    -ENOMSG, "%s", f->name);
 		KUNIT_EXPECT_EQ(test, value, 0xdeadbeef);
 	}
@@ -183,7 +219,7 @@ static void xiaomi_mca_test_firmware_error(struct kunit *test)
 	u32 value = 0xdeadbeef;
 
 	reply[4] = cpu_to_le32(1);
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_read_reply(reply, 280, 0x2008, 1, &value), -EIO);
+	KUNIT_EXPECT_EQ(test, mca_test_parse_read(reply, 280, 0x2008, 1, &value), -EIO);
 	KUNIT_EXPECT_EQ(test, value, 0xdeadbeef);
 }
 
@@ -193,10 +229,10 @@ static void xiaomi_mca_test_short_reply(struct kunit *test)
 	u32 value = 0xdeadbeef;
 
 	/* the 268-byte payload the battery manager driver expected as 12 */
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_read_reply(reply, 276, 0x2008, 1, &value), -EPROTO);
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_read_reply(reply, 281, 0x2008, 1, &value), -EPROTO);
+	KUNIT_EXPECT_EQ(test, mca_test_parse_read(reply, 276, 0x2008, 1, &value), -EPROTO);
+	KUNIT_EXPECT_EQ(test, mca_test_parse_read(reply, 281, 0x2008, 1, &value), -EPROTO);
 	/* too short to carry a sequence number */
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_parse_read_reply(reply, 23, 0x2008, 1, &value), -ENOMSG);
+	KUNIT_EXPECT_EQ(test, mca_test_parse_read(reply, 23, 0x2008, 1, &value), -ENOMSG);
 	KUNIT_EXPECT_EQ(test, value, 0xdeadbeef);
 }
 
@@ -214,6 +250,108 @@ static void xiaomi_mca_test_usb_values(struct kunit *test)
 			POWER_SUPPLY_USB_TYPE_UNKNOWN);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_propval(MCA_USB_REAL_TYPE, 2),
 			POWER_SUPPLY_USB_TYPE_UNKNOWN);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_propval(MCA_USB_CHARGE_CURRENT, 0), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_propval(MCA_USB_CHARGE_CURRENT, 2000), 2000000);
+}
+
+struct mca_test_current {
+	enum power_supply_property psp;
+	u32 real_type;
+	int ua;
+	int ret;
+	u32 ma;
+};
+
+#define MCA_ICL	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT
+#define MCA_FCC	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT
+
+/* Writes stay within the stock values for the charger type, 5 V types only. */
+static void xiaomi_mca_test_current_limits(struct kunit *test)
+{
+	static const struct mca_test_current cases[] = {
+		/* SDP: in_sdp 500, chg_sdp 500 */
+		{ MCA_ICL, 1, 500000, 0, 500 },
+		{ MCA_ICL, 1, 501000, -EINVAL },
+		{ MCA_FCC, 1, 500000, 0, 500 },
+		{ MCA_FCC, 1, 1000000, -EINVAL },
+		/* CDP: in_cdp 900, chg_cdp 900 */
+		{ MCA_ICL, 2, 900000, 0, 900 },
+		{ MCA_ICL, 2, 1000000, -EINVAL },
+		/* DCP: in_dcp 1500, chg_dcp 2000 */
+		{ MCA_ICL, 3, 1500000, 0, 1500 },
+		{ MCA_ICL, 3, 1500001, -EINVAL },
+		{ MCA_ICL, 3, 1600000, -EINVAL },
+		{ MCA_FCC, 3, 2000000, 0, 2000 },
+		{ MCA_FCC, 3, 2001000, -EINVAL },
+		{ MCA_FCC, 3, 3000000, -EINVAL },
+		/* sub-mA values round down */
+		{ MCA_ICL, 3, 1234567, 0, 1234 },
+		/* float: in_float 1000, chg_float 1000 */
+		{ MCA_ICL, 4, 1000000, 0, 1000 },
+		{ MCA_ICL, 4, 1100000, -EINVAL },
+		/* HVDCP2: in_hvdcp 1200 is below in_dcp */
+		{ MCA_ICL, 5, 1200000, 0, 1200 },
+		{ MCA_ICL, 5, 1300000, -EINVAL },
+		/* PD and PPS at 5 V: in_pd 1600, in_pps 2500, chg_pd 3000 held to DCP */
+		{ MCA_ICL, 10, 1500000, 0, 1500 },
+		{ MCA_ICL, 10, 1600000, -EINVAL },
+		{ MCA_ICL, 12, 2500000, -EINVAL },
+		{ MCA_FCC, 10, 2000000, 0, 2000 },
+		{ MCA_FCC, 12, 3500000, -EINVAL },
+		/* OCP like float */
+		{ MCA_ICL, 15, 1000000, 0, 1000 },
+		/* unknown, ACA, unnamed and out-of-table types: SDP values */
+		{ MCA_ICL, 0, 500000, 0, 500 },
+		{ MCA_ICL, 0, 900000, -EINVAL },
+		{ MCA_ICL, 13, 900000, -EINVAL },
+		{ MCA_ICL, 14, 900000, -EINVAL },
+		{ MCA_ICL, 16, 900000, -EINVAL },
+		{ MCA_ICL, 0xffffffff, 900000, -EINVAL },
+		/* the 100 mA floor */
+		{ MCA_ICL, 3, 100000, 0, 100 },
+		{ MCA_ICL, 3, 99999, -EINVAL },
+		{ MCA_FCC, 3, 0, -EINVAL },
+		{ MCA_FCC, 3, -500000, -EINVAL },
+		{ MCA_ICL, 3, INT_MIN, -EINVAL },
+		{ MCA_ICL, 3, INT_MAX, -EINVAL },
+		/* nothing else is written */
+		{ POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE, 3, 1000000, -EINVAL },
+		{ POWER_SUPPLY_PROP_ONLINE, 3, 1000000, -EINVAL },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		const struct mca_test_current *c = &cases[i];
+		u32 ma = 0xdeadbeef;
+
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_current_ma(c->psp, c->real_type, c->ua, &ma),
+				    c->ret, "case %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, ma, c->ret ? 0xdeadbeef : c->ma, "case %u", i);
+	}
+}
+
+/* A pending write is completed by its reply only, not by a read reply. */
+static void xiaomi_mca_test_callback_write(struct kunit *test)
+{
+	struct xiaomi_mca *mca = kunit_kzalloc(test, sizeof(*mca), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, mca);
+	init_completion(&mca->ack);
+	spin_lock_init(&mca->rx_lock);
+	mca->pending = true;
+	mca->pending_opcode = MCA_OPCODE_WRITE;
+	mca->pending_property = 0x2008;
+	mca->pending_seq = 34;
+
+	xiaomi_mca_callback(mca_test_reply(test, &mca_test_icl_seq41), 280, mca);
+	KUNIT_EXPECT_FALSE(test, mca->answered);
+
+	xiaomi_mca_callback(mca_test_reply(test, &mca_test_write_seq34), 280, mca);
+	KUNIT_EXPECT_TRUE(test, mca->answered);
+	KUNIT_EXPECT_TRUE(test, completion_done(&mca->ack));
+	KUNIT_EXPECT_EQ(test, mca->result, 0);
+	KUNIT_EXPECT_EQ(test, mca->stats.replies, 1);
+	KUNIT_EXPECT_EQ(test, mca->stats.unmatched, 1);
 }
 
 /* Only the reply to the pending read completes it, and only once. */
@@ -225,6 +363,7 @@ static void xiaomi_mca_test_callback(struct kunit *test)
 	init_completion(&mca->ack);
 	spin_lock_init(&mca->rx_lock);
 	mca->pending = true;
+	mca->pending_opcode = MCA_OPCODE_READ;
 	mca->pending_property = 0x2008;
 	mca->pending_seq = 1;
 
@@ -252,14 +391,17 @@ static void xiaomi_mca_test_callback(struct kunit *test)
 
 static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_build_read),
-	KUNIT_CASE(xiaomi_mca_test_request_layout),
+	KUNIT_CASE(xiaomi_mca_test_build_write),
 	KUNIT_CASE(xiaomi_mca_test_read_replies),
+	KUNIT_CASE(xiaomi_mca_test_write_reply),
 	KUNIT_CASE(xiaomi_mca_test_other_request),
 	KUNIT_CASE(xiaomi_mca_test_not_a_read),
 	KUNIT_CASE(xiaomi_mca_test_firmware_error),
 	KUNIT_CASE(xiaomi_mca_test_short_reply),
 	KUNIT_CASE(xiaomi_mca_test_usb_values),
+	KUNIT_CASE(xiaomi_mca_test_current_limits),
 	KUNIT_CASE(xiaomi_mca_test_callback),
+	KUNIT_CASE(xiaomi_mca_test_callback_write),
 	{}
 };
 
