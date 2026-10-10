@@ -1089,6 +1089,14 @@ enum wmi_tlv_pdev_param {
 	WMI_PDEV_PARAM_ENABLE_SR_PROHIBIT = 0xc6,
 };
 
+/* Value layout of WMI_PDEV_PARAM_TXPOWER_LIMIT2G/5G. A zero reason is the
+ * plain limit ath12k has always sent; the SAR reason is what the vendor host
+ * driver uses for its platform limit.
+ */
+#define WMI_PDEV_PARAM_TXPOWER_VALUE		GENMASK(7, 0)
+#define WMI_PDEV_PARAM_TXPOWER_REASON		GENMASK(15, 8)
+#define WMI_PDEV_PARAM_TXPOWER_REASON_SAR	1
+
 enum wmi_tlv_vdev_param {
 	WMI_VDEV_PARAM_RTS_THRESHOLD = 0x1,
 	WMI_VDEV_PARAM_FRAGMENTATION_THRESHOLD,

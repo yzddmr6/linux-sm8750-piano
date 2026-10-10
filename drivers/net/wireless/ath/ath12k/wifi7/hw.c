@@ -763,6 +763,11 @@ static const struct ath12k_hw_params ath12k_wifi7_hw_params[] = {
 				   BIT(NL80211_IFTYPE_P2P_CLIENT) |
 				   BIT(NL80211_IFTYPE_P2P_GO),
 		.supports_monitor = true,
+		/* qcacld-3.0 TxPower2g/TxPower5g default (cfg_mlme_power.h),
+		 * sent by hdd_features_init() at every start; the stock
+		 * WCNSS_qcom_cfg.ini does not override it.
+		 */
+		.pdev_txpower_sar_limit = 30,
 
 		.idle_ps = true,
 		.download_calib = false,
