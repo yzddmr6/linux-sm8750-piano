@@ -1158,6 +1158,16 @@ int msm_drv_probe(struct device *master_dev,
 			return ret;
 	}
 
+	/*
+	 * Without a single available interface or GPU there is nothing to
+	 * bind; component_master_add_with_match() does not accept an empty
+	 * match list.
+	 */
+	if (!match) {
+		dev_dbg(master_dev, "no components to bind\n");
+		return -ENODEV;
+	}
+
 	/* on all devices that I am aware of, iommu's which can map
 	 * any address the cpu can see are used:
 	 */
