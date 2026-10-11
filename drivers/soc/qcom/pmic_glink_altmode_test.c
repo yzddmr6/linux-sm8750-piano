@@ -333,7 +333,25 @@ static void altmode_test_disconnect_with_error(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->ack_calls, 1);
 }
 
+static void altmode_test_ack_only(struct kunit *test)
+{
+	struct altmode_test_ctx *ctx = test->priv;
+
+	ctx->port.ack_only = true;
+	pan_ack = false;
+	pmic_glink_altmode_worker(&ctx->port.work);
+	KUNIT_EXPECT_EQ(test, ctx->ack_calls, 0);
+	pan_ack = true;
+	pmic_glink_altmode_worker(&ctx->port.work);
+	KUNIT_EXPECT_EQ(test, ctx->ack_calls, 1);
+	KUNIT_EXPECT_EQ(test, ctx->switch_calls, 0);
+	KUNIT_EXPECT_EQ(test, ctx->mux_seen.calls, 0);
+	KUNIT_EXPECT_EQ(test, ctx->hpd_calls, 0);
+	pan_ack = false;
+}
+
 static struct kunit_case altmode_test_cases[] = {
+	KUNIT_CASE(altmode_test_ack_only),
 	KUNIT_CASE_PARAM(altmode_test_dp_notification, altmode_test_pin_gen_params),
 	KUNIT_CASE(altmode_test_invalid_pins),
 	KUNIT_CASE(altmode_test_mux_error),

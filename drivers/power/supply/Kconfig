@@ -217,6 +217,26 @@ config BATTERY_QCOM_BATTMGR
 	  which is used on modern Qualcomm platforms to provide battery and
 	  power supply information.
 
+config CHARGER_SC8541
+	tristate "Southchip SC8541 switched-capacitor charger"
+	depends on I2C
+	select REGMAP_I2C
+	help
+	  Southchip SC8541 direct charger. No charging policy is run here;
+	  a PD sink driver must drive the source and keep the stage alive.
+
+	  The module is called sc8541_charger.
+
+config CHARGER_SC8541_KUNIT_TEST
+	bool "KUnit tests for SC8541" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && CHARGER_SC8541=y
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise the protection register sequence, ADC conversion and
+	  software kick expiry using a RAM-backed regmap. No charger is
+	  accessed and these tests are not part of the product kernel.
+	  Choose Y only in a dedicated KUnit build.
+
 config CHARGER_XIAOMI_MCA
 	tristate "Xiaomi MCA charger firmware over PMIC GLINK"
 	depends on QCOM_PMIC_GLINK

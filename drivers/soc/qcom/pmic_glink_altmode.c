@@ -116,6 +116,7 @@ struct pmic_glink_altmode_port {
 	struct work_struct work;
 
 	struct auxiliary_device *bridge;
+	bool ack_only;
 
 	enum typec_orientation orientation;
 	u16 svid;
@@ -129,6 +130,15 @@ struct pmic_glink_altmode_port {
 
 #define work_to_altmode(w) container_of((w), struct pmic_glink_altmode, enable_work)
 
+/*
+ * Port-notification ACK policy from blu-sharky/linux-piano eae63ac2f462,
+ * bluseliu50, GPL-2.0-only. Keep the existing PAN client as the sole owner.
+ * Only piano ports without a connector use this opt-in ACK-only path.
+ */
+static bool pan_ack;
+module_param(pan_ack, bool, 0644);
+MODULE_PARM_DESC(pan_ack, "Acknowledge unmodeled piano ports (default off)");
+
 struct pmic_glink_altmode {
 	struct device *dev;
 
@@ -141,9 +151,32 @@ struct pmic_glink_altmode {
 	struct pmic_glink_client *client;
 
 	struct work_struct enable_work;
+	spinlock_t work_lock;
+	bool stopping;
 
 	struct pmic_glink_altmode_port ports[PMIC_GLINK_MAX_PORTS];
 };
+
+static void pmic_glink_altmode_queue(struct pmic_glink_altmode *altmode,
+				     struct work_struct *work)
+{
+	guard(spinlock_irqsave)(&altmode->work_lock);
+	if (!altmode->stopping)
+		queue_work(system_freezable_wq, work);
+}
+
+static void pmic_glink_altmode_stop(void *data)
+{
+	struct pmic_glink_altmode *altmode = data;
+	unsigned int port;
+
+	scoped_guard(spinlock_irqsave, &altmode->work_lock)
+		altmode->stopping = true;
+	cancel_work_sync(&altmode->enable_work);
+	for (port = 0; port < ARRAY_SIZE(altmode->ports); port++)
+		if (altmode->ports[port].altmode)
+			cancel_work_sync(&altmode->ports[port].work);
+}
 
 static int pmic_glink_altmode_request(struct pmic_glink_altmode *altmode, u32 cmd, u32 arg)
 {
@@ -369,6 +402,12 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 	enum drm_connector_status conn_status;
 	int ret;
 
+	if (alt_port->ack_only) {
+		if (READ_ONCE(pan_ack))
+			goto out_ack;
+		return;
+	}
+
 	ret = typec_switch_set(alt_port->typec_switch, alt_port->orientation);
 	if (ret)
 		dev_err(altmode->dev, "failed to set orientation: %d\n", ret);
@@ -477,7 +516,7 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
 	alt_port->mode = mode;
 	alt_port->hpd_state = hpd_state;
 	alt_port->hpd_irq = hpd_irq;
-	queue_work(system_freezable_wq, &alt_port->work);
+	pmic_glink_altmode_queue(altmode, &alt_port->work);
 }
 
 #define SC8280XP_DPAM_MASK	0x3f
@@ -528,7 +567,7 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
 		alt_port->tbt_data = *tbt;
 	}
 
-	queue_work(system_freezable_wq, &alt_port->work);
+	pmic_glink_altmode_queue(altmode, &alt_port->work);
 }
 
 static void pmic_glink_altmode_callback(const void *data, size_t len, void *priv)
@@ -584,7 +623,7 @@ static void pmic_glink_altmode_pdr_notify(void *priv, int state)
 	struct pmic_glink_altmode *altmode = priv;
 
 	if (state == SERVREG_SERVICE_STATE_UP)
-		schedule_work(&altmode->enable_work);
+		pmic_glink_altmode_queue(altmode, &altmode->enable_work);
 }
 
 static const struct of_device_id pmic_glink_altmode_of_quirks[] = {
@@ -618,6 +657,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 	INIT_WORK(&altmode->enable_work, pmic_glink_altmode_enable_worker);
 	init_completion(&altmode->pan_ack);
 	mutex_init(&altmode->lock);
+	spin_lock_init(&altmode->work_lock);
 
 	device_for_each_child_node(dev, fwnode) {
 		ret = fwnode_property_read_u32(fwnode, "reg", &port);
@@ -705,8 +745,16 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 
 	for (port = 0; port < ARRAY_SIZE(altmode->ports); port++) {
 		alt_port = &altmode->ports[port];
-		if (!alt_port->bridge)
+		if (!alt_port->bridge) {
+			if (of_device_is_compatible(dev->parent->of_node,
+							 "xiaomi,piano-pmic-glink")) {
+				alt_port->altmode = altmode;
+				alt_port->index = port;
+				alt_port->ack_only = true;
+				INIT_WORK(&alt_port->work, pmic_glink_altmode_worker);
+			}
 			continue;
+		}
 
 		ret = devm_drm_dp_hpd_bridge_add(dev, alt_port->bridge);
 		if (ret)
@@ -720,6 +768,10 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 						       altmode);
 	if (IS_ERR(altmode->client))
 		return PTR_ERR(altmode->client);
+
+	ret = devm_add_action_or_reset(dev, pmic_glink_altmode_stop, altmode);
+	if (ret)
+		return ret;
 
 	pmic_glink_client_register(altmode->client);
 
