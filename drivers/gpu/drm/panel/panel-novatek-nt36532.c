@@ -52,6 +52,8 @@ struct panel_info {
 	int (*init_sequence)(struct nt36532 *ctx,
 			     const struct drm_display_mode *mode);
 
+	void (*reset)(struct nt36532 *ctx);
+
 	bool is_dual_dsi;
 };
 
@@ -135,7 +137,10 @@ static int nt36532_prepare(struct drm_panel *panel)
 	if (ret < 0)
 		return ret;
 
-	nt36532_reset(ctx);
+	if (ctx->panel_info->reset)
+		ctx->panel_info->reset(ctx);
+	else
+		nt36532_reset(ctx);
 
 	ret = ctx->panel_info->init_sequence(ctx, nt36532_current_mode(ctx));
 	if (ret < 0) {
@@ -731,7 +736,7 @@ static const struct panel_info csot_panel_info = {
 	.is_dual_dsi = true,
 };
 
-#define PIANO_PANEL_INFO(_init) {						\
+#define PIANO_PANEL_INFO(_init, _reset) {						\
 	.lanes = 4,								\
 	.format = MIPI_DSI_FMT_RGB101010,					\
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS |	\
@@ -742,14 +747,28 @@ static const struct panel_info csot_panel_info = {
 	.num_supplies = ARRAY_SIZE(piano_supplies),				\
 	.dsc_cfg = &piano_dsc_cfg,						\
 	.init_sequence = _init,							\
+	.reset = _reset,							\
 	.is_dual_dsi = true,							\
 }
 
+/* P81 42-02-0a physical 0/10 ms, 1/3, 0/3, 1/15; reset is active-low. */
+static void piano_boe_reset(struct nt36532 *ctx)
+{
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+	usleep_range(10000, 10100);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+	usleep_range(3000, 3100);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
+	usleep_range(3000, 3100);
+	gpiod_set_value_cansleep(ctx->reset_gpio, 0);
+	usleep_range(15000, 15100);
+}
+
 static const struct panel_info piano_boe_panel_info =
-	PIANO_PANEL_INFO(piano_boe_init_sequence);
+	PIANO_PANEL_INFO(piano_boe_init_sequence, piano_boe_reset);
 
 static const struct panel_info piano_csot_panel_info =
-	PIANO_PANEL_INFO(piano_csot_init_sequence);
+	PIANO_PANEL_INFO(piano_csot_init_sequence, NULL);
 
 static const struct of_device_id nt36532_of_match[] = {
 	{ .compatible = "csot,ppc100hb1-1", .data = &csot_panel_info },
