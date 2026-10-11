@@ -98,7 +98,7 @@ static void xiaomi_mca_test_build_read(struct kunit *test)
 		w[i] = cpu_to_le32(sent[i]);
 
 	memset(&req, 0xa5, sizeof(req));
-	xiaomi_mca_build_request(&req, MCA_OPCODE_READ, 0x2008, 1, 0);
+	xiaomi_mca_build_request(&req, MCA_OPCODE_READ, 0x2008, 1, 0xdeadbeef);
 
 	KUNIT_EXPECT_EQ(test, sizeof(req), 276);
 	KUNIT_EXPECT_MEMEQ(test, &req, &expected, sizeof(req));
@@ -238,6 +238,22 @@ static void xiaomi_mca_test_short_reply(struct kunit *test)
 
 static void xiaomi_mca_test_usb_values(struct kunit *test)
 {
+	static const int types[] = {
+		POWER_SUPPLY_USB_TYPE_UNKNOWN, POWER_SUPPLY_USB_TYPE_SDP,
+		POWER_SUPPLY_USB_TYPE_CDP, POWER_SUPPLY_USB_TYPE_DCP,
+		POWER_SUPPLY_USB_TYPE_UNKNOWN, POWER_SUPPLY_USB_TYPE_DCP,
+		POWER_SUPPLY_USB_TYPE_DCP, POWER_SUPPLY_USB_TYPE_DCP,
+		POWER_SUPPLY_USB_TYPE_DCP, POWER_SUPPLY_USB_TYPE_C,
+		POWER_SUPPLY_USB_TYPE_PD, POWER_SUPPLY_USB_TYPE_PD,
+		POWER_SUPPLY_USB_TYPE_PD_PPS, POWER_SUPPLY_USB_TYPE_UNKNOWN,
+		POWER_SUPPLY_USB_TYPE_UNKNOWN, POWER_SUPPLY_USB_TYPE_UNKNOWN,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(types); i++)
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_type(i), types[i]);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_type(U32_MAX), POWER_SUPPLY_USB_TYPE_UNKNOWN);
+
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_propval(MCA_USB_ONLINE, 1), 1);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_propval(MCA_USB_ONLINE, 0), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_propval(MCA_USB_VOLTAGE_NOW, 5041000), 5041000);
@@ -249,7 +265,7 @@ static void xiaomi_mca_test_usb_values(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_propval(MCA_USB_REAL_TYPE, 0),
 			POWER_SUPPLY_USB_TYPE_UNKNOWN);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_propval(MCA_USB_REAL_TYPE, 2),
-			POWER_SUPPLY_USB_TYPE_UNKNOWN);
+			POWER_SUPPLY_USB_TYPE_CDP);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_propval(MCA_USB_CHARGE_CURRENT, 0), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_usb_propval(MCA_USB_CHARGE_CURRENT, 2000), 2000000);
 }
@@ -289,9 +305,9 @@ static void xiaomi_mca_test_current_limits(struct kunit *test)
 		/* float: in_float 1000, chg_float 1000 */
 		{ MCA_ICL, 4, 1000000, 0, 1000 },
 		{ MCA_ICL, 4, 1100000, -EINVAL },
-		/* HVDCP2: in_hvdcp 1200 is below in_dcp */
-		{ MCA_ICL, 5, 1200000, 0, 1200 },
-		{ MCA_ICL, 5, 1300000, -EINVAL },
+		/* At 5 V downstream treats all QC types as DCP. */
+		{ MCA_ICL, 5, 1500000, 0, 1500 },
+		{ MCA_ICL, 5, 1500001, -EINVAL },
 		/* PD and PPS at 5 V: in_pd 1600, in_pps 2500, chg_pd 3000 held to DCP */
 		{ MCA_ICL, 10, 1500000, 0, 1500 },
 		{ MCA_ICL, 10, 1600000, -EINVAL },
@@ -300,13 +316,13 @@ static void xiaomi_mca_test_current_limits(struct kunit *test)
 		{ MCA_FCC, 12, 3500000, -EINVAL },
 		/* OCP like float */
 		{ MCA_ICL, 15, 1000000, 0, 1000 },
-		/* unknown, ACA, unnamed and out-of-table types: SDP values */
-		{ MCA_ICL, 0, 500000, 0, 500 },
-		{ MCA_ICL, 0, 900000, -EINVAL },
-		{ MCA_ICL, 13, 900000, -EINVAL },
-		{ MCA_ICL, 14, 900000, -EINVAL },
-		{ MCA_ICL, 16, 900000, -EINVAL },
-		{ MCA_ICL, 0xffffffff, 900000, -EINVAL },
+		/* No fallback current for unknown or unsupported types. */
+		{ MCA_ICL, 0, 500000, -EOPNOTSUPP },
+		{ MCA_FCC, 0, 100000, -EOPNOTSUPP },
+		{ MCA_ICL, 13, 100000, -EOPNOTSUPP },
+		{ MCA_FCC, 14, 100000, -EOPNOTSUPP },
+		{ MCA_ICL, 16, 100000, -EOPNOTSUPP },
+		{ MCA_FCC, 0xffffffff, 100000, -EOPNOTSUPP },
 		/* the 100 mA floor */
 		{ MCA_ICL, 3, 100000, 0, 100 },
 		{ MCA_ICL, 3, 99999, -EINVAL },
@@ -328,6 +344,89 @@ static void xiaomi_mca_test_current_limits(struct kunit *test)
 				    c->ret, "case %u", i);
 		KUNIT_EXPECT_EQ_MSG(test, ma, c->ret ? 0xdeadbeef : c->ma, "case %u", i);
 	}
+}
+
+/* The FCC frame uses the same vendor int/mA encoding as ICL. */
+static void xiaomi_mca_test_build_fcc(struct kunit *test)
+{
+	static const u32 sent[] = { 0x800a, 1, 2, 0x2005, 35, 2000 };
+	struct xiaomi_mca_request req, expected = {};
+	__le32 *w = (__le32 *)&expected;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(sent); i++)
+		w[i] = cpu_to_le32(sent[i]);
+	xiaomi_mca_build_request(&req, MCA_OPCODE_WRITE, 0x2005, 35, 2000);
+	KUNIT_EXPECT_MEMEQ(test, &req, &expected, sizeof(req));
+}
+
+static void xiaomi_mca_test_all_limits(struct kunit *test)
+{
+	/* Raw types 0..16, from this unit's stock buck configuration at 5 V. */
+	static const u32 icl[] = {
+		0, 500, 900, 1500, 1000, 1500, 1500, 1500, 1500,
+		1500, 1500, 1500, 1500, 0, 0, 1000, 0,
+	};
+	static const u32 fcc[] = {
+		0, 500, 900, 2000, 1000, 2000, 2000, 2000, 2000,
+		2000, 2000, 2000, 2000, 0, 0, 1000, 0,
+	};
+	unsigned int type, prop;
+
+	for (type = 0; type < ARRAY_SIZE(icl); type++) {
+		for (prop = 0; prop < 2; prop++) {
+			enum power_supply_property psp = prop ? MCA_FCC : MCA_ICL;
+			u32 cap = prop ? fcc[type] : icl[type];
+			u32 ma = 0xdeadbeef;
+
+			if (!cap) {
+				KUNIT_EXPECT_EQ(test,
+					xiaomi_mca_current_ma(psp, type, 100000, &ma),
+					-EOPNOTSUPP);
+				KUNIT_EXPECT_EQ(test, ma, 0xdeadbeef);
+				continue;
+			}
+			KUNIT_EXPECT_EQ(test,
+				xiaomi_mca_current_ma(psp, type, cap * 1000, &ma), 0);
+			KUNIT_EXPECT_EQ(test, ma, cap);
+			KUNIT_EXPECT_EQ(test,
+				xiaomi_mca_current_ma(psp, type, cap * 1000 + 1, &ma),
+				-EINVAL);
+			KUNIT_EXPECT_EQ(test,
+				xiaomi_mca_current_ma(psp, type, 99999, &ma), -EINVAL);
+		}
+	}
+}
+
+static void xiaomi_mca_test_readonly_session(struct kunit *test)
+{
+	struct xiaomi_mca *mca = kunit_kzalloc(test, sizeof(*mca), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, mca);
+	mutex_init(&mca->lock);
+	mutex_lock(&mca->lock);
+	/* No client: this must return without sending even a read. */
+	xiaomi_mca_restore_icl(mca);
+	mutex_unlock(&mca->lock);
+	KUNIT_EXPECT_EQ(test, mca->seq, 0);
+	KUNIT_EXPECT_EQ(test, mca->stats.writes, 0);
+	KUNIT_EXPECT_EQ(test, mca->stats.reads, 0);
+	mutex_destroy(&mca->lock);
+}
+
+static void xiaomi_mca_test_writable_properties(struct kunit *test)
+{
+	unsigned int psp;
+
+	/* Raw protocol writes cannot bypass the two-property whitelist. */
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(NULL, 0x2003, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(NULL, 0x2007, 4350), -EINVAL);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(NULL, 0x21018, 9000), -EINVAL);
+
+	for (psp = 0; psp <= POWER_SUPPLY_PROP_SERIAL_NUMBER; psp++)
+		KUNIT_EXPECT_EQ(test,
+			xiaomi_mca_usb_property_is_writeable(NULL, psp),
+			psp == MCA_ICL || psp == MCA_FCC);
 }
 
 /* A pending write is completed by its reply only, not by a read reply. */
@@ -402,6 +501,10 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_current_limits),
 	KUNIT_CASE(xiaomi_mca_test_callback),
 	KUNIT_CASE(xiaomi_mca_test_callback_write),
+	KUNIT_CASE(xiaomi_mca_test_build_fcc),
+	KUNIT_CASE(xiaomi_mca_test_all_limits),
+	KUNIT_CASE(xiaomi_mca_test_readonly_session),
+	KUNIT_CASE(xiaomi_mca_test_writable_properties),
 	{}
 };
 

@@ -145,19 +145,16 @@ struct xiaomi_mca_limits {
  * The highest values written, in mA, by USB real type: the input limits
  * (in_*) and charge currents (chg_*) of the stock strategy_buckchg node of
  * the Xiaomi Pad 8 Pro, picked per type as the downstream strategy_buckchg
- * does. That stack raises QC and PD sources to 9 V first; this driver never
- * asks for more than 5 V, so those types are held to the 5 V DCP values
- * (in_dcp 1500, chg_dcp 2000) where their own are higher. Types not listed
- * get the SDP values, as downstream.
+ * does. At 5 V that stack maps QC types to DCP before selecting limits.
+ * This driver never requests a higher voltage; QC and PD are held to the
+ * 5 V DCP values (in_dcp 1500, chg_dcp 2000). Types not listed cannot write.
  */
-static const struct xiaomi_mca_limits xiaomi_mca_sdp_limits = { 500, 500 };
-
 static const struct xiaomi_mca_limits xiaomi_mca_type_limits[] = {
 	[MCA_USB_REAL_TYPE_SDP] = { 500, 500 },
 	[MCA_USB_REAL_TYPE_CDP] = { 900, 900 },
 	[MCA_USB_REAL_TYPE_DCP] = { 1500, 2000 },
 	[MCA_USB_REAL_TYPE_FLOAT] = { 1000, 1000 },
-	[MCA_USB_REAL_TYPE_HVDCP2] = { 1200, 2000 },
+	[MCA_USB_REAL_TYPE_HVDCP2] = { 1500, 2000 },
 	[MCA_USB_REAL_TYPE_HVDCP3] = { 1500, 2000 },
 	[MCA_USB_REAL_TYPE_HVDCP3_B] = { 1500, 2000 },
 	[MCA_USB_REAL_TYPE_HVDCP3P5] = { 1500, 2000 },
@@ -273,10 +270,27 @@ static int xiaomi_mca_parse_reply(const void *data, size_t len, u32 opcode, u32 
 
 static int xiaomi_mca_usb_type(u32 real_type)
 {
-	if (real_type == MCA_USB_REAL_TYPE_SDP)
+	switch (real_type) {
+	case MCA_USB_REAL_TYPE_SDP:
 		return POWER_SUPPLY_USB_TYPE_SDP;
-
-	return POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	case MCA_USB_REAL_TYPE_CDP:
+		return POWER_SUPPLY_USB_TYPE_CDP;
+	case MCA_USB_REAL_TYPE_DCP:
+	case MCA_USB_REAL_TYPE_HVDCP2:
+	case MCA_USB_REAL_TYPE_HVDCP3:
+	case MCA_USB_REAL_TYPE_HVDCP3_B:
+	case MCA_USB_REAL_TYPE_HVDCP3P5:
+		return POWER_SUPPLY_USB_TYPE_DCP;
+	case MCA_USB_REAL_TYPE_TYPEC:
+		return POWER_SUPPLY_USB_TYPE_C;
+	case MCA_USB_REAL_TYPE_PD:
+	case MCA_USB_REAL_TYPE_PD_VERIFY:
+		return POWER_SUPPLY_USB_TYPE_PD;
+	case MCA_USB_REAL_TYPE_PPS:
+		return POWER_SUPPLY_USB_TYPE_PD_PPS;
+	default:
+		return POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	}
 }
 
 static const struct xiaomi_mca_limits *xiaomi_mca_limits(u32 real_type)
@@ -285,18 +299,22 @@ static const struct xiaomi_mca_limits *xiaomi_mca_limits(u32 real_type)
 	    xiaomi_mca_type_limits[real_type].input_current_ma)
 		return &xiaomi_mca_type_limits[real_type];
 
-	return &xiaomi_mca_sdp_limits;
+	return NULL;
 }
 
 /*
  * Return 0 and the value in mA to write for @psp set to @ua with a source of
- * type @real_type attached, or -EINVAL if that is out of range.
+ * type @real_type attached, -EOPNOTSUPP for an unsupported source, or -EINVAL
+ * if the property or current is out of range.
  */
 static int xiaomi_mca_current_ma(enum power_supply_property psp, u32 real_type, int ua,
 				 u32 *ma)
 {
 	const struct xiaomi_mca_limits *limits = xiaomi_mca_limits(real_type);
 	u32 max;
+
+	if (!limits)
+		return -EOPNOTSUPP;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
@@ -407,6 +425,9 @@ static int xiaomi_mca_write(struct xiaomi_mca *mca, u32 property, u32 value)
 	u32 data = value;
 	int ret;
 
+	if (property != MCA_PROP_INPUT_CURRENT_LIMIT && property != MCA_PROP_CHARGE_CURRENT)
+		return -EINVAL;
+
 	ret = xiaomi_mca_transfer(mca, MCA_OPCODE_WRITE, property, &data);
 	/* Whatever the outcome, cached values may be stale now. */
 	xiaomi_mca_invalidate(mca);
@@ -433,11 +454,17 @@ static int xiaomi_mca_write(struct xiaomi_mca *mca, u32 property, u32 value)
  */
 static void xiaomi_mca_restore_icl(struct xiaomi_mca *mca)
 {
+	u32 real_type;
 	int ret;
 
 	lockdep_assert_held(&mca->lock);
 
 	if (!mca->icl_written)
+		return;
+
+	/* Unknown also forbids automatic writes; wait for a recognized source. */
+	ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &real_type);
+	if (ret || !xiaomi_mca_limits(real_type))
 		return;
 
 	ret = xiaomi_mca_write(mca, MCA_PROP_INPUT_CURRENT_LIMIT, MCA_ICL_DEFAULT_MA);
@@ -597,6 +624,11 @@ static const struct power_supply_desc xiaomi_mca_usb_psy_desc = {
 	.set_property = xiaomi_mca_usb_set_property,
 	.property_is_writeable = xiaomi_mca_usb_property_is_writeable,
 	.usb_types = BIT(POWER_SUPPLY_USB_TYPE_SDP) |
+		     BIT(POWER_SUPPLY_USB_TYPE_CDP) |
+		     BIT(POWER_SUPPLY_USB_TYPE_DCP) |
+		     BIT(POWER_SUPPLY_USB_TYPE_C) |
+		     BIT(POWER_SUPPLY_USB_TYPE_PD) |
+		     BIT(POWER_SUPPLY_USB_TYPE_PD_PPS) |
 		     BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
 };
 
