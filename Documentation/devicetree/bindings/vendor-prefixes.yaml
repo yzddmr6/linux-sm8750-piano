@@ -1621,6 +1621,8 @@ patternProperties:
     description: Source Parts Inc.
   "^spacemit,.*":
     description: SpacemiT (Hangzhou) Technology Co. Ltd
+  "^southchip,.*":
+    description: Southchip Semiconductor
   "^spansion,.*":
     description: Spansion Inc.
   "^sparkfun,.*":
