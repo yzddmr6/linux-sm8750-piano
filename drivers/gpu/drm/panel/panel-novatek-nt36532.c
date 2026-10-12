@@ -46,6 +46,9 @@ struct panel_info {
 	/* Enabled in this order and disabled in reverse order */
 	const struct regulator_bulk_data *supplies;
 	unsigned int num_supplies;
+	const unsigned int *supply_off_delay_ms;
+	unsigned int display_off_delay_ms;
+	unsigned int sleep_in_delay_ms;
 
 	const struct drm_dsc_config *dsc_cfg;
 
@@ -112,10 +115,15 @@ static int nt36532_power_on(struct nt36532 *ctx)
 
 static void nt36532_power_off(struct nt36532 *ctx)
 {
+	const struct panel_info *info = ctx->panel_info;
 	int i;
 
-	for (i = ctx->panel_info->num_supplies - 1; i >= 0; i--)
+	for (i = info->num_supplies - 1; i >= 0; i--) {
 		regulator_disable(ctx->supplies[i].consumer);
+		if (info->supply_off_delay_ms)
+			usleep_range(info->supply_off_delay_ms[i] * 1000,
+				     info->supply_off_delay_ms[i] * 1000 + 100);
+	}
 }
 
 static void nt36532_reset(struct nt36532 *ctx)
@@ -158,9 +166,11 @@ static int nt36532_off(struct nt36532 *ctx)
 	struct mipi_dsi_multi_context dsi_ctx = { .dsi = dsi };
 
 	mipi_dsi_dcs_set_display_off_multi(&dsi_ctx);
-	mipi_dsi_usleep_range(&dsi_ctx, 10000, 10100);
+	mipi_dsi_usleep_range(&dsi_ctx,
+			     ctx->panel_info->display_off_delay_ms * 1000,
+			     ctx->panel_info->display_off_delay_ms * 1000 + 100);
 	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
-	mipi_dsi_msleep(&dsi_ctx, 65);
+	mipi_dsi_msleep(&dsi_ctx, ctx->panel_info->sleep_in_delay_ms);
 
 	return dsi_ctx.accum_err;
 }
@@ -438,6 +448,9 @@ static const struct regulator_bulk_data piano_supplies[] = {
 	{ .supply = "avdd" },
 	{ .supply = "avee" },
 };
+
+/* P81 supply entries: vddio, positive bias, negative bias. */
+static const unsigned int piano_supply_off_delay_ms[] = { 2, 3, 2 };
 
 static const struct drm_dsc_config piano_dsc_cfg = {
 	.dsc_version_major = 1,
@@ -731,6 +744,8 @@ static const struct panel_info csot_panel_info = {
 	.num_modes = 1,
 	.supplies = nt36532_supplies,
 	.num_supplies = ARRAY_SIZE(nt36532_supplies),
+	.display_off_delay_ms = 10,
+	.sleep_in_delay_ms = 65,
 	.dsc_cfg = &csot_dsc_cfg,
 	.init_sequence = csot_init_sequence,
 	.is_dual_dsi = true,
@@ -745,6 +760,9 @@ static const struct panel_info csot_panel_info = {
 	.num_modes = ARRAY_SIZE(piano_display_modes),				\
 	.supplies = piano_supplies,						\
 	.num_supplies = ARRAY_SIZE(piano_supplies),				\
+	.supply_off_delay_ms = piano_supply_off_delay_ms,			\
+	.display_off_delay_ms = 20,					\
+	.sleep_in_delay_ms = 100,						\
 	.dsc_cfg = &piano_dsc_cfg,						\
 	.init_sequence = _init,							\
 	.reset = _reset,							\
