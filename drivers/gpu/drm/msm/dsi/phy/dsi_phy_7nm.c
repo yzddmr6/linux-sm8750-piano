@@ -535,7 +535,15 @@ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 	if (pll_7nm->slave)
 		writel(0x1, pll_7nm->slave->phy->base + REG_DSI_7nm_PHY_CMN_RBUF_CTRL);
 
+	return 0;
+
 error:
+	/* CCF does not call unprepare after a failed prepare. */
+	writel(0, pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
+	if (pll_7nm->slave)
+		dsi_pll_disable_pll_bias(pll_7nm->slave);
+	dsi_pll_disable_pll_bias(pll_7nm);
+	wmb();
 	return rc;
 }
 
