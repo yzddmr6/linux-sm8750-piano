@@ -12,10 +12,11 @@ maintainers:
 description:
   SPI controller with host-downloaded RAM firmware and raw sensor frames.
   The initial driver supports the cascade variant only. Touch power is shared
-  with the panel; the current firmware-powered diagnostic configuration does
-  not implement the complete shared power lifecycle.
+  with the panel. The panel phandle orders capture and firmware reload around
+  the shared TDDI reset and power sequence.
 
 allOf:
+  - $ref: touchscreen.yaml#
   - $ref: /schemas/spi/spi-peripheral-props.yaml#
 
 properties:

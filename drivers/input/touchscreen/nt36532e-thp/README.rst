@@ -30,17 +30,18 @@ come from the firmware header, as in the piano vendor flow.
 The transport uses per-device state, regmap and an exclusive misc device instead
 of global state and proc controls. The frame length is read from firmware, not
 copied from another panel. SPI errors stop capture; there is no blind retry,
-automatic firmware reload, pen configuration or reference-board RAM write.
+automatic error retry or reference-board RAM write.
 
 After each download the transport enables the IRQ and waits up to 500 ms for
-the first valid frame. It then sends the two host commands the piano stock
-stack sends while frames flow: idle-baseline update (``BF 19``, value 1) and op
+the first valid frame. It then disables stylus scanning (``BF 04``, value 0)
+and sends the two host commands the piano stock stack sends while frames
+flow: idle-baseline update (``BF 19``, value 1) and op
 mode 2 (``BF 01``, value 2), each confirmed by the vendor's command-byte clear
 within 110 ms. Sent before any frame, the first command did not clear on piano.
 A missing first frame or a command that does not clear stops the IRQ and fails
 the open; the log names the command and the byte last read. Frames read while
 the commands run stay queued. The stock stack repeats the pair on idle events;
-this transport sends it once per open.
+this transport sends it once per firmware start (open or panel prepare).
 
 Stream contract
 ---------------
@@ -56,7 +57,8 @@ bytes. Header fields, in order:
 * u32 magic: 0x3150544e (NTP1)
 * u16 header_length: 32
 * u16 frame_length: 257 plus the firmware-reported payload length
-* u64 sequence: starts at 1 on each open; gaps indicate dropped records
+* u64 sequence: starts at 1 on probe and stays monotonic across opens and panel
+  cycles; gaps indicate dropped records
 * u64 timestamp_ns: CLOCK_BOOTTIME at completion of the SPI read
 * u16 checksum: firmware payload checksum field
 * u16 flags: bit 0 valid, bit 1 first valid record of the firmware epoch
@@ -76,10 +78,19 @@ than finger data must not be interpreted as finger matrices.
 Power and test boundary
 -----------------------
 
-Panel power must already be present. Native shared TDDI power ownership, idle,
-screen-off and wake recovery are not implemented. An open stream therefore
-rejects system suspend; closing stops IRQ capture but does not claim to power
-down the chip. Do not enable this driver in a default product yet.
+With the generic ``panel`` phandle, a DRM panel follower stops the IRQ before
+panel unprepare resets the TDDI. Opens while the panel is off fail with EAGAIN;
+an existing reader waits without a hangup. After prepare, an open stream uses
+the same firmware/first-frame/host-command sequence as open. The first valid
+queued frame is marked EPOCH; sequence numbers are not reset. Queued bytes are
+preserved across a panel cycle so a partial read cannot splice two records.
+The consumer must reject stale records and reset its baseline on EPOCH.
+Restart failures are logged and reported to readers without retrying.
+
+Without a panel phandle, platform-supplied power is still required. System
+suspend of an open stream remains rejected; panel following is not system
+suspend support. Closing stops capture without powering down the panel.
+Panel restart and physical input after DPMS still require hardware validation.
 
 The optional KUnit suite uses a user-supplied ``nt36532e/piano-test.bin`` fixture
 through the firmware loader. It checks the piano layout, malformed inputs,

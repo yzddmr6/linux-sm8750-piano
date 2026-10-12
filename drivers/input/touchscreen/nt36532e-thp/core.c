@@ -4,6 +4,7 @@
  * SPI paging/host-download protocol from the piano vendor driver.
  * NTP1 framing follows ianchb's NT36532E THP stream. See README.rst.
  */
+#include <drm/drm_panel.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/kfifo.h>
@@ -49,6 +50,7 @@ struct nvt_thp {
 	struct spi_device *spi;
 	struct regmap *map;
 	struct miscdevice misc;
+	struct drm_panel_follower follower;
 	struct kref ref;
 	struct mutex lifecycle_lock; /* Serializes open, close, removal and PM. */
 	struct mutex read_lock; /* Keeps the FIFO single-consumer across shared fds. */
@@ -61,7 +63,7 @@ struct nvt_thp {
 	u64 sequence;
 	unsigned long flags;
 	int error;
-	bool dead, opened, running, epoch, suspended;
+	bool dead, opened, running, epoch, suspended, panel_off;
 };
 
 static_assert(sizeof(struct nvt_stream_header) == 32);
@@ -223,9 +225,9 @@ static void nvt_stop_irq(struct nvt_thp *nvt)
 		synchronize_irq(nvt->spi->irq);
 }
 
-static int nvt_open(struct inode *inode, struct file *file)
+/* Caller holds lifecycle_lock, with the IRQ stopped. */
+static int nvt_start_stream(struct nvt_thp *nvt)
 {
-	struct nvt_thp *nvt = container_of(file->private_data, struct nvt_thp, misc);
 	const struct firmware *firmware;
 	struct nvt_thp_command_status last;
 	struct nvt_thp_firmware image;
@@ -234,18 +236,11 @@ static int nvt_open(struct inode *inode, struct file *file)
 	ktime_t start;
 	int ret;
 
-	if (file->f_mode & FMODE_WRITE)
-		return -EPERM;
-	ret = mutex_lock_interruptible(&nvt->lifecycle_lock);
-	if (ret)
-		return ret;
-	if (nvt->dead || nvt->opened || nvt->suspended) {
-		ret = nvt->dead ? -ENODEV : -EBUSY;
-		goto unlock;
-	}
+	lockdep_assert_held(&nvt->lifecycle_lock);
+	WRITE_ONCE(nvt->error, 0);
 	ret = request_firmware_direct(&firmware, nvt->firmware_name, &nvt->spi->dev);
 	if (ret)
-		goto unlock;
+		return ret;
 	ret = nvt_thp_parse_firmware(firmware->data, firmware->size, &image);
 	if (!ret) {
 		ret = nvt_thp_boot_firmware(nvt->map, firmware, &image, &payload_length);
@@ -253,17 +248,14 @@ static int nvt_open(struct inode *inode, struct file *file)
 	}
 	release_firmware(firmware);
 	if (ret)
-		goto unlock;
+		return ret;
 	/* IRQ packets must fit one transaction; do not split a changing frame. */
 	if (payload_length < 64 || payload_length > nvt->max_read - (NVT_FRAME_PREFIX - 1)) {
 		ret = -EMSGSIZE;
-		goto unlock;
+		return ret;
 	}
 	nvt->frame_length = NVT_FRAME_PREFIX + payload_length;
-	kfifo_reset(&nvt->fifo);
-	nvt->sequence = 0;
-	nvt->epoch = true;
-	WRITE_ONCE(nvt->error, 0);
+	WRITE_ONCE(nvt->epoch, true);
 	WRITE_ONCE(nvt->running, true);
 	set_bit(NVT_IRQ_ENABLED, &nvt->flags);
 	enable_irq(nvt->spi->irq);
@@ -293,17 +285,91 @@ static int nvt_open(struct inode *inode, struct file *file)
 			last.sub_command, ret, last.status);
 		goto stop;
 	}
+	ret = READ_ONCE(nvt->error);
+	if (ret)
+		goto stop;
 	dev_info(&nvt->spi->dev,
 		 "THP first frame after %lld ms; stylus disabled, idle-baseline update and op mode 2 accepted\n",
 		 first_frame_ms);
+	dev_info(&nvt->spi->dev, "THP stream ready, payload %u bytes\n", payload_length);
+	return 0;
+stop:
+	nvt_stop_irq(nvt);
+	return ret;
+}
+
+static int nvt_panel_unpreparing(struct drm_panel_follower *follower)
+{
+	struct nvt_thp *nvt = container_of(follower, struct nvt_thp, follower);
+
+	mutex_lock(&nvt->lifecycle_lock);
+	nvt_stop_irq(nvt);
+	WRITE_ONCE(nvt->panel_off, true);
+	mutex_unlock(&nvt->lifecycle_lock);
+	return 0;
+}
+
+static int nvt_panel_prepared(struct drm_panel_follower *follower)
+{
+	struct nvt_thp *nvt = container_of(follower, struct nvt_thp, follower);
+	int ret = 0;
+
+	mutex_lock(&nvt->lifecycle_lock);
+	if (nvt->dead)
+		goto unlock;
+	WRITE_ONCE(nvt->error, 0);
+	WRITE_ONCE(nvt->panel_off, false);
+	/* Preserve queued bytes, including any partially read NTP1 record. */
+	wake_up_interruptible(&nvt->wait);
+	if (nvt->opened) {
+		ret = nvt_start_stream(nvt);
+		if (ret) {
+			WRITE_ONCE(nvt->error, ret);
+			dev_err(&nvt->spi->dev, "THP panel restart failed: %d\n", ret);
+			wake_up_interruptible(&nvt->wait);
+		}
+	}
+unlock:
+	mutex_unlock(&nvt->lifecycle_lock);
+	return ret;
+}
+
+static const struct drm_panel_follower_funcs nvt_panel_follower_funcs = {
+	.panel_unpreparing = nvt_panel_unpreparing,
+	.panel_prepared = nvt_panel_prepared,
+};
+
+static int nvt_open(struct inode *inode, struct file *file)
+{
+	struct nvt_thp *nvt = container_of(file->private_data, struct nvt_thp, misc);
+	int ret;
+
+	if (file->f_mode & FMODE_WRITE)
+		return -EPERM;
+	ret = mutex_lock_interruptible(&nvt->lifecycle_lock);
+	if (ret)
+		return ret;
+	if (nvt->dead) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	if (nvt->panel_off) {
+		dev_info(&nvt->spi->dev, "THP open deferred while panel is off\n");
+		ret = -EAGAIN;
+		goto unlock;
+	}
+	if (nvt->opened || nvt->suspended) {
+		ret = -EBUSY;
+		goto unlock;
+	}
+	kfifo_reset(&nvt->fifo);
+	ret = nvt_start_stream(nvt);
+	if (ret)
+		goto unlock;
 	nvt->opened = true;
 	kref_get(&nvt->ref);
 	file->private_data = nvt;
 	stream_open(inode, file);
-	dev_info(&nvt->spi->dev, "THP stream ready, payload %u bytes\n", payload_length);
-	goto unlock;
-stop:
-	nvt_stop_irq(nvt);
 unlock:
 	mutex_unlock(&nvt->lifecycle_lock);
 	return ret;
@@ -324,7 +390,9 @@ static int nvt_release(struct inode *inode, struct file *file)
 
 static bool nvt_read_ready(struct nvt_thp *nvt)
 {
-	return READ_ONCE(nvt->dead) || READ_ONCE(nvt->error) || !kfifo_is_empty(&nvt->fifo);
+	return READ_ONCE(nvt->dead) ||
+	       (!READ_ONCE(nvt->panel_off) &&
+		(READ_ONCE(nvt->error) || !kfifo_is_empty(&nvt->fifo)));
 }
 
 static ssize_t nvt_read(struct file *file, char __user *buffer, size_t count, loff_t *position)
@@ -367,7 +435,11 @@ static __poll_t nvt_poll(struct file *file, poll_table *wait)
 	struct nvt_thp *nvt = file->private_data;
 
 	poll_wait(file, &nvt->wait, wait);
-	if (READ_ONCE(nvt->dead) || READ_ONCE(nvt->error))
+	if (READ_ONCE(nvt->dead))
+		return EPOLLERR | EPOLLHUP;
+	if (READ_ONCE(nvt->panel_off))
+		return 0;
+	if (READ_ONCE(nvt->error))
 		return EPOLLERR | EPOLLHUP;
 	return kfifo_is_empty(&nvt->fifo) ? 0 : EPOLLIN | EPOLLRDNORM;
 }
@@ -440,6 +512,13 @@ static int nvt_probe(struct spi_device *spi)
 	if (ret)
 		return ret;
 	spi_set_drvdata(spi, nvt);
+	if (drm_is_panel_follower(&spi->dev)) {
+		nvt->panel_off = true;
+		nvt->follower.funcs = &nvt_panel_follower_funcs;
+		ret = devm_drm_panel_add_follower(&spi->dev, &nvt->follower);
+		if (ret)
+			return dev_err_probe(&spi->dev, ret, "Failed to follow panel\n");
+	}
 	nvt->misc.minor = MISC_DYNAMIC_MINOR;
 	nvt->misc.fops = &nvt_fops;
 	nvt->misc.parent = &spi->dev;

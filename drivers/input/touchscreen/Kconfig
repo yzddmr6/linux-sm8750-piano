@@ -1413,14 +1413,15 @@ config TOUCHSCREEN_NT36532E_THP_KUNIT_TEST
 config TOUCHSCREEN_NT36532E_THP
 	tristate "Novatek NT36532E host-processed touch transport"
 	depends on SPI
+	depends on DRM || !DRM
 	select REGMAP
 	select FW_LOADER
 	help
 	  Raw THP transport for the NT36532E cascade configuration. A separate
 	  userspace processor is required to report touch coordinates. Firmware
 	  download and capture begin when its exclusive read-only misc device
-	  is opened. Display power must already be supplied by the platform;
-	  native panel power management is not implemented yet.
+	  is opened. With a panel phandle, capture follows the shared TDDI
+	  panel power sequence and reloads firmware after panel prepare.
 
 	  If unsure, say N.
 
