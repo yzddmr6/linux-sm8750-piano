@@ -1421,7 +1421,7 @@ config TOUCHSCREEN_NT36532E_THP
 	  userspace processor is required to report touch coordinates. Firmware
 	  download and capture begin when its exclusive read-only misc device
 	  is opened. With a panel phandle, capture follows the shared TDDI
-	  panel power sequence and reloads firmware after panel prepare.
+	  panel enable sequence and reloads firmware after panel enable.
 
 	  If unsure, say N.
 

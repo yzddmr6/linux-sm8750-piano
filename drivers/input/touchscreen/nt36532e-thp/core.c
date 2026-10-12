@@ -25,6 +25,10 @@
 #include <linux/uaccess.h>
 #include "firmware.h"
 
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
+#include <kunit/test.h>
+#endif
+
 #define NVT_WRITE_SIZE	(63 * 1024)
 #define NVT_READ_SIZE	8192
 #define NVT_FRAME_PREFIX	257
@@ -298,18 +302,20 @@ stop:
 	return ret;
 }
 
-static int nvt_panel_unpreparing(struct drm_panel_follower *follower)
+static int nvt_panel_disabling(struct drm_panel_follower *follower)
 {
 	struct nvt_thp *nvt = container_of(follower, struct nvt_thp, follower);
 
 	mutex_lock(&nvt->lifecycle_lock);
-	nvt_stop_irq(nvt);
-	WRITE_ONCE(nvt->panel_off, true);
+	if (!nvt->panel_off) {
+		nvt_stop_irq(nvt);
+		WRITE_ONCE(nvt->panel_off, true);
+	}
 	mutex_unlock(&nvt->lifecycle_lock);
 	return 0;
 }
 
-static int nvt_panel_prepared(struct drm_panel_follower *follower)
+static int nvt_panel_enabled(struct drm_panel_follower *follower)
 {
 	struct nvt_thp *nvt = container_of(follower, struct nvt_thp, follower);
 	int ret = 0;
@@ -335,8 +341,10 @@ unlock:
 }
 
 static const struct drm_panel_follower_funcs nvt_panel_follower_funcs = {
-	.panel_unpreparing = nvt_panel_unpreparing,
-	.panel_prepared = nvt_panel_prepared,
+	/* TDDI scanning needs the display timing, not just panel power. */
+	.panel_enabled = nvt_panel_enabled,
+	.panel_disabling = nvt_panel_disabling,
+	.panel_unpreparing = nvt_panel_disabling,
 };
 
 static int nvt_open(struct inode *inode, struct file *file)
@@ -353,19 +361,20 @@ static int nvt_open(struct inode *inode, struct file *file)
 		ret = -ENODEV;
 		goto unlock;
 	}
-	if (nvt->panel_off) {
-		dev_info(&nvt->spi->dev, "THP open deferred while panel is off\n");
-		ret = -EAGAIN;
-		goto unlock;
-	}
 	if (nvt->opened || nvt->suspended) {
 		ret = -EBUSY;
 		goto unlock;
 	}
 	kfifo_reset(&nvt->fifo);
-	ret = nvt_start_stream(nvt);
-	if (ret)
-		goto unlock;
+	WRITE_ONCE(nvt->error, 0);
+	/* udev may open the stream before the panel has been enabled. */
+	if (!nvt->panel_off) {
+		ret = nvt_start_stream(nvt);
+		if (ret) {
+			dev_err(&nvt->spi->dev, "THP stream start failed: %d\n", ret);
+			goto unlock;
+		}
+	}
 	nvt->opened = true;
 	kref_get(&nvt->ref);
 	file->private_data = nvt;
@@ -599,6 +608,67 @@ static struct spi_driver nvt_driver = {
 	.id_table = nvt_ids,
 };
 module_spi_driver(nvt_driver);
+
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
+static void nvt_test_free_fifo(void *data)
+{
+	struct nvt_thp *nvt = data;
+
+	kfifo_free(&nvt->fifo);
+}
+
+static void nvt_test_open_disabled_panel(struct kunit *test)
+{
+	struct nvt_thp *nvt = kunit_kzalloc(test, sizeof(*nvt), GFP_KERNEL);
+	struct file file = { .f_mode = FMODE_READ };
+	struct file second = { .f_mode = FMODE_READ };
+	struct inode inode = {};
+
+	KUNIT_ASSERT_NOT_NULL(test, nvt);
+	mutex_init(&nvt->lifecycle_lock);
+	init_waitqueue_head(&nvt->wait);
+	kref_init(&nvt->ref);
+	KUNIT_ASSERT_EQ(test, kfifo_alloc(&nvt->fifo, 64, GFP_KERNEL), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, nvt_test_free_fifo, nvt), 0);
+	nvt->panel_off = true;
+	nvt->sequence = 41;
+	nvt->error = -EIO;
+	kfifo_in(&nvt->fifo, "old", 3);
+	file.private_data = &nvt->misc;
+	second.private_data = &nvt->misc;
+
+	/* No SPI device: a disabled-panel open must not try firmware I/O. */
+	KUNIT_ASSERT_EQ(test, nvt_open(&inode, &file), 0);
+	KUNIT_EXPECT_TRUE(test, nvt->opened);
+	KUNIT_EXPECT_FALSE(test, nvt->running);
+	KUNIT_EXPECT_EQ(test, nvt->sequence, 41ULL);
+	KUNIT_EXPECT_TRUE(test, kfifo_is_empty(&nvt->fifo));
+	KUNIT_EXPECT_EQ(test, nvt_poll(&file, NULL), (__poll_t)0);
+	KUNIT_EXPECT_FALSE(test, nvt_read_ready(nvt));
+	KUNIT_EXPECT_EQ(test, nvt_open(&inode, &second), -EBUSY);
+	KUNIT_EXPECT_EQ(test, nvt_panel_disabling(&nvt->follower), 0);
+	KUNIT_EXPECT_EQ(test, nvt_panel_disabling(&nvt->follower), 0);
+
+	/* Removal still wakes a waiting reader, and close drops its reference. */
+	nvt->dead = true;
+	KUNIT_EXPECT_EQ(test, nvt_poll(&file, NULL), (__poll_t)(EPOLLERR | EPOLLHUP));
+	KUNIT_EXPECT_EQ(test, nvt_release(&inode, &file), 0);
+	KUNIT_EXPECT_FALSE(test, nvt->opened);
+	KUNIT_EXPECT_EQ(test, kref_read(&nvt->ref), 1U);
+}
+
+static struct kunit_case nvt_panel_cases[] = {
+	KUNIT_CASE(nvt_test_open_disabled_panel),
+	{}
+};
+
+static struct kunit_suite nvt_panel_suite = {
+	.name = "nt36532e-panel",
+	.test_cases = nvt_panel_cases,
+};
+
+kunit_test_suite(nvt_panel_suite);
+#endif
 
 MODULE_DESCRIPTION("NT36532E cascade SPI host-touch transport");
 MODULE_LICENSE("GPL");

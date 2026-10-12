@@ -41,13 +41,14 @@ within 110 ms. Sent before any frame, the first command did not clear on piano.
 A missing first frame or a command that does not clear stops the IRQ and fails
 the open; the log names the command and the byte last read. Frames read while
 the commands run stay queued. The stock stack repeats the pair on idle events;
-this transport sends it once per firmware start (open or panel prepare).
+this transport sends it once per firmware start (open or panel enable).
 
 Stream contract
 ---------------
 
 ``/dev/nvt-thp-<spi-device-name>`` is root-only and read-only. Opening it downloads
-the explicitly named firmware once and enables capture. A second open fails
+the explicitly named firmware once and enables capture if the panel is enabled;
+otherwise open succeeds and capture waits for panel enable. A second open fails
 with EBUSY. Probe itself does not issue SPI commands. Reads form a byte stream;
 callers must handle partial records. Poll reports readiness, error or removal.
 
@@ -79,9 +80,12 @@ Power and test boundary
 -----------------------
 
 With the generic ``panel`` phandle, a DRM panel follower stops the IRQ before
-panel unprepare resets the TDDI. Opens while the panel is off fail with EAGAIN;
-an existing reader waits without a hangup. After prepare, an open stream uses
-the same firmware/first-frame/host-command sequence as open. The first valid
+panel disable removes the display timing needed by TDDI scanning. Unprepare
+also stops capture as an idempotent fallback before the shared reset. Open
+succeeds while the panel is disabled and the reader waits without a hangup.
+After panel enable, an open stream uses the same firmware/first-frame/host-command
+sequence as an open on an already enabled panel. Prepare alone is too early:
+panel power does not guarantee display timing or touch frames. The first valid
 queued frame is marked EPOCH; sequence numbers are not reset. Queued bytes are
 preserved across a panel cycle so a partial read cannot splice two records.
 The consumer must reject stale records and reset its baseline on EPOCH.
