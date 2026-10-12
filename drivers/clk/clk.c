@@ -3938,6 +3938,39 @@ static inline void clk_debug_unregister(struct clk_core *core)
 }
 #endif
 
+static int clk_core_reparent_orphan(struct clk_core *orphan,
+				  struct clk_core *parent)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	lockdep_assert_held(&prepare_lock);
+
+	if (orphan->prepare_count) {
+		ret = clk_core_prepare(parent);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * Only the software topology changes here; there is no set_parent()
+	 * operation needing CLK_OPS_PARENT_ENABLE. Transfer the active reference
+	 * while holding enable_lock so a concurrent enable/disable observes
+	 * either the old orphan or a parent with balanced references.
+	 */
+	flags = clk_enable_lock();
+	if (orphan->enable_count)
+		ret = clk_core_enable(parent);
+	if (!ret)
+		clk_reparent(orphan, parent);
+	clk_enable_unlock(flags);
+
+	if (ret)
+		clk_core_unprepare(parent);
+
+	return ret;
+}
+
 static void clk_core_reparent_orphans_nolock(void)
 {
 	struct clk_core *orphan;
@@ -3951,15 +3984,13 @@ static void clk_core_reparent_orphans_nolock(void)
 		struct clk_core *parent = __clk_init_parent(orphan);
 
 		/*
-		 * We need to use __clk_set_parent_before() and _after() to
-		 * properly migrate any prepare/enable count of the orphan
-		 * clock. This is important for CLK_IS_CRITICAL clocks, which
-		 * are enabled during init but might not have a parent yet.
+		 * Migrate references before changing the topology. A parent may
+		 * not be ready to prepare yet; leave the orphan and its consumers'
+		 * references intact in that case.
 		 */
 		if (parent) {
-			/* update the clk tree topology */
-			__clk_set_parent_before(orphan, parent);
-			__clk_set_parent_after(orphan, parent, NULL);
+			if (clk_core_reparent_orphan(orphan, parent))
+				continue;
 			__clk_recalc_accuracies(orphan);
 			__clk_recalc_rates(orphan, true, 0);
 

@@ -26,6 +26,230 @@ static const struct clk_ops empty_clk_ops = { };
 #define DUMMY_CLOCK_RATE_1		(142 * HZ_PER_MHZ)
 #define DUMMY_CLOCK_RATE_2		(242 * HZ_PER_MHZ)
 
+struct clk_orphan_adoption_ctx {
+	struct clk_hw child;
+	struct clk_hw parent;
+	struct clk *child_clk;
+	bool child_registered;
+	bool parent_registered;
+	unsigned int child_refs;
+	int prepare_error;
+	int enable_error;
+	int prepare_users;
+	int enable_users;
+	unsigned int prepare_calls;
+};
+
+static int clk_orphan_adoption_prepare(struct clk_hw *hw)
+{
+	struct clk_orphan_adoption_ctx *ctx =
+		container_of(hw, struct clk_orphan_adoption_ctx, parent);
+
+	ctx->prepare_calls++;
+	if (ctx->prepare_error)
+		return ctx->prepare_error;
+	ctx->prepare_users++;
+	return 0;
+}
+
+static void clk_orphan_adoption_unprepare(struct clk_hw *hw)
+{
+	struct clk_orphan_adoption_ctx *ctx =
+		container_of(hw, struct clk_orphan_adoption_ctx, parent);
+
+	ctx->prepare_users--;
+}
+
+static int clk_orphan_adoption_enable(struct clk_hw *hw)
+{
+	struct clk_orphan_adoption_ctx *ctx =
+		container_of(hw, struct clk_orphan_adoption_ctx, parent);
+
+	if (ctx->enable_error)
+		return ctx->enable_error;
+	ctx->enable_users++;
+	return 0;
+}
+
+static void clk_orphan_adoption_disable(struct clk_hw *hw)
+{
+	struct clk_orphan_adoption_ctx *ctx =
+		container_of(hw, struct clk_orphan_adoption_ctx, parent);
+
+	ctx->enable_users--;
+}
+
+static const struct clk_ops clk_orphan_adoption_parent_ops = {
+	.prepare = clk_orphan_adoption_prepare,
+	.unprepare = clk_orphan_adoption_unprepare,
+	.enable = clk_orphan_adoption_enable,
+	.disable = clk_orphan_adoption_disable,
+};
+
+static void clk_orphan_adoption_cleanup(void *data)
+{
+	struct clk_orphan_adoption_ctx *ctx = data;
+
+	while (ctx->child_refs) {
+		clk_disable_unprepare(ctx->child_clk);
+		ctx->child_refs--;
+	}
+	if (!IS_ERR_OR_NULL(ctx->child_clk))
+		clk_put(ctx->child_clk);
+	if (ctx->child_registered)
+		clk_hw_unregister(&ctx->child);
+	if (ctx->parent_registered)
+		clk_hw_unregister(&ctx->parent);
+}
+
+static void clk_orphan_adoption_setup(struct kunit *test)
+{
+	struct clk_orphan_adoption_ctx *ctx;
+	unsigned long flags = *(const unsigned long *)test->param_value;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	test->priv = ctx;
+	KUNIT_ASSERT_EQ(test, 0,
+		kunit_add_action_or_reset(test, clk_orphan_adoption_cleanup, ctx));
+	ctx->child.init = CLK_HW_INIT("adoption-child", "adoption-parent",
+				     &empty_clk_ops, flags);
+	KUNIT_ASSERT_EQ(test, 0, clk_hw_register(NULL, &ctx->child));
+	ctx->child_registered = true;
+	ctx->child_clk = clk_hw_get_clk(&ctx->child, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx->child_clk);
+}
+
+static void clk_orphan_adoption_register_parent(struct kunit *test)
+{
+	struct clk_orphan_adoption_ctx *ctx = test->priv;
+
+	ctx->parent.init = CLK_HW_INIT_NO_PARENT("adoption-parent",
+					      &clk_orphan_adoption_parent_ops, 0);
+	KUNIT_ASSERT_EQ(test, 0, clk_hw_register(NULL, &ctx->parent));
+	ctx->parent_registered = true;
+}
+
+static void clk_orphan_adoption_get_twice(struct kunit *test)
+{
+	struct clk_orphan_adoption_ctx *ctx = test->priv;
+	unsigned int i;
+
+	for (i = 0; i < 2; i++) {
+		KUNIT_ASSERT_EQ(test, 0, clk_prepare_enable(ctx->child_clk));
+		ctx->child_refs++;
+	}
+}
+
+static void clk_orphan_adoption_put_twice(struct kunit *test)
+{
+	struct clk_orphan_adoption_ctx *ctx = test->priv;
+
+	while (ctx->child_refs) {
+		clk_disable_unprepare(ctx->child_clk);
+		ctx->child_refs--;
+	}
+	KUNIT_EXPECT_EQ(test, ctx->prepare_users, 0);
+	KUNIT_EXPECT_EQ(test, ctx->enable_users, 0);
+	KUNIT_EXPECT_FALSE(test, clk_hw_is_prepared(&ctx->parent));
+	KUNIT_EXPECT_EQ(test, __clk_get_enable_count(ctx->parent.clk), 0U);
+}
+
+/* Discovering a hardware parent is not a hardware mux operation. */
+static void clk_orphan_adoption_inactive(struct kunit *test)
+{
+	struct clk_orphan_adoption_ctx *ctx;
+
+	clk_orphan_adoption_setup(test);
+	ctx = test->priv;
+	ctx->prepare_error = -EAGAIN;
+	clk_orphan_adoption_register_parent(test);
+	KUNIT_EXPECT_PTR_EQ(test, clk_hw_get_parent(&ctx->child), &ctx->parent);
+	KUNIT_EXPECT_EQ(test, ctx->prepare_calls, 0U);
+	KUNIT_EXPECT_EQ(test, ctx->prepare_users, 0);
+}
+
+/* A failed prepare must not create a parent link without a reference. */
+static void clk_orphan_adoption_prepare_failure(struct kunit *test)
+{
+	struct clk_orphan_adoption_ctx *ctx;
+
+	clk_orphan_adoption_setup(test);
+	ctx = test->priv;
+	clk_orphan_adoption_get_twice(test);
+	ctx->prepare_error = -EAGAIN;
+	clk_orphan_adoption_register_parent(test);
+	KUNIT_EXPECT_PTR_EQ(test, clk_hw_get_parent(&ctx->child), NULL);
+	KUNIT_EXPECT_EQ(test, __clk_get_enable_count(ctx->child_clk), 2U);
+	KUNIT_EXPECT_EQ(test, ctx->prepare_calls, 1U);
+	clk_orphan_adoption_put_twice(test);
+}
+
+/* A failed enable must also release the prepare reference just acquired. */
+static void clk_orphan_adoption_enable_failure(struct kunit *test)
+{
+	struct clk_orphan_adoption_ctx *ctx;
+
+	clk_orphan_adoption_setup(test);
+	ctx = test->priv;
+	clk_orphan_adoption_get_twice(test);
+	ctx->enable_error = -EIO;
+	clk_orphan_adoption_register_parent(test);
+	KUNIT_EXPECT_PTR_EQ(test, clk_hw_get_parent(&ctx->child), NULL);
+	KUNIT_EXPECT_EQ(test, __clk_get_enable_count(ctx->child_clk), 2U);
+	clk_orphan_adoption_put_twice(test);
+}
+
+/* A later normal reparent must adopt the live references exactly once. */
+static void clk_orphan_adoption_later_parent(struct kunit *test)
+{
+	struct clk_orphan_adoption_ctx *ctx;
+	struct clk *parent_clk;
+
+	clk_orphan_adoption_setup(test);
+	ctx = test->priv;
+	clk_orphan_adoption_get_twice(test);
+	ctx->prepare_error = -EAGAIN;
+	clk_orphan_adoption_register_parent(test);
+	KUNIT_EXPECT_PTR_EQ(test, clk_hw_get_parent(&ctx->child), NULL);
+	ctx->prepare_error = 0;
+	parent_clk = clk_hw_get_clk_kunit(test, &ctx->parent, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, parent_clk);
+	KUNIT_ASSERT_EQ(test, clk_set_parent(ctx->child_clk, parent_clk), 0);
+	KUNIT_EXPECT_PTR_EQ(test, clk_hw_get_parent(&ctx->child), &ctx->parent);
+	KUNIT_EXPECT_EQ(test, __clk_get_enable_count(ctx->child_clk), 2U);
+	KUNIT_EXPECT_EQ(test, __clk_get_enable_count(parent_clk), 1U);
+	KUNIT_EXPECT_EQ(test, ctx->prepare_users, 1);
+	KUNIT_EXPECT_EQ(test, ctx->enable_users, 1);
+	clk_orphan_adoption_put_twice(test);
+}
+
+static const unsigned long clk_orphan_adoption_flags[] = {
+	0, CLK_OPS_PARENT_ENABLE,
+};
+
+static void clk_orphan_adoption_desc(const unsigned long *flags, char *desc)
+{
+	snprintf(desc, KUNIT_PARAM_DESC_SIZE, "parent_enable_%u", !!*flags);
+}
+
+KUNIT_ARRAY_PARAM(clk_orphan_adoption, clk_orphan_adoption_flags,
+		  clk_orphan_adoption_desc)
+
+static struct kunit_case clk_orphan_adoption_cases[] = {
+	KUNIT_CASE_PARAM(clk_orphan_adoption_inactive, clk_orphan_adoption_gen_params),
+	KUNIT_CASE_PARAM(clk_orphan_adoption_prepare_failure, clk_orphan_adoption_gen_params),
+	KUNIT_CASE_PARAM(clk_orphan_adoption_enable_failure, clk_orphan_adoption_gen_params),
+	KUNIT_CASE_PARAM(clk_orphan_adoption_later_parent, clk_orphan_adoption_gen_params),
+	{}
+};
+
+static struct kunit_suite clk_orphan_adoption_suite = {
+	.name = "clk-orphan-adoption",
+	.test_cases = clk_orphan_adoption_cases,
+};
+
+
 struct clk_dummy_context {
 	struct clk_hw hw;
 	unsigned long rate;
@@ -3877,6 +4101,7 @@ static struct kunit_suite clk_parse_clkspec_test_suite = {
 };
 
 kunit_test_suites(
+	&clk_orphan_adoption_suite,
 	&clk_assigned_rates_suite,
 	&clk_assigned_sscs_suite,
 	&clk_hw_get_dev_of_node_test_suite,
