@@ -37,6 +37,8 @@ struct msm_dsi_phy_cfg {
 	const int quirks;
 	bool has_phy_regulator;
 	bool has_phy_lane;
+	/* Bonded slave has independently reset divider/mux registers. */
+	bool restore_slave_pll;
 };
 
 extern const struct msm_dsi_phy_cfg dsi_phy_28nm_hpm_cfgs;

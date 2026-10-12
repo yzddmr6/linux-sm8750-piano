@@ -368,6 +368,9 @@ static void dsi_mgr_bridge_post_disable(struct drm_bridge *bridge,
 
 	/* Save PHY status if it is a clock source */
 	msm_dsi_phy_pll_save_state(msm_dsi->phy);
+	if (is_bonded_dsi && msm_dsi1 &&
+	    msm_dsi1->phy->cfg->restore_slave_pll)
+		msm_dsi_phy_pll_save_state(msm_dsi1->phy);
 
 	/* Stop the external-clock consumer before its clock-source host. */
 	if (is_bonded_dsi && msm_dsi1) {

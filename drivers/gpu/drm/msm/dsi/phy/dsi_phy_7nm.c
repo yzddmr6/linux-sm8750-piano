@@ -1544,6 +1544,7 @@ const struct msm_dsi_phy_cfg dsi_phy_4nm_8650_cfgs = {
 
 const struct msm_dsi_phy_cfg dsi_phy_3nm_8750_cfgs = {
 	.has_phy_lane = true,
+	.restore_slave_pll = true,
 	.regulator_data = dsi_phy_7nm_98000uA_regulators,
 	.num_regulators = ARRAY_SIZE(dsi_phy_7nm_98000uA_regulators),
 	.ops = {

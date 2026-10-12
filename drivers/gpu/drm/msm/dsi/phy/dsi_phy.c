@@ -775,7 +775,8 @@ int msm_dsi_phy_enable(struct msm_dsi_phy *phy,
 	 * link clocks. Restore PLL status if its PLL is being used as clock
 	 * source.
 	 */
-	if (phy->usecase != MSM_DSI_PHY_SLAVE) {
+	if (phy->usecase != MSM_DSI_PHY_SLAVE ||
+	    phy->cfg->restore_slave_pll) {
 		ret = msm_dsi_phy_pll_restore_state(phy);
 		if (ret) {
 			DRM_DEV_ERROR(dev, "%s: failed to restore phy state, %d\n",
