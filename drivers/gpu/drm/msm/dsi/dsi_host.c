@@ -30,6 +30,7 @@
 #include "msm_dsc_helper.h"
 #include "msm_kms.h"
 #include "msm_gem.h"
+#include "msm_atomic_trace.h"
 #include "phy/dsi_phy.h"
 
 #define DSI_RESET_TOGGLE_DELAY_MS 20
@@ -1635,6 +1636,7 @@ static void dsi_fifo_status(struct msm_dsi_host *msm_host)
 
 	/* fifo underflow, overflow */
 	if (status) {
+		trace_msm_dsi_fifo_error(msm_host->id, status);
 		dsi_write(msm_host, REG_DSI_FIFO_STATUS, status);
 		msm_host->err_work_state |= DSI_ERR_STATE_FIFO;
 		if (status & DSI_FIFO_STATUS_CMD_MDP_FIFO_UNDERFLOW)

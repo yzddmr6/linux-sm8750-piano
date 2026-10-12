@@ -8,6 +8,21 @@
 #define TRACE_SYSTEM drm_msm_atomic
 #define TRACE_INCLUDE_FILE msm_atomic_trace
 
+TRACE_EVENT(msm_dsi_fifo_error,
+	    TP_PROTO(unsigned int id, u32 status),
+	    TP_ARGS(id, status),
+	    TP_STRUCT__entry(
+		    __field(unsigned int, id)
+		    __field(u32, status)
+		    ),
+	    TP_fast_assign(
+		    __entry->id = id;
+		    __entry->status = status;
+		    ),
+	    TP_printk("host=%u fifo_status=0x%08x",
+		    __entry->id, __entry->status)
+);
+
 TRACE_EVENT(msm_atomic_commit_tail_start,
 	    TP_PROTO(bool async, unsigned crtc_mask),
 	    TP_ARGS(async, crtc_mask),
