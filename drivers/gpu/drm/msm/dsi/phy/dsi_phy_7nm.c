@@ -83,6 +83,7 @@ struct dsi_pll_7nm {
 	struct msm_dsi_phy *phy;
 
 	u64 vco_current_rate;
+	bool vco_rate_valid;
 
 	/* protects REG_DSI_7nm_PHY_CMN_CLK_CFG0 register */
 	spinlock_t postdiv_lock;
@@ -368,6 +369,7 @@ static int dsi_pll_7nm_vco_set_rate(struct clk_hw *hw, unsigned long rate,
 
 	dsi_pll_ssc_commit(pll_7nm, &config);
 
+	pll_7nm->vco_rate_valid = true;
 	dsi_pll_disable_pll_bias(pll_7nm);
 	/* flush, ensure all register writes are done*/
 	wmb();
@@ -496,6 +498,18 @@ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(hw);
 	int rc;
 
+	/*
+	 * Orphan clock adoption can reach us before the DSI host has enabled
+	 * the PHY. Register access/PLL startup requires the digital top, and
+	 * the minimum-rate fallback alone does not configure the hardware.
+	 * Leave the consumer orphaned until the normal PHY enable/restore
+	 * and host reparent sequence can supply a usable clock.
+	 */
+	if (!pll_7nm->vco_rate_valid ||
+	    !(readl(pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0) &
+	      DSI_7nm_PHY_CMN_CTRL_0_DIGTOP_PWRDN_B))
+		return -EAGAIN;
+
 	dsi_pll_enable_pll_bias(pll_7nm);
 	if (pll_7nm->slave)
 		dsi_pll_enable_pll_bias(pll_7nm->slave);
@@ -607,6 +621,7 @@ static unsigned long dsi_pll_7nm_vco_recalc_rate(struct clk_hw *hw,
 
 	vco_rate = pll_freq;
 	pll_7nm->vco_current_rate = vco_rate;
+	pll_7nm->vco_rate_valid = vco_rate != 0;
 
 	DBG("DSI PLL%d returning vco rate = %lu, dec = %x, frac = %x",
 	    pll_7nm->phy->id, (unsigned long)vco_rate, dec, frac);
