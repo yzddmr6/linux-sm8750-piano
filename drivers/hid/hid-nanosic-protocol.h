@@ -166,6 +166,11 @@ static inline int nanosic_frame_next(u8 *frame, size_t size, size_t *cursor,
 		wire_size = 32;
 		hid_size = 0;
 		break;
+	case 0x24:
+	case 0x26:
+		wire_size = size - offset;
+		hid_size = 0;
+		break;
 	default:
 		return -EOPNOTSUPP;
 	}

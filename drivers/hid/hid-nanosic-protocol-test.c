@@ -154,7 +154,7 @@ static void nanosic_test_bad_frames(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, nanosic_frame_next(frame, 29, &cursor, &report), -EMSGSIZE);
 	KUNIT_EXPECT_EQ(test, cursor, (size_t)0);
-	frame[3] = 0x24;
+	frame[3] = 0x27;
 	KUNIT_EXPECT_EQ(test, nanosic_frame_next(frame, sizeof(frame), &cursor, &report),
 			-EOPNOTSUPP);
 	frame[0] = 0;

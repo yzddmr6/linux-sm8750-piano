@@ -6,6 +6,10 @@
  */
 
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
+#include <linux/regulator/consumer.h>
+
+#include "hid-nanosic-protocol.h"
 #include <linux/firmware.h>
 #include <linux/hid.h>
 #include <linux/i2c.h>
@@ -75,6 +79,12 @@ struct nanosic_wn8030 {
 	struct i2c_client *client;
 	struct hid_device *hid_keyboard;
 	struct hid_device *hid_touchpad;
+	struct input_dev *tablet;
+	struct completion attach_known;
+	u8 attach;
+	bool tablet_registered;
+	bool no_touchpad;
+	const char *firmware_name;
 
 	struct gpio_desc *status_gpio;
 	struct gpio_desc *sleep_gpio;
@@ -123,58 +133,6 @@ static const struct regmap_config nanosic_wn8030_regmap_config = {
 	.reg_bits = 8,
 	.val_bits = 8,
 };
-
-#pragma pack(push, 1)
-struct wn8030_bin_header {
-	u8 flag[7];
-	u16 chip_id;
-	u32 ro_data;
-	u32 rame_code; //??
-	u32 rame_code_size; //??
-	u32 code_entry;
-	u16 pid;
-	u16 vid;
-	u8 major_version;
-	u8 minor_version;
-	char version_string[17];
-	u32 ram_code_size;
-	u32 ram_code_checksum;
-	u32 unk;
-	u8 device_type;
-	u8 unk1[3];
-};
-#pragma pack(pop)
-
-#pragma pack(push, 1)
-struct wn8030_header_cmd {
-	u8 cmd; /* 0x06 */
-	u8 flag[7];
-	u16 chip_id;
-	u32 ram_code_source;
-	u32 ram_code_dest;
-	u32 ram_code_size;
-	u32 code_entry;
-	u16 pid;
-	u16 vid;
-	u8 major_version;
-	u8 minor_version;
-	u8 unk[17]; /* version_string? */
-	u32 image_size;
-	u32 ram_code_checksum;
-	u32 image_checksum;
-	u8 pad[3];
-	u8 header_checksum;
-};
-#pragma pack(pop)
-
-#pragma pack(push, 1)
-struct wn8030_send_cmd {
-	u8 cmd; /* 0x07 */
-	__be32 ram_dest;
-	__be32 size;
-	u8 data[503];
-};
-#pragma pack(pop)
 
 static u8 hid_keyboard_descriptor[] = {
 	0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
@@ -359,6 +317,8 @@ static u8 hid_touchpad_descriptor[] = {
 };
 
 /* Keyboard, consumer control and mouse reports of the Pad 8 Pro cover. */
+#define PIANO_KEYBOARD_NO_POINTER_SIZE (61 + 25)
+
 static const u8 piano_keyboard_descriptor[] = {
 	0x05, 0x01,       /* Usage Page (Generic Desktop) */
 	0x09, 0x06,       /* Usage (Keyboard) */
@@ -600,7 +560,8 @@ static int nanosic_wn8030_hid_parse(struct hid_device *hid)
 
 	if (hid->product == 0x00A3)
 		return hid_parse_report(hid, (u8 *)variant->kbd_rdesc,
-					variant->kbd_rsize);
+					(nanosic->no_touchpad && variant->packed_reports) ?
+					PIANO_KEYBOARD_NO_POINTER_SIZE : variant->kbd_rsize);
 	else if (hid->product == 0x00A1)
 		return hid_parse_report(hid, (u8 *)variant->tp_rdesc,
 					variant->tp_rsize);
@@ -633,16 +594,6 @@ static int nanosic_wn8030_raw_request(struct hid_device *hid,
 				      unsigned char rtype, int reqtype)
 {
 	return len;
-}
-
-static inline u32 nanosic_wn8030_checksum32(const u8 *data, int size)
-{
-	u32 checksum = 0;
-
-	for (u32 i = 0; i < size; i += 4)
-		checksum += data[i] + (data[i+1] << 8) + (data[i+2] << 16) + (data[i+3] << 24);
-
-	return checksum;
 }
 
 static inline u8 nanosic_wn8030_checksum8(const u8 *data, int size)
@@ -766,6 +717,8 @@ static int nanosic_wn8030_set_touchpad(struct nanosic_wn8030 *nanosic, bool enab
 	u8 buf[XM_WN8030_I2C_WRITE] = { 0x32, 0x00, 0x4E, 0x31,
 					0x80, 0x38, 0x21, 0x01 };
 
+	if (nanosic->no_touchpad)
+		return 0;
 	buf[8] = enable;
 	buf[9] = nanosic_wn8030_checksum8(&buf[2], 7);
 
@@ -888,6 +841,9 @@ static void nanosic_wn8030_add_touchpad_hid(struct nanosic_wn8030 *nanosic)
 {
 	struct hid_device *hid;
 
+	if (nanosic->no_touchpad)
+		return;
+
 	hid = hid_allocate_device();
 	if (IS_ERR(hid)) {
 		dev_err(nanosic->dev, "failed allocate touchpad hid device");
@@ -977,6 +933,12 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic,
 	/* WN8012(KB) -> HOST, kb detect/attach state info */
 	else if (p[4] == 0xa2) {
 		mutex_lock(&nanosic->conn_mutex);
+		nanosic->attach = p[9];
+		complete_all(&nanosic->attach_known);
+		if (nanosic->tablet_registered) {
+			input_report_switch(nanosic->tablet, SW_TABLET_MODE, !(p[9] & BIT(0)));
+			input_sync(nanosic->tablet);
+		}
 		if (((p[9] & 0x3) == 0x3) && !nanosic->keyboard_attached) {
 			bool input_enabled = READ_ONCE(nanosic->input_enabled);
 
@@ -999,7 +961,7 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic,
 			schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
 			notify_plugin = true;
 			plugin_attached = true;
-		} else if (((p[9] & 0x3) == 0x0) && nanosic->keyboard_attached) {
+		} else if (!(p[9] & BIT(0)) && nanosic->keyboard_attached) {
 			cancel_delayed_work_sync(&nanosic->wake_worker);
 			nanosic->micmute_key_down = false;
 			if (nanosic->hid_keyboard) {
@@ -1112,7 +1074,7 @@ static int nanosic_wn8030_dispatch(struct nanosic_wn8030 *nanosic,
 
 	switch (p[0]) {
 	case 0x2:
-		if (READ_ONCE(nanosic->input_enabled) && nanosic->hid_keyboard)
+		if (!nanosic->no_touchpad && READ_ONCE(nanosic->input_enabled) && nanosic->hid_keyboard)
 			hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
 					 (u8 *)p, size, 0);
 		break;
@@ -1144,7 +1106,7 @@ static int nanosic_wn8030_dispatch(struct nanosic_wn8030 *nanosic,
 	case 0x6:
 		if (READ_ONCE(nanosic->input_enabled) && nanosic->hid_keyboard)
 			hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
-					 (u8 *)p, size, 0);
+					 (u8 *)p, 3, 0);
 		break;
 	case 0x19:
 		if (READ_ONCE(nanosic->input_enabled) && nanosic->hid_touchpad)
@@ -1166,6 +1128,8 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
 	int ret;
 	struct nanosic_wn8030 *nanosic = data;
 	u8 buf[XM_WN8030_I2C_READ];
+	struct nanosic_report report;
+	size_t cursor = 0;
 	int len, size, off;
 
 	/* After sleep pin deactivated, fw will trigger irq to notify about
@@ -1180,6 +1144,12 @@ static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
 	ret = regmap_bulk_read(nanosic->regmap, 0x4c, buf, sizeof(buf));
 	if (ret) {
 		dev_warn(nanosic->dev, "failed to read data on irq %d\n", ret);
+		return IRQ_HANDLED;
+	}
+
+	if (nanosic->variant->packed_reports) {
+		while (nanosic_frame_next(buf, sizeof(buf), &cursor, &report) > 0)
+			nanosic_wn8030_dispatch(nanosic, report.data, report.wire_size);
 		return IRQ_HANDLED;
 	}
 
@@ -1261,77 +1231,36 @@ static int nanosic_wn8030_get_boot_state(struct nanosic_wn8030 *nanosic)
 	return boot_state;
 }
 
-static int nanosic_wn8030_send_header(struct nanosic_wn8030 *nanosic, const u8 *fw_buf, u32 *ram_code_size)
+static int nanosic_wn8030_send_header(struct nanosic_wn8030 *nanosic,
+				    const struct nanosic_firmware *fw)
 {
+	u8 command[NANOSIC_FW_HEADER_CMD_SIZE];
 	int ret;
-	struct wn8030_header_cmd hdr_cmd = {0};
-	struct wn8030_bin_header *bin_hdr = (struct wn8030_bin_header *)&fw_buf[WN8030_HEADER_ADDR];
 
-	hdr_cmd.cmd = 0x06; /* header send cmd */
-	memcpy(hdr_cmd.flag, bin_hdr->flag, sizeof(hdr_cmd.flag));
-	hdr_cmd.chip_id = 0x8140;
-	hdr_cmd.ram_code_source = 0x2345;
-	hdr_cmd.ram_code_dest = 0x40;
-	hdr_cmd.ram_code_size = bin_hdr->ram_code_size;
-	*ram_code_size = bin_hdr->ram_code_size;
-	hdr_cmd.code_entry = bin_hdr->code_entry;
-	hdr_cmd.code_entry = bin_hdr->code_entry;
-	hdr_cmd.pid = bin_hdr->pid;
-	hdr_cmd.vid = bin_hdr->vid;
-	hdr_cmd.major_version = bin_hdr->major_version;
-	hdr_cmd.minor_version = bin_hdr->minor_version;
-	hdr_cmd.image_size = 0;
-	hdr_cmd.ram_code_checksum = nanosic_wn8030_checksum32(&fw_buf[WN8030_CODE_ADDR], hdr_cmd.ram_code_size);
-	hdr_cmd.image_checksum = 0;
-	hdr_cmd.header_checksum = nanosic_wn8030_checksum8((u8 *)&hdr_cmd + 1, 64);
-
-	ret = nanosic_wn8030_bl_write(nanosic, &hdr_cmd, sizeof(hdr_cmd));
-	if (ret) {
-		dev_err(nanosic->dev, "failed to send header\n");
+	nanosic_firmware_header(fw, command);
+	ret = nanosic_wn8030_bl_write(nanosic, command, sizeof(command));
+	if (ret)
 		return ret;
-	}
-
 	ret = nanosic_wn8030_get_boot_state(nanosic);
-	if (ret < 0)
-		return ret;
-
-	if (ret != 0x1) {
-		dev_err(nanosic->dev, "unexpected bootloader state after sending header %d\n", ret);
-		return -EINVAL;
-	}
-
-	return 0;
+	return ret < 0 ? ret : (ret == 1 ? 0 : -EINVAL);
 }
 
-static int nanosic_wn8030_send_data(struct nanosic_wn8030 *nanosic, const u8 *fw_buf, u32 ram_code_size)
+static int nanosic_wn8030_send_data(struct nanosic_wn8030 *nanosic,
+				  const struct nanosic_firmware *fw)
 {
-	int ret;
-	struct wn8030_send_cmd send_cmd;
-	unsigned int offset = 0;
+	u8 command[NANOSIC_FW_DATA_CMD_SIZE];
+	u32 offset = 0;
+	int count, ret;
 
-	while (ram_code_size > offset) {
-		unsigned int send_size;
-
-		memset(&send_cmd, 0, sizeof(send_cmd));
-		send_cmd.cmd = 0x07;
-		send_cmd.ram_dest = cpu_to_be32(offset);
-
-		if (ram_code_size - offset < 503)
-			send_size = ram_code_size - offset;
-		else
-			send_size = 503;
-
-		send_cmd.size = cpu_to_be32(send_size);
-		memcpy(send_cmd.data, &fw_buf[WN8030_CODE_ADDR+offset], send_size);
-
-		ret = nanosic_wn8030_bl_write(nanosic, &send_cmd, sizeof(send_cmd));
-		if (ret) {
-			dev_err(nanosic->dev, "failed to send data to 0x%x\n", offset);
+	while (offset < fw->size) {
+		count = nanosic_firmware_chunk(fw, offset, command);
+		if (count < 0)
+			return count;
+		ret = nanosic_wn8030_bl_write(nanosic, command, sizeof(command));
+		if (ret)
 			return ret;
-		}
-		offset += send_size;
+		offset += count;
 	}
-
 	return 0;
 }
 
@@ -1339,31 +1268,21 @@ static int nanosic_wn8030_load_fw(struct nanosic_wn8030 *nanosic)
 {
 	int ret;
 	const struct firmware *firmware;
-	unsigned int ram_code_size;
+	struct nanosic_firmware fw;
 
-	ret = request_firmware(&firmware, "nanosic/MCU_Upgrade.bin", nanosic->dev);
+	ret = request_firmware(&firmware, nanosic->firmware_name, nanosic->dev);
 	if (ret) {
 		dev_err(nanosic->dev, "failed to load MCU firmware\n");
 		return ret;
 	}
 
-	if (firmware->size < 0xA000) {
-		dev_err(nanosic->dev, "invalid firmware size\n");
-		ret = -EINVAL;
-		goto exit;
-	}
-
-	if (strncmp(&firmware->data[0x7FC0], "NANO IC", 7) != 0) {
-		dev_err(nanosic->dev, "invalid firmware header\n");
-		ret = -EINVAL;
-		goto exit;
-	}
-
-	ret = nanosic_wn8030_send_header(nanosic, firmware->data, &ram_code_size);
+	ret = nanosic_firmware_parse(firmware->data, firmware->size, &fw);
 	if (ret)
 		goto exit;
-
-	ret = nanosic_wn8030_send_data(nanosic, firmware->data, ram_code_size);
+	ret = nanosic_wn8030_send_header(nanosic, &fw);
+	if (ret)
+		goto exit;
+	ret = nanosic_wn8030_send_data(nanosic, &fw);
 	if (ret)
 		goto exit;
 
@@ -1533,6 +1452,9 @@ static int nanosic_wn8030_hall_connect(struct input_handler *handler,
 	struct input_handle *handle = &nanosic->hall_handle;
 	int ret;
 
+	/* Do not feed our attach-derived switch back into the cover policy. */
+	if (dev == nanosic->tablet)
+		return -ENODEV;
 	if (handle->dev)
 		return -EEXIST;
 
@@ -1780,6 +1702,33 @@ static const struct file_operations nanosic_auth_fops = {
 	.write = nanosic_auth_write,
 };
 
+static int nanosic_wn8030_alloc_tablet(struct nanosic_wn8030 *nanosic)
+{
+	struct input_dev *input = devm_input_allocate_device(nanosic->dev);
+
+	if (!input)
+		return -ENOMEM;
+	input->name = "Xiaomi Keyboard Tablet Mode";
+	input->phys = dev_name(nanosic->dev);
+	input->id.bustype = BUS_I2C;
+	input->id.vendor = 0x15d9;
+	input_set_capability(input, EV_SW, SW_TABLET_MODE);
+	nanosic->tablet = input;
+	return 0;
+}
+
+static int nanosic_wn8030_register_tablet(struct nanosic_wn8030 *nanosic)
+{
+	int ret;
+
+	mutex_lock(&nanosic->conn_mutex);
+	__assign_bit(SW_TABLET_MODE, nanosic->tablet->sw, !(nanosic->attach & BIT(0)));
+	ret = input_register_device(nanosic->tablet);
+	nanosic->tablet_registered = !ret;
+	mutex_unlock(&nanosic->conn_mutex);
+	return ret;
+}
+
 static int nanosic_wn8030_probe(struct i2c_client *client)
 {
 	struct nanosic_wn8030 *nanosic;
@@ -1791,6 +1740,10 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 
 	nanosic->dev = &client->dev;
 	nanosic->client = client;
+	init_completion(&nanosic->attach_known);
+	nanosic->no_touchpad = device_property_read_bool(nanosic->dev, "nanosic,no-touchpad");
+	nanosic->firmware_name = "nanosic/MCU_Upgrade.bin";
+	device_property_read_string(nanosic->dev, "firmware-name", &nanosic->firmware_name);
 	nanosic->variant = i2c_get_match_data(client);
 	if (!nanosic->variant)
 		return -ENODEV;
@@ -1917,6 +1870,10 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 		goto err_kbd_backlight_led;
 	}
 
+	ret = nanosic_wn8030_alloc_tablet(nanosic);
+	if (ret)
+		goto err_input;
+
 	ret = devm_request_threaded_irq(&client->dev, client->irq,
 					NULL, nanosic_wn8030_handler,
 					IRQF_ONESHOT | IRQF_TRIGGER_RISING,
@@ -1926,7 +1883,33 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 		goto err_input;
 	}
 
+	/* Query the initial state as in the previously validated piano driver. */
+	{
+		u8 command[XM_WN8030_I2C_WRITE] = { 0x32, 0, 0x4e, 0x31, 0x80, 0x38,
+						  0xa1, 1, 1 };
+
+		command[9] = nanosic_wn8030_checksum8(command + 2, 7);
+		ret = nanosic_wn8030_set_kb_power(nanosic, true);
+		if (!ret)
+			ret = nanosic_wn8030_cmd(nanosic, command);
+		if (ret)
+			goto err_irq;
+	}
+	if (!wait_for_completion_timeout(&nanosic->attach_known, msecs_to_jiffies(500)))
+		dev_warn(nanosic->dev, "no attach state from the MCU, assuming no keyboard\n");
+	ret = nanosic_wn8030_register_tablet(nanosic);
+	if (ret)
+		goto err_irq;
 	return 0;
+
+err_irq:
+	devm_free_irq(nanosic->dev, client->irq, nanosic);
+	cancel_delayed_work_sync(&nanosic->wake_worker);
+	if (nanosic->hid_keyboard)
+		hid_destroy_device(nanosic->hid_keyboard);
+	if (nanosic->hid_touchpad)
+		hid_destroy_device(nanosic->hid_touchpad);
+
 
 err_input:
 	input_unregister_handler(&nanosic->hall_handler);
@@ -2064,3 +2047,10 @@ module_i2c_driver(nanosic_wn8030_driver);
 MODULE_AUTHOR("map220v <map220v300@gmail.com>");
 MODULE_DESCRIPTION("HID driver for Nanosic WN8030 keyboard MCU");
 MODULE_LICENSE("GPL v2");
+
+#if IS_ENABLED(CONFIG_HID_NANOSIC_WN8030_KUNIT_TEST)
+#include "hid-nanosic-wn8030-test.c"
+#endif
+
+MODULE_FIRMWARE("nanosic/MCU_Upgrade.bin");
+MODULE_FIRMWARE("nanosic/piano/MCU_Upgrade.bin");

@@ -47,6 +47,14 @@ properties:
   dvdd-supply:
     description: 3.3 V MCU supply. It is switched on only after vddio.
 
+  firmware-name:
+    maxItems: 1
+    description: Board-specific stock MCU application firmware.
+
+  nanosic,no-touchpad:
+    type: boolean
+    description: The attached keyboard accessory has no pointing device.
+
 required:
   - compatible
   - reg

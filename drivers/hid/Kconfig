@@ -854,26 +854,6 @@ config HID_MULTITOUCH
 	  To compile this driver as a module, choose M here: the
 	  module will be called hid-multitouch.
 
-config HID_NANOSIC
-	tristate "Nanosic WN8030 keyboard bridge on Xiaomi piano"
-	depends on I2C && OF && GPIOLIB && REGULATOR
-	select FW_LOADER
-	help
-	  Initial native I2C transport for the piano keyboard bridge, using
-	  a separately provided stock application firmware. Keyboard, mouse,
-	  consumer and touchpad reports are passed to the standard HID core.
-	  Power management and hardware validation are not yet complete.
-
-config HID_NANOSIC_KUNIT_TEST
-	bool "KUnit tests for the Nanosic transport" if !KUNIT_ALL_TESTS
-	depends on KUNIT=y && HID_NANOSIC=y
-	default KUNIT_ALL_TESTS
-	help
-	  Test transfer errors, boot-state handling and HID attachment with
-	  a simulated I2C adapter. No physical adapter or GPIO is accessed.
-	  These tests check software contracts, not the MCU's actual timing
-	  or keyboard functionality on a tablet.
-
 config HID_NANOSIC_PROTOCOL_KUNIT_TEST
 	tristate "KUnit tests for Nanosic WN8030 protocol" if !KUNIT_ALL_TESTS
 	depends on KUNIT
@@ -887,10 +867,20 @@ config HID_NANOSIC_PROTOCOL_KUNIT_TEST
 
 config HID_NANOSIC_WN8030
 	tristate "Nanosic WN8030 keyboard MCU"
-	depends on OF && PM && HIDRAW && I2C && GPIOLIB && LEDS_CLASS
+	depends on OF && PM && HIDRAW && I2C && GPIOLIB && LEDS_CLASS && REGULATOR
+	select REGMAP_I2C
+	select FW_LOADER
 	help
 	  Say Y here if you want to enable support for the Nanosic WN8030 MCU
 	  used as keyboard controller in devices such as Xiaomi Pad 6S Pro 12.4
+
+config HID_NANOSIC_WN8030_KUNIT_TEST
+	bool "KUnit tests for the WN8030 transport" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && HID_NANOSIC_WN8030=y
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise the real transport with a simulated I2C adapter, HID and
+	  input core. No physical GPIO, regulator or bus is accessed.
 
 config HID_NINTENDO
 	tristate "Nintendo Joy-Con, NSO, and Pro Controller support"
