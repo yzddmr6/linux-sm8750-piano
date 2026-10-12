@@ -338,12 +338,15 @@ static void altmode_test_ack_only(struct kunit *test)
 	struct altmode_test_ctx *ctx = test->priv;
 
 	ctx->port.ack_only = true;
+	ctx->port.ack_pending = true;
 	pan_ack = false;
 	pmic_glink_altmode_worker(&ctx->port.work);
 	KUNIT_EXPECT_EQ(test, ctx->ack_calls, 0);
+	KUNIT_EXPECT_TRUE(test, ctx->port.ack_pending);
 	pan_ack = true;
 	pmic_glink_altmode_worker(&ctx->port.work);
 	KUNIT_EXPECT_EQ(test, ctx->ack_calls, 1);
+	KUNIT_EXPECT_FALSE(test, ctx->port.ack_pending);
 	KUNIT_EXPECT_EQ(test, ctx->switch_calls, 0);
 	KUNIT_EXPECT_EQ(test, ctx->mux_seen.calls, 0);
 	KUNIT_EXPECT_EQ(test, ctx->hpd_calls, 0);

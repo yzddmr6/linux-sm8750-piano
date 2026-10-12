@@ -575,6 +575,10 @@ static void xiaomi_mca_test_policy_defaults(struct kunit *test)
 {
 	__le32 value = cpu_to_le32(9000);
 
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_icl(MCA_TYPE_C), 500);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_icl(MCA_TYPE_FLOAT), 500);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_fcc(MCA_TYPE_C, false), 500);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_icl(MCA_TYPE_UNKNOWN), 0);
 	KUNIT_EXPECT_FALSE(test, charge_policy);
 	KUNIT_EXPECT_FALSE(test, charge_current);
 	KUNIT_EXPECT_FALSE(test, hv_charge);
@@ -652,6 +656,10 @@ static void xiaomi_mca_test_policy_refusal(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 500),
 				-EOPNOTSUPP);
 	}
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	f->type = MCA_TYPE_DCP;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write_u32(mca, MCA_PROP_PD_FIXED_VOLT, 9000),
+			-EOPNOTSUPP);
 	KUNIT_EXPECT_EQ(test, f->writes, 0);
 	f->type = MCA_TYPE_PD;
 	f->vbus = 9000000;

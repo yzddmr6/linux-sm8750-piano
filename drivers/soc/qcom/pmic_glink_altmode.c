@@ -117,6 +117,7 @@ struct pmic_glink_altmode_port {
 
 	struct auxiliary_device *bridge;
 	bool ack_only;
+	bool ack_pending;
 
 	enum typec_orientation orientation;
 	u16 svid;
@@ -136,7 +137,6 @@ struct pmic_glink_altmode_port {
  * Only piano ports without a connector use this opt-in ACK-only path.
  */
 static bool pan_ack;
-module_param(pan_ack, bool, 0644);
 MODULE_PARM_DESC(pan_ack, "Acknowledge unmodeled piano ports (default off)");
 
 struct pmic_glink_altmode {
@@ -164,6 +164,38 @@ static void pmic_glink_altmode_queue(struct pmic_glink_altmode *altmode,
 	if (!altmode->stopping)
 		queue_work(system_freezable_wq, work);
 }
+
+static struct auxiliary_driver pmic_glink_altmode_driver;
+
+static int pmic_glink_altmode_queue_pending(struct device *dev, void *unused)
+{
+	struct pmic_glink_altmode *altmode = dev_get_drvdata(dev);
+	unsigned int port;
+
+	if (!altmode)
+		return 0;
+	for (port = 0; port < ARRAY_SIZE(altmode->ports); port++)
+		if (altmode->ports[port].ack_only)
+			pmic_glink_altmode_queue(altmode, &altmode->ports[port].work);
+	return 0;
+}
+
+static int pmic_glink_altmode_pan_ack_set(const char *value, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(value, kp);
+
+	/* Before module init, the value is simply used by the first probe. */
+	if (!ret && pan_ack && pmic_glink_altmode_driver.driver.p)
+		ret = driver_for_each_device(&pmic_glink_altmode_driver.driver, NULL, NULL,
+					    pmic_glink_altmode_queue_pending);
+	return ret;
+}
+
+static const struct kernel_param_ops pmic_glink_altmode_pan_ack_ops = {
+	.set = pmic_glink_altmode_pan_ack_set,
+	.get = param_get_bool,
+};
+module_param_cb(pan_ack, &pmic_glink_altmode_pan_ack_ops, &pan_ack, 0644);
 
 static void pmic_glink_altmode_stop(void *data)
 {
@@ -403,9 +435,12 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 	int ret;
 
 	if (alt_port->ack_only) {
-		if (READ_ONCE(pan_ack))
-			goto out_ack;
-		return;
+		scoped_guard(spinlock_irqsave, &altmode->work_lock) {
+			if (!READ_ONCE(pan_ack) || !alt_port->ack_pending)
+				return;
+			alt_port->ack_pending = false;
+		}
+		goto out_ack;
 	}
 
 	ret = typec_switch_set(alt_port->typec_switch, alt_port->orientation);
@@ -516,6 +551,8 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
 	alt_port->mode = mode;
 	alt_port->hpd_state = hpd_state;
 	alt_port->hpd_irq = hpd_irq;
+	scoped_guard(spinlock_irqsave, &altmode->work_lock)
+		alt_port->ack_pending = true;
 	pmic_glink_altmode_queue(altmode, &alt_port->work);
 }
 
@@ -567,6 +604,8 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
 		alt_port->tbt_data = *tbt;
 	}
 
+	scoped_guard(spinlock_irqsave, &altmode->work_lock)
+		alt_port->ack_pending = true;
 	pmic_glink_altmode_queue(altmode, &alt_port->work);
 }
 
@@ -773,6 +812,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 	if (ret)
 		return ret;
 
+	dev_set_drvdata(dev, altmode);
 	pmic_glink_client_register(altmode->client);
 
 	return 0;

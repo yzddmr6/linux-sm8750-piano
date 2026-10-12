@@ -930,6 +930,8 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	}
 }
 
+static bool xiaomi_mca_is_pd(u32 real_type);
+
 /* All paths share the original checked transport and this refusal gate. */
 static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 				 const void *data, size_t len)
@@ -945,6 +947,8 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	if (ret)
 		return ret;
 	if (!xiaomi_mca_limits(type))
+		return -EOPNOTSUPP;
+	if (prop >= MCA_PROP_VERIFY_PROCESS && !xiaomi_mca_is_pd(type))
 		return -EOPNOTSUPP;
 	if (prop == MCA_PROP_INPUT_CURRENT_LIMIT || prop == MCA_PROP_CHARGE_CURRENT) {
 		ret = xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus);
@@ -1004,8 +1008,31 @@ static const char *xiaomi_mca_type_name(u32 type)
 static u32 xiaomi_mca_policy_icl(u32 real_type)
 {
 	const struct xiaomi_mca_limits *limits = xiaomi_mca_limits(real_type);
+	u32 target;
 
-	return limits ? limits->input_current_ma : 0;
+	if (!limits)
+		return 0;
+	/* Preserve the community policy's lower Type-C/FLOAT fallback. */
+	switch (real_type) {
+	case MCA_TYPE_CDP:
+		target = 900;
+		break;
+	case MCA_TYPE_DCP:
+	case MCA_TYPE_DCP_B:
+	case MCA_TYPE_HVDCP:
+	case MCA_TYPE_HVDCP_3:
+	case MCA_TYPE_HVDCP_3_B:
+	case MCA_TYPE_HVDCP_3P5:
+	case MCA_TYPE_PD:
+	case MCA_TYPE_PD_VERIFY:
+	case MCA_TYPE_PD_PPS:
+		target = 1500;
+		break;
+	default:
+		target = MCA_POLICY_ICL_DEFAULT_MA;
+		break;
+	}
+	return min(target, limits->input_current_ma);
 }
 
 /*
@@ -1058,6 +1085,9 @@ static u32 xiaomi_mca_policy_fcc(u32 real_type, bool hv)
 	if (hv && (real_type == MCA_TYPE_PD || real_type == MCA_TYPE_PD_VERIFY ||
 		   real_type == MCA_TYPE_PD_PPS))
 		return MCA_FCC_MAX_MA;
+	/* The community policy does not raise FCC for unclassified Type-C. */
+	if (real_type == MCA_TYPE_C)
+		return MCA_FCC_DEFAULT_MA;
 	return limits->charge_current_ma;
 }
 
