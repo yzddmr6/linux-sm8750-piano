@@ -169,9 +169,13 @@ static struct auxiliary_driver pmic_glink_altmode_driver;
 
 static int pmic_glink_altmode_queue_pending(struct device *dev, void *unused)
 {
-	struct pmic_glink_altmode *altmode = dev_get_drvdata(dev);
+	struct pmic_glink_altmode *altmode;
 	unsigned int port;
 
+	guard(device)(dev);
+	if (dev->driver != &pmic_glink_altmode_driver.driver)
+		return 0;
+	altmode = dev_get_drvdata(dev);
 	if (!altmode)
 		return 0;
 	for (port = 0; port < ARRAY_SIZE(altmode->ports); port++)
