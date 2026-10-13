@@ -22,10 +22,12 @@
 #include <linux/completion.h>
 #include <linux/debugfs.h>
 #include <linux/devm-helpers.h>
+#include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/hex.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/pm.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/seq_file.h>
@@ -416,6 +418,7 @@ enum xiaomi_mca_cp {
 	MCA_CP_OFF,		/* buck charging, may start */
 	MCA_CP_OPENING,		/* source asked for, stage being started */
 	MCA_CP_ON,		/* stage running */
+	MCA_CP_STOPPING,	/* stop failed; retain ownership until confirmed off */
 	MCA_CP_DONE,		/* buck charging until detach */
 };
 
@@ -538,9 +541,12 @@ struct xiaomi_mca {
 	bool last_valid;
 	/* an input current limit was written for the source in @icl_source */
 	bool icl_written;
+	bool fcc_written;
+	bool voltage_written;	/* a raised voltage request may have reached firmware */
 	struct xiaomi_mca_state icl_source;
 
 	struct delayed_work poll_work;
+	bool sleeping;		/* no transactions between prepare and complete */
 	bool online;
 	int vbus_uv;
 	int ibus_ua;
@@ -738,10 +744,12 @@ static int xiaomi_mca_transfer_data(struct xiaomi_mca *mca, u32 opcode, u32 prop
 {
 	int ret;
 
+	lockdep_assert_held(&mca->lock);
+	if (mca->sleeping)
+		return -EHOSTDOWN;
 #if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
 	KUNIT_STATIC_STUB_REDIRECT(xiaomi_mca_transfer_data, mca, opcode, property, data, len);
 #endif
-	lockdep_assert_held(&mca->lock);
 
 	if (len > MCA_DATA_LEN)
 		return -EINVAL;
@@ -838,7 +846,7 @@ static int xiaomi_mca_write(struct xiaomi_mca *mca, u32 property, u32 value)
  * firmware starts with, as the downstream stack does on detach. On failure
  * the next poll tries again.
  */
-static void xiaomi_mca_restore_icl(struct xiaomi_mca *mca)
+static int xiaomi_mca_restore_icl(struct xiaomi_mca *mca)
 {
 	u32 real_type;
 	int ret;
@@ -846,23 +854,24 @@ static void xiaomi_mca_restore_icl(struct xiaomi_mca *mca)
 	lockdep_assert_held(&mca->lock);
 
 	if (!mca->icl_written)
-		return;
+		return 0;
 
 	/* Unknown also forbids automatic writes; wait for a recognized source. */
 	ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &real_type);
 	if (ret || !xiaomi_mca_limits(real_type))
-		return;
+		return ret ?: -EOPNOTSUPP;
 
 	ret = xiaomi_mca_write(mca, MCA_PROP_INPUT_CURRENT_LIMIT, MCA_ICL_DEFAULT_MA);
 	if (ret) {
 		dev_warn_ratelimited(mca->dev,
 				     "failed to restore the input current limit: %d\n", ret);
-		return;
+		return ret;
 	}
 
 	mca->icl_written = false;
 	mca->icl_set_ma = 0;
 	dev_info(mca->dev, "input current limit restored to %u mA\n", MCA_ICL_DEFAULT_MA);
+	return 0;
 }
 
 static int xiaomi_mca_read_blob(struct xiaomi_mca *mca, u32 prop, void *buf, size_t len)
@@ -901,8 +910,8 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 		return len == sizeof(u32) &&
 		       val >= MCA_FCC_MIN_MA && val <= MCA_FCC_MAX_MA;
 	case MCA_PROP_PD_FIXED_VOLT:
-		return hv_charge && len == sizeof(u32) &&
-		       (val == 5000 || val == MCA_HV_MV);
+		return len == sizeof(u32) &&
+		       (val == 5000 || (hv_charge && val == MCA_HV_MV));
 	case MCA_PROP_PPS_SELECT:
 		return hv_charge && len == sizeof(u32) &&
 		       xiaomi_mca_pps_word_ok(val);
@@ -966,6 +975,12 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		}
 	}
 	memcpy(buf, data, len);
+	/* A lost acknowledgment does not prove the request had no effect. */
+	if (prop == MCA_PROP_CHARGE_CURRENT)
+		mca->fcc_written = true;
+	if (prop == MCA_PROP_PPS_SELECT ||
+	    (prop == MCA_PROP_PD_FIXED_VOLT && get_unaligned_le32(data) > 5000))
+		mca->voltage_written = true;
 	ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
 	xiaomi_mca_invalidate(mca);
 	if (ret)
@@ -1074,10 +1089,15 @@ static void xiaomi_mca_reset_icl(struct xiaomi_mca *mca)
 }
 
 /* The ADSP keeps the charge current too; put the fallback value back */
-static void xiaomi_mca_reset_fcc(struct xiaomi_mca *mca)
+static int xiaomi_mca_reset_fcc(struct xiaomi_mca *mca)
 {
-	if (!xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, MCA_FCC_DEFAULT_MA))
+	int ret = xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, MCA_FCC_DEFAULT_MA);
+
+	if (!ret) {
 		mca->fcc_set_ma = 0;
+		mca->fcc_written = false;
+	}
+	return ret;
 }
 
 /* Stock buck strategy chg_* charge currents (mA) per charger type */
@@ -1372,7 +1392,8 @@ static int xiaomi_mca_gauges(int *vbat_mv, int *ibat_ma, int *tcool, int *tbat)
 
 static bool xiaomi_mca_cp_active(struct xiaomi_mca *mca)
 {
-	return mca->cp == MCA_CP_OPENING || mca->cp == MCA_CP_ON;
+	return mca->cp == MCA_CP_OPENING || mca->cp == MCA_CP_ON ||
+	       mca->cp == MCA_CP_STOPPING;
 }
 
 static int xiaomi_mca_cp_get(struct xiaomi_mca *mca,
@@ -1437,13 +1458,19 @@ static int xiaomi_mca_cp_set_buck(struct xiaomi_mca *mca, u32 icl_ma,
 	return 0;
 }
 
-static void xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
+static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 {
-	if (!xiaomi_mca_cp_active(mca))
-		return;
+	int ret;
 
-	if (xiaomi_mca_cp_set_online(mca, false))
-		dev_err(mca->dev, "failed to stop the switched-capacitor stage\n");
+	if (!xiaomi_mca_cp_active(mca))
+		return 0;
+
+	ret = xiaomi_mca_cp_set_online(mca, false);
+	if (ret) {
+		mca->cp = MCA_CP_STOPPING;
+		dev_err(mca->dev, "failed to stop the switched-capacitor stage: %d\n", ret);
+		return ret;
+	}
 	power_supply_put(mca->cp_psy);
 	mca->cp_psy = NULL;
 	dev_info(mca->dev, "direct charging stopped: %s\n", why);
@@ -1451,6 +1478,7 @@ static void xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	mca->cp = MCA_CP_DONE;
 	mca->hv = MCA_HV_OFF;
 	mca->hv_retry = jiffies;
+	return 0;
 }
 
 /*
@@ -1635,7 +1663,8 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	ret = xiaomi_mca_cp_set_buck(mca, MCA_CP_BUCK_MA, MCA_CP_BUCK_MA);
 	ret = ret ?: xiaomi_mca_cp_request(mca, start_mv);
 	if (ret) {
-		xiaomi_mca_cp_stop(mca, "start refused");
+		if (xiaomi_mca_cp_stop(mca, "start refused"))
+			return;
 		/* again after the adapter reset */
 		if (xiaomi_mca_auth_pending(mca))
 			mca->cp = MCA_CP_OFF;
@@ -2044,6 +2073,12 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 	bool online;
 	u32 real_type = MCA_TYPE_UNKNOWN;
 
+	/* Do not change source voltage or restart a stage whose stop failed. */
+	if (mca->cp == MCA_CP_STOPPING) {
+		xiaomi_mca_cp_stop(mca, "pending stop");
+		return;
+	}
+
 	mca->vbus_uv = xiaomi_mca_read_u32(mca, MCA_PROP_USB_VOLTAGE_NOW);
 	online = mca->vbus_uv >= MCA_VBUS_ONLINE_UV;
 
@@ -2081,7 +2116,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 	if (real_type != mca->real_type && xiaomi_mca_limits(real_type)) {
 		if (mca->icl_written)
 			xiaomi_mca_reset_icl(mca);
-		if (mca->fcc_set_ma)
+		if (mca->fcc_written)
 			xiaomi_mca_reset_fcc(mca);
 	}
 	mca->online = online;
@@ -2089,11 +2124,12 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 
 	if (!online) {
 		xiaomi_mca_cp_learn_drop(mca);
-		xiaomi_mca_cp_stop(mca, "detached");
+		if (xiaomi_mca_cp_stop(mca, "detached"))
+			return;
 		mca->cp = MCA_CP_OFF;
 		if (mca->icl_set_ma)
 			xiaomi_mca_reset_icl(mca);
-		if (mca->fcc_set_ma)
+		if (mca->fcc_written)
 			xiaomi_mca_reset_fcc(mca);
 		/* a hard reset in answer to the request looks like a detach */
 		if (mca->hv == MCA_HV_REQUESTED)
@@ -2129,13 +2165,15 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
 			generation = mca->service_generation;
 		if (mca->policy_generation != generation) {
-			xiaomi_mca_cp_stop(mca, "ADSP restart");
+			if (xiaomi_mca_cp_stop(mca, "ADSP restart"))
+				goto out;
 			mca->cp = MCA_CP_OFF;
 			mca->hv = MCA_HV_OFF;
 			mca->hv_renegs = 0;
 			mca->icl_written = false;
 			mca->icl_set_ma = 0;
 			mca->fcc_set_ma = 0;
+			mca->fcc_written = false;
 			mca->fcc_full = 0;
 			mca->auth_ok = false;
 			mca->online = false;
@@ -2145,14 +2183,12 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->policy_active = true;
 			xiaomi_mca_policy_poll(mca);
 		} else if (mca->policy_active) {
-			bool voltage_requested = xiaomi_mca_cp_active(mca) ||
-				mca->hv == MCA_HV_ON || mca->hv == MCA_HV_REQUESTED;
-
-			xiaomi_mca_cp_stop(mca, "policy disabled");
+			if (xiaomi_mca_cp_stop(mca, "policy disabled"))
+				goto out;
 			xiaomi_mca_restore_icl(mca);
-			if (mca->fcc_set_ma)
+			if (mca->fcc_written)
 				xiaomi_mca_reset_fcc(mca);
-			if (voltage_requested)
+			if (mca->voltage_written)
 				xiaomi_mca_request_volt(mca, 5000);
 			mca->policy_active = false;
 			mca->cp = MCA_CP_OFF;
@@ -2178,6 +2214,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			changed = true;
 		}
 
+out:
 		/* The uevent must not report what was cached before the change. */
 		if (changed)
 			xiaomi_mca_invalidate(mca);
@@ -2622,18 +2659,105 @@ static void xiaomi_mca_debugfs_remove(void *data)
 static void xiaomi_mca_unbind_restore(void *data)
 {
 	struct xiaomi_mca *mca = data;
-	bool voltage_requested;
 
 	guard(mutex)(&mca->lock);
-	voltage_requested = xiaomi_mca_cp_active(mca) ||
-		mca->hv == MCA_HV_ON || mca->hv == MCA_HV_REQUESTED;
-	xiaomi_mca_cp_stop(mca, "unbind");
+	if (xiaomi_mca_cp_stop(mca, "unbind")) {
+		/* Unbind cannot fail; the stage driver retains its stop watcher. */
+		power_supply_put(mca->cp_psy);
+		mca->cp_psy = NULL;
+		return;
+	}
 	xiaomi_mca_restore_icl(mca);
-	if (mca->fcc_set_ma)
+	if (mca->fcc_written)
 		xiaomi_mca_reset_fcc(mca);
-	if (voltage_requested)
+	if (mca->voltage_written)
 		xiaomi_mca_request_volt(mca, 5000);
 }
+
+/* Stop host-controlled charging before its suppliers can suspend. */
+static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
+{
+	u32 vbus;
+	int ret, wait_ret;
+
+	ret = xiaomi_mca_cp_stop(mca, "system sleep");
+	ret = ret ?: xiaomi_mca_restore_icl(mca);
+	if (!ret && mca->fcc_written)
+		ret = xiaomi_mca_reset_fcc(mca);
+	if (ret)
+		return ret;
+
+	if (mca->voltage_written) {
+		/* Cancel a pending raise even if the bus still reads 5 V. */
+		ret = xiaomi_mca_request_volt(mca, 5000);
+		if (ret)
+			return ret;
+		/* Observe the existing voltage-settling budget; do not resend. */
+		wait_ret = read_poll_timeout(xiaomi_mca_read, ret,
+					     ret || vbus < MCA_HV_VBUS_5V_MAX_UV,
+					     jiffies_to_usecs(MCA_POLL_INTERVAL),
+					     jiffies_to_usecs(MCA_POLL_INTERVAL *
+							      MCA_HV_SETTLE_POLLS),
+					     false, mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus);
+		if (ret || wait_ret)
+			return ret ?: wait_ret;
+	}
+
+	mca->cp = MCA_CP_OFF;
+	mca->hv = MCA_HV_OFF;
+	mca->voltage_written = false;
+	mca->hv_renegs = 0;
+	mca->fcc_full = 0;
+	mca->auth_ok = false;
+	mca->online = false;
+	mca->policy_active = false;
+	return 0;
+}
+
+/*
+ * All prepare callbacks precede supplier suspend, and all supplier resumes
+ * finish before complete. A freezable queue alone cannot hand back the
+ * host's charging policy or protect transactions from other kernel callers.
+ */
+static int xiaomi_mca_prepare(struct device *dev)
+{
+	struct xiaomi_mca *mca = dev_get_drvdata(dev);
+	int ret;
+
+	disable_delayed_work_sync(&mca->poll_work);
+	scoped_guard(mutex, &mca->lock) {
+		ret = xiaomi_mca_quiesce(mca);
+		if (!ret) {
+			mca->sleeping = true;
+			mca->last_valid = false;
+			xiaomi_mca_invalidate(mca);
+		}
+	}
+	if (ret) {
+		dev_err(dev, "cannot quiesce charging for system sleep: %d\n", ret);
+		enable_delayed_work(&mca->poll_work);
+		schedule_delayed_work(&mca->poll_work, 0);
+	}
+	return ret;
+}
+
+static void xiaomi_mca_complete(struct device *dev)
+{
+	struct xiaomi_mca *mca = dev_get_drvdata(dev);
+
+	scoped_guard(mutex, &mca->lock) {
+		if (!mca->sleeping)
+			return;
+		mca->sleeping = false;
+	}
+	enable_delayed_work(&mca->poll_work);
+	schedule_delayed_work(&mca->poll_work, 0);
+}
+
+static const struct dev_pm_ops xiaomi_mca_pm_ops = {
+	.prepare = xiaomi_mca_prepare,
+	.complete = xiaomi_mca_complete,
+};
 
 static int xiaomi_mca_probe(struct auxiliary_device *adev,
 			    const struct auxiliary_device_id *id)
@@ -2648,6 +2772,7 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 		return -ENOMEM;
 
 	mca->dev = dev;
+	dev_set_drvdata(dev, mca);
 	init_completion(&mca->ack);
 	spin_lock_init(&mca->rx_lock);
 	ret = devm_mutex_init(dev, &mca->lock);
@@ -2711,6 +2836,7 @@ static struct auxiliary_driver xiaomi_mca_driver = {
 	.name = "xiaomi_mca",
 	.probe = xiaomi_mca_probe,
 	.id_table = xiaomi_mca_id_table,
+	.driver.pm = pm_sleep_ptr(&xiaomi_mca_pm_ops),
 };
 module_auxiliary_driver(xiaomi_mca_driver);
 
