@@ -147,6 +147,25 @@ static void sc8541_test_suspend_stopped(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->sc.watch));
 }
 
+static void sc8541_test_consumer_stop(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+	struct power_supply psy = { .drv_data = &f->sc };
+	union power_supply_propval val = { .intval = 0 };
+	int ret;
+
+	f->stuck_enabled = true;
+	ret = sc8541_set_property(&psy, POWER_SUPPLY_PROP_ONLINE, &val);
+	KUNIT_EXPECT_EQ(test, ret, -EBUSY);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->sc.watch));
+
+	f->stuck_enabled = false;
+	ret = sc8541_set_property(&psy, POWER_SUPPLY_PROP_ONLINE, &val);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->sc.watch));
+}
+
 static struct kunit_case sc8541_test_cases[] = {
 	KUNIT_CASE(sc8541_test_protections),
 	KUNIT_CASE(sc8541_test_failed_arm),
@@ -155,6 +174,7 @@ static struct kunit_case sc8541_test_cases[] = {
 	KUNIT_CASE(sc8541_test_suspend_read_failure),
 	KUNIT_CASE(sc8541_test_suspend_still_enabled),
 	KUNIT_CASE(sc8541_test_suspend_stopped),
+	KUNIT_CASE(sc8541_test_consumer_stop),
 	{}
 };
 
