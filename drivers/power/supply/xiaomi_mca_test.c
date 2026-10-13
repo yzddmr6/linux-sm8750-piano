@@ -499,7 +499,11 @@ struct mca_policy_fixture {
 	u32 last_prop;
 	u8 last_data[MCA_VDM_LEN];
 	unsigned int writes;
+	unsigned int fcc_reads;
+	bool fcc_read_zero;
+	bool icl_read_stale;
 	int error;
+	int write_error;
 };
 
 static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
@@ -512,6 +516,8 @@ static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 		return f->error;
 	if (op == MCA_OPCODE_WRITE) {
 		f->writes++;
+		if (f->write_error)
+			return f->write_error;
 		f->last_prop = prop;
 		memcpy(f->last_data, data, len);
 		if (prop == MCA_PROP_INPUT_CURRENT_LIMIT)
@@ -532,10 +538,11 @@ static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 		value = f->vbus;
 		break;
 	case MCA_PROP_INPUT_CURRENT_LIMIT:
-		value = f->icl;
+		value = f->icl_read_stale ? 100 : f->icl;
 		break;
 	case MCA_PROP_CHARGE_CURRENT:
-		value = f->fcc;
+		f->fcc_reads++;
+		value = f->fcc_read_zero ? 0 : f->fcc;
 		break;
 	case MCA_PROP_PACK_TBAT:
 		value = f->tbat;
@@ -742,6 +749,41 @@ static void xiaomi_mca_test_cp_limits(struct kunit *test)
 	cp_charge = false;
 }
 
+static void xiaomi_mca_test_fcc_ack_without_readback(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	u32 reported;
+
+	f->fcc_read_zero = true;
+	guard(mutex)(&f->mca.lock);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_read(&f->mca, MCA_PROP_CHARGE_CURRENT, &reported), 0);
+	KUNIT_ASSERT_EQ(test, reported, 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_CHARGE_CURRENT, 500), 0);
+	KUNIT_EXPECT_EQ(test, f->writes, 1);
+	KUNIT_EXPECT_EQ(test, f->fcc_reads, 1);
+	/* A readable ICL setpoint must still agree with its request. */
+	f->icl_read_stale = true;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 500), -EIO);
+}
+
+static void xiaomi_mca_test_fcc_request_failure(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	f->error = -ETIMEDOUT;
+	mca->fcc_set_ma = 900;
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_reset_fcc(mca);
+	KUNIT_EXPECT_EQ(test, mca->fcc_set_ma, 900);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	f->error = 0;
+	f->write_error = -EIO;
+	xiaomi_mca_reset_fcc(mca);
+	KUNIT_EXPECT_EQ(test, mca->fcc_set_ma, 900);
+	KUNIT_EXPECT_EQ(test, f->writes, 1);
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_policy_defaults),
 	KUNIT_CASE(xiaomi_mca_test_hv_fixed),
@@ -750,6 +792,8 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_auth_relay),
 	KUNIT_CASE(xiaomi_mca_test_temperature_follow),
 	KUNIT_CASE(xiaomi_mca_test_cp_limits),
+	KUNIT_CASE(xiaomi_mca_test_fcc_ack_without_readback),
+	KUNIT_CASE(xiaomi_mca_test_fcc_request_failure),
 
 	KUNIT_CASE(xiaomi_mca_test_build_read),
 	KUNIT_CASE(xiaomi_mca_test_build_write),

@@ -818,10 +818,7 @@ static void xiaomi_mca_invalidate(struct xiaomi_mca *mca)
 		mca->cache[i].valid = false;
 }
 
-/*
- * Write @value to @property and read it back. The firmware acknowledges a
- * write with a return code only, so the value it then reports is checked.
- */
+/* Current requests use the same bounded, acknowledged write path as sysfs. */
 static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 property,
 				 const void *data, size_t len);
 
@@ -973,7 +970,15 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	xiaomi_mca_invalidate(mca);
 	if (ret)
 		return ret;
-	if (prop == MCA_PROP_INPUT_CURRENT_LIMIT || prop == MCA_PROP_CHARGE_CURRENT) {
+	/*
+	 * ICL has a readable setpoint. FCC is a request to the charger firmware:
+	 * the vendor set_ichg interface only writes it, and this unit reports
+	 * zero on reads even after an acknowledged write. Do not manufacture a
+	 * transport failure by comparing that value with the requested current.
+	 * The matching firmware reply still has to acknowledge every write;
+	 * actual charging is measured separately through the fuel gauges.
+	 */
+	if (prop == MCA_PROP_INPUT_CURRENT_LIMIT) {
 		ret = xiaomi_mca_read(mca, prop, &readback);
 		if (ret)
 			return ret;
