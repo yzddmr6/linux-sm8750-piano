@@ -66,6 +66,7 @@ struct bq27xxx_device_info {
 	int voltage_min_design;
 	int voltage_max_design;
 	bool removed;
+	bool suspended;
 	unsigned long last_update;
 	union power_supply_propval last_status;
 	struct delayed_work work;

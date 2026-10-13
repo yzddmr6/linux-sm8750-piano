@@ -1139,8 +1139,11 @@ static int poll_interval_param_set(const char *val, const struct kernel_param *k
 		return ret;
 
 	mutex_lock(&bq27xxx_list_lock);
-	list_for_each_entry(di, &bq27xxx_battery_devices, list)
-		mod_delayed_work(system_percpu_wq, &di->work, 0);
+	list_for_each_entry(di, &bq27xxx_battery_devices, list) {
+		guard(mutex)(&di->lock);
+		if (!di->suspended && !di->removed)
+			mod_delayed_work(system_percpu_wq, &di->work, 0);
+	}
 	mutex_unlock(&bq27xxx_list_lock);
 
 	return ret;
@@ -1964,7 +1967,8 @@ static void bq27xxx_battery_update_unlocked(struct bq27xxx_device_info *di)
 void bq27xxx_battery_update(struct bq27xxx_device_info *di)
 {
 	mutex_lock(&di->lock);
-	bq27xxx_battery_update_unlocked(di);
+	if (!di->suspended && !di->removed)
+		bq27xxx_battery_update_unlocked(di);
 	mutex_unlock(&di->lock);
 }
 EXPORT_SYMBOL_GPL(bq27xxx_battery_update);
@@ -2138,10 +2142,12 @@ static int bq27xxx_battery_get_property(struct power_supply *psy,
 	int ret = 0;
 	struct bq27xxx_device_info *di = power_supply_get_drvdata(psy);
 
-	mutex_lock(&di->lock);
+	guard(mutex)(&di->lock);
+	if (di->suspended)
+		return -EAGAIN;
+
 	if (time_is_before_jiffies(di->last_update + 5 * HZ))
 		bq27xxx_battery_update_unlocked(di);
-	mutex_unlock(&di->lock);
 
 	if (psp != POWER_SUPPLY_PROP_PRESENT && di->cache.flags < 0)
 		return di->cache.flags;
@@ -2233,6 +2239,10 @@ static void bq27xxx_external_power_changed(struct power_supply *psy)
 {
 	struct bq27xxx_device_info *di = power_supply_get_drvdata(psy);
 
+	guard(mutex)(&di->lock);
+	if (di->suspended || di->removed)
+		return;
+
 	/* After charger plug in/out wait 0.5s for things to stabilize */
 	mod_delayed_work(system_percpu_wq, &di->work, HZ / 2);
 }
@@ -2307,6 +2317,9 @@ static int bq27xxx_battery_suspend(struct device *dev)
 {
 	struct bq27xxx_device_info *di = dev_get_drvdata(dev);
 
+	/* Drain bus access before the parent adapter suspends. */
+	scoped_guard(mutex, &di->lock)
+		di->suspended = true;
 	cancel_delayed_work_sync(&di->work);
 	return 0;
 }
@@ -2315,7 +2328,9 @@ static int bq27xxx_battery_resume(struct device *dev)
 {
 	struct bq27xxx_device_info *di = dev_get_drvdata(dev);
 
-	schedule_delayed_work(&di->work, 0);
+	guard(mutex)(&di->lock);
+	di->suspended = false;
+	mod_delayed_work(system_percpu_wq, &di->work, 0);
 	return 0;
 }
 #endif /* CONFIG_PM_SLEEP */
@@ -2327,3 +2342,7 @@ EXPORT_SYMBOL_GPL(bq27xxx_battery_battery_pm_ops);
 MODULE_AUTHOR("Rodolfo Giometti <giometti@linux.it>");
 MODULE_DESCRIPTION("BQ27xxx battery monitor driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_BATTERY_BQ27XXX_KUNIT_TEST)
+#include "bq27xxx_battery_test.c"
+#endif
