@@ -263,19 +263,23 @@ static void sc8541_disable(struct sc8541 *sc)
  * Final stop (unbind, shutdown, suspend): no watch afterwards, so stop,
  * wait out the CHG_EN latency and stop again.
  */
-static void sc8541_disable_sync(struct sc8541 *sc)
+static int sc8541_disable_sync(struct sc8541 *sc)
 {
 	unsigned int ctrl;
+	int ret;
 
 	sc8541_disable(sc);
 	cancel_delayed_work_sync(&sc->watch);
 	msleep(SC8541_GUARD_MS);
 	mutex_lock(&sc->lock);
-	sc8541_stop_switching(sc);
-	if (!regmap_read(sc->regmap, SC8541_CTRL2, &ctrl) &&
-	    (ctrl & SC8541_CHG_EN))
+	ret = sc8541_stop_switching(sc);
+	ret = ret ?: regmap_read(sc->regmap, SC8541_CTRL2, &ctrl);
+	if (!ret && (ctrl & SC8541_CHG_EN)) {
 		dev_err(sc->dev, "still switching after stop\n");
+		ret = -EBUSY;
+	}
 	mutex_unlock(&sc->lock);
+	return ret;
 }
 
 static void sc8541_watch(struct work_struct *work)
@@ -541,8 +545,15 @@ static void sc8541_shutdown(struct i2c_client *client)
 
 static int sc8541_suspend(struct device *dev)
 {
-	sc8541_disable_sync(dev_get_drvdata(dev));
-	return 0;
+	struct sc8541 *sc = dev_get_drvdata(dev);
+	int ret;
+
+	ret = sc8541_disable_sync(sc);
+	if (ret)
+		/* Suspend was refused; keep the normal stop verification alive. */
+		mod_delayed_work(system_dfl_wq, &sc->watch,
+				 msecs_to_jiffies(SC8541_GUARD_MS));
+	return ret;
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(sc8541_pm_ops, sc8541_suspend, NULL);
