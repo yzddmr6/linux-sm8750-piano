@@ -327,7 +327,8 @@ static int nvt_panel_enabled(struct drm_panel_follower *follower)
 	WRITE_ONCE(nvt->panel_off, false);
 	/* Preserve queued bytes, including any partially read NTP1 record. */
 	wake_up_interruptible(&nvt->wait);
-	if (nvt->opened) {
+	/* Panel and SPI resume callbacks may run in either order. */
+	if (nvt->opened && !nvt->suspended && !nvt->running) {
 		ret = nvt_start_stream(nvt);
 		if (ret) {
 			WRITE_ONCE(nvt->error, ret);
@@ -400,7 +401,7 @@ static int nvt_release(struct inode *inode, struct file *file)
 static bool nvt_read_ready(struct nvt_thp *nvt)
 {
 	return READ_ONCE(nvt->dead) ||
-	       (!READ_ONCE(nvt->panel_off) &&
+	       (!READ_ONCE(nvt->panel_off) && !READ_ONCE(nvt->suspended) &&
 		(READ_ONCE(nvt->error) || !kfifo_is_empty(&nvt->fifo)));
 }
 
@@ -446,7 +447,7 @@ static __poll_t nvt_poll(struct file *file, poll_table *wait)
 	poll_wait(file, &nvt->wait, wait);
 	if (READ_ONCE(nvt->dead))
 		return EPOLLERR | EPOLLHUP;
-	if (READ_ONCE(nvt->panel_off))
+	if (READ_ONCE(nvt->panel_off) || READ_ONCE(nvt->suspended))
 		return 0;
 	if (READ_ONCE(nvt->error))
 		return EPOLLERR | EPOLLHUP;
@@ -574,24 +575,39 @@ MODULE_DEVICE_TABLE(spi, nvt_ids);
 static int nvt_suspend(struct device *dev)
 {
 	struct nvt_thp *nvt = dev_get_drvdata(dev);
-	int ret;
 
 	mutex_lock(&nvt->lifecycle_lock);
-	ret = nvt->opened ? -EBUSY : 0;
-	if (!ret)
-		nvt->suspended = true;
+	/* An open userspace stream must survive system sleep.  Stop SPI before
+	 * its controller suspends; the panel callback owns the shared reset.
+	 * An already disabled panel has synchronously stopped the IRQ.
+	 */
+	if (!nvt->panel_off)
+		nvt_stop_irq(nvt);
+	WRITE_ONCE(nvt->suspended, true);
 	mutex_unlock(&nvt->lifecycle_lock);
-	return ret;
+	return 0;
 }
 
 static int nvt_resume(struct device *dev)
 {
 	struct nvt_thp *nvt = dev_get_drvdata(dev);
+	int ret = 0;
 
 	mutex_lock(&nvt->lifecycle_lock);
-	nvt->suspended = false;
+	WRITE_ONCE(nvt->suspended, false);
+	/* If DRM resumes later, panel_enabled will restart instead.  Keep the
+	 * FIFO and the open fd, including any partially consumed NTP1 record.
+	 */
+	if (!nvt->dead && nvt->opened && !nvt->panel_off && !nvt->running) {
+		ret = nvt_start_stream(nvt);
+		if (ret) {
+			WRITE_ONCE(nvt->error, ret);
+			dev_err(dev, "THP resume restart failed: %d\n", ret);
+		}
+	}
+	wake_up_interruptible(&nvt->wait);
 	mutex_unlock(&nvt->lifecycle_lock);
-	return 0;
+	return ret;
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(nvt_pm, nvt_suspend, nvt_resume);
@@ -657,8 +673,49 @@ static void nvt_test_open_disabled_panel(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, kref_read(&nvt->ref), 1U);
 }
 
+static void nvt_test_suspend_open_stream(struct kunit *test)
+{
+	struct nvt_thp *nvt = kunit_kzalloc(test, sizeof(*nvt), GFP_KERNEL);
+	struct device dev = {};
+	struct file file = {};
+
+	KUNIT_ASSERT_NOT_NULL(test, nvt);
+	mutex_init(&nvt->lifecycle_lock);
+	init_waitqueue_head(&nvt->wait);
+	dev_set_drvdata(&dev, nvt);
+	file.private_data = nvt;
+	nvt->opened = true;
+	nvt->panel_off = true;
+	KUNIT_ASSERT_EQ(test, kfifo_alloc(&nvt->fifo, 64, GFP_KERNEL), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, nvt_test_free_fifo, nvt), 0);
+	kfifo_in(&nvt->fifo, "partial", 7);
+
+	/* No SPI device: screen-off sleep must keep the open stream and bytes. */
+	KUNIT_ASSERT_EQ(test, nvt_suspend(&dev), 0);
+	KUNIT_EXPECT_TRUE(test, nvt->suspended);
+	KUNIT_EXPECT_TRUE(test, nvt->opened);
+	KUNIT_EXPECT_EQ(test, kfifo_len(&nvt->fifo), 7U);
+	KUNIT_ASSERT_EQ(test, nvt_resume(&dev), 0);
+	KUNIT_EXPECT_FALSE(test, nvt->suspended);
+	KUNIT_EXPECT_FALSE(test, nvt_read_ready(nvt));
+	KUNIT_EXPECT_EQ(test, kfifo_len(&nvt->fifo), 7U);
+
+	/* DRM may enable before the SPI resume. It must not perform SPI I/O. */
+	KUNIT_ASSERT_EQ(test, nvt_suspend(&dev), 0);
+	KUNIT_ASSERT_EQ(test, nvt_panel_enabled(&nvt->follower), 0);
+	KUNIT_EXPECT_FALSE(test, nvt->panel_off);
+	KUNIT_EXPECT_FALSE(test, nvt->running);
+	KUNIT_EXPECT_EQ(test, nvt_poll(&file, NULL), (__poll_t)0);
+	KUNIT_EXPECT_FALSE(test, nvt_read_ready(nvt));
+	/* Closed stream resumes without restarting even with the panel enabled. */
+	nvt->opened = false;
+	KUNIT_ASSERT_EQ(test, nvt_resume(&dev), 0);
+	KUNIT_EXPECT_FALSE(test, nvt->suspended);
+}
+
 static struct kunit_case nvt_panel_cases[] = {
 	KUNIT_CASE(nvt_test_open_disabled_panel),
+	KUNIT_CASE(nvt_test_suspend_open_stream),
 	{}
 };
 
