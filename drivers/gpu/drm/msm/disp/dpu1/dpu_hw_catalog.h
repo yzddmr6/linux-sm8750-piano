@@ -701,6 +701,15 @@ struct dpu_perf_cfg {
 	struct dpu_perf_cdp_cfg cdp_cfg[DPU_PERF_CDP_USAGE_MAX];
 };
 
+struct dpu_lutdma_cfg {
+	u32 version;
+	u32 db_base;
+	u32 xin_id;
+	enum dpu_clk_ctrl_type clk_ctrl;
+	u32 read_ot_limit;
+	u8 qos[8];
+};
+
 /**
  * struct dpu_mdss_cfg - information of MDSS HW
  * This is the main catalog data structure representing
@@ -712,15 +721,6 @@ struct dpu_perf_cfg {
  * @cursor_formats     Supported formats for cursor pipe
  * @vig_formats        Supported formats for vig pipe
  */
-struct dpu_lutdma_cfg {
-	u32 version;
-	u32 db_base;
-	u32 xin_id;
-	enum dpu_clk_ctrl_type clk_ctrl;
-	u32 read_ot_limit;
-	u8 qos[8];
-};
-
 struct dpu_mdss_cfg {
 	const struct dpu_mdss_version *mdss_ver;
 
