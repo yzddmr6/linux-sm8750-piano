@@ -30,6 +30,10 @@ properties:
     description: MCLK supply clock.
     maxItems: 1
 
+  power-domains:
+    maxItems: 1
+    description: Power domain required for the sensor master clock.
+
   reset-gpios:
     description: Active low GPIO connected to RESET pad of the sensor.
     maxItems: 1
