@@ -865,9 +865,11 @@ static void iris_get_ts_metadata(struct iris_inst *inst, u64 timestamp_ns,
 		return;
 	}
 
+	/* Capture can lag behind the metadata ring. Do not copy metadata from
+	 * an unrelated input, or the next write slot which may be past its end.
+	 */
 	vbuf->flags &= ~mask;
-	vbuf->flags |= inst->tss[inst->metadata_idx].flags;
-	vbuf->timecode = inst->tss[inst->metadata_idx].tc;
+	memset(&vbuf->timecode, 0, sizeof(vbuf->timecode));
 }
 
 int iris_vb2_buffer_done(struct iris_inst *inst, struct iris_buffer *buf)
