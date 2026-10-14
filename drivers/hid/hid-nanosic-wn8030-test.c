@@ -45,7 +45,6 @@ static void wn8030_test_cleanup(void *data)
 {
 	struct nanosic_wn8030 *nano = data;
 
-	cancel_delayed_work_sync(&nano->wake_worker);
 	cancel_work_sync(&nano->input_state_work);
 	if (nano->hid_keyboard)
 		hid_destroy_device(nano->hid_keyboard);
@@ -96,7 +95,6 @@ static int wn8030_test_init(struct kunit *test)
 		return PTR_ERR(nano->regmap);
 	mutex_init(&nano->conn_mutex);
 	init_completion(&nano->attach_known);
-	INIT_DELAYED_WORK(&nano->wake_worker, nanosic_wn8030_wake_worker);
 	INIT_WORK(&nano->input_state_work, nanosic_wn8030_input_state_work);
 	spin_lock_init(&nano->hinge_lock);
 	init_waitqueue_head(&nano->hinge_read_wq);
@@ -166,7 +164,6 @@ static void wn8030_attach_switch_and_no_touchpad(struct kunit *test)
 	nanosic_wn8030_handle_vendor(nano, report, sizeof(report));
 	KUNIT_EXPECT_TRUE(test, test_bit(SW_TABLET_MODE, nano->tablet->sw));
 	KUNIT_EXPECT_PTR_EQ(test, nano->hid_keyboard, NULL);
-	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&nano->wake_worker));
 	report[9] = 3;
 	nanosic_wn8030_handle_vendor(nano, report, sizeof(report));
 	KUNIT_ASSERT_NOT_NULL(test, nano->hid_keyboard);

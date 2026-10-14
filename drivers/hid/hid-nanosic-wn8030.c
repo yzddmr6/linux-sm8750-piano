@@ -93,7 +93,6 @@ struct nanosic_wn8030 {
 
 	struct regmap *regmap;
 	struct mutex conn_mutex;
-	struct delayed_work wake_worker;
 	struct work_struct input_state_work;
 	struct input_handler hall_handler;
 	struct input_handle hall_handle;
@@ -958,11 +957,10 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic,
 				nanosic_wn8030_set_indicator_led(nanosic, 0xF3);
 			}
 			nanosic_wn8030_sync_kbd_backlight(nanosic);
-			schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
+			nanosic_wn8030_set_kb_power(nanosic, true);
 			notify_plugin = true;
 			plugin_attached = true;
 		} else if (!(p[9] & BIT(0)) && nanosic->keyboard_attached) {
-			cancel_delayed_work_sync(&nanosic->wake_worker);
 			nanosic->micmute_key_down = false;
 			if (nanosic->hid_keyboard) {
 				hid_destroy_device(nanosic->hid_keyboard);
@@ -1363,15 +1361,6 @@ static void nanosic_wn8030_power_off(struct nanosic_wn8030 *nanosic)
 	msleep(10);
 	regulator_disable(nanosic->supplies[1].consumer);
 	regulator_disable(nanosic->supplies[0].consumer);
-}
-
-static void nanosic_wn8030_wake_worker(struct work_struct *data)
-{
-	struct nanosic_wn8030 *nanosic =
-		container_of(data, struct nanosic_wn8030, wake_worker.work);
-
-	nanosic_wn8030_set_kb_power(nanosic, true);
-	schedule_delayed_work(&nanosic->wake_worker, msecs_to_jiffies(12000));
 }
 
 static void nanosic_wn8030_release_inputs(struct nanosic_wn8030 *nanosic)
@@ -1791,7 +1780,6 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 	dev_set_drvdata(nanosic->dev, nanosic);
 	i2c_set_clientdata(client, nanosic);
 
-	INIT_DELAYED_WORK(&nanosic->wake_worker, nanosic_wn8030_wake_worker);
 	INIT_WORK(&nanosic->input_state_work, nanosic_wn8030_input_state_work);
 	nanosic->userspace_angle_enabled = true;
 	nanosic->input_enabled = true;
@@ -1904,7 +1892,6 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 
 err_irq:
 	devm_free_irq(nanosic->dev, client->irq, nanosic);
-	cancel_delayed_work_sync(&nanosic->wake_worker);
 	if (nanosic->hid_keyboard)
 		hid_destroy_device(nanosic->hid_keyboard);
 	if (nanosic->hid_touchpad)
@@ -1937,7 +1924,6 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
 	input_unregister_handler(&nanosic->hall_handler);
 	cancel_work_sync(&nanosic->input_state_work);
 	disable_irq(nanosic->client->irq);
-	cancel_delayed_work_sync(&nanosic->wake_worker);
 
 	misc_deregister(&nanosic->hinge_misc);
 	misc_deregister(&nanosic->auth_misc);
@@ -1981,7 +1967,6 @@ static int nanosic_wn8030_suspend(struct device *dev)
 
 	WRITE_ONCE(nanosic->suspended, true);
 	disable_irq(nanosic->client->irq);
-	cancel_delayed_work_sync(&nanosic->wake_worker);
 	cancel_work_sync(&nanosic->input_state_work);
 
 	gpiod_set_value_cansleep(nanosic->sleep_gpio, 1);
