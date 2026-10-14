@@ -2096,16 +2096,13 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 		ret = nanosic->wake_irq;
 		goto err_irq;
 	}
-	ret = device_init_wakeup(nanosic->dev,
-				 device_property_read_bool(nanosic->dev, "wakeup-source"));
-	if (ret)
-		goto err_irq;
+	/* The I2C core owns "wakeup-source": it initialises wakeup and clears it on remove. */
 	ret = devm_request_threaded_irq(nanosic->dev, nanosic->wake_irq, NULL,
 					nanosic_wn8030_wakeup_handler,
 					IRQF_ONESHOT | IRQF_TRIGGER_RISING,
 					"nanosic_wn8030_wakeup", nanosic);
 	if (ret)
-		goto err_wakeup;
+		goto err_irq;
 	if (drm_is_panel_follower(nanosic->dev)) {
 		nanosic->follower.funcs = &nanosic_wn8030_panel_funcs;
 		ret = nanosic_wn8030_panel_disabling(&nanosic->follower);
@@ -2121,9 +2118,6 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 
 err_wake_irq:
 	devm_free_irq(nanosic->dev, nanosic->wake_irq, nanosic);
-err_wakeup:
-	device_init_wakeup(nanosic->dev, false);
-
 err_irq:
 	devm_free_irq(nanosic->dev, client->irq, nanosic);
 	input_unregister_handler(&nanosic->hall_handler);
@@ -2156,7 +2150,6 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
 	struct nanosic_wn8030 *nanosic = i2c_get_clientdata(client);
 
 	devm_free_irq(nanosic->dev, nanosic->wake_irq, nanosic);
-	device_init_wakeup(nanosic->dev, false);
 	if (nanosic->follower.panel)
 		drm_panel_remove_follower(&nanosic->follower);
 	cancel_work_sync(&nanosic->panel_work);
