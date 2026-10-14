@@ -7,6 +7,7 @@
 
 #include "msm_kms.h"
 #include "dsi.h"
+#include "phy/dsi_phy.h"
 
 #define DSI_CLOCK_MASTER	DSI_0
 #define DSI_CLOCK_SLAVE		DSI_1
