@@ -30,6 +30,15 @@ properties:
     maxItems: 1
     description: Data-ready line, rising edge.
 
+  data-gpios:
+    maxItems: 1
+    description: Data IRQ line, also high when the bridge is ready after wake.
+
+  panel:
+    description: Panel whose blanking controls the keyboard power lifecycle.
+
+  wakeup-source: true
+
   reset-gpios:
     maxItems: 1
 
@@ -39,7 +48,7 @@ properties:
 
   status-gpios:
     maxItems: 1
-    description: Cover attach status reported by the MCU.
+    description: MCU wake request to the host, rising edge on piano.
 
   vddio-supply:
     description: 1.8 V I/O and I2C pull-up supply.
