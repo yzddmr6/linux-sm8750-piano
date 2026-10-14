@@ -1444,7 +1444,7 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	 *
 	 * If DSC is enabled, use 2 LMs for 2:2:1 topology
 	 *
-	 * Add dspps to the reservation requirements if ctm or gamma_lut are requested
+	 * Reserve DSPPs for CTM/LUT requests and for the GC2 bypass state.
 	 *
 	 * Only hardcode num_lm to 2 for cases where num_intf == 2 and CWB is not
 	 * enabled. This is because in cases where CWB is enabled, num_intf will
@@ -1464,7 +1464,11 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	else
 		topology.num_lm = 1;
 
-	if (crtc_state->ctm || crtc_state->gamma_lut)
+	/* GC2 must program bypass while it still owns every broadcast target.
+	 * Keep the attached DSPPs reserved for the enabled CRTC, including an
+	 * empty LUT, instead of releasing them before the disable command.
+	 */
+	if (dpu_kms->lutdma || crtc_state->ctm || crtc_state->gamma_lut)
 		topology.num_dspp = topology.num_lm;
 
 	return topology;
