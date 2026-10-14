@@ -15,6 +15,7 @@
 #include <linux/i2c.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/leds.h>
 #include <linux/miscdevice.h>
@@ -26,6 +27,8 @@
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
 #include <uapi/linux/nanosic_hinge.h>
+
+#include <drm/drm_panel.h>
 
 #define WN8030_HEADER_ADDR 0x7FC0
 #define WN8030_CODE_ADDR 0x8000
@@ -86,6 +89,7 @@ struct nanosic_wn8030 {
 	bool no_touchpad;
 	const char *firmware_name;
 
+	struct gpio_desc *data_gpio;
 	struct gpio_desc *status_gpio;
 	struct gpio_desc *sleep_gpio;
 	struct gpio_desc *reset_gpio;
@@ -93,6 +97,15 @@ struct nanosic_wn8030 {
 
 	struct regmap *regmap;
 	struct mutex conn_mutex;
+	/* Serialize bus access against sleep and system PM. */
+	struct mutex io_mutex;
+	/* Panel/system transitions; never taken by the data IRQ. */
+	struct mutex lifecycle_mutex;
+	struct drm_panel_follower follower;
+	struct work_struct panel_work;
+	bool panel_on;
+	bool bridge_asleep;
+	bool waking;
 	struct work_struct input_state_work;
 	struct input_handler hall_handler;
 	struct input_handle hall_handle;
@@ -607,8 +620,19 @@ static inline u8 nanosic_wn8030_checksum8(const u8 *data, int size)
 
 static int nanosic_wn8030_cmd(struct nanosic_wn8030 *nanosic, const u8 *buf)
 {
-	return regmap_bulk_write(nanosic->regmap, nanosic->variant->cmd_reg,
-				 buf, XM_WN8030_I2C_WRITE);
+	int ret;
+
+	mutex_lock(&nanosic->io_mutex);
+	if (nanosic->suspended || nanosic->bridge_asleep)
+		ret = -EHOSTDOWN;
+	else if (nanosic->waking && (buf[6] == 0x21 || buf[6] == 0x23 || buf[6] == 0x2e))
+		/* Recheck under the bus lock; cached outputs follow power-on. */
+		ret = 0;
+	else
+		ret = regmap_bulk_write(nanosic->regmap, nanosic->variant->cmd_reg,
+					buf, XM_WN8030_I2C_WRITE);
+	mutex_unlock(&nanosic->io_mutex);
+	return ret;
 }
 
 static int nanosic_wn8030_set_indicator_led(struct nanosic_wn8030 *nanosic, u8 state)
@@ -639,7 +663,8 @@ static int nanosic_wn8030_sync_kbd_backlight(struct nanosic_wn8030 *nanosic)
 	u8 brightness;
 
 	if (!READ_ONCE(nanosic->keyboard_attached) ||
-	    READ_ONCE(nanosic->suspended))
+	    READ_ONCE(nanosic->suspended) || !READ_ONCE(nanosic->panel_on) ||
+	    READ_ONCE(nanosic->waking))
 		return 0;
 
 	brightness = READ_ONCE(nanosic->input_enabled) ?
@@ -650,7 +675,8 @@ static int nanosic_wn8030_sync_kbd_backlight(struct nanosic_wn8030 *nanosic)
 static int nanosic_wn8030_set_caps_led(struct nanosic_wn8030 *nanosic, bool enable)
 {
 	WRITE_ONCE(nanosic->capslock_enabled, enable);
-	if (!READ_ONCE(nanosic->input_enabled))
+	if (!READ_ONCE(nanosic->input_enabled) || !READ_ONCE(nanosic->panel_on) ||
+	    READ_ONCE(nanosic->waking))
 		return 0;
 
 	return nanosic_wn8030_set_indicator_led(nanosic,
@@ -660,7 +686,8 @@ static int nanosic_wn8030_set_caps_led(struct nanosic_wn8030 *nanosic, bool enab
 static int nanosic_wn8030_sync_micmute_led(struct nanosic_wn8030 *nanosic, bool enable)
 {
 	if (!nanosic->keyboard_attached || READ_ONCE(nanosic->suspended) ||
-	    !nanosic->input_enabled || nanosic->micmute_key_down)
+	    !nanosic->input_enabled || !READ_ONCE(nanosic->panel_on) ||
+	    nanosic->micmute_key_down || READ_ONCE(nanosic->waking))
 		return 0;
 
 	return nanosic_wn8030_set_indicator_led(nanosic,
@@ -724,15 +751,30 @@ static int nanosic_wn8030_set_touchpad(struct nanosic_wn8030 *nanosic, bool enab
 	return nanosic_wn8030_cmd(nanosic, buf);
 }
 
-static int nanosic_wn8030_set_kb_power(struct nanosic_wn8030 *nanosic, bool enable)
+/* Caller holds io_mutex; used also while changing bridge_asleep. */
+static int nanosic_wn8030_power_command(struct nanosic_wn8030 *nanosic, bool enable)
 {
 	u8 buf[XM_WN8030_I2C_WRITE] = { 0x32, 0x00, 0x4E, 0x31,
 					0x80, 0x38, 0x25, 0x01 };
 
 	buf[8] = enable;
 	buf[9] = nanosic_wn8030_checksum8(&buf[2], 7);
+	return regmap_bulk_write(nanosic->regmap, nanosic->variant->cmd_reg,
+				 buf, sizeof(buf));
+}
 
-	return nanosic_wn8030_cmd(nanosic, buf);
+static int nanosic_wn8030_set_kb_power(struct nanosic_wn8030 *nanosic, bool enable)
+{
+	int ret;
+
+	mutex_lock(&nanosic->io_mutex);
+	if (nanosic->suspended || nanosic->bridge_asleep || nanosic->waking ||
+	    !nanosic->panel_on)
+		ret = -EHOSTDOWN;
+	else
+		ret = nanosic_wn8030_power_command(nanosic, enable);
+	mutex_unlock(&nanosic->io_mutex);
+	return ret;
 }
 
 static int nanosic_wn8030_xm_auth_init(struct nanosic_wn8030 *nanosic)
@@ -938,26 +980,20 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic,
 			input_report_switch(nanosic->tablet, SW_TABLET_MODE, !(p[9] & BIT(0)));
 			input_sync(nanosic->tablet);
 		}
-		if (((p[9] & 0x3) == 0x3) && !nanosic->keyboard_attached) {
+		if ((p[9] & BIT(0)) && !nanosic->keyboard_attached) {
 			bool input_enabled = READ_ONCE(nanosic->input_enabled);
 
-			/* Caps LED state saved between reconnects by WN8030 */
-			nanosic_wn8030_set_caps_led(nanosic, false);
-			nanosic_wn8030_set_touchpad(nanosic, input_enabled);
+			/* Keep cached output while the panel/bridge is asleep. */
+			if (READ_ONCE(nanosic->panel_on) && !READ_ONCE(nanosic->bridge_asleep) &&
+			    !READ_ONCE(nanosic->waking)) {
+				nanosic_wn8030_set_kb_power(nanosic, true);
+				nanosic_wn8030_set_caps_led(nanosic, false);
+				nanosic_wn8030_set_touchpad(nanosic, input_enabled);
+			}
 			nanosic_wn8030_add_keyboard_hid(nanosic);
 			nanosic_wn8030_add_touchpad_hid(nanosic);
 			nanosic->keyboard_attached = true;
-			if (input_enabled) {
-				u8 micmute_led = READ_ONCE(nanosic->micmute_led.brightness) ?
-						  0xF7 : 0xF3;
-
-				nanosic_wn8030_set_indicator_led(nanosic, micmute_led);
-			} else {
-				nanosic_wn8030_set_indicator_led(nanosic, 0xFC);
-				nanosic_wn8030_set_indicator_led(nanosic, 0xF3);
-			}
-			nanosic_wn8030_sync_kbd_backlight(nanosic);
-			nanosic_wn8030_set_kb_power(nanosic, true);
+			schedule_work(&nanosic->input_state_work);
 			notify_plugin = true;
 			plugin_attached = true;
 		} else if (!(p[9] & BIT(0)) && nanosic->keyboard_attached) {
@@ -1121,49 +1157,55 @@ static int nanosic_wn8030_dispatch(struct nanosic_wn8030 *nanosic,
 	return size;
 }
 
-static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
+static int nanosic_wn8030_read_frame(struct nanosic_wn8030 *nanosic)
 {
-	int ret;
-	struct nanosic_wn8030 *nanosic = data;
 	u8 buf[XM_WN8030_I2C_READ];
 	struct nanosic_report report;
 	size_t cursor = 0;
-	int len, size, off;
+	int ret;
 
-	/* After sleep pin deactivated, fw will trigger irq to notify about
-	 * successful resume, second irq will tell about kb connection state
-	 */
-	if (READ_ONCE(nanosic->suspended)) {
-		WRITE_ONCE(nanosic->suspended, false);
-		schedule_work(&nanosic->input_state_work);
-		return IRQ_HANDLED;
-	}
-
-	ret = regmap_bulk_read(nanosic->regmap, 0x4c, buf, sizeof(buf));
-	if (ret) {
-		dev_warn(nanosic->dev, "failed to read data on irq %d\n", ret);
-		return IRQ_HANDLED;
-	}
+	mutex_lock(&nanosic->io_mutex);
+	if (nanosic->suspended)
+		ret = -EHOSTDOWN;
+	else
+		ret = regmap_bulk_read(nanosic->regmap, 0x4c, buf, sizeof(buf));
+	mutex_unlock(&nanosic->io_mutex);
+	if (ret)
+		return ret;
 
 	if (nanosic->variant->packed_reports) {
-		while (nanosic_frame_next(buf, sizeof(buf), &cursor, &report) > 0)
+		while ((ret = nanosic_frame_next(buf, sizeof(buf), &cursor, &report)) > 0)
 			nanosic_wn8030_dispatch(nanosic, report.data, report.wire_size);
-		return IRQ_HANDLED;
+		return ret < 0 ? ret : !!cursor;
 	}
 
-	/* Bad data */
-	if (buf[0] != 0x57 || buf[2] == 0x0)
-		return IRQ_HANDLED;
+	if (buf[0] == 0x57 && buf[2])
+		nanosic_wn8030_dispatch(nanosic, buf + 3, sizeof(buf) - 3);
+	return 0;
+}
 
-	off = 3;
+/* Data IRQ and panel wake share the parser; consume until the empty frame. */
+static int nanosic_wn8030_read_pending(struct nanosic_wn8030 *nanosic)
+{
+	int ret;
+
 	do {
-		len = sizeof(buf) - off;
-		size = nanosic_wn8030_dispatch(nanosic, &buf[off], len);
-		off += size;
-	} while (nanosic->variant->packed_reports && size && off < sizeof(buf));
+		ret = nanosic_wn8030_read_frame(nanosic);
+	} while (ret > 0);
+	return ret;
+}
 
-	//print_hex_dump(KERN_INFO, "", DUMP_PREFIX_OFFSET, 16, 1, buf, sizeof(buf), false);
+static irqreturn_t nanosic_wn8030_handler(int irq, void *data)
+{
+	struct nanosic_wn8030 *nanosic = data;
+	int ret;
 
+	/* The FIFO stays unread until panel wake, after the adapter resumes. */
+	if (READ_ONCE(nanosic->suspended) || READ_ONCE(nanosic->bridge_asleep))
+		return IRQ_HANDLED;
+	ret = nanosic_wn8030_read_pending(nanosic);
+	if (ret)
+		dev_warn(nanosic->dev, "failed to read pending data: %d\n", ret);
 	return IRQ_HANDLED;
 }
 
@@ -1381,10 +1423,8 @@ static void nanosic_wn8030_release_inputs(struct nanosic_wn8030 *nanosic)
 	WRITE_ONCE(nanosic->micmute_key_down, false);
 }
 
-static void nanosic_wn8030_input_state_work(struct work_struct *work)
+static void nanosic_wn8030_sync_input_state(struct nanosic_wn8030 *nanosic)
 {
-	struct nanosic_wn8030 *nanosic =
-		container_of(work, struct nanosic_wn8030, input_state_work);
 	bool enable = READ_ONCE(nanosic->userspace_angle_enabled) &&
 		      !READ_ONCE(nanosic->lid_closed) &&
 		      !READ_ONCE(nanosic->tablet_mode);
@@ -1400,7 +1440,9 @@ static void nanosic_wn8030_input_state_work(struct work_struct *work)
 			nanosic_wn8030_release_inputs(nanosic);
 	}
 
-	if (!nanosic->keyboard_attached || READ_ONCE(nanosic->suspended))
+	if (!nanosic->keyboard_attached || READ_ONCE(nanosic->suspended) ||
+	    !READ_ONCE(nanosic->panel_on) || READ_ONCE(nanosic->bridge_asleep) ||
+	    READ_ONCE(nanosic->waking))
 		goto out;
 
 	nanosic_wn8030_set_touchpad(nanosic, enable);
@@ -1416,6 +1458,135 @@ static void nanosic_wn8030_input_state_work(struct work_struct *work)
 out:
 	mutex_unlock(&nanosic->conn_mutex);
 }
+
+static void nanosic_wn8030_input_state_work(struct work_struct *work)
+{
+	struct nanosic_wn8030 *nanosic =
+		container_of(work, struct nanosic_wn8030, input_state_work);
+
+	nanosic_wn8030_sync_input_state(nanosic);
+}
+
+/* lifecycle_mutex held, with the data IRQ synchronized by the caller. */
+static int nanosic_wn8030_bridge_sleep(struct nanosic_wn8030 *nanosic)
+{
+	int ret = 0;
+
+	mutex_lock(&nanosic->io_mutex);
+	if (!nanosic->bridge_asleep && !nanosic->suspended) {
+		if (READ_ONCE(nanosic->attach) & BIT(0))
+			ret = nanosic_wn8030_power_command(nanosic, false);
+		WRITE_ONCE(nanosic->bridge_asleep, true);
+		gpiod_set_value_cansleep(nanosic->sleep_gpio, 1);
+	}
+	mutex_unlock(&nanosic->io_mutex);
+	return ret;
+}
+
+static int nanosic_wn8030_bridge_wake(struct nanosic_wn8030 *nanosic)
+{
+	int ready, ret;
+
+	if (nanosic->suspended || !nanosic->bridge_asleep)
+		return 0;
+	gpiod_set_value_cansleep(nanosic->sleep_gpio, 0);
+	if (nanosic->data_gpio) {
+		ready = gpiod_get_value_cansleep(nanosic->data_gpio);
+		if (ready < 0) {
+			ret = ready;
+			goto sleep;
+		}
+		if (!ready) {
+			/* Stock: 100 x 1 ms for IRQ high, then 5 ms to settle. */
+			ret = read_poll_timeout(gpiod_get_value_cansleep, ready,
+						ready != 0, 1000, 100000, false,
+						nanosic->data_gpio);
+			if (ret || ready < 0) {
+				ret = ret ?: ready;
+				goto sleep;
+			}
+			fsleep(5000);
+		}
+	}
+
+	/* Read/dispatch before powering the accessory. Auth replies may use I2C. */
+	mutex_lock(&nanosic->io_mutex);
+	WRITE_ONCE(nanosic->waking, true);
+	WRITE_ONCE(nanosic->bridge_asleep, false);
+	mutex_unlock(&nanosic->io_mutex);
+	ret = nanosic_wn8030_read_pending(nanosic);
+	if (ret)
+		goto sleep;
+	mutex_lock(&nanosic->io_mutex);
+	ret = 0;
+	if (READ_ONCE(nanosic->attach) & BIT(0))
+		ret = nanosic_wn8030_power_command(nanosic, true);
+	WRITE_ONCE(nanosic->waking, false);
+	mutex_unlock(&nanosic->io_mutex);
+	if (ret)
+		goto sleep;
+	nanosic_wn8030_sync_input_state(nanosic);
+	return 0;
+sleep:
+	mutex_lock(&nanosic->io_mutex);
+	WRITE_ONCE(nanosic->bridge_asleep, true);
+	WRITE_ONCE(nanosic->waking, false);
+	gpiod_set_value_cansleep(nanosic->sleep_gpio, 1);
+	mutex_unlock(&nanosic->io_mutex);
+	dev_err(nanosic->dev, "bridge wake failed: %d\n", ret);
+	return ret;
+}
+
+static int nanosic_wn8030_panel_disabling(struct drm_panel_follower *follower)
+{
+	struct nanosic_wn8030 *nanosic =
+		container_of(follower, struct nanosic_wn8030, follower);
+	int ret;
+
+	mutex_lock(&nanosic->lifecycle_mutex);
+	WRITE_ONCE(nanosic->panel_on, false);
+	disable_irq(nanosic->client->irq);
+	ret = nanosic_wn8030_bridge_sleep(nanosic);
+	enable_irq(nanosic->client->irq);
+	mutex_unlock(&nanosic->lifecycle_mutex);
+	return ret;
+}
+
+static int nanosic_wn8030_panel_enabled(struct drm_panel_follower *follower)
+{
+	struct nanosic_wn8030 *nanosic =
+		container_of(follower, struct nanosic_wn8030, follower);
+	int ret;
+
+	mutex_lock(&nanosic->lifecycle_mutex);
+	WRITE_ONCE(nanosic->panel_on, true);
+	disable_irq(nanosic->client->irq);
+	ret = nanosic_wn8030_bridge_wake(nanosic);
+	enable_irq(nanosic->client->irq);
+	mutex_unlock(&nanosic->lifecycle_mutex);
+	return ret;
+}
+
+/* Only completes a panel-enable notification that arrived during system PM. */
+static void nanosic_wn8030_panel_work(struct work_struct *work)
+{
+	struct nanosic_wn8030 *nanosic =
+		container_of(work, struct nanosic_wn8030, panel_work);
+
+	mutex_lock(&nanosic->lifecycle_mutex);
+	if (nanosic->panel_on && !nanosic->suspended) {
+		disable_irq(nanosic->client->irq);
+		nanosic_wn8030_bridge_wake(nanosic);
+		enable_irq(nanosic->client->irq);
+	}
+	mutex_unlock(&nanosic->lifecycle_mutex);
+}
+
+static const struct drm_panel_follower_funcs nanosic_wn8030_panel_funcs = {
+	.panel_enabled = nanosic_wn8030_panel_enabled,
+	.panel_disabling = nanosic_wn8030_panel_disabling,
+	.panel_unpreparing = nanosic_wn8030_panel_disabling,
+};
 
 static void nanosic_wn8030_hall_event(struct input_handle *handle,
 				      unsigned int type,
@@ -1728,6 +1899,7 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 		return -ENOMEM;
 
 	nanosic->dev = &client->dev;
+	nanosic->panel_on = !drm_is_panel_follower(nanosic->dev);
 	nanosic->client = client;
 	init_completion(&nanosic->attach_known);
 	nanosic->no_touchpad = device_property_read_bool(nanosic->dev, "nanosic,no-touchpad");
@@ -1749,6 +1921,11 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 	if (IS_ERR(nanosic->status_gpio))
 		return dev_err_probe(nanosic->dev, PTR_ERR(nanosic->status_gpio),
 				     "failed to get status gpio\n");
+
+	nanosic->data_gpio = devm_gpiod_get_optional(nanosic->dev, "data", GPIOD_IN);
+	if (IS_ERR(nanosic->data_gpio))
+		return dev_err_probe(nanosic->dev, PTR_ERR(nanosic->data_gpio),
+				     "failed to get data gpio\n");
 
 	nanosic->sleep_gpio = devm_gpiod_get(nanosic->dev, "sleep",
 					     nanosic->variant->reset_ms ?
@@ -1776,6 +1953,9 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 	}
 
 	mutex_init(&nanosic->conn_mutex);
+	mutex_init(&nanosic->io_mutex);
+	mutex_init(&nanosic->lifecycle_mutex);
+	INIT_WORK(&nanosic->panel_work, nanosic_wn8030_panel_work);
 
 	dev_set_drvdata(nanosic->dev, nanosic);
 	i2c_set_clientdata(client, nanosic);
@@ -1877,7 +2057,7 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 						  0xa1, 1, 1 };
 
 		command[9] = nanosic_wn8030_checksum8(command + 2, 7);
-		ret = nanosic_wn8030_set_kb_power(nanosic, true);
+		ret = nanosic->panel_on ? nanosic_wn8030_set_kb_power(nanosic, true) : 0;
 		if (!ret)
 			ret = nanosic_wn8030_cmd(nanosic, command);
 		if (ret)
@@ -1888,6 +2068,17 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 	ret = nanosic_wn8030_register_tablet(nanosic);
 	if (ret)
 		goto err_irq;
+	if (drm_is_panel_follower(nanosic->dev)) {
+		nanosic->follower.funcs = &nanosic_wn8030_panel_funcs;
+		ret = nanosic_wn8030_panel_disabling(&nanosic->follower);
+		if (ret)
+			goto err_irq;
+		ret = drm_panel_add_follower(nanosic->dev, &nanosic->follower);
+		if (ret) {
+			dev_err_probe(nanosic->dev, ret, "failed to follow panel\n");
+			goto err_irq;
+		}
+	}
 	return 0;
 
 err_irq:
@@ -1919,6 +2110,9 @@ static void nanosic_wn8030_remove(struct i2c_client *client)
 {
 	struct nanosic_wn8030 *nanosic = i2c_get_clientdata(client);
 
+	if (nanosic->follower.panel)
+		drm_panel_remove_follower(&nanosic->follower);
+	cancel_work_sync(&nanosic->panel_work);
 	devm_led_classdev_unregister(nanosic->dev, &nanosic->kbd_backlight_led);
 	devm_led_classdev_unregister(nanosic->dev, &nanosic->micmute_led);
 	input_unregister_handler(&nanosic->hall_handler);
@@ -1939,40 +2133,35 @@ static int nanosic_wn8030_resume(struct device *dev)
 {
 	struct nanosic_wn8030 *nanosic = dev_get_drvdata(dev);
 
-	enable_irq(nanosic->client->irq);
-
-	gpiod_set_value_cansleep(nanosic->sleep_gpio, 0);
-	msleep(25);
-
-	if (READ_ONCE(nanosic->suspended)) {
-		dev_warn(dev, "timeout waiting for chip resume. Reseting chip...\n");
-		gpiod_set_value_cansleep(nanosic->reset_gpio, 1);
-		msleep(nanosic->variant->reset_ms ?: 10);
-		gpiod_set_value_cansleep(nanosic->reset_gpio, 0);
-		msleep(nanosic->variant->boot_ms);
-		WRITE_ONCE(nanosic->suspended, false);
-		return nanosic_wn8030_load_fw(nanosic);
-	}
-
-	/* Wake up keyboard after MCU exits sleep */
-	nanosic_wn8030_set_kb_power(nanosic, true);
-	schedule_work(&nanosic->input_state_work);
-
+	mutex_lock(&nanosic->lifecycle_mutex);
+	mutex_lock(&nanosic->io_mutex);
+	WRITE_ONCE(nanosic->suspended, false);
+	mutex_unlock(&nanosic->io_mutex);
+	/* No bus commands here. Finish an earlier panel notification after PM. */
+	if (nanosic->panel_on)
+		queue_work(system_freezable_wq, &nanosic->panel_work);
+	mutex_unlock(&nanosic->lifecycle_mutex);
 	return 0;
 }
 
 static int nanosic_wn8030_suspend(struct device *dev)
 {
 	struct nanosic_wn8030 *nanosic = dev_get_drvdata(dev);
+	int ret;
 
-	WRITE_ONCE(nanosic->suspended, true);
+	mutex_lock(&nanosic->lifecycle_mutex);
 	disable_irq(nanosic->client->irq);
-	cancel_work_sync(&nanosic->input_state_work);
-
-	gpiod_set_value_cansleep(nanosic->sleep_gpio, 1);
-	msleep(10);
-
-	return 0;
+	ret = nanosic_wn8030_bridge_sleep(nanosic);
+	/* A subsequent panel-enable notification owns wake, even if PM was first. */
+	if (nanosic->follower.panel)
+		WRITE_ONCE(nanosic->panel_on, false);
+	mutex_lock(&nanosic->io_mutex);
+	if (!ret)
+		WRITE_ONCE(nanosic->suspended, true);
+	mutex_unlock(&nanosic->io_mutex);
+	enable_irq(nanosic->client->irq);
+	mutex_unlock(&nanosic->lifecycle_mutex);
+	return ret;
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(nanosic_wn8030_pm_ops, nanosic_wn8030_suspend, nanosic_wn8030_resume);

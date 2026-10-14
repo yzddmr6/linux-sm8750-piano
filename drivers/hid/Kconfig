@@ -868,6 +868,7 @@ config HID_NANOSIC_PROTOCOL_KUNIT_TEST
 config HID_NANOSIC_WN8030
 	tristate "Nanosic WN8030 keyboard MCU"
 	depends on OF && PM && HIDRAW && I2C && GPIOLIB && LEDS_CLASS && REGULATOR
+	depends on DRM_PANEL || !DRM_PANEL
 	select REGMAP_I2C
 	select FW_LOADER
 	help

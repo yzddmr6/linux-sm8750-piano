@@ -45,6 +45,7 @@ static void wn8030_test_cleanup(void *data)
 {
 	struct nanosic_wn8030 *nano = data;
 
+	cancel_work_sync(&nano->panel_work);
 	cancel_work_sync(&nano->input_state_work);
 	if (nano->hid_keyboard)
 		hid_destroy_device(nano->hid_keyboard);
@@ -94,6 +95,10 @@ static int wn8030_test_init(struct kunit *test)
 	if (IS_ERR(nano->regmap))
 		return PTR_ERR(nano->regmap);
 	mutex_init(&nano->conn_mutex);
+	mutex_init(&nano->io_mutex);
+	mutex_init(&nano->lifecycle_mutex);
+	nano->panel_on = true;
+	INIT_WORK(&nano->panel_work, nanosic_wn8030_panel_work);
 	init_completion(&nano->attach_known);
 	INIT_WORK(&nano->input_state_work, nanosic_wn8030_input_state_work);
 	spin_lock_init(&nano->hinge_lock);
