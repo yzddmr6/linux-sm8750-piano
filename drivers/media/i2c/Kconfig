@@ -1864,3 +1864,13 @@ source "drivers/media/i2c/maxim-serdes/Kconfig"
 endmenu
 
 endif # VIDEO_DEV
+
+config VIDEO_DW9768_KUNIT_TEST
+	tristate "DW9768 GT9764 power and control tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT && I2C && VIDEO_DEV && REGULATOR
+	select V4L2_FWNODE
+	default KUNIT_ALL_TESTS
+	help
+	  Test the GT9764 stock initialization, focus controls and failed
+	  power-up unwinding with stubbed I2C/regulator/delay boundaries.
+	  These tests do not access camera hardware.

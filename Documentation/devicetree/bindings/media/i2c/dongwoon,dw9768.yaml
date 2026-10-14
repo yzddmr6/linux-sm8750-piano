@@ -23,6 +23,7 @@ properties:
     enum:
       - dongwoon,dw9768 # for DW9768 VCM
       - giantec,gt9769  # for GT9769 VCM
+      - giantec,gt9764  # for GT9764 VCM (including GT9764BA)
 
   reg:
     maxItems: 1
@@ -74,6 +75,17 @@ required:
   - reg
   - vin-supply
   - vdd-supply
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: giantec,gt9764
+    then:
+      properties:
+        dongwoon,aac-mode: false
+        dongwoon,aac-timing: false
+        dongwoon,clock-presc: false
 
 additionalProperties: false
 

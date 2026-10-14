@@ -4,6 +4,7 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 #include <media/v4l2-async.h>
@@ -104,6 +105,7 @@ struct dw9768 {
 	struct v4l2_ctrl *focus;
 	struct v4l2_subdev sd;
 
+	bool is_gt9764;
 	u32 aac_mode;
 	u32 aac_timing;
 	u32 clock_presc;
@@ -216,10 +218,42 @@ static int dw9768_set_dac(struct dw9768 *dw9768, u16 val)
 	return i2c_smbus_write_word_swapped(client, DW9768_MSB_ADDR, val);
 }
 
+/* GT9764BA sequence from the piano stock actuator module configuration. */
+static int gt9764_init(struct dw9768 *dw9768)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&dw9768->sd);
+	static const u8 settings[][2] = {
+		{ 0x02, 0x00 },
+		{ 0x02, 0x02 },
+		{ 0x06, 0x40 },
+		{ 0x07, 0x73 },
+	};
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(settings); i++) {
+		ret = i2c_smbus_write_byte_data(client, settings[i][0],
+					      settings[i][1]);
+		if (ret < 0)
+			return ret;
+		if (i)
+			usleep_range(100, 200);
+	}
+
+	return 0;
+}
+
 static int dw9768_init(struct dw9768 *dw9768)
 {
 	struct i2c_client *client = v4l2_get_subdevdata(&dw9768->sd);
 	int ret, val;
+
+	if (dw9768->is_gt9764) {
+		ret = gt9764_init(dw9768);
+		if (ret)
+			return ret;
+		goto restore_position;
+	}
 
 	/* Reset DW9768_RING_PD_CONTROL_REG to default status 0x00 */
 	ret = i2c_smbus_write_byte_data(client, DW9768_RING_PD_CONTROL_REG,
@@ -263,6 +297,7 @@ static int dw9768_init(struct dw9768 *dw9768)
 			return ret;
 	}
 
+restore_position:
 	for (val = dw9768->focus->val % DW9768_MOVE_STEPS;
 	     val <= dw9768->focus->val;
 	     val += DW9768_MOVE_STEPS) {
@@ -294,6 +329,10 @@ static int dw9768_release(struct dw9768 *dw9768)
 			     dw9768->move_delay_us + 1000);
 	}
 
+	/* The stock GT9764 sequence removes power without a PD write. */
+	if (dw9768->is_gt9764)
+		return 0;
+
 	ret = i2c_smbus_write_byte_data(client, DW9768_RING_PD_CONTROL_REG,
 					DW9768_PD_MODE_EN);
 	if (ret < 0)
@@ -308,14 +347,25 @@ static int dw9768_release(struct dw9768 *dw9768)
 	return 0;
 }
 
+static void dw9768_power_off(struct dw9768 *dw9768)
+{
+	if (dw9768->is_gt9764) {
+		/* Stock order: VIO, then VAF. BOB is owned by the PMIC rails. */
+		regulator_disable(dw9768->supplies[0].consumer);
+		regulator_disable(dw9768->supplies[1].consumer);
+	} else {
+		regulator_bulk_disable(ARRAY_SIZE(dw9768_supply_names),
+				       dw9768->supplies);
+	}
+}
+
 static int dw9768_runtime_suspend(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
 	struct dw9768 *dw9768 = sd_to_dw9768(sd);
 
 	dw9768_release(dw9768);
-	regulator_bulk_disable(ARRAY_SIZE(dw9768_supply_names),
-			       dw9768->supplies);
+	dw9768_power_off(dw9768);
 
 	return 0;
 }
@@ -326,18 +376,27 @@ static int dw9768_runtime_resume(struct device *dev)
 	struct dw9768 *dw9768 = sd_to_dw9768(sd);
 	int ret;
 
-	ret = regulator_bulk_enable(ARRAY_SIZE(dw9768_supply_names),
-				    dw9768->supplies);
-	if (ret < 0) {
-		dev_err(dev, "failed to enable regulators\n");
-		return ret;
+	if (dw9768->is_gt9764) {
+		/* VAF (vdd) must settle before VIO (vin) is enabled. */
+		ret = regulator_enable(dw9768->supplies[1].consumer);
+		if (ret)
+			return ret;
+		usleep_range(10000, 11000);
+		ret = regulator_enable(dw9768->supplies[0].consumer);
+		if (ret) {
+			regulator_disable(dw9768->supplies[1].consumer);
+			return ret;
+		}
+		usleep_range(2000, 2100);
+	} else {
+		ret = regulator_bulk_enable(ARRAY_SIZE(dw9768_supply_names),
+					    dw9768->supplies);
+		if (ret < 0) {
+			dev_err(dev, "failed to enable regulators\n");
+			return ret;
+		}
+		usleep_range(DW9768_T_OPR_US, DW9768_T_OPR_US + 100);
 	}
-
-	/*
-	 * The datasheet refers to t_OPR that needs to be waited before sending
-	 * I2C commands after power-up.
-	 */
-	usleep_range(DW9768_T_OPR_US, DW9768_T_OPR_US + 100);
 
 	ret = dw9768_init(dw9768);
 	if (ret < 0)
@@ -346,8 +405,7 @@ static int dw9768_runtime_resume(struct device *dev)
 	return 0;
 
 disable_regulator:
-	regulator_bulk_disable(ARRAY_SIZE(dw9768_supply_names),
-			       dw9768->supplies);
+	dw9768_power_off(dw9768);
 
 	return ret;
 }
@@ -416,6 +474,8 @@ static int dw9768_probe(struct i2c_client *client)
 	dw9768 = devm_kzalloc(dev, sizeof(*dw9768), GFP_KERNEL);
 	if (!dw9768)
 		return -ENOMEM;
+
+	dw9768->is_gt9764 = of_device_is_compatible(dev->of_node, "giantec,gt9764");
 
 	/* Initialize subdev */
 	v4l2_i2c_subdev_init(&dw9768->sd, client, &dw9768_ops);
@@ -530,6 +590,7 @@ static void dw9768_remove(struct i2c_client *client)
 static const struct of_device_id dw9768_of_table[] = {
 	{ .compatible = "dongwoon,dw9768" },
 	{ .compatible = "giantec,gt9769" },
+	{ .compatible = "giantec,gt9764" },
 	{}
 };
 MODULE_DEVICE_TABLE(of, dw9768_of_table);
