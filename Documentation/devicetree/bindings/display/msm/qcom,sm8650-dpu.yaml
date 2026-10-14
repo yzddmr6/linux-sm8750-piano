@@ -62,9 +62,10 @@ allOf:
   - if:
       properties:
         compatible:
-          contains:
-            const: qcom,sm8750-dpu
-    else:
+          not:
+            contains:
+              const: qcom,sm8750-dpu
+    then:
       properties:
         reg:
           maxItems: 2
