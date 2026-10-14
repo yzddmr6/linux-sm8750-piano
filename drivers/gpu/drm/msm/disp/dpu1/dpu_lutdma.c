@@ -49,7 +49,7 @@ struct dpu_lutdma {
 	__le32 *commands;
 	u64 iova;
 	struct mutex lock;
-	bool faulted, inflight, module_held, pm_held, clock_changed;
+	bool faulted, inflight, module_held, pm_held, clock_changed, leaked;
 	u32 active_ctl, pmu_before;
 	unsigned long ctl_mask;
 };
@@ -328,26 +328,32 @@ free_dma:
 
 void dpu_lutdma_quiesce(struct dpu_lutdma *dma)
 {
+	unsigned int retries;
+
 	if (!dma)
 		return;
 	mutex_lock(&dma->lock);
 	WRITE_ONCE(dma->faulted, true);
-	/* The outer unbind path cannot be vetoed by a void destroy callback.
-	 * It must wait here while the KMS, clock, MMIO, VM and GEM owners all
-	 * still exist. Only the actual active queue is reset. No workqueue
-	 * is flushed under this mutex: waiting commit workers are released
-	 * with -EIO after confirmed stop.
+	/* Unbind cannot be vetoed. Prefer leaking the DMA-owned storage to
+	 * freeing it without a stop acknowledgement, but do not hold up
+	 * shutdown indefinitely. A leaked engine must never be touched again.
 	 */
-	while (dma->inflight) {
+	if (dma->leaked)
+		goto unlock;
+	for (retries = 0; dma->inflight && retries < 20; retries++) {
 		if (!queue_reset(dma, dma->active_ctl)) {
 			retire_reference(dma);
 			break;
 		}
-		drm_err_ratelimited(dma->kms->dev,
-			"REGDMA ctl=%u stop unconfirmed; teardown waits with mappings retained\n",
-			dma->active_ctl);
 		msleep(100);
 	}
+	if (dma->inflight) {
+		dma->leaked = true;
+		drm_err(dma->kms->dev,
+			"REGDMA ctl=%u stop unconfirmed after 2 s; leaking DMA resources\n",
+			dma->active_ctl);
+	}
+unlock:
 	mutex_unlock(&dma->lock);
 }
 
@@ -357,6 +363,10 @@ void dpu_lutdma_destroy(struct dpu_lutdma *dma)
 		return;
 	dpu_lutdma_quiesce(dma);
 	mutex_lock(&dma->lock);
+	if (dma->leaked) {
+		mutex_unlock(&dma->lock);
+		return;
+	}
 	msm_gem_kernel_put(dma->bo, dma->vm);
 	drm_gpuvm_put(dma->vm);
 	iounmap(dma->mmio);

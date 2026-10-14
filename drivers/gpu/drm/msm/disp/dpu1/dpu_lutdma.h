@@ -15,8 +15,8 @@ bool dpu_lutdma_idle(struct dpu_lutdma *dma);
 void dpu_lutdma_quiesce(struct dpu_lutdma *dma);
 int dpu_lutdma_submit_gc(struct dpu_lutdma *dma, struct dpu_hw_ctl *ctl,
 			u32 dspp_mask, const struct dpu_hw_gc_lut *lut);
-/* Quiesces before freeing. An unconfirmed active queue never returns to
- * the outer uninit/shutdown path; it keeps all dependencies alive.
+/* Quiesces before freeing. If reset remains unconfirmed, return with the
+ * DMA-owned resources intentionally leaked instead of freeing live storage.
  */
 void dpu_lutdma_destroy(struct dpu_lutdma *dma);
 
