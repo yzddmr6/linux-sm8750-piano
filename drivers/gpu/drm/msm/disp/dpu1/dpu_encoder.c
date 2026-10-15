@@ -1418,6 +1418,30 @@ static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
 	if (dpu_enc->cur_master && dpu_enc->cur_master->ops.disable)
 		dpu_enc->cur_master->ops.disable(dpu_enc->cur_master);
 
+	/*
+	 * A video-mode slave shares the master's CTL, and its cleanup resets
+	 * that CTL. The master's disable above waited for the frame in which
+	 * both timing engines stopped, so the slave is torn down only now;
+	 * doing it earlier underruns both INTFs for the final frame.
+	 */
+	if (dpu_enc->cur_slave && dpu_enc->cur_master &&
+	    dpu_enc->cur_slave->intf_mode == INTF_MODE_VIDEO) {
+		struct dpu_encoder_phys *slave = dpu_enc->cur_slave;
+		struct dpu_hw_intf_status status = { 0 };
+		unsigned int polls = 0;
+
+		/* The slave latches its disable at its own frame boundary. */
+		while (slave->hw_intf && slave->hw_intf->ops.get_status) {
+			slave->hw_intf->ops.get_status(slave->hw_intf, &status);
+			if (!status.is_en || polls++ >= 40)
+				break;
+			usleep_range(1000, 1500);
+		}
+		if (status.is_en)
+			DPU_ERROR("enc%d slave intf:%d still enabled before cleanup\n",
+				  drm_enc->base.id, slave->hw_intf->idx - INTF_0);
+		dpu_encoder_helper_phys_cleanup(slave);
+	}
 
 	/* after phys waits for frame-done, should be no more frames pending */
 	if (atomic_xchg(&dpu_enc->frame_done_timeout_ms, 0)) {
