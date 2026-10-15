@@ -38,6 +38,8 @@
 #define NVT_IRQ_ENABLED	0
 /* Vendor nvt_check_fw_reset_state() budget for post-INIT states: 50 x 10 ms. */
 #define NVT_FIRST_FRAME_MS	500
+/* Consecutive frame reads allowed to fail with a recovered SPI channel. */
+#define NVT_READ_RETRIES	1
 
 struct nvt_stream_header {
 	__le32 magic;
@@ -66,6 +68,7 @@ struct nvt_thp {
 	u16 frame_length;
 	u64 sequence;
 	unsigned long flags;
+	unsigned int read_errors;
 	int error;
 	bool dead, opened, running, epoch, suspended, panel_off;
 };
@@ -191,6 +194,20 @@ static irqreturn_t nvt_irq(int irq, void *data)
 		return IRQ_HANDLED;
 	frame[0] = 0; /* Same command placeholder as the established NTP1 stream. */
 	ret = regmap_bulk_read(nvt->map, 0x11c400, frame + 1, nvt->frame_length - 1);
+	if (ret == -ETIMEDOUT || ret == -EIO) {
+		/*
+		 * A GSI transfer timeout is handled below the SPI core: the
+		 * controller terminates, resets and restarts its DMA channels
+		 * before the error reaches us, so the next frame can be read
+		 * normally. Losing this frame is no worse than a missed IRQ.
+		 * Only a second consecutive failure stops the stream.
+		 */
+		if (nvt->read_errors++ < NVT_READ_RETRIES) {
+			dev_warn_ratelimited(&nvt->spi->dev,
+					     "THP SPI read failed: %d; keeping the stream\n", ret);
+			return IRQ_HANDLED;
+		}
+	}
 	if (ret) {
 		WRITE_ONCE(nvt->error, ret);
 		WRITE_ONCE(nvt->running, false);
@@ -200,6 +217,7 @@ static irqreturn_t nvt_irq(int irq, void *data)
 		wake_up_interruptible(&nvt->wait);
 		return IRQ_HANDLED;
 	}
+	nvt->read_errors = 0;
 	valid = nvt_valid_frame(payload, nvt->frame_length - NVT_FRAME_PREFIX);
 	header->magic = cpu_to_le32(NVT_STREAM_MAGIC);
 	header->header_length = cpu_to_le16(sizeof(*header));
@@ -242,6 +260,7 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 
 	lockdep_assert_held(&nvt->lifecycle_lock);
 	WRITE_ONCE(nvt->error, 0);
+	nvt->read_errors = 0;
 	ret = request_firmware_direct(&firmware, nvt->firmware_name, &nvt->spi->dev);
 	if (ret)
 		return ret;
