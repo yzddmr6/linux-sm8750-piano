@@ -23,10 +23,12 @@
 #include <linux/spi/spi.h>
 #include <linux/unaligned.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 #include "firmware.h"
 
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
 #include <kunit/test.h>
+#include <linux/kthread.h>
 #endif
 
 #define NVT_WRITE_SIZE	(63 * 1024)
@@ -58,7 +60,16 @@ struct nvt_thp {
 	struct miscdevice misc;
 	struct drm_panel_follower follower;
 	struct kref ref;
-	struct mutex lifecycle_lock; /* Serializes open, close, removal and PM. */
+	/* API transitions serialize across cancellation; the worker never takes this. */
+	struct mutex transition_lock;
+	struct mutex lifecycle_lock; /* Serializes synchronous open and the worker. */
+	struct work_struct start_work;
+	bool start_requested; /* transition_lock; one attempt until the next stop. */
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
+	int (*test_start)(struct nvt_thp *nvt);
+	void (*test_stop)(struct nvt_thp *nvt);
+	struct completion *test_quiescing;
+#endif
 	struct mutex read_lock; /* Keeps the FIFO single-consumer across shared fds. */
 	wait_queue_head_t wait;
 	struct kfifo fifo;
@@ -241,6 +252,12 @@ static irqreturn_t nvt_irq(int irq, void *data)
 static void nvt_stop_irq(struct nvt_thp *nvt)
 {
 	WRITE_ONCE(nvt->running, false);
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
+	if (nvt->test_stop) {
+		nvt->test_stop(nvt);
+		return;
+	}
+#endif
 	if (test_and_clear_bit(NVT_IRQ_ENABLED, &nvt->flags))
 		disable_irq(nvt->spi->irq);
 	else
@@ -259,6 +276,10 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	int ret;
 
 	lockdep_assert_held(&nvt->lifecycle_lock);
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
+	if (nvt->test_start)
+		return nvt->test_start(nvt);
+#endif
 	WRITE_ONCE(nvt->error, 0);
 	nvt->read_errors = 0;
 	ret = request_firmware_direct(&firmware, nvt->firmware_name, &nvt->spi->dev);
@@ -321,43 +342,93 @@ stop:
 	return ret;
 }
 
+static void nvt_start_work(struct work_struct *work)
+{
+	struct nvt_thp *nvt = container_of(work, struct nvt_thp, start_work);
+	ktime_t start;
+	int ret;
+
+	mutex_lock(&nvt->lifecycle_lock);
+	/* Stop transitions publish their gate before cancelling this work. */
+	if (!READ_ONCE(nvt->opened) || READ_ONCE(nvt->panel_off) ||
+	    READ_ONCE(nvt->suspended) || READ_ONCE(nvt->dead) ||
+	    READ_ONCE(nvt->running))
+		goto unlock;
+	start = ktime_get();
+	dev_dbg(&nvt->spi->dev, "THP worker start\n");
+	ret = nvt_start_stream(nvt);
+	if (ret) {
+		WRITE_ONCE(nvt->error, ret);
+		dev_err(&nvt->spi->dev, "THP async restart failed: %d\n", ret);
+		wake_up_interruptible(&nvt->wait);
+	}
+	dev_dbg(&nvt->spi->dev, "THP stream %s: %d after %lld ms\n",
+		ret ? "failed" : "ready", ret, ktime_ms_delta(ktime_get(), start));
+unlock:
+	mutex_unlock(&nvt->lifecycle_lock);
+}
+
+static void nvt_queue_start(struct nvt_thp *nvt)
+{
+	lockdep_assert_held(&nvt->transition_lock);
+	if (!nvt->dead && nvt->opened && !nvt->panel_off && !nvt->suspended &&
+	    !READ_ONCE(nvt->running) && !nvt->start_requested) {
+		nvt->start_requested = true;
+		/* Readers must not see the previous failure while start is queued. */
+		WRITE_ONCE(nvt->error, 0);
+		dev_dbg(&nvt->spi->dev, "THP follower/resume queued\n");
+		schedule_work(&nvt->start_work);
+	}
+}
+
+/*
+ * Caller holds transition_lock and has closed a start gate. Holding it across
+ * cancellation excludes enable/resume/open until IRQ shutdown is complete.
+ * Never cancel under lifecycle_lock: the worker needs it to finish or bail.
+ */
+static void nvt_quiesce(struct nvt_thp *nvt)
+{
+	lockdep_assert_held(&nvt->transition_lock);
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
+	if (nvt->test_quiescing)
+		complete(nvt->test_quiescing);
+#endif
+	cancel_work_sync(&nvt->start_work);
+	nvt->start_requested = false;
+	mutex_lock(&nvt->lifecycle_lock);
+	nvt_stop_irq(nvt);
+	mutex_unlock(&nvt->lifecycle_lock);
+}
+
 static int nvt_panel_disabling(struct drm_panel_follower *follower)
 {
 	struct nvt_thp *nvt = container_of(follower, struct nvt_thp, follower);
 
-	mutex_lock(&nvt->lifecycle_lock);
-	if (!nvt->panel_off) {
-		nvt_stop_irq(nvt);
+	mutex_lock(&nvt->transition_lock);
+	if (!nvt->panel_off && !nvt->dead) {
 		WRITE_ONCE(nvt->panel_off, true);
+		nvt_quiesce(nvt);
 	}
-	mutex_unlock(&nvt->lifecycle_lock);
+	mutex_unlock(&nvt->transition_lock);
 	return 0;
 }
 
 static int nvt_panel_enabled(struct drm_panel_follower *follower)
 {
 	struct nvt_thp *nvt = container_of(follower, struct nvt_thp, follower);
-	int ret = 0;
 
-	mutex_lock(&nvt->lifecycle_lock);
-	if (nvt->dead)
-		goto unlock;
-	WRITE_ONCE(nvt->error, 0);
-	WRITE_ONCE(nvt->panel_off, false);
-	/* Preserve queued bytes, including any partially read NTP1 record. */
-	wake_up_interruptible(&nvt->wait);
-	/* Panel and SPI resume callbacks may run in either order. */
-	if (nvt->opened && !nvt->suspended && !nvt->running) {
-		ret = nvt_start_stream(nvt);
-		if (ret) {
-			WRITE_ONCE(nvt->error, ret);
-			dev_err(&nvt->spi->dev, "THP panel restart failed: %d\n", ret);
-			wake_up_interruptible(&nvt->wait);
+	mutex_lock(&nvt->transition_lock);
+	if (!nvt->dead) {
+		if (nvt->panel_off) {
+			WRITE_ONCE(nvt->error, 0);
+			WRITE_ONCE(nvt->panel_off, false);
 		}
+		/* Preserve queued bytes, including a partially read NTP1 record. */
+		wake_up_interruptible(&nvt->wait);
+		nvt_queue_start(nvt);
 	}
-unlock:
-	mutex_unlock(&nvt->lifecycle_lock);
-	return ret;
+	mutex_unlock(&nvt->transition_lock);
+	return 0;
 }
 
 static const struct drm_panel_follower_funcs nvt_panel_follower_funcs = {
@@ -374,9 +445,10 @@ static int nvt_open(struct inode *inode, struct file *file)
 
 	if (file->f_mode & FMODE_WRITE)
 		return -EPERM;
-	ret = mutex_lock_interruptible(&nvt->lifecycle_lock);
+	ret = mutex_lock_interruptible(&nvt->transition_lock);
 	if (ret)
 		return ret;
+	mutex_lock(&nvt->lifecycle_lock);
 	if (nvt->dead) {
 		ret = -ENODEV;
 		goto unlock;
@@ -395,12 +467,13 @@ static int nvt_open(struct inode *inode, struct file *file)
 			goto unlock;
 		}
 	}
-	nvt->opened = true;
+	WRITE_ONCE(nvt->opened, true);
 	kref_get(&nvt->ref);
 	file->private_data = nvt;
 	stream_open(inode, file);
 unlock:
 	mutex_unlock(&nvt->lifecycle_lock);
+	mutex_unlock(&nvt->transition_lock);
 	return ret;
 }
 
@@ -408,11 +481,11 @@ static int nvt_release(struct inode *inode, struct file *file)
 {
 	struct nvt_thp *nvt = file->private_data;
 
-	mutex_lock(&nvt->lifecycle_lock);
+	mutex_lock(&nvt->transition_lock);
+	WRITE_ONCE(nvt->opened, false);
 	if (!nvt->dead)
-		nvt_stop_irq(nvt);
-	nvt->opened = false;
-	mutex_unlock(&nvt->lifecycle_lock);
+		nvt_quiesce(nvt);
+	mutex_unlock(&nvt->transition_lock);
 	nvt_put(nvt);
 	return 0;
 }
@@ -512,7 +585,9 @@ static int nvt_probe(struct spi_device *spi)
 		return ret;
 	nvt->spi = spi;
 	nvt->max_read = min_t(size_t, NVT_READ_SIZE - 2, transfer_max - 2);
+	mutex_init(&nvt->transition_lock);
 	mutex_init(&nvt->lifecycle_lock);
+	INIT_WORK(&nvt->start_work, nvt_start_work);
 	mutex_init(&nvt->read_lock);
 	init_waitqueue_head(&nvt->wait);
 	ret = device_property_read_string(&spi->dev, "firmware-name", &nvt->firmware_name);
@@ -555,28 +630,24 @@ static int nvt_probe(struct spi_device *spi)
 	return misc_register(&nvt->misc);
 }
 
-static void nvt_remove(struct spi_device *spi)
-{
-	struct nvt_thp *nvt = spi_get_drvdata(spi);
-
-	/* Do not hold lifecycle_lock while misc_open may be waiting for it. */
-	misc_deregister(&nvt->misc);
-	mutex_lock(&nvt->lifecycle_lock);
-	WRITE_ONCE(nvt->dead, true);
-	nvt_stop_irq(nvt);
-	wake_up_interruptible(&nvt->wait);
-	mutex_unlock(&nvt->lifecycle_lock);
-}
-
 static void nvt_shutdown(struct spi_device *spi)
 {
 	struct nvt_thp *nvt = spi_get_drvdata(spi);
 
-	mutex_lock(&nvt->lifecycle_lock);
+	mutex_lock(&nvt->transition_lock);
 	WRITE_ONCE(nvt->dead, true);
-	nvt_stop_irq(nvt);
+	nvt_quiesce(nvt);
 	wake_up_interruptible(&nvt->wait);
-	mutex_unlock(&nvt->lifecycle_lock);
+	mutex_unlock(&nvt->transition_lock);
+}
+
+static void nvt_remove(struct spi_device *spi)
+{
+	struct nvt_thp *nvt = spi_get_drvdata(spi);
+
+	/* Do not hold transition_lock while misc_open may be waiting for it. */
+	misc_deregister(&nvt->misc);
+	nvt_shutdown(spi);
 }
 
 static const struct of_device_id nvt_of_match[] = {
@@ -594,39 +665,29 @@ MODULE_DEVICE_TABLE(spi, nvt_ids);
 static int nvt_suspend(struct device *dev)
 {
 	struct nvt_thp *nvt = dev_get_drvdata(dev);
+	bool panel_off;
 
-	mutex_lock(&nvt->lifecycle_lock);
-	/* An open userspace stream must survive system sleep.  Stop SPI before
-	 * its controller suspends; the panel callback owns the shared reset.
-	 * An already disabled panel has synchronously stopped the IRQ.
-	 */
-	if (!nvt->panel_off)
-		nvt_stop_irq(nvt);
+	mutex_lock(&nvt->transition_lock);
+	panel_off = nvt->panel_off;
 	WRITE_ONCE(nvt->suspended, true);
-	mutex_unlock(&nvt->lifecycle_lock);
+	/* A disabled panel has already cancelled work and stopped its IRQ. */
+	if (!nvt->dead && !panel_off)
+		nvt_quiesce(nvt);
+	mutex_unlock(&nvt->transition_lock);
 	return 0;
 }
 
 static int nvt_resume(struct device *dev)
 {
 	struct nvt_thp *nvt = dev_get_drvdata(dev);
-	int ret = 0;
 
-	mutex_lock(&nvt->lifecycle_lock);
+	mutex_lock(&nvt->transition_lock);
 	WRITE_ONCE(nvt->suspended, false);
-	/* If DRM resumes later, panel_enabled will restart instead.  Keep the
-	 * FIFO and the open fd, including any partially consumed NTP1 record.
-	 */
-	if (!nvt->dead && nvt->opened && !nvt->panel_off && !nvt->running) {
-		ret = nvt_start_stream(nvt);
-		if (ret) {
-			WRITE_ONCE(nvt->error, ret);
-			dev_err(dev, "THP resume restart failed: %d\n", ret);
-		}
-	}
+	/* The later of panel enable and SPI resume queues the single attempt. */
+	nvt_queue_start(nvt);
 	wake_up_interruptible(&nvt->wait);
-	mutex_unlock(&nvt->lifecycle_lock);
-	return ret;
+	mutex_unlock(&nvt->transition_lock);
+	return 0;
 }
 
 static DEFINE_SIMPLE_DEV_PM_OPS(nvt_pm, nvt_suspend, nvt_resume);
@@ -652,6 +713,10 @@ static void nvt_test_free_fifo(void *data)
 	kfifo_free(&nvt->fifo);
 }
 
+static void nvt_test_stop_noop(struct nvt_thp *nvt)
+{
+}
+
 static void nvt_test_open_disabled_panel(struct kunit *test)
 {
 	struct nvt_thp *nvt = kunit_kzalloc(test, sizeof(*nvt), GFP_KERNEL);
@@ -660,7 +725,10 @@ static void nvt_test_open_disabled_panel(struct kunit *test)
 	struct inode inode = {};
 
 	KUNIT_ASSERT_NOT_NULL(test, nvt);
+	mutex_init(&nvt->transition_lock);
 	mutex_init(&nvt->lifecycle_lock);
+	INIT_WORK(&nvt->start_work, nvt_start_work);
+	nvt->test_stop = nvt_test_stop_noop;
 	init_waitqueue_head(&nvt->wait);
 	kref_init(&nvt->ref);
 	KUNIT_ASSERT_EQ(test, kfifo_alloc(&nvt->fifo, 64, GFP_KERNEL), 0);
@@ -699,7 +767,10 @@ static void nvt_test_suspend_open_stream(struct kunit *test)
 	struct file file = {};
 
 	KUNIT_ASSERT_NOT_NULL(test, nvt);
+	mutex_init(&nvt->transition_lock);
 	mutex_init(&nvt->lifecycle_lock);
+	INIT_WORK(&nvt->start_work, nvt_start_work);
+	nvt->test_stop = nvt_test_stop_noop;
 	init_waitqueue_head(&nvt->wait);
 	dev_set_drvdata(&dev, nvt);
 	file.private_data = nvt;
@@ -732,9 +803,221 @@ static void nvt_test_suspend_open_stream(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, nvt->suspended);
 }
 
+struct nvt_async_test {
+	struct nvt_thp nvt;
+	struct spi_device spi;
+	struct completion started, finish_start, quiescing, stopped;
+	struct task_struct *stop_task;
+	unsigned int starts, stops;
+	int start_error;
+	bool remove, misc_registered;
+};
+
+static int nvt_test_start_blocked(struct nvt_thp *nvt)
+{
+	struct nvt_async_test *ctx = container_of(nvt, struct nvt_async_test, nvt);
+
+	ctx->starts++;
+	complete(&ctx->started);
+	wait_for_completion(&ctx->finish_start);
+	WRITE_ONCE(nvt->running, !ctx->start_error);
+	if (!ctx->start_error)
+		set_bit(NVT_IRQ_ENABLED, &nvt->flags);
+	return ctx->start_error;
+}
+
+static void nvt_test_stop_count(struct nvt_thp *nvt)
+{
+	struct nvt_async_test *ctx = container_of(nvt, struct nvt_async_test, nvt);
+
+	ctx->stops++;
+	clear_bit(NVT_IRQ_ENABLED, &nvt->flags);
+}
+
+static void nvt_test_async_cleanup(void *data)
+{
+	struct nvt_async_test *ctx = data;
+
+	complete_all(&ctx->finish_start);
+	if (ctx->stop_task)
+		kthread_stop_put(ctx->stop_task);
+	if (ctx->misc_registered)
+		misc_deregister(&ctx->nvt.misc);
+	cancel_work_sync(&ctx->nvt.start_work);
+}
+
+static struct nvt_async_test *nvt_test_async_init(struct kunit *test)
+{
+	struct nvt_async_test *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	struct nvt_thp *nvt;
+
+	if (!ctx)
+		return NULL;
+	nvt = &ctx->nvt;
+	mutex_init(&nvt->transition_lock);
+	mutex_init(&nvt->lifecycle_lock);
+	INIT_WORK(&nvt->start_work, nvt_start_work);
+	init_waitqueue_head(&nvt->wait);
+	init_completion(&ctx->started);
+	init_completion(&ctx->finish_start);
+	init_completion(&ctx->quiescing);
+	init_completion(&ctx->stopped);
+	nvt->spi = &ctx->spi;
+	ctx->spi.dev.init_name = "nvt-async-test";
+	spi_set_drvdata(&ctx->spi, nvt);
+	nvt->test_start = nvt_test_start_blocked;
+	nvt->test_stop = nvt_test_stop_count;
+	nvt->test_quiescing = &ctx->quiescing;
+	nvt->opened = true;
+	nvt->panel_off = true;
+	if (kunit_add_action_or_reset(test, nvt_test_async_cleanup, ctx))
+		return NULL;
+	return ctx;
+}
+
+static int nvt_test_disable_thread(void *data)
+{
+	struct nvt_async_test *ctx = data;
+
+	if (ctx->remove) {
+		nvt_remove(&ctx->spi);
+		ctx->misc_registered = false;
+	} else
+		nvt_panel_disabling(&ctx->nvt.follower);
+	complete(&ctx->stopped);
+	return 0;
+}
+
+static void nvt_test_enable_async_coalesces(struct kunit *test)
+{
+	struct nvt_async_test *ctx = nvt_test_async_init(test);
+	struct nvt_thp *nvt;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	nvt = &ctx->nvt;
+	/* Worker cannot enter start until both callbacks have returned. */
+	mutex_lock(&nvt->lifecycle_lock);
+	KUNIT_EXPECT_EQ(test, nvt_panel_enabled(&nvt->follower), 0);
+	KUNIT_EXPECT_EQ(test, nvt_panel_enabled(&nvt->follower), 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&ctx->started));
+	mutex_unlock(&nvt->lifecycle_lock);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&ctx->started, HZ), 0UL);
+	/* A running attempt is coalesced too, without waiting for its start. */
+	KUNIT_EXPECT_EQ(test, nvt_panel_enabled(&nvt->follower), 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&ctx->finish_start));
+	complete(&ctx->finish_start);
+	flush_work(&nvt->start_work);
+	KUNIT_EXPECT_EQ(test, ctx->starts, 1U);
+	KUNIT_EXPECT_TRUE(test, nvt->running);
+	nvt_panel_disabling(&nvt->follower);
+	KUNIT_EXPECT_FALSE(test, nvt->running);
+	KUNIT_EXPECT_FALSE(test, test_bit(NVT_IRQ_ENABLED, &nvt->flags));
+}
+
+static void nvt_test_stop_async(struct kunit *test, bool running, bool remove)
+{
+	struct nvt_async_test *ctx = nvt_test_async_init(test);
+	struct nvt_thp *nvt;
+	unsigned long reached;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	nvt = &ctx->nvt;
+	ctx->remove = remove;
+	if (remove) {
+		nvt->misc.minor = MISC_DYNAMIC_MINOR;
+		nvt->misc.name = "nvt-kunit-remove";
+		nvt->misc.fops = &nvt_fops;
+		KUNIT_ASSERT_EQ(test, misc_register(&nvt->misc), 0);
+		ctx->misc_registered = true;
+	}
+	if (!running)
+		mutex_lock(&nvt->lifecycle_lock);
+	nvt_panel_enabled(&nvt->follower);
+	if (running)
+		KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&ctx->started, HZ), 0UL);
+	ctx->stop_task = kthread_create(nvt_test_disable_thread, ctx, "nvt-kunit-stop");
+	if (IS_ERR(ctx->stop_task)) {
+		ctx->stop_task = NULL;
+		if (!running)
+			mutex_unlock(&nvt->lifecycle_lock);
+		KUNIT_FAIL(test, "could not start stop thread");
+		return;
+	}
+	get_task_struct(ctx->stop_task);
+	wake_up_process(ctx->stop_task);
+	reached = wait_for_completion_timeout(&ctx->quiescing, HZ);
+	KUNIT_EXPECT_NE(test, reached, 0UL);
+	KUNIT_EXPECT_FALSE(test, completion_done(&ctx->stopped));
+	if (!running)
+		mutex_unlock(&nvt->lifecycle_lock);
+	complete(&ctx->finish_start);
+	KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&ctx->stopped, HZ), 0UL);
+	KUNIT_EXPECT_EQ(test, ctx->starts, running ? 1U : 0U);
+	KUNIT_EXPECT_EQ(test, ctx->stops, 1U);
+	KUNIT_EXPECT_FALSE(test, nvt->running);
+	KUNIT_EXPECT_FALSE(test, test_bit(NVT_IRQ_ENABLED, &nvt->flags));
+	KUNIT_EXPECT_FALSE(test, work_busy(&nvt->start_work));
+	if (remove) {
+		KUNIT_EXPECT_TRUE(test, nvt->dead);
+		nvt_panel_enabled(&nvt->follower);
+		KUNIT_EXPECT_FALSE(test, work_busy(&nvt->start_work));
+	}
+}
+
+static void nvt_test_disable_pending(struct kunit *test)
+{
+	nvt_test_stop_async(test, false, false);
+}
+
+static void nvt_test_disable_running(struct kunit *test)
+{
+	nvt_test_stop_async(test, true, false);
+}
+
+static void nvt_test_remove_pending(struct kunit *test)
+{
+	nvt_test_stop_async(test, false, true);
+}
+
+static void nvt_test_async_error(struct kunit *test)
+{
+	struct nvt_async_test *ctx = nvt_test_async_init(test);
+	struct file file;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	ctx->start_error = -EIO;
+	file.private_data = &ctx->nvt;
+	complete_all(&ctx->finish_start);
+	nvt_panel_enabled(&ctx->nvt.follower);
+	flush_work(&ctx->nvt.start_work);
+	KUNIT_EXPECT_EQ(test, ctx->nvt.error, -EIO);
+	KUNIT_EXPECT_TRUE(test, nvt_read_ready(&ctx->nvt));
+	KUNIT_EXPECT_EQ(test, nvt_poll(&file, NULL), (__poll_t)(EPOLLERR | EPOLLHUP));
+	/* Duplicate enable must neither hide the error nor retry the download. */
+	nvt_panel_enabled(&ctx->nvt.follower);
+	flush_work(&ctx->nvt.start_work);
+	KUNIT_EXPECT_EQ(test, ctx->starts, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->nvt.error, -EIO);
+
+	/* Resume must not expose the previous error before the worker runs. */
+	KUNIT_ASSERT_EQ(test, nvt_suspend(&ctx->spi.dev), 0);
+	mutex_lock(&ctx->nvt.lifecycle_lock);
+	KUNIT_EXPECT_EQ(test, nvt_resume(&ctx->spi.dev), 0);
+	KUNIT_EXPECT_EQ(test, ctx->nvt.error, 0);
+	mutex_unlock(&ctx->nvt.lifecycle_lock);
+	flush_work(&ctx->nvt.start_work);
+	KUNIT_EXPECT_EQ(test, ctx->starts, 2U);
+	KUNIT_EXPECT_EQ(test, ctx->nvt.error, -EIO);
+}
+
 static struct kunit_case nvt_panel_cases[] = {
 	KUNIT_CASE(nvt_test_open_disabled_panel),
 	KUNIT_CASE(nvt_test_suspend_open_stream),
+	KUNIT_CASE(nvt_test_enable_async_coalesces),
+	KUNIT_CASE(nvt_test_disable_pending),
+	KUNIT_CASE(nvt_test_disable_running),
+	KUNIT_CASE(nvt_test_remove_pending),
+	KUNIT_CASE(nvt_test_async_error),
 	{}
 };
 
