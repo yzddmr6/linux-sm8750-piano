@@ -28,6 +28,15 @@ struct apm_graph_mgmt_cmd {
 #define APM_GRAPH_MGMT_PSIZE(p, n) ALIGN(struct_size(p, sub_graph_id_list, n), 8)
 
 static struct q6apm *g_apm;
+static DEFINE_MUTEX(g_apm_lock);
+
+static void q6apm_clear_global(struct q6apm *apm)
+{
+	mutex_lock(&g_apm_lock);
+	if (g_apm == apm)
+		g_apm = NULL;
+	mutex_unlock(&g_apm_lock);
+}
 
 int q6apm_send_cmd_sync(struct q6apm *apm, struct gpr_pkt *pkt,
 			uint32_t rsp_opcode)
@@ -144,22 +153,31 @@ static void q6apm_put_audioreach_graph(struct kref *ref)
 
 static int q6apm_get_apm_state(struct q6apm *apm)
 {
+	int ret;
 	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(0,
 								APM_CMD_GET_SPF_STATE, 0);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
-	q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
+	ret = q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
+	if (ret < 0)
+		return ret;
 
 	return apm->state;
 }
 
 bool q6apm_is_adsp_ready(void)
 {
-	if (g_apm)
-		return q6apm_get_apm_state(g_apm);
+	bool ready = false;
 
-	return false;
+	/* A DSP restart removes the APM device. Keep it alive for the whole
+	 * query, including the synchronous command's wait for a reply. */
+	mutex_lock(&g_apm_lock);
+	if (g_apm)
+		ready = q6apm_get_apm_state(g_apm) > 0;
+	mutex_unlock(&g_apm_lock);
+
+	return ready;
 }
 EXPORT_SYMBOL_GPL(q6apm_is_adsp_ready);
 
@@ -905,8 +923,6 @@ static int apm_probe(gpr_device_t *gdev)
 
 	idr_init(&apm->modules_idr);
 
-	g_apm = apm;
-
 	q6apm_get_apm_state(apm);
 
 	ret = snd_soc_register_component(dev, &q6apm_audio_component, NULL, 0);
@@ -915,16 +931,22 @@ static int apm_probe(gpr_device_t *gdev)
 		return ret;
 	}
 
+	mutex_lock(&g_apm_lock);
+	g_apm = apm;
+	mutex_unlock(&g_apm_lock);
+
 	ret = of_platform_populate(dev->of_node, NULL, NULL, dev);
-	if (ret)
+	if (ret) {
+		q6apm_clear_global(apm);
 		snd_soc_unregister_component(dev);
+	}
 
 	return ret;
 }
 
 static void apm_remove(gpr_device_t *gdev)
 {
-	g_apm = NULL;
+	q6apm_clear_global(dev_get_drvdata(&gdev->dev));
 	of_platform_depopulate(&gdev->dev);
 	snd_soc_unregister_component(&gdev->dev);
 }
