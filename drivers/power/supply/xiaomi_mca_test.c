@@ -1002,7 +1002,135 @@ static void xiaomi_mca_test_pm_lost_ack(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->mca.voltage_written);
 }
 
+struct mca_otg_fixture {
+	struct xiaomi_mca mca;
+	u32 props[8];
+	u8 data[8][16];
+	size_t lengths[8];
+	int writes;
+	int fail_write;
+	int cp_result;
+	enum sc8541_otg_action actions[16];
+	int calls;
+	u8 plugin;
+	int polls;
+};
+
+static void mca_otg_test_poll(struct work_struct *work)
+{
+	struct xiaomi_mca *mca = container_of(to_delayed_work(work), struct xiaomi_mca,
+					      poll_work);
+	struct mca_otg_fixture *f = container_of(mca, struct mca_otg_fixture, mca);
+
+	f->polls++;
+}
+
+static int mca_otg_test_cp(struct xiaomi_mca *mca, enum sc8541_otg_action action)
+{
+	struct mca_otg_fixture *f = container_of(mca, struct mca_otg_fixture, mca);
+
+	if (f->calls < ARRAY_SIZE(f->actions))
+		f->actions[f->calls++] = action;
+	return f->cp_result;
+}
+
+static int mca_otg_test_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
+			   void *data, size_t len)
+{
+	struct mca_otg_fixture *f = container_of(mca, struct mca_otg_fixture, mca);
+	int i = f->writes;
+
+	if (op == MCA_OPCODE_READ && prop == MCA_PROP_OTG_PLUGIN && len == 1) {
+		*(u8 *)data = f->plugin;
+		return 0;
+	}
+	if (op != MCA_OPCODE_WRITE || len > 16 || i >= ARRAY_SIZE(f->props))
+		return -EINVAL;
+	f->props[i] = prop;
+	f->lengths[i] = len;
+	memcpy(f->data[i], data, len);
+	f->writes++;
+	return f->fail_write == f->writes ? -EIO : 0;
+}
+
+static struct mca_otg_fixture *mca_otg_fixture(struct kunit *test)
+{
+	struct mca_otg_fixture *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->mca.dev = kunit_device_register(test, "mca-otg-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, f->mca.dev);
+	mutex_init(&f->mca.lock);
+	spin_lock_init(&f->mca.rx_lock);
+	INIT_DELAYED_WORK(&f->mca.poll_work, mca_otg_test_poll);
+	kunit_add_action_or_reset(test, xiaomi_mca_stop_poll, &f->mca);
+	f->mca.piano_otg = true;
+	f->mca.service_up = true;
+	f->mca.service_generation = 1;
+	kunit_activate_static_stub(test, xiaomi_mca_transfer_data, mca_otg_test_xfer);
+	kunit_activate_static_stub(test, xiaomi_mca_otg_cp, mca_otg_test_cp);
+	return f;
+}
+
+static void xiaomi_mca_test_otg_config(struct kunit *test)
+{
+	static const u8 expected[] = {
+		0, 0, 0, 0, 1, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255,
+	};
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+	u8 invalid = 2;
+
+	guard(mutex)(&f->mca.lock);
+	xiaomi_mca_sync_config(&f->mca);
+	KUNIT_ASSERT_EQ(test, f->writes, 2);
+	KUNIT_EXPECT_EQ(test, f->props[0], 0x201c);
+	KUNIT_EXPECT_EQ(test, f->lengths[0], 1);
+	KUNIT_EXPECT_EQ(test, f->data[0][0], 1);
+	KUNIT_EXPECT_EQ(test, f->props[1], 0x201a);
+	KUNIT_EXPECT_EQ(test, f->lengths[1], 16);
+	KUNIT_EXPECT_MEMEQ(test, f->data[1], expected, sizeof(expected));
+	xiaomi_mca_sync_config(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->writes, 2);
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x201c, &invalid, 1));
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x201a, expected, 4));
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x200f, expected, 4));
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x2010, expected, 4));
+}
+
+static void xiaomi_mca_test_otg_restart(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+
+	guard(mutex)(&f->mca.lock);
+	xiaomi_mca_sync_config(&f->mca);
+	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_DOWN);
+	xiaomi_mca_sync_config(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->writes, 2);
+	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_UP);
+	xiaomi_mca_sync_config(&f->mca);
+	KUNIT_ASSERT_EQ(test, f->writes, 4);
+	KUNIT_EXPECT_EQ(test, f->props[2], 0x201c);
+	KUNIT_EXPECT_EQ(test, f->props[3], 0x201a);
+	KUNIT_EXPECT_EQ(test, f->mca.config_generation, 3);
+}
+
+static void xiaomi_mca_test_otg_config_failure(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+
+	guard(mutex)(&f->mca.lock);
+	f->fail_write = 1;
+	xiaomi_mca_sync_config(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->writes, 1);
+	KUNIT_EXPECT_EQ(test, f->mca.config_result, -EIO);
+	xiaomi_mca_sync_config(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->writes, 1);
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_otg_config),
+	KUNIT_CASE(xiaomi_mca_test_otg_restart),
+	KUNIT_CASE(xiaomi_mca_test_otg_config_failure),
 	KUNIT_CASE(xiaomi_mca_test_policy_defaults),
 	KUNIT_CASE(xiaomi_mca_test_hv_fixed),
 	KUNIT_CASE(xiaomi_mca_test_hv_pps),

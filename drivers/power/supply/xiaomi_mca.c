@@ -26,6 +26,9 @@
 #include <linux/jiffies.h>
 #include <linux/hex.h>
 #include <linux/module.h>
+#include <linux/of.h>
+#include <linux/ktime.h>
+#include <linux/power/sc8541_charger.h>
 #include <linux/mutex.h>
 #include <linux/pm.h>
 #include <linux/power_supply.h>
@@ -52,6 +55,15 @@
 #define MCA_PROP_INPUT_CURRENT_LIMIT	0x2008
 #define MCA_PROP_AICL_ENABLED		0x2012
 #define MCA_PROP_INPUT_SUSPEND		0x2019
+#define MCA_PROP_OTG_CFG			0x201a
+#define MCA_PROP_CP_STATE		0x201c
+#define MCA_PROP_OTG_PLUGIN		0x21020
+
+/* Piano's charger boost and PMIC GPIO controller, with no external GPIOs. */
+static const __le32 xiaomi_mca_piano_otg_cfg[] = {
+	cpu_to_le32(0), cpu_to_le32(1), cpu_to_le32(~0U), cpu_to_le32(~0U),
+};
+
 #define MCA_PROP_AICL_STATUS		0x2029
 /* USB input properties, voltages in uV, currents in uA */
 #define MCA_PROP_USB_ONLINE		0x20001
@@ -545,6 +557,12 @@ struct xiaomi_mca {
 	bool voltage_written;	/* a raised voltage request may have reached firmware */
 	struct xiaomi_mca_state icl_source;
 
+	bool piano_otg;
+	bool config_attempted;
+	u32 config_generation;
+	int config_result;
+	bool cp_absent_warned;
+
 	struct delayed_work poll_work;
 	bool sleeping;		/* no transactions between prepare and complete */
 	bool online;
@@ -593,6 +611,7 @@ struct xiaomi_mca {
 	/* orders the fields below against the GLINK callbacks */
 	spinlock_t rx_lock;
 	bool service_up;
+	bool poll_ready;
 	bool pending;
 	bool answered;
 	u32 pending_opcode;
@@ -903,6 +922,11 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	u32 val = len == sizeof(u32) ? get_unaligned_le32(data) : 0;
 
 	switch (prop) {
+	case MCA_PROP_CP_STATE:
+		return len == 1 && *(const u8 *)data <= 1;
+	case MCA_PROP_OTG_CFG:
+		return len == sizeof(xiaomi_mca_piano_otg_cfg) &&
+		       !memcmp(data, xiaomi_mca_piano_otg_cfg, len);
 	case MCA_PROP_INPUT_CURRENT_LIMIT:
 		return len == sizeof(u32) &&
 		       val >= MCA_ICL_MIN_MA && val <= MCA_ICL_HV_MAX_MA;
@@ -949,6 +973,12 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	if (len > sizeof(buf) || !xiaomi_mca_write_allowed(prop, data, len))
 		return -EPERM;
 	lockdep_assert_held(&mca->lock);
+	if (prop == MCA_PROP_CP_STATE || prop == MCA_PROP_OTG_CFG) {
+		if (!mca->piano_otg)
+			return -EOPNOTSUPP;
+		memcpy(buf, data, len);
+		return xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
+	}
 	ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &type);
 	if (ret)
 		return ret;
@@ -2010,6 +2040,68 @@ static const struct power_supply_desc xiaomi_mca_usb_psy_desc = {
 		     BIT(POWER_SUPPLY_USB_TYPE_UNKNOWN),
 };
 
+/* Optional provider: a missing or unbound SC8541 does not fail MCA probe. */
+static int xiaomi_mca_otg_cp(struct xiaomi_mca *mca, enum sc8541_otg_action action)
+{
+	struct power_supply *psy;
+	int ret;
+
+#if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(xiaomi_mca_otg_cp, mca, action);
+#endif
+	psy = power_supply_get_by_reference(dev_fwnode(mca->dev), "xiaomi,charge-pump");
+	if (IS_ERR_OR_NULL(psy))
+		return -ENODEV;
+	ret = sc8541_otg_configure(psy, action);
+	power_supply_put(psy);
+	return ret;
+}
+
+static void xiaomi_mca_cp_missing(struct xiaomi_mca *mca, int ret)
+{
+	if ((ret == -ENODEV || ret == -EOPNOTSUPP) && !mca->cp_absent_warned) {
+		dev_warn(mca->dev, "OTG CP provider unavailable: %d\n", ret);
+		mca->cp_absent_warned = true;
+	}
+}
+
+/* Stock qcom_subpmic_sync_cfg_work: CP_STATE, then the 16-byte OTG_CFG. */
+static void xiaomi_mca_sync_config(struct xiaomi_mca *mca)
+{
+	u32 generation;
+	bool up;
+	u8 present;
+	int ret;
+
+	if (!mca->piano_otg)
+		return;
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		generation = mca->service_generation;
+		up = mca->service_up;
+	}
+	if (!up || (mca->config_attempted && mca->config_generation == generation))
+		return;
+	/* Exactly one attempt per service generation, including failed writes. */
+	mca->config_attempted = true;
+	mca->config_generation = generation;
+	ret = xiaomi_mca_otg_cp(mca, SC8541_OTG_PRESENT);
+	present = !ret;
+	xiaomi_mca_cp_missing(mca, ret);
+	ret = xiaomi_mca_write_blob(mca, MCA_PROP_CP_STATE, &present, sizeof(present));
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		if (mca->service_generation != generation || !mca->service_up)
+			ret = -ESTALE;
+	}
+	if (!ret)
+		ret = xiaomi_mca_write_blob(mca, MCA_PROP_OTG_CFG,
+				xiaomi_mca_piano_otg_cfg, sizeof(xiaomi_mca_piano_otg_cfg));
+	mca->config_result = ret;
+	dev_info(mca->dev, "OTG config generation %u CP present %u result %d; CID cfg omitted\n",
+		 generation, present, ret);
+	if (ret)
+		dev_warn(mca->dev, "OTG configuration sync failed: %d\n", ret);
+}
+
 static void xiaomi_mca_callback(const void *data, size_t len, void *priv)
 {
 	const struct pmic_glink_hdr *hdr = data;
@@ -2066,6 +2158,8 @@ static void xiaomi_mca_pdr_notify(void *priv, int state)
 	if (mca->service_up != (state == SERVREG_SERVICE_STATE_UP))
 		mca->service_generation++;
 	mca->service_up = state == SERVREG_SERVICE_STATE_UP;
+	if (mca->poll_ready && mca->service_up)
+		mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
 }
 
 static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
@@ -2164,6 +2258,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 	scoped_guard(mutex, &mca->lock) {
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
 			generation = mca->service_generation;
+		xiaomi_mca_sync_config(mca);
 		if (mca->policy_generation != generation) {
 			if (xiaomi_mca_cp_stop(mca, "ADSP restart"))
 				goto out;
@@ -2650,6 +2745,15 @@ static int xiaomi_mca_frames_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(xiaomi_mca_frames);
 
+static void xiaomi_mca_stop_poll(void *data)
+{
+	struct xiaomi_mca *mca = data;
+
+	scoped_guard(spinlock_irqsave, &mca->rx_lock)
+		mca->poll_ready = false;
+	disable_delayed_work_sync(&mca->poll_work);
+}
+
 static void xiaomi_mca_debugfs_remove(void *data)
 {
 	debugfs_remove_recursive(data);
@@ -2772,6 +2876,7 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 		return -ENOMEM;
 
 	mca->dev = dev;
+	mca->piano_otg = of_device_is_compatible(dev->of_node, "xiaomi,piano-pmic-glink");
 	dev_set_drvdata(dev, mca);
 	init_completion(&mca->ack);
 	spin_lock_init(&mca->rx_lock);
@@ -2808,7 +2913,8 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 				     "failed to register USB power supply\n");
 
 	/* Cancelled before the power supply is unregistered. */
-	ret = devm_delayed_work_autocancel(dev, &mca->poll_work, xiaomi_mca_poll);
+	INIT_DELAYED_WORK(&mca->poll_work, xiaomi_mca_poll);
+	ret = devm_add_action_or_reset(dev, xiaomi_mca_stop_poll, mca);
 	if (ret)
 		return ret;
 
@@ -2820,6 +2926,8 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 	if (ret)
 		return ret;
 
+	scoped_guard(spinlock_irqsave, &mca->rx_lock)
+		mca->poll_ready = true;
 	pmic_glink_client_register(mca->client);
 	schedule_delayed_work(&mca->poll_work, 0);
 
