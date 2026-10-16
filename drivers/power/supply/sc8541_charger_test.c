@@ -9,6 +9,9 @@ struct sc8541_test {
 	int fail_reg;
 	int fail_read_reg;
 	bool stuck_enabled;
+	u8 write_regs[64];
+	u8 write_values[64];
+	unsigned int writes;
 };
 
 static int sc8541_test_read(void *ctx, unsigned int reg, unsigned int *value)
@@ -27,6 +30,10 @@ static int sc8541_test_write(void *ctx, unsigned int reg, unsigned int value)
 {
 	struct sc8541_test *f = ctx;
 
+	if (f->writes < ARRAY_SIZE(f->write_regs)) {
+		f->write_regs[f->writes] = reg;
+		f->write_values[f->writes++] = value;
+	}
 	if (reg == f->fail_reg)
 		return -EIO;
 	f->regs[reg] = value;
@@ -166,7 +173,70 @@ static void sc8541_test_consumer_stop(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->sc.watch));
 }
 
+/* Literal stock ops_cp_set_revchg register sequence, not driver tables. */
+static void sc8541_test_otg_sequence(struct kunit *test)
+{
+	static const u8 off_regs[] = {
+		0x0f, 0x00, 0x12, 0x02, 0x08, 0x05, 0x01,
+		0x00, 0x01, 0x02, 0x08, 0x06, 0x0e, 0x0f,
+	};
+	static const u8 off_values[] = {
+		0, 0, 0x80, 0x80, 0, 0, 0, 0x60, 0x4c, 0xd0, 0x18, 0x78, 0x60, 0,
+	};
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_ON), 0);
+	KUNIT_ASSERT_EQ(test, f->writes, 2);
+	KUNIT_EXPECT_EQ(test, f->write_regs[0], 0x40);
+	KUNIT_EXPECT_EQ(test, f->write_values[0], 0x40);
+	KUNIT_EXPECT_EQ(test, f->write_regs[1], 0x40);
+	KUNIT_EXPECT_EQ(test, f->write_values[1], 0x60);
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -EBUSY);
+	f->writes = 0;
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_OFF), 0);
+	KUNIT_ASSERT_EQ(test, f->writes, ARRAY_SIZE(off_regs));
+	KUNIT_EXPECT_MEMEQ(test, f->write_regs, off_regs, sizeof(off_regs));
+	KUNIT_EXPECT_MEMEQ(test, f->write_values, off_values, sizeof(off_values));
+	KUNIT_EXPECT_EQ(test, f->regs[0x40], 0x60);
+	KUNIT_EXPECT_FALSE(test, f->sc.otg_owned);
+}
+
+static void sc8541_test_otg_detach(struct kunit *test)
+{
+	static const u8 regs[] = { 5, 5, 0x41, 0x41 };
+	static const u8 values[] = { 0x24, 0x20, 0x12, 0x02 };
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->regs[5] = 0xa4;
+	f->regs[0x41] = 0x92;
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_DETACH), 0);
+	KUNIT_ASSERT_EQ(test, f->writes, 4);
+	KUNIT_EXPECT_MEMEQ(test, f->write_regs, regs, sizeof(regs));
+	KUNIT_EXPECT_MEMEQ(test, f->write_values, values, sizeof(values));
+}
+
+static void sc8541_test_otg_failure(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->fail_reg = 0x40;
+	KUNIT_EXPECT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_ON), -EIO);
+	KUNIT_EXPECT_EQ(test, f->writes, 1);
+	KUNIT_EXPECT_TRUE(test, f->sc.otg_owned);
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -EBUSY);
+	f->fail_reg = -1;
+	f->fail_read_reg = 0x40;
+	KUNIT_EXPECT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_OFF), -EREMOTEIO);
+	KUNIT_EXPECT_TRUE(test, f->sc.otg_owned);
+	f->fail_read_reg = -1;
+	KUNIT_EXPECT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_OFF), 0);
+	KUNIT_EXPECT_FALSE(test, f->sc.otg_owned);
+}
+
 static struct kunit_case sc8541_test_cases[] = {
+	KUNIT_CASE(sc8541_test_otg_failure),
+	KUNIT_CASE(sc8541_test_otg_detach),
+	KUNIT_CASE(sc8541_test_otg_sequence),
 	KUNIT_CASE(sc8541_test_protections),
 	KUNIT_CASE(sc8541_test_failed_arm),
 	KUNIT_CASE(sc8541_test_adc),
