@@ -55,9 +55,17 @@
 #define MCA_PROP_INPUT_CURRENT_LIMIT	0x2008
 #define MCA_PROP_AICL_ENABLED		0x2012
 #define MCA_PROP_INPUT_SUSPEND		0x2019
+#define MCA_PROP_OTG_BOOST_STATUS	0x200d
+#define MCA_PROP_OTG_GATE_STATUS		0x200e
 #define MCA_PROP_OTG_CFG			0x201a
 #define MCA_PROP_CP_STATE		0x201c
 #define MCA_PROP_OTG_PLUGIN		0x21020
+#define MCA_PROP_TYPEC_MODE		0x21015
+#define MCA_NOTIFY_TYPE_CHANGE		0
+#define MCA_NOTIFY_BOOST			3
+#define MCA_NOTIFY_TYPEC_CHANGE		5
+#define MCA_NOTIFY_OTG_CP_CONFIG		10
+#define MCA_NOTIFY_HISTORY		32
 
 /* Piano's charger boost and PMIC GPIO controller, with no external GPIOs. */
 static const __le32 xiaomi_mca_piano_otg_cfg[] = {
@@ -537,6 +545,20 @@ struct xiaomi_mca_stats {
 	u64 notifications;
 };
 
+/* Stock mca_glink_nty_msg: notification is not hdr.opcode. */
+struct xiaomi_mca_notification {
+	struct pmic_glink_hdr hdr;
+	__le32 id;
+	u8 data[MCA_DATA_LEN];
+};
+
+struct xiaomi_mca_notify_record {
+	u64 time_ns;
+	u32 generation;
+	u32 id;
+	u32 data[4];
+};
+
 struct xiaomi_mca {
 	struct device *dev;
 	struct pmic_glink_client *client;
@@ -562,6 +584,7 @@ struct xiaomi_mca {
 	u32 config_generation;
 	int config_result;
 	bool cp_absent_warned;
+	bool otg_active;
 
 	struct delayed_work poll_work;
 	bool sleeping;		/* no transactions between prepare and complete */
@@ -612,6 +635,11 @@ struct xiaomi_mca {
 	spinlock_t rx_lock;
 	bool service_up;
 	bool poll_ready;
+	struct xiaomi_mca_notify_record notify[MCA_NOTIFY_HISTORY];
+	u32 notify_head;
+	u32 notify_count;
+	u32 notify_pending;
+	u64 notify_dropped;
 	bool pending;
 	bool answered;
 	u32 pending_opcode;
@@ -2102,6 +2130,56 @@ static void xiaomi_mca_sync_config(struct xiaomi_mca *mca)
 		dev_warn(mca->dev, "OTG configuration sync failed: %d\n", ret);
 }
 
+/* Process in the existing poll, preserving notification order. No retries. */
+static void xiaomi_mca_process_notifications(struct xiaomi_mca *mca)
+{
+	struct xiaomi_mca_notify_record record;
+	u32 generation;
+	u8 plugin;
+	int ret, budget = MCA_NOTIFY_HISTORY;
+
+	while (budget--) {
+		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+			if (!mca->notify_pending)
+				return;
+			record = mca->notify[(mca->notify_head + MCA_NOTIFY_HISTORY -
+					      mca->notify_pending) % MCA_NOTIFY_HISTORY];
+			mca->notify_pending--;
+			generation = mca->service_generation;
+		}
+		dev_info(mca->dev, "MCA notification %u data %#x generation %u%s\n",
+			 record.id, record.data[0], record.generation,
+			 record.generation == generation ? "" : " stale");
+		if (!mca->piano_otg || record.generation != generation)
+			continue;
+		switch (record.id) {
+		case MCA_NOTIFY_OTG_CP_CONFIG:
+			/* Prevent the forward policy from changing a reverse path. */
+			mca->otg_active = true;
+			ret = xiaomi_mca_otg_cp(mca, record.data[0] ?
+					SC8541_OTG_REVERSE_ON : SC8541_OTG_REVERSE_OFF);
+			if (!ret && !record.data[0])
+				mca->otg_active = false;
+			break;
+		case MCA_NOTIFY_BOOST:
+			/*
+			 * boost_src=0 bypasses proxy's ovpgate_with_check.
+			 * Ordinary OTG only clears manual reverse on detach
+			 * (strategy_buckchg_cp_revert_handler, 0x5794..0x57c8).
+			 */
+			ret = xiaomi_mca_read_blob(mca, MCA_PROP_OTG_PLUGIN,
+						  &plugin, sizeof(plugin));
+			if (!ret && !plugin)
+				ret = xiaomi_mca_otg_cp(mca, SC8541_OTG_DETACH);
+			break;
+		default:
+			continue;
+		}
+		xiaomi_mca_cp_missing(mca, ret);
+		dev_info(mca->dev, "OTG notification %u CP result %d\n", record.id, ret);
+	}
+}
+
 static void xiaomi_mca_callback(const void *data, size_t len, void *priv)
 {
 	const struct pmic_glink_hdr *hdr = data;
@@ -2117,7 +2195,34 @@ static void xiaomi_mca_callback(const void *data, size_t len, void *priv)
 	}
 
 	if (le32_to_cpu(hdr->type) == PMIC_GLINK_NOTIFY) {
+		const struct xiaomi_mca_notification *msg = data;
+		struct xiaomi_mca_notify_record *record;
+		int i;
+
 		mca->stats.notifications++;
+		if (len != sizeof(*msg) ||
+		    le32_to_cpu(hdr->owner) != PMIC_GLINK_OWNER_BATTMGR) {
+			mca->stats.malformed++;
+			return;
+		}
+		record = &mca->notify[mca->notify_head];
+		record->time_ns = ktime_get_boottime_ns();
+		record->generation = mca->service_generation;
+		record->id = le32_to_cpu(msg->id);
+		for (i = 0; i < ARRAY_SIZE(record->data); i++)
+			record->data[i] = get_unaligned_le32(msg->data + i * sizeof(u32));
+		mca->notify_head = (mca->notify_head + 1) % MCA_NOTIFY_HISTORY;
+		mca->notify_count = min_t(u32, mca->notify_count + 1, MCA_NOTIFY_HISTORY);
+		if (mca->notify_pending == MCA_NOTIFY_HISTORY)
+			mca->notify_dropped++;
+		else
+			mca->notify_pending++;
+		if (mca->poll_ready &&
+		    (record->id == MCA_NOTIFY_TYPE_CHANGE ||
+		     record->id == MCA_NOTIFY_TYPEC_CHANGE ||
+		     record->id == MCA_NOTIFY_BOOST ||
+		     record->id == MCA_NOTIFY_OTG_CP_CONFIG))
+			mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
 		return;
 	}
 
@@ -2274,10 +2379,11 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->online = false;
 			mca->policy_generation = generation;
 		}
-		if (charge_policy) {
+		xiaomi_mca_process_notifications(mca);
+		if (charge_policy && !mca->otg_active) {
 			mca->policy_active = true;
 			xiaomi_mca_policy_poll(mca);
-		} else if (mca->policy_active) {
+		} else if (!mca->otg_active && mca->policy_active) {
 			if (xiaomi_mca_cp_stop(mca, "policy disabled"))
 				goto out;
 			xiaomi_mca_restore_icl(mca);

@@ -469,7 +469,9 @@ static void xiaomi_mca_test_callback(struct kunit *test)
 	mca->pending_seq = 1;
 
 	xiaomi_mca_callback(mca_test_reply(test, &mca_test_battmgr_get), 280, mca);
-	xiaomi_mca_callback(mca_test_reply(test, &mca_test_notification), 280, mca);
+	/* The fixture allocator is reply-sized; a notification is 272 bytes. */
+	xiaomi_mca_callback(mca_test_reply(test, &mca_test_notification),
+			    sizeof(struct xiaomi_mca_notification), mca);
 	xiaomi_mca_callback(mca_test_reply(test, &mca_test_vbus_seq10), 280, mca);
 	KUNIT_EXPECT_FALSE(test, mca->answered);
 	KUNIT_EXPECT_FALSE(test, completion_done(&mca->ack));
@@ -1002,6 +1004,7 @@ static void xiaomi_mca_test_pm_lost_ack(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->mca.voltage_written);
 }
 
+
 struct mca_otg_fixture {
 	struct xiaomi_mca mca;
 	u32 props[8];
@@ -1072,6 +1075,21 @@ static struct mca_otg_fixture *mca_otg_fixture(struct kunit *test)
 	return f;
 }
 
+static void mca_otg_send(struct xiaomi_mca *mca, u32 id, u32 data)
+{
+	struct xiaomi_mca_notification msg = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_NOTIFY),
+		/* Deliberately different from id to catch decoding hdr.opcode. */
+		.hdr.opcode = cpu_to_le32(0x77),
+		.id = cpu_to_le32(id),
+	};
+
+	put_unaligned_le32(data, msg.data);
+	put_unaligned_le32(0x12345678, msg.data + 12);
+	xiaomi_mca_callback(&msg, sizeof(msg), mca);
+}
+
 static void xiaomi_mca_test_otg_config(struct kunit *test)
 {
 	static const u8 expected[] = {
@@ -1127,10 +1145,89 @@ static void xiaomi_mca_test_otg_config_failure(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->writes, 1);
 }
 
+static void xiaomi_mca_test_otg_absent(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+
+	f->cp_result = -ENODEV;
+	guard(mutex)(&f->mca.lock);
+	xiaomi_mca_sync_config(&f->mca);
+	KUNIT_ASSERT_EQ(test, f->writes, 2);
+	KUNIT_EXPECT_EQ(test, f->data[0][0], 0);
+	KUNIT_EXPECT_TRUE(test, f->mca.cp_absent_warned);
+	mca_otg_send(&f->mca, 10, 1);
+	xiaomi_mca_process_notifications(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->calls, 2);
+	KUNIT_EXPECT_EQ(test, f->actions[1], SC8541_OTG_REVERSE_ON);
+}
+
+static void xiaomi_mca_test_otg_dispatch(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+
+	mca_otg_send(&f->mca, 10, 2);
+	mca_otg_send(&f->mca, 10, 0);
+	guard(mutex)(&f->mca.lock);
+	xiaomi_mca_process_notifications(&f->mca);
+	KUNIT_ASSERT_EQ(test, f->calls, 2);
+	KUNIT_EXPECT_EQ(test, f->actions[0], SC8541_OTG_REVERSE_ON);
+	KUNIT_EXPECT_EQ(test, f->actions[1], SC8541_OTG_REVERSE_OFF);
+	KUNIT_EXPECT_FALSE(test, f->mca.otg_active);
+	KUNIT_EXPECT_EQ(test, f->mca.notify[0].id, 10);
+	KUNIT_EXPECT_EQ(test, f->mca.notify[0].data[3], 0x12345678);
+	KUNIT_EXPECT_GT(test, f->mca.notify[0].time_ns, 0);
+	f->plugin = 1;
+	mca_otg_send(&f->mca, 3, 1);
+	xiaomi_mca_process_notifications(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->calls, 2);
+	f->plugin = 0;
+	mca_otg_send(&f->mca, 3, 0);
+	xiaomi_mca_process_notifications(&f->mca);
+	KUNIT_ASSERT_EQ(test, f->calls, 3);
+	KUNIT_EXPECT_EQ(test, f->actions[2], SC8541_OTG_DETACH);
+}
+
+static void xiaomi_mca_test_otg_poll_and_stop(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+
+	f->mca.poll_ready = true;
+	mca_otg_send(&f->mca, 5, 0);
+	flush_delayed_work(&f->mca.poll_work);
+	KUNIT_EXPECT_EQ(test, f->polls, 1);
+	xiaomi_mca_stop_poll(&f->mca);
+	mca_otg_send(&f->mca, 5, 0);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->mca.poll_work));
+	KUNIT_EXPECT_EQ(test, f->polls, 1);
+}
+
+static void xiaomi_mca_test_otg_bad_and_stale(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+	struct xiaomi_mca_notification msg = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_NOTIFY),
+		.id = cpu_to_le32(10),
+	};
+
+	xiaomi_mca_callback(&msg, sizeof(msg) - 1, &f->mca);
+	KUNIT_EXPECT_EQ(test, f->mca.stats.malformed, 1);
+	KUNIT_EXPECT_EQ(test, f->mca.notify_pending, 0);
+	mca_otg_send(&f->mca, 10, 1);
+	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_DOWN);
+	guard(mutex)(&f->mca.lock);
+	xiaomi_mca_process_notifications(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->calls, 0);
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
-	KUNIT_CASE(xiaomi_mca_test_otg_config),
-	KUNIT_CASE(xiaomi_mca_test_otg_restart),
+	KUNIT_CASE(xiaomi_mca_test_otg_bad_and_stale),
+	KUNIT_CASE(xiaomi_mca_test_otg_poll_and_stop),
+	KUNIT_CASE(xiaomi_mca_test_otg_dispatch),
+	KUNIT_CASE(xiaomi_mca_test_otg_absent),
 	KUNIT_CASE(xiaomi_mca_test_otg_config_failure),
+	KUNIT_CASE(xiaomi_mca_test_otg_restart),
+	KUNIT_CASE(xiaomi_mca_test_otg_config),
 	KUNIT_CASE(xiaomi_mca_test_policy_defaults),
 	KUNIT_CASE(xiaomi_mca_test_hv_fixed),
 	KUNIT_CASE(xiaomi_mca_test_hv_pps),
