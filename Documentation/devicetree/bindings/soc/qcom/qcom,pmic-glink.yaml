@@ -62,6 +62,10 @@ properties:
           - const: qcom,sm8550-pmic-glink
           - const: qcom,pmic-glink
 
+  xiaomi,charge-pump:
+    description: Charge pump cooperating with the Xiaomi MCA firmware for OTG.
+    $ref: /schemas/types.yaml#/definitions/phandle
+
   '#address-cells':
     const: 1
 
