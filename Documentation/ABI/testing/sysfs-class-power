@@ -947,3 +947,14 @@ Description:
 		one-byte insertion flag; the other attributes are 32-bit boost,
 		gate and Type-C mode status words. These firmware reports do
 		not establish physical VBUS voltage or USB enumeration.
+
+What:		/sys/class/power_supply/xiaomi-mca-usb/cc_toggle
+What:		/sys/class/power_supply/xiaomi-mca-usb/snk_src_mode
+Date:		October 2026
+Contact:	Linux Power Supply Mailing List <linux-pm@vger.kernel.org>
+Description:
+		Read-only Xiaomi MCA firmware port-role telemetry. cc_toggle
+		reads the one-byte CC toggle state; snk_src_mode reads the
+		32-bit sink/source mode. Both return raw unsigned decimal
+		values, or a transport error if unavailable. Reading these
+		attributes does not request a role change or force CC toggling.

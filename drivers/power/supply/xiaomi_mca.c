@@ -58,8 +58,11 @@
 #define MCA_PROP_OTG_BOOST_STATUS	0x200d
 #define MCA_PROP_OTG_GATE_STATUS		0x200e
 #define MCA_PROP_OTG_CFG			0x201a
+#define MCA_PROP_CID_CFG			0x201b
 #define MCA_PROP_CP_STATE		0x201c
 #define MCA_PROP_OTG_PLUGIN		0x21020
+#define MCA_PROP_CC_TOGGLE		0x21021
+#define MCA_PROP_SNK_SRC_MODE		0x21022
 #define MCA_PROP_TYPEC_MODE		0x21015
 #define MCA_NOTIFY_TYPE_CHANGE		0
 #define MCA_NOTIFY_BOOST			3
@@ -71,6 +74,14 @@
 static const __le32 xiaomi_mca_piano_otg_cfg[] = {
 	cpu_to_le32(0), cpu_to_le32(1), cpu_to_le32(~0U), cpu_to_le32(~0U),
 };
+
+/*
+ * Piano stock cid_gpio_int, passed unchanged by qcom_subpmic_probe()
+ * (0x59c..0x5b0) and sync_cfg_work() (0xba0..0xbb4) to CID_CFG.
+ * ADSP mca_misc_cid_cfg_init/register_cid_irq consumes this firmware
+ * identifier. It is not an AP GPIO/IRQ number; do not translate it.
+ */
+#define MCA_PIANO_CID_CFG		0x708
 
 #define MCA_PROP_AICL_STATUS		0x2029
 /* USB input properties, voltages in uV, currents in uA */
@@ -950,6 +961,8 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	u32 val = len == sizeof(u32) ? get_unaligned_le32(data) : 0;
 
 	switch (prop) {
+	case MCA_PROP_CID_CFG:
+		return len == sizeof(u32) && val == MCA_PIANO_CID_CFG;
 	case MCA_PROP_CP_STATE:
 		return len == 1 && *(const u8 *)data <= 1;
 	case MCA_PROP_OTG_CFG:
@@ -1001,7 +1014,7 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	if (len > sizeof(buf) || !xiaomi_mca_write_allowed(prop, data, len))
 		return -EPERM;
 	lockdep_assert_held(&mca->lock);
-	if (prop == MCA_PROP_CP_STATE || prop == MCA_PROP_OTG_CFG) {
+	if (prop == MCA_PROP_CP_STATE || prop == MCA_PROP_OTG_CFG || prop == MCA_PROP_CID_CFG) {
 		if (!mca->piano_otg)
 			return -EOPNOTSUPP;
 		memcpy(buf, data, len);
@@ -2093,9 +2106,10 @@ static void xiaomi_mca_cp_missing(struct xiaomi_mca *mca, int ret)
 	}
 }
 
-/* Stock qcom_subpmic_sync_cfg_work: CP_STATE, then the 16-byte OTG_CFG. */
+/* Stock qcom_subpmic_sync_cfg_work: CP_STATE, OTG_CFG, then CID_CFG. */
 static void xiaomi_mca_sync_config(struct xiaomi_mca *mca)
 {
+	const __le32 cid = cpu_to_le32(MCA_PIANO_CID_CFG);
 	u32 generation;
 	bool up;
 	u8 present;
@@ -2123,9 +2137,15 @@ static void xiaomi_mca_sync_config(struct xiaomi_mca *mca)
 	if (!ret)
 		ret = xiaomi_mca_write_blob(mca, MCA_PROP_OTG_CFG,
 				xiaomi_mca_piano_otg_cfg, sizeof(xiaomi_mca_piano_otg_cfg));
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		if (mca->service_generation != generation || !mca->service_up)
+			ret = -ESTALE;
+	}
+	if (!ret)
+		ret = xiaomi_mca_write_blob(mca, MCA_PROP_CID_CFG, &cid, sizeof(cid));
 	mca->config_result = ret;
-	dev_info(mca->dev, "OTG config generation %u CP present %u result %d; CID cfg omitted\n",
-		 generation, present, ret);
+	dev_info(mca->dev, "OTG config generation %u CP present %u CID %#x result %d\n",
+		 generation, present, MCA_PIANO_CID_CFG, ret);
 	if (ret)
 		dev_warn(mca->dev, "OTG configuration sync failed: %d\n", ret);
 }
@@ -2457,7 +2477,7 @@ static ssize_t xiaomi_mca_otg_show(struct device *dev, char *buf, u32 prop)
 	int ret;
 
 	guard(mutex)(&mca->lock);
-	if (prop == MCA_PROP_OTG_PLUGIN) {
+	if (prop == MCA_PROP_OTG_PLUGIN || prop == MCA_PROP_CC_TOGGLE) {
 		ret = xiaomi_mca_read_blob(mca, prop, &plugin, sizeof(plugin));
 		if (!ret)
 			value = plugin;
@@ -2495,12 +2515,28 @@ static ssize_t typec_mode_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(typec_mode);
 
+static ssize_t cc_toggle_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	return xiaomi_mca_otg_show(dev, buf, MCA_PROP_CC_TOGGLE);
+}
+static DEVICE_ATTR_RO(cc_toggle);
+
+static ssize_t snk_src_mode_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return xiaomi_mca_otg_show(dev, buf, MCA_PROP_SNK_SRC_MODE);
+}
+static DEVICE_ATTR_RO(snk_src_mode);
+
 static struct attribute *xiaomi_mca_usb_attrs[] = {
 	&dev_attr_charger_type.attr,
 	&dev_attr_otg_boost_status.attr,
 	&dev_attr_otg_gate_status.attr,
 	&dev_attr_otg_plugin.attr,
 	&dev_attr_typec_mode.attr,
+	&dev_attr_cc_toggle.attr,
+	&dev_attr_snk_src_mode.attr,
 	NULL,
 };
 
