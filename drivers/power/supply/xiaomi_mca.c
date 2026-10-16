@@ -2449,8 +2449,58 @@ static ssize_t charger_type_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(charger_type);
 
+static ssize_t xiaomi_mca_otg_show(struct device *dev, char *buf, u32 prop)
+{
+	struct xiaomi_mca *mca = power_supply_get_drvdata(to_power_supply(dev));
+	u32 value = 0;
+	u8 plugin;
+	int ret;
+
+	guard(mutex)(&mca->lock);
+	if (prop == MCA_PROP_OTG_PLUGIN) {
+		ret = xiaomi_mca_read_blob(mca, prop, &plugin, sizeof(plugin));
+		if (!ret)
+			value = plugin;
+	} else {
+		ret = xiaomi_mca_read(mca, prop, &value);
+	}
+	return ret ?: sysfs_emit(buf, "%u\n", value);
+}
+
+static ssize_t otg_boost_status_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return xiaomi_mca_otg_show(dev, buf, MCA_PROP_OTG_BOOST_STATUS);
+}
+static DEVICE_ATTR_RO(otg_boost_status);
+
+static ssize_t otg_gate_status_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return xiaomi_mca_otg_show(dev, buf, MCA_PROP_OTG_GATE_STATUS);
+}
+static DEVICE_ATTR_RO(otg_gate_status);
+
+static ssize_t otg_plugin_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return xiaomi_mca_otg_show(dev, buf, MCA_PROP_OTG_PLUGIN);
+}
+static DEVICE_ATTR_RO(otg_plugin);
+
+static ssize_t typec_mode_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return xiaomi_mca_otg_show(dev, buf, MCA_PROP_TYPEC_MODE);
+}
+static DEVICE_ATTR_RO(typec_mode);
+
 static struct attribute *xiaomi_mca_usb_attrs[] = {
 	&dev_attr_charger_type.attr,
+	&dev_attr_otg_boost_status.attr,
+	&dev_attr_otg_gate_status.attr,
+	&dev_attr_otg_plugin.attr,
+	&dev_attr_typec_mode.attr,
 	NULL,
 };
 
@@ -2851,6 +2901,36 @@ static int xiaomi_mca_frames_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(xiaomi_mca_frames);
 
+static int xiaomi_mca_notifications_show(struct seq_file *s, void *unused)
+{
+	struct xiaomi_mca *mca = s->private;
+	struct xiaomi_mca_notify_record records[MCA_NOTIFY_HISTORY];
+	u32 count, head, i;
+	u64 dropped;
+
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		memcpy(records, mca->notify, sizeof(records));
+		count = mca->notify_count;
+		head = mca->notify_head;
+		dropped = mca->notify_dropped;
+	}
+	seq_printf(s, "dropped_pending %llu\n", dropped);
+	scoped_guard(mutex, &mca->lock)
+		seq_printf(s, "config_attempted %u generation %u result %d\n",
+			   mca->config_attempted, mca->config_generation, mca->config_result);
+	seq_puts(s, "boottime_ns generation id data0 data1 data2 data3\n");
+	for (i = 0; i < count; i++) {
+		struct xiaomi_mca_notify_record *r;
+
+		r = &records[(head + MCA_NOTIFY_HISTORY - count + i) % MCA_NOTIFY_HISTORY];
+		seq_printf(s, "%llu %u %u %08x %08x %08x %08x\n",
+			   r->time_ns, r->generation, r->id,
+			   r->data[0], r->data[1], r->data[2], r->data[3]);
+	}
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(xiaomi_mca_notifications);
+
 static void xiaomi_mca_stop_poll(void *data)
 {
 	struct xiaomi_mca *mca = data;
@@ -3028,6 +3108,8 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 	debugfs_create_file("status", 0400, mca->debugfs, mca, &xiaomi_mca_status_fops);
 	debugfs_create_file("stats", 0400, mca->debugfs, mca, &xiaomi_mca_stats_fops);
 	debugfs_create_file("frames", 0400, mca->debugfs, mca, &xiaomi_mca_frames_fops);
+	debugfs_create_file("notifications", 0400, mca->debugfs, mca,
+			    &xiaomi_mca_notifications_fops);
 	ret = devm_add_action_or_reset(dev, xiaomi_mca_debugfs_remove, mca->debugfs);
 	if (ret)
 		return ret;

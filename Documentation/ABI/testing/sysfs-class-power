@@ -933,3 +933,17 @@ Description:
 		Valid values:
 
 		- 0 - 70 (minutes), step by 10 (rounded down)
+
+What:		/sys/class/power_supply/xiaomi-mca-usb/otg_boost_status
+What:		/sys/class/power_supply/xiaomi-mca-usb/otg_gate_status
+What:		/sys/class/power_supply/xiaomi-mca-usb/otg_plugin
+What:		/sys/class/power_supply/xiaomi-mca-usb/typec_mode
+Date:		October 2026
+Contact:	Linux Power Supply Mailing List <linux-pm@vger.kernel.org>
+Description:
+		Read-only Xiaomi MCA firmware OTG telemetry. Each read performs
+		a checked firmware request and returns the raw unsigned decimal
+		value, or a transport error if unavailable. otg_plugin is the
+		one-byte insertion flag; the other attributes are 32-bit boost,
+		gate and Type-C mode status words. These firmware reports do
+		not establish physical VBUS voltage or USB enumeration.
