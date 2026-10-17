@@ -409,6 +409,22 @@ static int gunyah_vcpu_run(struct gunyah_vcpu *vcpu)
 			schedule();
 		} else {
 			ret = gunyah_error_remap(gunyah_error);
+			/*
+			 * The resource manager stops the vCPUs of an exiting VM
+			 * before its VM_EXITED notification reaches us. A vCPU
+			 * woken in between (wakeup VIRQ) re-enters the hypercall
+			 * and gets an error: wait briefly for the notification
+			 * and report the VM status instead of the error.
+			 */
+			if (wait_event_interruptible_timeout(
+				    vcpu->ghvm->vm_status_wait,
+				    READ_ONCE(vcpu->ghvm->vm_status) !=
+					    GUNYAH_RM_VM_STATUS_RUNNING,
+				    msecs_to_jiffies(500)) > 0 &&
+			    !gunyah_vcpu_check_system(vcpu)) {
+				ret = 0;
+				goto out;
+			}
 		}
 	}
 
