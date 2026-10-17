@@ -711,6 +711,8 @@ static __must_check struct gunyah_vm *gunyah_vm_alloc(struct gunyah_rm *rm)
 	INIT_LIST_HEAD(&ghvm->resources);
 	INIT_LIST_HEAD(&ghvm->resource_tickets);
 	xa_init(&ghvm->boot_context);
+	INIT_LIST_HEAD(&ghvm->pshares);
+	mutex_init(&ghvm->pshares_lock);
 
 	init_rwsem(&ghvm->mmio_handler_lock);
 	ghvm->mmio_handler_root = RB_ROOT;
@@ -1108,9 +1110,60 @@ static long gunyah_vm_ioctl(struct file *filp, unsigned int cmd,
 
 		return gunyah_vm_set_auth_type(ghvm, &auth_desc);
 	}
+	case GH_VM_PROTECTED_SHARE: {
+		struct gunyah_protected_share share;
+
+		/* only allow owner task to add memory */
+		if (ghvm->mm_s != current->mm)
+			return -EPERM;
+		if (copy_from_user(&share, argp, sizeof(share)))
+			return -EFAULT;
+		if (share.reserved)
+			return -EINVAL;
+
+		r = gunyah_vm_pshare_user(ghvm, &share);
+		if (!r && copy_to_user(argp, &share, sizeof(share))) {
+			/* userspace never learned the handle: do not leave it shared */
+			gunyah_vm_punshare(ghvm, share.label);
+			return -EFAULT;
+		}
+		break;
+	}
+	case GH_VM_PROTECTED_SHARE_DMABUF: {
+		struct gunyah_protected_share_dmabuf share;
+
+		/* only allow owner task to add memory */
+		if (ghvm->mm_s != current->mm)
+			return -EPERM;
+		if (copy_from_user(&share, argp, sizeof(share)))
+			return -EFAULT;
+
+		r = gunyah_vm_pshare_dmabuf(ghvm, &share);
+		if (!r && copy_to_user(argp, &share, sizeof(share))) {
+			/* userspace never learned the handle: do not leave it shared */
+			gunyah_vm_punshare(ghvm, share.label);
+			return -EFAULT;
+		}
+		break;
+	}
+	case GH_VM_PROTECTED_UNSHARE: {
+		struct gunyah_protected_unshare unshare;
+
+		/* only allow owner task to remove memory */
+		if (ghvm->mm_s != current->mm)
+			return -EPERM;
+		if (copy_from_user(&unshare, argp, sizeof(unshare)))
+			return -EFAULT;
+		if (unshare.reserved)
+			return -EINVAL;
+
+		r = gunyah_vm_punshare(ghvm, unshare.label);
+		break;
+	}
 	case GH_VM_CHECK_EXTENSION:
 		switch (arg) {
 		case GH_CAP_VCPU_TIMER_WAKEUP:
+		case GH_CAP_PROTECTED_SHARE:
 			r = 1;
 			break;
 		default:
@@ -1192,6 +1245,8 @@ static void _gunyah_vm_put(struct kref *kref)
 	}
 
 	WARN_ON(gunyah_reclaim_parcels(ghvm, 0, ULONG_MAX));
+	/* After the reset: RM releases the guest's acceptances at VM reset */
+	gunyah_vm_pshare_release_all(ghvm);
 	down_write(&ghvm->bindings_lock);
 	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX) {
 		mtree_erase(&ghvm->bindings, gunyah_gpa_to_gfn(b->guest_phys_addr));

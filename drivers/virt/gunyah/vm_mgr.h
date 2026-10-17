@@ -115,6 +115,9 @@ long gunyah_dev_vm_mgr_ioctl(struct gunyah_rm *rm, unsigned int cmd,
  * @dtb.parcel_pages: Number of pages lent for the memory parcel
  * @dtb.parcel: Data for resource manager to lend the parcel
  * @boot_context: Requested initial boot context to set when launching the VM
+ * @pshares: List of &struct gunyah_vm_pshare: memparcels shared at runtime for
+ *           the guest to accept itself (GH_VM_PROTECTED_SHARE)
+ * @pshares_lock: Serializes @pshares
  *
  * Members are grouped by hot path.
  */
@@ -162,6 +165,8 @@ struct gunyah_vm {
 		struct gunyah_vm_parcel parcel;
 	} fw;
 	struct xarray boot_context;
+	struct list_head pshares;
+	struct mutex pshares_lock;
 };
 
 int gunyah_vm_mmio_write(struct gunyah_vm *ghvm, u64 addr, u32 len, u64 data);
@@ -274,6 +279,14 @@ int gunyah_demand_page(struct gunyah_vm *ghvm, u64 gpa, bool write);
 int gunyah_setup_demand_paging(struct gunyah_vm *ghvm, u64 start_gfn,
 				u64 end_gfn);
 int gunyah_vm_set_protected(struct gunyah_vm *ghvm);
+
+/* Runtime shares a protected guest accepts itself (vm_mgr_pshare.c) */
+int gunyah_vm_pshare_user(struct gunyah_vm *ghvm,
+			  struct gunyah_protected_share *args);
+int gunyah_vm_pshare_dmabuf(struct gunyah_vm *ghvm,
+			    struct gunyah_protected_share_dmabuf *args);
+int gunyah_vm_punshare(struct gunyah_vm *ghvm, u32 label);
+void gunyah_vm_pshare_release_all(struct gunyah_vm *ghvm);
 #ifdef CONFIG_DMA_CMA
 int gunyah_cma_mem_init(void);
 void gunyah_cma_mem_exit(void);

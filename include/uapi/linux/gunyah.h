@@ -475,6 +475,88 @@ struct gunyah_auth_desc {
  *
  * GH_CAP_VCPU_TIMER_WAKEUP: kernel handles GUNYAH_VCPU_STATE_EXPECTS_WAKEUP_OR_TIMEOUT,
  *     arming a per-vCPU hrtimer for the hypervisor-provided deadline.
+ * GH_CAP_PROTECTED_SHARE: GH_VM_PROTECTED_SHARE{,_DMABUF} / GH_VM_PROTECTED_UNSHARE
+ *     are available.
  */
 #define GH_CAP_VCPU_TIMER_WAKEUP	0
+#define GH_CAP_PROTECTED_SHARE		1
+
+/*
+ * Runtime memory sharing with a protected guest ("GuestAccept").
+ *
+ * The host cannot map memory into a protected VM's stage-2: the guest owns it.
+ * Instead the host SHAREs a resource-manager memparcel to the VM and returns the
+ * parcel handle; the guest must then ACCEPT the handle itself (RM MEM_ACCEPT,
+ * MAP_IPA_CONTIGUOUS) at a guest physical address of its choosing. Nothing is
+ * mapped until the guest agrees. The VM must have been started.
+ *
+ * The parcel stays shared until GH_VM_PROTECTED_UNSHARE reclaims it, which the
+ * resource manager only allows once the guest has released its acceptance.
+ * Whatever is still shared when the VM fd is closed is reclaimed after the VM
+ * has been reset.
+ */
+
+/**
+ * struct gunyah_protected_share - share a page-aligned userspace buffer
+ * @label: Identifier for the parcel, unique among this VM's protected shares.
+ * @flags: Guest access: GUNYAH_MEM_ALLOW_READ / _WRITE / _EXEC. Host keeps RWX.
+ * @guest_phys_addr: Where the guest intends to accept it. Informational only.
+ * @memory_size: Page-aligned byte count.
+ * @userspace_addr: Page-aligned buffer in the VM owner's address space.
+ * @mem_handle: OUT - resource-manager memparcel handle for the guest to accept.
+ * @reserved: Must be zero.
+ */
+struct gunyah_protected_share {
+	__u32 label;
+	__u32 flags;
+	__u64 guest_phys_addr;
+	__u64 memory_size;
+	__u64 userspace_addr;
+	__u32 mem_handle;
+	__u32 reserved;
+};
+#define GH_VM_PROTECTED_SHARE		_IOWR(GH_ANDROID_IOCTL_TYPE, 0x18, \
+						struct gunyah_protected_share)
+
+/**
+ * struct gunyah_protected_share_dmabuf - share a page-aligned slice of a DMA-BUF
+ * @label: Identifier for the parcel, unique among this VM's protected shares.
+ * @flags: Guest access: GUNYAH_MEM_ALLOW_READ / _WRITE / _EXEC. Host keeps RWX.
+ * @guest_phys_addr: Where the guest intends to accept it. Informational only.
+ * @memory_size: Page-aligned byte count.
+ * @dmabuf_offset: Page-aligned offset into the DMA-BUF.
+ * @dmabuf_fd: DMA-BUF file descriptor.
+ * @mem_handle: OUT - resource-manager memparcel handle for the guest to accept.
+ *
+ * For exporters whose mmap is VM_PFNMAP/VM_MIXEDMAP and therefore cannot be
+ * pinned through GH_VM_PROTECTED_SHARE. The kernel holds an attachment on the
+ * buffer until the parcel is reclaimed.
+ */
+struct gunyah_protected_share_dmabuf {
+	__u32 label;
+	__u32 flags;
+	__u64 guest_phys_addr;
+	__u64 memory_size;
+	__u64 dmabuf_offset;
+	__s32 dmabuf_fd;
+	__u32 mem_handle;
+};
+#define GH_VM_PROTECTED_SHARE_DMABUF	_IOWR(GH_ANDROID_IOCTL_TYPE, 0x19, \
+						struct gunyah_protected_share_dmabuf)
+
+/**
+ * struct gunyah_protected_unshare - reclaim a protected share by label
+ * @label: Label given at share time.
+ * @reserved: Must be zero.
+ *
+ * Fails with -EBUSY (and leaves the parcel shared and pinned) while the guest
+ * still holds its acceptance; the guest must release first. Memory is only
+ * returned to the host allocator once the resource manager has reclaimed it.
+ */
+struct gunyah_protected_unshare {
+	__u32 label;
+	__u32 reserved;
+};
+#define GH_VM_PROTECTED_UNSHARE		_IOW(GH_ANDROID_IOCTL_TYPE, 0x1a, \
+						struct gunyah_protected_unshare)
 #endif

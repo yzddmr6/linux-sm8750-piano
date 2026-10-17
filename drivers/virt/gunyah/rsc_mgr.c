@@ -6,6 +6,7 @@
 #define pr_fmt(fmt) "gunyah: " fmt
 
 #include <linux/completion.h>
+#include <linux/dma-mapping.h>
 #include <linux/gunyah.h>
 #include <linux/kobject.h>
 #include <linux/module.h>
@@ -188,6 +189,8 @@ static inline int gunyah_rm_error_remap(enum gunyah_rm_error rm_error)
 	case GUNYAH_RM_ERROR_DENIED:
 		return -EPERM;
 	case GUNYAH_RM_ERROR_BUSY:
+	case GUNYAH_RM_ERROR_MEM_INUSE:
+		/* e.g. reclaim of a memparcel a borrower still has accepted */
 		return -EBUSY;
 	case GUNYAH_RM_ERROR_INVALID:
 	case GUNYAH_RM_ERROR_ARGUMENT_INVALID:
@@ -195,7 +198,6 @@ static inline int gunyah_rm_error_remap(enum gunyah_rm_error rm_error)
 	case GUNYAH_RM_ERROR_VALIDATE_FAILED:
 	case GUNYAH_RM_ERROR_MAP_FAILED:
 	case GUNYAH_RM_ERROR_MEM_INVALID:
-	case GUNYAH_RM_ERROR_MEM_INUSE:
 	case GUNYAH_RM_ERROR_MEM_RELEASED:
 	case GUNYAH_RM_ERROR_VMID_INVALID:
 	case GUNYAH_RM_ERROR_LOOKUP_FAILED:
@@ -1030,6 +1032,15 @@ static int __init gunyah_rm_init(void)
 		pr_err("Failed to register gunyah misc device\n");
 		goto free_rx_irq;
 	}
+
+	/*
+	 * The misc device doubles as the DMA-BUF importer for runtime protected
+	 * shares (vm_mgr_pshare.c); map_attachment needs a DMA mask on it.
+	 */
+	ret = dma_coerce_mask_and_coherent(rm->miscdev.this_device,
+					   DMA_BIT_MASK(64));
+	if (ret)
+		goto deregister_misc;
 
 	ret = gunyah_adev_init(rm, "gh_rm_core");
 	if (ret) {
