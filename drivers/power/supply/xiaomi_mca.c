@@ -964,6 +964,7 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	case MCA_PROP_CID_CFG:
 		return len == sizeof(u32) && val == MCA_PIANO_CID_CFG;
 	case MCA_PROP_CP_STATE:
+	case MCA_PROP_CC_TOGGLE:
 		return len == 1 && *(const u8 *)data <= 1;
 	case MCA_PROP_OTG_CFG:
 		return len == sizeof(xiaomi_mca_piano_otg_cfg) &&
@@ -1008,12 +1009,30 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 				 const void *data, size_t len)
 {
 	u8 buf[MCA_VDM_LEN];
-	u32 type, vbus, value, checked, readback;
+	u32 type, vbus, value, checked, readback, generation;
 	int ret;
 
 	if (len > sizeof(buf) || !xiaomi_mca_write_allowed(prop, data, len))
 		return -EPERM;
 	lockdep_assert_held(&mca->lock);
+	if (prop == MCA_PROP_CC_TOGGLE) {
+		if (!mca->piano_otg)
+			return -EOPNOTSUPP;
+		scoped_guard(spinlock_irqsave, &mca->rx_lock)
+			generation = mca->service_generation;
+		memcpy(buf, data, len);
+		ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
+		if (ret)
+			return ret;
+		ret = xiaomi_mca_read_blob(mca, prop, buf, len);
+		if (ret)
+			return ret;
+		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+			if (generation != mca->service_generation || !mca->service_up)
+				return -ECONNRESET;
+		}
+		return buf[0] == *(const u8 *)data ? 0 : -EIO;
+	}
 	if (prop == MCA_PROP_CP_STATE || prop == MCA_PROP_OTG_CFG || prop == MCA_PROP_CID_CFG) {
 		if (!mca->piano_otg)
 			return -EOPNOTSUPP;
@@ -2520,7 +2539,24 @@ static ssize_t cc_toggle_show(struct device *dev,
 {
 	return xiaomi_mca_otg_show(dev, buf, MCA_PROP_CC_TOGGLE);
 }
-static DEVICE_ATTR_RO(cc_toggle);
+
+static ssize_t cc_toggle_store(struct device *dev,
+			       struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct xiaomi_mca *mca = power_supply_get_drvdata(to_power_supply(dev));
+	u8 enable;
+	int value, ret;
+
+	/* Stock cc_toggle_store -> PD class -> adsp_protocol_set_cc_toggle. */
+	ret = kstrtoint(buf, 10, &value);
+	if (ret)
+		return ret;
+	enable = !!value;
+	guard(mutex)(&mca->lock);
+	ret = xiaomi_mca_write_blob(mca, MCA_PROP_CC_TOGGLE, &enable, sizeof(enable));
+	return ret ?: count;
+}
+static DEVICE_ATTR_RW(cc_toggle);
 
 static ssize_t snk_src_mode_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)

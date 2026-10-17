@@ -1016,6 +1016,9 @@ struct mca_otg_fixture {
 	enum sc8541_otg_action actions[16];
 	int calls;
 	u8 plugin;
+	u8 cc_toggle;
+	bool restart_on_read;
+	int reads;
 	int read_error;
 	u32 read_prop;
 	size_t read_len;
@@ -1047,12 +1050,15 @@ static int mca_otg_test_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 	int i = f->writes;
 
 	if (op == MCA_OPCODE_READ) {
+		f->reads++;
 		f->read_prop = prop;
 		f->read_len = len;
 		if (f->read_error)
 			return f->read_error;
 		if (prop == MCA_PROP_CC_TOGGLE && len == 1) {
-			*(u8 *)data = 0xa5;
+			*(u8 *)data = f->cc_toggle;
+			if (f->restart_on_read)
+				mca->service_generation++;
 			return 0;
 		}
 		if (prop == MCA_PROP_SNK_SRC_MODE && len == sizeof(u32)) {
@@ -1087,6 +1093,7 @@ static struct mca_otg_fixture *mca_otg_fixture(struct kunit *test)
 	f->mca.piano_otg = true;
 	f->mca.service_up = true;
 	f->mca.service_generation = 1;
+	f->cc_toggle = 0xa5;
 	kunit_activate_static_stub(test, xiaomi_mca_transfer_data, mca_otg_test_xfer);
 	kunit_activate_static_stub(test, xiaomi_mca_otg_cp, mca_otg_test_cp);
 	return f;
@@ -1289,12 +1296,120 @@ static void xiaomi_mca_test_port_role_telemetry(struct kunit *test)
 	f->read_error = -EIO;
 	KUNIT_EXPECT_EQ(test, cc_toggle_show(&psy->dev, NULL, buf), -EIO);
 	KUNIT_EXPECT_EQ(test, snk_src_mode_show(&psy->dev, NULL, buf), -EIO);
-	KUNIT_EXPECT_EQ(test, dev_attr_cc_toggle.attr.mode, 0444);
+	KUNIT_EXPECT_EQ(test, dev_attr_cc_toggle.attr.mode, 0644);
 	KUNIT_EXPECT_EQ(test, dev_attr_snk_src_mode.attr.mode, 0444);
 	KUNIT_EXPECT_EQ(test, f->writes, 0);
 }
 
+static void xiaomi_mca_test_cc_toggle_values(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+	struct power_supply psy = { .drv_data = &f->mca };
+	static const char * const inputs[] = { "0\n", "1\n", "2\n", "-7\n", "+1\n" };
+	static const u8 header[] = {
+		0x0a, 0x80, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0,
+		0x21, 0x10, 2, 0, 1, 0, 0, 0,
+	};
+	struct xiaomi_mca_request req;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(inputs); i++) {
+		f->cc_toggle = !!i;
+		KUNIT_ASSERT_EQ(test, cc_toggle_store(&psy.dev, NULL, inputs[i],
+						    strlen(inputs[i])), strlen(inputs[i]));
+		KUNIT_ASSERT_EQ(test, f->writes, i + 1);
+		KUNIT_EXPECT_EQ(test, f->props[i], 0x21021);
+		KUNIT_ASSERT_EQ(test, f->lengths[i], 1);
+		KUNIT_EXPECT_EQ(test, f->data[i][0], !!i);
+		KUNIT_EXPECT_EQ(test, f->read_prop, 0x21021);
+		KUNIT_EXPECT_EQ(test, f->read_len, 1);
+		KUNIT_EXPECT_EQ(test, f->reads, i + 1);
+		/* Same request builder and payload copy used by the transport. */
+		xiaomi_mca_build_request(&req, MCA_OPCODE_WRITE, f->props[i], 1, 0);
+		memcpy(req.data, f->data[i], f->lengths[i]);
+		KUNIT_EXPECT_MEMEQ(test, &req, header, sizeof(header));
+		KUNIT_EXPECT_EQ(test, req.data[0], !!i);
+		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(req.data + 1, 0,
+						    sizeof(req.data) - 1), NULL);
+	}
+}
+
+static void xiaomi_mca_test_cc_toggle_errors(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+	struct power_supply psy = { .drv_data = &f->mca };
+
+	f->cc_toggle = 0;
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -EIO);
+	f->cc_toggle = 1;
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "0", 1), -EIO);
+	f->read_error = -ETIMEDOUT;
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -ETIMEDOUT);
+	f->fail_write = 4;
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -EIO);
+	KUNIT_EXPECT_EQ(test, f->reads, 3); /* Failed writes have no readback. */
+	f->read_error = 0;
+	f->restart_on_read = true;
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -ECONNRESET);
+	f->mca.sleeping = true;
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -EHOSTDOWN);
+	KUNIT_EXPECT_EQ(test, f->writes, 5);
+}
+
+static void xiaomi_mca_test_cc_toggle_refusal(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+	struct power_supply psy = { .drv_data = &f->mca };
+	static const char * const invalid[] = { "", "true", "0x1", "1 0", "1junk" };
+	__le32 word = cpu_to_le32(1);
+	u8 value = 2;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(invalid); i++)
+		KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, invalid[i],
+						    strlen(invalid[i])), -EINVAL);
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "2147483648", 10), -ERANGE);
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "-2147483649", 11), -ERANGE);
+	f->mca.piano_otg = false;
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -EOPNOTSUPP);
+	guard(mutex)(&f->mca.lock);
+	f->mca.piano_otg = true;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write_blob(&f->mca, 0x21021, &value, 1), -EPERM);
+	value = 0;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write_blob(&f->mca, 0x21021, &value, 0), -EPERM);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write_blob(&f->mca, 0x21021, &word, 4), -EPERM);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write_blob(&f->mca, 0x21022, &value, 1), -EPERM);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	KUNIT_EXPECT_EQ(test, f->reads, 0);
+}
+
+static void xiaomi_mca_test_cc_toggle_no_replay(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+	struct power_supply psy = { .drv_data = &f->mca };
+	int i;
+
+	scoped_guard(mutex, &f->mca.lock)
+		xiaomi_mca_sync_config(&f->mca);
+	KUNIT_ASSERT_EQ(test, f->writes, 3);
+	f->cc_toggle = 1;
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), 1);
+	guard(mutex)(&f->mca.lock);
+	KUNIT_ASSERT_EQ(test, f->writes, 4);
+	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_DOWN);
+	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_UP);
+	KUNIT_EXPECT_EQ(test, f->writes, 4);
+	xiaomi_mca_sync_config(&f->mca);
+	KUNIT_ASSERT_EQ(test, f->writes, 7);
+	for (i = 4; i < f->writes; i++)
+		KUNIT_EXPECT_NE(test, f->props[i], 0x21021);
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_cc_toggle_values),
+	KUNIT_CASE(xiaomi_mca_test_cc_toggle_errors),
+	KUNIT_CASE(xiaomi_mca_test_cc_toggle_refusal),
+	KUNIT_CASE(xiaomi_mca_test_cc_toggle_no_replay),
 	KUNIT_CASE(xiaomi_mca_test_cid_allowlist),
 	KUNIT_CASE(xiaomi_mca_test_port_role_telemetry),
 	KUNIT_CASE(xiaomi_mca_test_otg_bad_and_stale),

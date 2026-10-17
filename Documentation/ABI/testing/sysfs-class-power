@@ -949,12 +949,30 @@ Description:
 		not establish physical VBUS voltage or USB enumeration.
 
 What:		/sys/class/power_supply/xiaomi-mca-usb/cc_toggle
+Date:		October 2026
+Contact:	Linux Power Supply Mailing List <linux-pm@vger.kernel.org>
+Description:
+		Xiaomi MCA firmware's explicit OTG CC toggle control. Reads
+		return the raw one-byte state as an unsigned decimal value,
+		or a transport error if unavailable. Reading does not change
+		the firmware state.
+
+		Writable by root (0644), only on xiaomi,piano-pmic-glink.
+		Accepts a signed 32-bit decimal integer: zero disables forced
+		CC toggling, any nonzero value enables it. The driver writes
+		one byte (0 or 1) and reads the state back. A mismatch returns
+		EIO; transport errors are propagated. An error does not imply
+		that the firmware ignored the write.
+
+		The driver does not write this control automatically or apply
+		an idle timeout. No setting is replayed after an ADSP restart;
+		userspace must write it again if the mode is still desired.
+
 What:		/sys/class/power_supply/xiaomi-mca-usb/snk_src_mode
 Date:		October 2026
 Contact:	Linux Power Supply Mailing List <linux-pm@vger.kernel.org>
 Description:
-		Read-only Xiaomi MCA firmware port-role telemetry. cc_toggle
-		reads the one-byte CC toggle state; snk_src_mode reads the
-		32-bit sink/source mode. Both return raw unsigned decimal
-		values, or a transport error if unavailable. Reading these
-		attributes does not request a role change or force CC toggling.
+		Read-only Xiaomi MCA firmware port-role telemetry. Reads the
+		32-bit sink/source mode as a raw unsigned decimal value, or a
+		transport error if unavailable. Reading this attribute does
+		not request a role change or force CC toggling.
