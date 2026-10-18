@@ -109,7 +109,7 @@ static int nvt_mock_read(void *context, const void *reg, size_t reg_size,
 	case 0x1fc925:
 		break;
 	case 0x11c460:
-		value[0] = mock->boot_ready ? 0xa0 : 0;
+		value[0] = mock->boot_ready ? NVT_RESET_STATE_REK : 0;
 		break;
 	case 0x11c450:
 		if (size != 1)
@@ -239,6 +239,7 @@ static void nvt_test_upload(struct kunit *test)
 	const struct firmware *fw = nvt_fixture(test);
 	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
 	struct nvt_thp_firmware *image;
+	struct nvt_thp_boot_status boot;
 	struct regmap *map;
 	u16 length = 0;
 	unsigned int index;
@@ -248,7 +249,7 @@ static void nvt_test_upload(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, mock);
 	image = nvt_image(test, fw);
 	map = nvt_mock_map(test, mock);
-	KUNIT_ASSERT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length), 0);
+	KUNIT_ASSERT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length, &boot), 0);
 	KUNIT_EXPECT_EQ(test, length, 5192);
 	KUNIT_EXPECT_EQ(test, mock->uploaded, 187132U);
 	KUNIT_EXPECT_EQ(test, mock->resets, 2U);
@@ -278,6 +279,7 @@ static void nvt_test_io_errors(struct kunit *test)
 	const struct firmware *fw = nvt_fixture(test);
 	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
 	struct nvt_thp_firmware *image;
+	struct nvt_thp_boot_status boot;
 	struct regmap *map;
 	unsigned int calls, index;
 	u16 length;
@@ -287,14 +289,14 @@ static void nvt_test_io_errors(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, mock);
 	image = nvt_image(test, fw);
 	map = nvt_mock_map(test, mock);
-	KUNIT_ASSERT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length), 0);
+	KUNIT_ASSERT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length, &boot), 0);
 	calls = mock->calls;
 	kunit_info(test, "injecting failure at each of %u register-bus calls", calls);
 	for (index = 1; index <= calls; ++index) {
 		mock->calls = 0;
 		mock->fail_call = index;
 		length = 0;
-		KUNIT_EXPECT_EQ_MSG(test, nvt_thp_boot_firmware(map, fw, image, &length),
+		KUNIT_EXPECT_EQ_MSG(test, nvt_thp_boot_firmware(map, fw, image, &length, &boot),
 				    -EREMOTEIO, "bus call %u", index);
 		KUNIT_EXPECT_EQ(test, mock->calls, index);
 		KUNIT_EXPECT_EQ(test, length, 0);
@@ -306,6 +308,7 @@ static void nvt_test_identity(struct kunit *test)
 	const struct firmware *fw = nvt_fixture(test);
 	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
 	struct nvt_thp_firmware *image;
+	struct nvt_thp_boot_status boot;
 	struct regmap *map;
 	u16 length;
 
@@ -315,12 +318,12 @@ static void nvt_test_identity(struct kunit *test)
 	image = nvt_image(test, fw);
 	map = nvt_mock_map(test, mock);
 	mock->bad_id = true;
-	KUNIT_EXPECT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length), -ENODEV);
+	KUNIT_EXPECT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length, &boot), -ENODEV);
 	KUNIT_EXPECT_EQ(test, mock->uploaded, 0U);
 	KUNIT_EXPECT_FALSE(test, mock->boot_ready);
 	mock->bad_id = false;
 	mock->bad_info = true;
-	KUNIT_EXPECT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length), -EBADMSG);
+	KUNIT_EXPECT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length, &boot), -EBADMSG);
 }
 
 static void nvt_test_host_commands(struct kunit *test)

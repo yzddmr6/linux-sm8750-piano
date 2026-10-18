@@ -16,6 +16,9 @@
 #define NVT_ADDRESS_MAX		0x7fffff
 #define NVT_EVENT_BUF		0x11c400
 #define NVT_HOST_COMMAND	(NVT_EVENT_BUF + 0x50)	/* EVENT_MAP_HOST_CMD */
+#define NVT_RESET_COMPLETE	(NVT_EVENT_BUF + 0x60)
+#define NVT_REK_POLL_US		10000
+#define NVT_REK_TIMEOUT_MS	500
 #define NVT_AUTO_COPY		0x1fc925
 #define NVT_RESET		0x1fb43e
 #define NVT_BOOT_READY		0x1fb50d
@@ -149,13 +152,49 @@ static int nvt_crc_bank(struct regmap *map, const struct nvt_thp_partition *part
 	return regmap_bulk_write(map, golden, bytes, sizeof(bytes));
 }
 
+int nvt_thp_read_reset_state(struct regmap *map, u8 *state)
+{
+	unsigned int value;
+	int ret = regmap_read(map, NVT_RESET_COMPLETE, &value);
+
+	if (!ret)
+		*state = value;
+	return ret;
+}
+
+/*
+ * Vendor nt36xxx.c:1693-1727, nvt_check_fw_reset_state(): an immediate
+ * read followed by at most 50 sleeps of 10 ms for post-INIT states.
+ * Resume waits for REK before enabling IRQs (nt36xxx.c:5671-5679).
+ * A valid frame alone does not establish this firmware readiness contract.
+ */
+int nvt_thp_wait_rek(struct regmap *map, u8 *state)
+{
+	ktime_t deadline = ktime_add_ms(ktime_get(), NVT_REK_TIMEOUT_MS);
+	unsigned int polls;
+	int ret;
+
+	for (polls = 0; ; polls++) {
+		ret = nvt_thp_read_reset_state(map, state);
+		if (ret)
+			return ret;
+		if (*state >= NVT_RESET_STATE_REK && *state <= NVT_RESET_STATE_MAX)
+			return 0;
+		if (polls == 50 || ktime_compare(ktime_get(), deadline) >= 0)
+			return -ETIMEDOUT;
+		usleep_range(NVT_REK_POLL_US, NVT_REK_POLL_US);
+	}
+}
+
 int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
-			  const struct nvt_thp_firmware *image, u16 *payload_length)
+			  const struct nvt_thp_firmware *image, u16 *payload_length,
+			  struct nvt_thp_boot_status *status)
 {
 	u8 identity[6], info[39], zeros[6] = {}, crc_command[] = { 0xae, 0 };
 	unsigned int value, index;
 	int ret;
 
+	*status = (struct nvt_thp_boot_status) { .rek_ms = -1 };
 	ret = regmap_write(map, 0x7fff80, 0x5a);
 	if (ret)
 		return ret;
@@ -177,6 +216,7 @@ int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
 		return ret;
 	if (value & BIT(0))
 		return -EOPNOTSUPP;
+	status->reset_time = ktime_get();
 	ret = nvt_boot_reset(map);
 	if (ret)
 		return ret;
@@ -202,7 +242,7 @@ int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
 	ret = regmap_read_poll_timeout(map, NVT_AUTO_COPY, value, !value, 1000, 200000);
 	if (ret)
 		return ret;
-	ret = regmap_bulk_write(map, NVT_EVENT_BUF + 0x60, zeros, sizeof(zeros));
+	ret = regmap_bulk_write(map, NVT_RESET_COMPLETE, zeros, sizeof(zeros));
 	if (ret)
 		return ret;
 	ret = regmap_bulk_write(map, NVT_HOST_COMMAND, crc_command, sizeof(crc_command));
@@ -212,8 +252,10 @@ int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
 	if (ret)
 		return ret;
 	usleep_range(5000, 6000); /* Vendor boot-ready settling time. */
-	ret = regmap_read_poll_timeout(map, NVT_EVENT_BUF + 0x60, value,
-				       value >= 0xa0 && value <= 0xaf, 10000, 100000);
+	ret = regmap_read_poll_timeout(map, NVT_RESET_COMPLETE, value,
+				       value >= NVT_RESET_STATE_INIT &&
+				       value <= NVT_RESET_STATE_MAX, 10000, 100000);
+	status->reset_state = value;
 	if (ret)
 		return ret;
 	ret = regmap_bulk_read(map, NVT_EVENT_BUF + 0x78, info, sizeof(info) - 1);
@@ -222,6 +264,10 @@ int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
 	if (info[0] + info[1] != 0xff)
 		return -EBADMSG;
 	ret = regmap_bulk_read(map, 0x1093d8, info, sizeof(info));
+	if (ret)
+		return ret;
+	ret = nvt_thp_wait_rek(map, &status->reset_state);
+	status->rek_ms = ktime_ms_delta(ktime_get(), status->reset_time);
 	if (ret)
 		return ret;
 	*payload_length = get_unaligned_le16(info + 2);

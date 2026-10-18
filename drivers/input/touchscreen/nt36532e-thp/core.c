@@ -270,6 +270,7 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	const struct firmware *firmware;
 	struct nvt_thp_command_status last;
 	struct nvt_thp_firmware image;
+	struct nvt_thp_boot_status boot = {};
 	s64 first_frame_ms;
 	u16 payload_length;
 	ktime_t start;
@@ -287,12 +288,15 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 		return ret;
 	ret = nvt_thp_parse_firmware(firmware->data, firmware->size, &image);
 	if (!ret) {
-		ret = nvt_thp_boot_firmware(nvt->map, firmware, &image, &payload_length);
+		ret = nvt_thp_boot_firmware(nvt->map, firmware, &image, &payload_length, &boot);
 		nvt_thp_free_firmware(&image);
 	}
 	release_firmware(firmware);
-	if (ret)
+	if (ret) {
+		dev_err(&nvt->spi->dev, "THP firmware boot failed: %d, last reset state %#04x\n",
+			ret, boot.reset_state);
 		return ret;
+	}
 	/* IRQ packets must fit one transaction; do not split a changing frame. */
 	if (payload_length < 64 || payload_length > nvt->max_read - (NVT_FRAME_PREFIX - 1)) {
 		ret = -EMSGSIZE;
