@@ -302,6 +302,38 @@ static int nvt_extend_command(struct regmap *map, u8 sub_command, u16 value,
 }
 
 /*
+ * Vendor nvt_get_extend_custom_cmd(), nt36xxx_ext_proc.c:1065-1135.
+ * Its six-byte SPI buffer includes the register address; regmap transfers the
+ * five response bytes only. Write once and poll at most eleven times, without
+ * replaying a command or publishing a value before the command byte clears.
+ */
+int nvt_thp_get_extend_command(struct regmap *map, u8 sub_command, u16 *value,
+			       struct nvt_thp_command_status *last)
+{
+	u8 command[] = { 0xbf, sub_command, 0x01 };
+	u8 response[5];
+	int ret, i;
+
+	last->sub_command = sub_command;
+	last->status = command[0];
+	ret = regmap_bulk_write(map, NVT_HOST_COMMAND, command, sizeof(command));
+	if (ret)
+		return ret;
+	for (i = 0; i < 11; i++) {
+		usleep_range(10000, 11000);
+		ret = regmap_bulk_read(map, NVT_HOST_COMMAND, response, sizeof(response));
+		if (ret)
+			return ret;
+		last->status = response[0];
+		if (!response[0]) {
+			*value = get_unaligned_le16(response + 3);
+			return 0;
+		}
+	}
+	return -ETIMEDOUT;
+}
+
+/*
  * The piano stock stack first disables stylus scanning when no pen consumer
  * is connected (update_pen_status()/nvt_xm_htc_set_stylus_enable(), sub-command
  * 0x04). This transport currently exposes fingers only; do not leave the

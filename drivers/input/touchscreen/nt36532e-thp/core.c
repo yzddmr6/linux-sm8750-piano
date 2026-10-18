@@ -265,6 +265,27 @@ static void nvt_stop_irq(struct nvt_thp *nvt)
 		synchronize_irq(nvt->spi->irq);
 }
 
+/* Negative entries are read errors, never firmware values. */
+static void nvt_read_modes(struct nvt_thp *nvt, const char *phase, int modes[3])
+{
+	static const u8 commands[] = { 0x01, 0x19, 0x04 };
+	struct nvt_thp_command_status last;
+	u16 value;
+	int i, ret;
+
+	for (i = 0; i < ARRAY_SIZE(commands); i++) {
+		ret = nvt_thp_get_extend_command(nvt->map, commands[i], &value, &last);
+		modes[i] = ret ? ret : value;
+		if (ret)
+			dev_info(&nvt->spi->dev,
+				 "THP %s read BF %02x error %d, command byte %#04x\n",
+				 phase, commands[i], ret, last.status);
+	}
+	dev_info(&nvt->spi->dev,
+		 "THP %s readback: op mode=%d, idle baseline=%d, stylus=%d (negative=read error)\n",
+		 phase, modes[0], modes[1], modes[2]);
+}
+
 /* Caller holds lifecycle_lock, with the IRQ stopped. */
 static int nvt_start_stream(struct nvt_thp *nvt)
 {
@@ -275,7 +296,7 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	s64 first_frame_ms, reset_to_frame_ms, commands_ms;
 	u16 payload_length;
 	ktime_t start;
-	int ret, state_ret;
+	int ret, state_ret, modes[3];
 
 	lockdep_assert_held(&nvt->lifecycle_lock);
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
@@ -337,9 +358,11 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	/* Diagnostic read: preserve the last sample and command result on error. */
 	state_ret = nvt_thp_read_reset_state(nvt->map, &nvt->reset_state);
 	if (ret) {
+		nvt_read_modes(nvt, "post-failure", modes);
 		dev_err(&nvt->spi->dev,
-			"THP host command BF %02x failed: %d, command byte %#04x, last reset state %#04x (read %d)\n",
-			last.sub_command, ret, last.status, nvt->reset_state, state_ret);
+			"THP host command BF %02x failed: %d, command byte %#04x, last reset state %#04x (read %d); post-failure op mode=%d, idle baseline=%d, stylus=%d\n",
+			last.sub_command, ret, last.status, nvt->reset_state, state_ret,
+			modes[0], modes[1], modes[2]);
 		goto stop;
 	}
 	ret = READ_ONCE(nvt->error);
