@@ -293,8 +293,9 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	struct nvt_thp_command_status last;
 	struct nvt_thp_firmware image;
 	struct nvt_thp_boot_status boot = {};
-	s64 first_frame_ms, reset_to_frame_ms, commands_ms;
+	s64 first_frame_ms, reset_to_frame_ms, commands_ms, normal_run_ms;
 	u16 payload_length;
+	u8 first_frame_state = 0;
 	ktime_t start;
 	int ret, state_ret, modes[3];
 
@@ -352,6 +353,19 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	}
 	first_frame_ms = ktime_ms_delta(ktime_get(), start);
 	reset_to_frame_ms = ktime_ms_delta(ktime_get(), boot.reset_time);
+	/* Sample readiness after the first frame, before any host command. */
+	start = ktime_get();
+	ret = nvt_thp_read_reset_state(nvt->map, &first_frame_state);
+	nvt->reset_state = first_frame_state;
+	if (!ret)
+		ret = nvt_thp_wait_normal_run(nvt->map, &nvt->reset_state);
+	normal_run_ms = ktime_ms_delta(ktime_get(), start);
+	if (ret) {
+		dev_err(&nvt->spi->dev,
+			"THP NORMAL_RUN wait failed: %d, first-frame reset state %#04x, last reset state %#04x, first-frame-to-NORMAL_RUN %lld ms\n",
+			ret, first_frame_state, nvt->reset_state, normal_run_ms);
+		goto stop;
+	}
 	start = ktime_get();
 	ret = nvt_thp_apply_host_commands(nvt->map, &last);
 	commands_ms = ktime_ms_delta(ktime_get(), start);
@@ -360,9 +374,9 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	if (ret) {
 		nvt_read_modes(nvt, "post-failure", modes);
 		dev_err(&nvt->spi->dev,
-			"THP host command BF %02x failed: %d, command byte %#04x, last reset state %#04x (read %d); post-failure op mode=%d, idle baseline=%d, stylus=%d\n",
+			"THP host command BF %02x failed: %d, command byte %#04x, last reset state %#04x (read %d); post-failure op mode=%d, idle baseline=%d, stylus=%d; first-frame reset state %#04x, first-frame-to-NORMAL_RUN %lld ms\n",
 			last.sub_command, ret, last.status, nvt->reset_state, state_ret,
-			modes[0], modes[1], modes[2]);
+			modes[0], modes[1], modes[2], first_frame_state, normal_run_ms);
 		goto stop;
 	}
 	ret = READ_ONCE(nvt->error);
@@ -372,9 +386,9 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 		 "THP first frame after %lld ms; stylus disabled, idle-baseline update and op mode 2 accepted\n",
 		 first_frame_ms);
 	dev_info(&nvt->spi->dev,
-		 "THP stream ready, payload %u bytes; reset-to-REK %lld ms, reset-to-first-frame %lld ms, BF sequence %lld ms, last reset state %#04x (read %d)\n",
+		 "THP stream ready, payload %u bytes; reset-to-REK %lld ms, reset-to-first-frame %lld ms, BF sequence %lld ms, last reset state %#04x (read %d); first-frame reset state %#04x, first-frame-to-NORMAL_RUN %lld ms\n",
 		 payload_length, boot.rek_ms, reset_to_frame_ms, commands_ms,
-		 nvt->reset_state, state_ret);
+		 nvt->reset_state, state_ret, first_frame_state, normal_run_ms);
 	return 0;
 stop:
 	nvt_stop_irq(nvt);

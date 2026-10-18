@@ -24,6 +24,7 @@ struct nvt_thp_boot_status {
 
 int nvt_thp_read_reset_state(struct regmap *map, u8 *state);
 int nvt_thp_wait_rek(struct regmap *map, u8 *state);
+int nvt_thp_wait_normal_run(struct regmap *map, u8 *state);
 
 struct nvt_thp_partition {
 	u32 offset;

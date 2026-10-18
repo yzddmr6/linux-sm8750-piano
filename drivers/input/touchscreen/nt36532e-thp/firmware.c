@@ -17,8 +17,8 @@
 #define NVT_EVENT_BUF		0x11c400
 #define NVT_HOST_COMMAND	(NVT_EVENT_BUF + 0x50)	/* EVENT_MAP_HOST_CMD */
 #define NVT_RESET_COMPLETE	(NVT_EVENT_BUF + 0x60)
-#define NVT_REK_POLL_US		10000
-#define NVT_REK_TIMEOUT_MS	500
+#define NVT_RESET_POLL_US		10000
+#define NVT_RESET_TIMEOUT_MS	500
 #define NVT_AUTO_COPY		0x1fc925
 #define NVT_RESET		0x1fb43e
 #define NVT_BOOT_READY		0x1fb50d
@@ -168,9 +168,9 @@ int nvt_thp_read_reset_state(struct regmap *map, u8 *state)
  * Resume waits for REK before enabling IRQs (nt36xxx.c:5671-5679).
  * A valid frame alone does not establish this firmware readiness contract.
  */
-int nvt_thp_wait_rek(struct regmap *map, u8 *state)
+static int nvt_wait_reset_state(struct regmap *map, u8 minimum, u8 *state)
 {
-	ktime_t deadline = ktime_add_ms(ktime_get(), NVT_REK_TIMEOUT_MS);
+	ktime_t deadline = ktime_add_ms(ktime_get(), NVT_RESET_TIMEOUT_MS);
 	unsigned int polls;
 	int ret;
 
@@ -178,12 +178,23 @@ int nvt_thp_wait_rek(struct regmap *map, u8 *state)
 		ret = nvt_thp_read_reset_state(map, state);
 		if (ret)
 			return ret;
-		if (*state >= NVT_RESET_STATE_REK && *state <= NVT_RESET_STATE_MAX)
+		if (*state >= minimum && *state <= NVT_RESET_STATE_MAX)
 			return 0;
 		if (polls == 50 || ktime_compare(ktime_get(), deadline) >= 0)
 			return -ETIMEDOUT;
-		usleep_range(NVT_REK_POLL_US, NVT_REK_POLL_US);
+		usleep_range(NVT_RESET_POLL_US, NVT_RESET_POLL_US);
 	}
+}
+
+int nvt_thp_wait_rek(struct regmap *map, u8 *state)
+{
+	return nvt_wait_reset_state(map, NVT_RESET_STATE_REK, state);
+}
+
+/* Vendor MP commands wait for NORMAL_RUN (nt36xxx_mp_ctrlram.c:2085). */
+int nvt_thp_wait_normal_run(struct regmap *map, u8 *state)
+{
+	return nvt_wait_reset_state(map, NVT_RESET_STATE_NORMAL_RUN, state);
 }
 
 int nvt_thp_boot_firmware(struct regmap *map, const struct firmware *firmware,
@@ -340,14 +351,8 @@ int nvt_thp_get_extend_command(struct regmap *map, u8 sub_command, u16 *value,
  * freshly loaded firmware's pen state implicit. A pen input implementation
  * must manage that state explicitly when it is added.
  *
- * Then stock updates the idle baseline and selects idle operation:
- * nvt_xm_htc_set_idle_baseline_update(), nt36xxx_ext_proc.c:4242-4255
- * (DATA_MODE_124, nt36xxx.c:4152), then nvt_xm_htc_set_op_mode(2),
- * nt36xxx_ext_proc.c:1137-1150 (DATA_MODE_53 idle, nt36xxx.c:4132-4133).
- * Stock logs show the latter two only while frames are being read, never
- * earlier than about 425 ms after the firmware reset state is reached. Pen
- * disable is earlier in stock. The caller keeps the established first-frame
- * admission for this sequence, without introducing a guessed delay.
+ * TD-047 isolation experiment: use the original three-write sequence after
+ * the caller has waited for NORMAL_RUN, without pre-command mode readback.
  */
 int nvt_thp_apply_host_commands(struct regmap *map, struct nvt_thp_command_status *last)
 {

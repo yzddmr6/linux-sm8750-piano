@@ -14,7 +14,8 @@ sequence are adapted from Novatek's GPL-2.0-or-later driver:
 * https://github.com/MiCode/vendor_xiaomi_proprietary_touch-driver
   at 6957f6b646d1c919e175e6f9000eb50c8635273c:
   ``p81/nt36532/nt36xxx.c``, ``nt36xxx_fw_update.c``,
-  ``nt36xxx.h`` and ``nt36xxx_mem_map.h``.
+  ``nt36xxx.h``, ``nt36xxx_mem_map.h``, ``nt36xxx_ext_proc.c``
+  and ``nt36xxx_mp_ctrlram.c``.
 * ianchb's GPL-2.0-or-later mainline adaptation:
   https://github.com/ianchb/sm8550-mainline
   at 42f3b40c702abbc37c3a04c95af008cd283aeaf3,
@@ -32,6 +33,11 @@ of global state and proc controls. The frame length is read from firmware, not
 copied from another panel. SPI errors stop capture; there is no blind retry,
 automatic error retry or reference-board RAM write.
 
+The startup contract is::
+
+  firmware download -> REK -> IRQ enable -> first valid frame
+                    -> NORMAL_RUN -> BF 04=0 -> BF 19=1 -> BF 01=2
+
 After each download the transport retains the INIT check and then waits for
 ``EVENT_MAP_RESET_COMPLETE`` (``0x11c460``) to enter REK through MAX
 (``0xa1..0xaf``), before enabling the IRQ. The named reset states follow
@@ -40,34 +46,62 @@ follows ``nvt_check_fw_reset_state()`` (``nt36xxx.c:1693-1727``): read immediate
 then poll at 10 ms intervals, with at most 50 sleeps and a 500 ms deadline.
 Scheduling and bus latency can extend the final sample beyond that deadline.
 Timeout returns ``-ETIMEDOUT`` with the last state; bus errors propagate without
-retrying. No host command is sent and the IRQ remains disabled on failure.
+retrying. No host command is sent and the IRQ remains disabled if REK fails.
 
 In the vendor ``nvt_ts_resume()`` path (``nt36xxx.c:5671-5699``),
 ``nvt_update_firmware()`` is followed by a REK wait before IRQ enable and
 ``NVT_IC_RESUME_OUT``. The THP DATA_MODE_53/124 handlers gate BF01/BF19 on that
-state (``nt36xxx.c:4114-4152``). An early valid frame proves frame delivery,
-not firmware readiness for host commands; it cannot replace the REK contract.
+state (``nt36xxx.c:4114-4152``). After REK the transport enables the IRQ and
+waits up to 500 ms for the first valid frame. It then samples the reset state
+and waits for NORMAL_RUN through MAX (``0xa3..0xaf``), using the same bounded
+polling contract. The vendor MP paths wait for NORMAL_RUN before commands
+requiring the normal firmware loop (``nt36xxx_mp_ctrlram.c:2085,2095``,
+``2342,2352,2431,2441``). If this wait fails, the transport stops the IRQ and
+reports the first-frame state, last state and elapsed wait without sending
+host commands.
 
-After REK the transport enables the IRQ and still waits up to 500 ms for
-the first valid frame. It then disables stylus scanning (``BF 04``, value 0)
-and sends the two host commands the piano stock stack sends while frames
-flow: idle-baseline update (``BF 19``, value 1) and op
-mode 2 (``BF 01``, value 2), each confirmed by the vendor's command-byte clear
-within 110 ms. Sent before any frame, the first command did not clear on piano.
-A missing first frame or a command that does not clear stops the IRQ and fails
-the open; the log names the command and the byte last read. Frames read while
-the commands run stay queued. The stock stack repeats the pair on idle events;
-this transport sends it once per firmware start (open or panel enable).
+A first valid frame proves delivery, not readiness for host commands. On a
+hot restart after killing and reopening the userspace service, firmware is
+soft-reset and downloaded again. The first frame arrives about 5 ms after
+REK, while the sampled state is still ``0xa1``. On cold boot and after panel
+power-up it arrives about 120 ms after REK, already in ``0xa3``. An early or
+residual frame can satisfy the frame admission before the normal firmware
+loop is ready; the exact origin of that early frame has not been established.
+In this interval BF04 can complete while BF19/BF01 fail to clear their command
+byte within 110 ms. Waiting for NORMAL_RUN after the hot-restart frame took
+117-120 ms and allowed the original write sequence to complete in five of
+five SIGKILL tests; both DPMS tests also passed.
+
+The three writes disable stylus scanning (``BF 04=0``), update the idle
+baseline (``BF 19=1``), and select operation mode 2 (``BF 01=2``). Each write
+must be confirmed by the vendor command-byte clear within 110 ms. A missing
+frame, failed readiness wait or uncleared command stops the IRQ and fails
+the startup. Frames read while commands run stay queued. This sequence runs
+once per firmware start (open or panel enable), without a fixed delay or
+command retry.
+
+Only after a failed BF write, the transport reads operation mode (``BF 01``),
+idle-baseline state (``BF 19``) and stylus state (``BF 04``) for diagnostics.
+The protocol follows ``nvt_get_extend_custom_cmd()`` in
+``nt36xxx_ext_proc.c:1065-1135``: write ``bf, sub, 01`` once, sleep 10-11 ms
+before each of at most eleven samples, and accept the little-endian value
+only when the command byte clears. The vendor six-byte SPI buffer includes
+the address; regmap reads five response bytes, with the value at offsets 3/4.
+Read errors are logged as negative errno values. These reads never run before
+the startup writes and never replace the original failure or change its
+stop path.
 
 The stream-ready log reports reset-to-REK, reset-to-first-frame and BF-sequence
-durations, plus the final reset-state byte. Both reset-relative durations start
-immediately before the final bootloader reset used for the download (not the
-earlier chip-identification reset). The existing first-frame log measures the
-wait after IRQ enable. BF timing covers only the three-command sequence.
-Diagnostic reads after that sequence or a first-frame failure preserve the last
-sample on a bus error, report the read error separately, and do not change the
-startup result. Firmware failures report the last state from the boot attempt;
-zero before any state sample is available is not evidence of a completed reset.
+durations, the final reset-state byte, the state sampled after first-frame
+admission, and the first-frame-to-NORMAL_RUN duration. Both reset-relative
+durations start immediately before the final bootloader reset used for the
+download, not the earlier chip-identification reset. The first-frame log
+measures the wait after IRQ enable. The NORMAL_RUN duration includes the
+initial state sample and polling; BF timing covers only the three writes.
+The BF failure log also preserves the first-frame state and NORMAL_RUN wait.
+Diagnostic reset-state reads preserve the last sample on a bus error and
+report that error separately. Firmware failures report the last state from
+the boot attempt; zero before any sample is not evidence of a completed reset.
 
 Stream contract
 ---------------
@@ -109,8 +143,8 @@ With the generic ``panel`` phandle, a DRM panel follower stops the IRQ before
 panel disable removes the display timing needed by TDDI scanning. Unprepare
 also stops capture as an idempotent fallback before the shared reset. Open
 succeeds while the panel is disabled and the reader waits without a hangup.
-After panel enable, an open stream uses the same firmware/first-frame/host-command
-sequence as an open on an already enabled panel. Prepare alone is too early:
+After panel enable, an open stream uses the same download/REK/first-frame/
+NORMAL_RUN/host-command sequence as an open on an already enabled panel. Prepare alone is too early:
 panel power does not guarantee display timing or touch frames. The first valid
 queued frame is marked EPOCH; sequence numbers are not reset. Queued bytes are
 preserved across a panel cycle so a partial read cannot splice two records.
@@ -120,7 +154,8 @@ Restart failures are logged and reported to readers without retrying.
 Without a panel phandle, platform-supplied power is still required. System
 suspend of an open stream remains rejected; panel following is not system
 suspend support. Closing stops capture without powering down the panel.
-Panel restart and physical input after DPMS still require hardware validation.
+The NORMAL_RUN path passed two DPMS stream-restart and hardware-scanout checks.
+These checks do not replace physical touch or gesture validation.
 
 The optional KUnit suite uses a user-supplied ``nt36532e/piano-test.bin`` fixture
 through the firmware loader. It checks the piano layout, malformed inputs,
@@ -129,6 +164,9 @@ host commands, their timeout and the reported command byte, and immediate
 propagation of each injected register-bus error. REK tests cover delayed and
 immediate readiness, all named accepted states including MAX, timeout below
 REK and above MAX, last-state preservation on read error, and boot refusing to
-complete while stuck at INIT. The standalone REK tests need no firmware fixture. This does not test physical
-SPI, IRQs, the first-frame wait in open, panel power, live framing, or real
-gestures.
+complete while stuck at INIT. NORMAL_RUN tests cover immediate and delayed
+readiness, the upper bound, timeout below NORMAL_RUN and above MAX, and
+preservation of the last state on a bus error. Readback tests cover byte order, timeout and bus-error reporting.
+The standalone state-wait and command tests need no firmware fixture. KUnit
+does not test physical SPI, IRQs, the first-frame wait in open, panel power,
+live framing, or real gestures.
