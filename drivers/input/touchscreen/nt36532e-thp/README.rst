@@ -32,7 +32,23 @@ of global state and proc controls. The frame length is read from firmware, not
 copied from another panel. SPI errors stop capture; there is no blind retry,
 automatic error retry or reference-board RAM write.
 
-After each download the transport enables the IRQ and waits up to 500 ms for
+After each download the transport retains the INIT check and then waits for
+``EVENT_MAP_RESET_COMPLETE`` (``0x11c460``) to enter REK through MAX
+(``0xa1..0xaf``), before enabling the IRQ. The named reset states follow
+``nt36xxx.h:489-495``: INIT, REK, REK_FINISH, NORMAL_RUN and MAX. The wait
+follows ``nvt_check_fw_reset_state()`` (``nt36xxx.c:1693-1727``): read immediately,
+then poll at 10 ms intervals, with at most 50 sleeps and a 500 ms deadline.
+Scheduling and bus latency can extend the final sample beyond that deadline.
+Timeout returns ``-ETIMEDOUT`` with the last state; bus errors propagate without
+retrying. No host command is sent and the IRQ remains disabled on failure.
+
+In the vendor ``nvt_ts_resume()`` path (``nt36xxx.c:5671-5699``),
+``nvt_update_firmware()`` is followed by a REK wait before IRQ enable and
+``NVT_IC_RESUME_OUT``. The THP DATA_MODE_53/124 handlers gate BF01/BF19 on that
+state (``nt36xxx.c:4114-4152``). An early valid frame proves frame delivery,
+not firmware readiness for host commands; it cannot replace the REK contract.
+
+After REK the transport enables the IRQ and still waits up to 500 ms for
 the first valid frame. It then disables stylus scanning (``BF 04``, value 0)
 and sends the two host commands the piano stock stack sends while frames
 flow: idle-baseline update (``BF 19``, value 1) and op
@@ -42,6 +58,16 @@ A missing first frame or a command that does not clear stops the IRQ and fails
 the open; the log names the command and the byte last read. Frames read while
 the commands run stay queued. The stock stack repeats the pair on idle events;
 this transport sends it once per firmware start (open or panel enable).
+
+The stream-ready log reports reset-to-REK, reset-to-first-frame and BF-sequence
+durations, plus the final reset-state byte. Both reset-relative durations start
+immediately before the final bootloader reset used for the download (not the
+earlier chip-identification reset). The existing first-frame log measures the
+wait after IRQ enable. BF timing covers only the three-command sequence.
+Diagnostic reads after that sequence or a first-frame failure preserve the last
+sample on a bus error, report the read error separately, and do not change the
+startup result. Firmware failures report the last state from the boot attempt;
+zero before any state sample is available is not evidence of a completed reset.
 
 Stream contract
 ---------------
@@ -98,8 +124,11 @@ Panel restart and physical input after DPMS still require hardware validation.
 
 The optional KUnit suite uses a user-supplied ``nt36532e/piano-test.bin`` fixture
 through the firmware loader. It checks the piano layout, malformed inputs,
-byte-exact simulated SRAM writes, golden CRC setup, identity rejection, the two
+byte-exact simulated SRAM writes, golden CRC setup, identity rejection, the three
 host commands, their timeout and the reported command byte, and immediate
-propagation of each injected register-bus error. This does not test physical
+propagation of each injected register-bus error. REK tests cover delayed and
+immediate readiness, all named accepted states including MAX, timeout below
+REK and above MAX, last-state preservation on read error, and boot refusing to
+complete while stuck at INIT. The standalone REK tests need no firmware fixture. This does not test physical
 SPI, IRQs, the first-frame wait in open, panel power, live framing, or real
 gestures.

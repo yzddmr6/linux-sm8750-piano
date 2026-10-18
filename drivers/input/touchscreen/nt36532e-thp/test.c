@@ -14,6 +14,8 @@ struct nvt_mock {
 	unsigned int calls, fail_call, uploaded, resets;
 	unsigned int host_commands, host_polls, busy_reads;
 	u8 host_command[3][5];
+	u8 reset_states[4];
+	unsigned int reset_count, reset_polls;
 	bool bad_id, bad_info, boot_ready, stuck_command;
 };
 
@@ -109,7 +111,11 @@ static int nvt_mock_read(void *context, const void *reg, size_t reg_size,
 	case 0x1fc925:
 		break;
 	case 0x11c460:
-		value[0] = mock->boot_ready ? NVT_RESET_STATE_REK : 0;
+		if (mock->boot_ready)
+			value[0] = mock->reset_count ?
+				mock->reset_states[min(mock->reset_polls, mock->reset_count - 1)] :
+				NVT_RESET_STATE_REK;
+		mock->reset_polls++;
 		break;
 	case 0x11c450:
 		if (size != 1)
@@ -249,7 +255,16 @@ static void nvt_test_upload(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, mock);
 	image = nvt_image(test, fw);
 	map = nvt_mock_map(test, mock);
+	/* INIT alone must not let boot finish before REK. */
+	mock->reset_states[0] = NVT_RESET_STATE_INIT;
+	mock->reset_states[1] = NVT_RESET_STATE_INIT;
+	mock->reset_states[2] = NVT_RESET_STATE_REK;
+	mock->reset_count = 3;
 	KUNIT_ASSERT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length, &boot), 0);
+	KUNIT_EXPECT_EQ(test, mock->reset_polls, 3U);
+	KUNIT_EXPECT_EQ(test, boot.reset_state, NVT_RESET_STATE_REK);
+	KUNIT_EXPECT_GT(test, boot.reset_time, (ktime_t)0);
+	KUNIT_EXPECT_GE(test, boot.rek_ms, (s64)10);
 	KUNIT_EXPECT_EQ(test, length, 5192);
 	KUNIT_EXPECT_EQ(test, mock->uploaded, 187132U);
 	KUNIT_EXPECT_EQ(test, mock->resets, 2U);
@@ -326,6 +341,111 @@ static void nvt_test_identity(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length, &boot), -EBADMSG);
 }
 
+static void nvt_test_rek_success(struct kunit *test)
+{
+	static const u8 ready[] = {
+		NVT_RESET_STATE_REK, NVT_RESET_STATE_REK_FINISH,
+		NVT_RESET_STATE_NORMAL_RUN, NVT_RESET_STATE_MAX,
+	};
+	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
+	struct regmap *map;
+	unsigned int index;
+	ktime_t start;
+	u8 state = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, mock);
+	map = nvt_mock_map(test, mock);
+	mock->boot_ready = true;
+	mock->reset_count = 3;
+	mock->reset_states[0] = 0;
+	mock->reset_states[1] = NVT_RESET_STATE_INIT;
+	for (index = 0; index < ARRAY_SIZE(ready); index++) {
+		mock->reset_states[2] = ready[index];
+		mock->reset_polls = 0;
+		start = ktime_get();
+		KUNIT_EXPECT_EQ(test, nvt_thp_wait_rek(map, &state), 0);
+		KUNIT_EXPECT_EQ(test, state, ready[index]);
+		KUNIT_EXPECT_EQ(test, mock->reset_polls, 3U);
+		KUNIT_EXPECT_GE(test, ktime_ms_delta(ktime_get(), start), (s64)20);
+	}
+	/* Already ready: accept the first read without another poll. */
+	mock->reset_polls = 0;
+	mock->reset_count = 1;
+	mock->reset_states[0] = NVT_RESET_STATE_REK;
+	KUNIT_EXPECT_EQ(test, nvt_thp_wait_rek(map, &state), 0);
+	KUNIT_EXPECT_EQ(test, mock->reset_polls, 1U);
+}
+
+static void nvt_test_rek_timeout(struct kunit *test)
+{
+	static const u8 not_ready[] = { 0, 0x9f, NVT_RESET_STATE_INIT, 0xb0 };
+	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
+	struct regmap *map;
+	unsigned int index;
+	ktime_t start;
+	u8 state = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, mock);
+	map = nvt_mock_map(test, mock);
+	mock->boot_ready = true;
+	mock->reset_count = 1;
+	for (index = 0; index < ARRAY_SIZE(not_ready); index++) {
+		mock->reset_states[0] = not_ready[index];
+		mock->reset_polls = 0;
+		start = ktime_get();
+		KUNIT_EXPECT_EQ(test, nvt_thp_wait_rek(map, &state), -ETIMEDOUT);
+		KUNIT_EXPECT_EQ(test, state, not_ready[index]);
+		KUNIT_EXPECT_GE(test, ktime_ms_delta(ktime_get(), start), (s64)500);
+		KUNIT_EXPECT_GE(test, mock->reset_polls, 2U);
+		KUNIT_EXPECT_LE(test, mock->reset_polls, 51U);
+	}
+	KUNIT_EXPECT_EQ(test, mock->host_commands, 0U);
+}
+
+static void nvt_test_rek_io_error(struct kunit *test)
+{
+	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
+	struct regmap *map;
+	u8 state = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, mock);
+	map = nvt_mock_map(test, mock);
+	mock->boot_ready = true;
+	mock->reset_count = 1;
+	mock->reset_states[0] = NVT_RESET_STATE_INIT;
+	mock->fail_call = 2;
+	KUNIT_EXPECT_EQ(test, nvt_thp_wait_rek(map, &state), -EREMOTEIO);
+	KUNIT_EXPECT_EQ(test, state, NVT_RESET_STATE_INIT);
+	KUNIT_EXPECT_EQ(test, mock->calls, 2U);
+	KUNIT_EXPECT_EQ(test, mock->reset_polls, 1U);
+	KUNIT_EXPECT_EQ(test, mock->host_commands, 0U);
+}
+
+static void nvt_test_boot_rek_timeout(struct kunit *test)
+{
+	const struct firmware *fw = nvt_fixture(test);
+	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
+	struct nvt_thp_firmware *image;
+	struct nvt_thp_boot_status boot;
+	struct regmap *map;
+	u16 length = 0;
+
+	if (!fw)
+		return;
+	KUNIT_ASSERT_NOT_NULL(test, mock);
+	image = nvt_image(test, fw);
+	map = nvt_mock_map(test, mock);
+	mock->reset_count = 1;
+	mock->reset_states[0] = NVT_RESET_STATE_INIT;
+	KUNIT_EXPECT_EQ(test, nvt_thp_boot_firmware(map, fw, image, &length, &boot),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, mock->boot_ready);
+	KUNIT_EXPECT_EQ(test, boot.reset_state, NVT_RESET_STATE_INIT);
+	KUNIT_EXPECT_GE(test, boot.rek_ms, (s64)500);
+	KUNIT_EXPECT_EQ(test, length, 0);
+	KUNIT_EXPECT_EQ(test, mock->host_commands, 0U);
+}
+
 static void nvt_test_host_commands(struct kunit *test)
 {
 	static const u8 expected[3][5] = {
@@ -386,6 +506,10 @@ static struct kunit_case nvt_cases[] = {
 	KUNIT_CASE(nvt_test_upload),
 	KUNIT_CASE(nvt_test_io_errors),
 	KUNIT_CASE(nvt_test_identity),
+	KUNIT_CASE(nvt_test_rek_success),
+	KUNIT_CASE(nvt_test_rek_timeout),
+	KUNIT_CASE(nvt_test_rek_io_error),
+	KUNIT_CASE(nvt_test_boot_rek_timeout),
 	KUNIT_CASE(nvt_test_host_commands),
 	KUNIT_CASE(nvt_test_host_command_timeout),
 	{}
