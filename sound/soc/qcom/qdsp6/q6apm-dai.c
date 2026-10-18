@@ -567,6 +567,22 @@ err:
 	return ret;
 }
 
+static int q6apm_dai_hw_free(struct snd_soc_component *component,
+			     struct snd_pcm_substream *substream)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct q6apm_dai_rtd *prtd = runtime->private_data;
+
+	if (prtd->state) {
+		/* Stop the graph started in prepare before DPCM closes the backends. */
+		q6apm_graph_stop(prtd->graph);
+		q6apm_free_fragments(prtd->graph, substream->stream);
+		prtd->state = Q6APM_STREAM_IDLE;
+	}
+
+	return 0;
+}
+
 static int q6apm_dai_close(struct snd_soc_component *component,
 			   struct snd_pcm_substream *substream)
 {
@@ -1176,6 +1192,7 @@ static const struct snd_soc_component_driver q6apm_fe_dai_component = {
 	.pcm_new	= q6apm_dai_pcm_new,
 	.pcm_free	= q6apm_dai_pcm_free,
 	.hw_params	= q6apm_dai_hw_params,
+	.hw_free	= q6apm_dai_hw_free,
 	.pointer	= q6apm_dai_pointer,
 	.trigger	= q6apm_dai_trigger,
 	.ack		= q6apm_dai_ack,
