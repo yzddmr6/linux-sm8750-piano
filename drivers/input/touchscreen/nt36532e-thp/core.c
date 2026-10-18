@@ -77,6 +77,7 @@ struct nvt_thp {
 	u8 *tx, *rx, *record;
 	size_t max_read;
 	u16 frame_length;
+	u8 reset_state; /* Last successful reset-state sample for this start. */
 	u64 sequence;
 	unsigned long flags;
 	unsigned int read_errors;
@@ -271,10 +272,10 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	struct nvt_thp_command_status last;
 	struct nvt_thp_firmware image;
 	struct nvt_thp_boot_status boot = {};
-	s64 first_frame_ms;
+	s64 first_frame_ms, reset_to_frame_ms, commands_ms;
 	u16 payload_length;
 	ktime_t start;
-	int ret;
+	int ret, state_ret;
 
 	lockdep_assert_held(&nvt->lifecycle_lock);
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
@@ -283,6 +284,7 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 #endif
 	WRITE_ONCE(nvt->error, 0);
 	nvt->read_errors = 0;
+	nvt->reset_state = 0;
 	ret = request_firmware_direct(&firmware, nvt->firmware_name, &nvt->spi->dev);
 	if (ret)
 		return ret;
@@ -292,6 +294,7 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 		nvt_thp_free_firmware(&image);
 	}
 	release_firmware(firmware);
+	nvt->reset_state = boot.reset_state;
 	if (ret) {
 		dev_err(&nvt->spi->dev, "THP firmware boot failed: %d, last reset state %#04x\n",
 			ret, boot.reset_state);
@@ -308,10 +311,8 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	set_bit(NVT_IRQ_ENABLED, &nvt->flags);
 	enable_irq(nvt->spi->irq);
 	/*
-	 * Sent right after the boot reset state, the idle-baseline command did
-	 * not clear within its budget on piano. The stock stack sends it only
-	 * while frames flow, so wait for the first valid frame, which stays
-	 * queued for the reader.
+	 * REK is the firmware readiness contract. Retain the established
+	 * first-frame admission as well; the frame stays queued for the reader.
 	 */
 	start = ktime_get();
 	ret = wait_event_interruptible_timeout(nvt->wait,
@@ -322,15 +323,23 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	else if (ret > 0)
 		ret = READ_ONCE(nvt->error);
 	if (ret) {
-		dev_err(&nvt->spi->dev, "THP first valid frame not received: %d\n", ret);
+		state_ret = nvt_thp_read_reset_state(nvt->map, &nvt->reset_state);
+		dev_err(&nvt->spi->dev,
+			"THP first valid frame not received: %d, last reset state %#04x (read %d)\n",
+			ret, nvt->reset_state, state_ret);
 		goto stop;
 	}
 	first_frame_ms = ktime_ms_delta(ktime_get(), start);
+	reset_to_frame_ms = ktime_ms_delta(ktime_get(), boot.reset_time);
+	start = ktime_get();
 	ret = nvt_thp_apply_host_commands(nvt->map, &last);
+	commands_ms = ktime_ms_delta(ktime_get(), start);
+	/* Diagnostic read: preserve the last sample and command result on error. */
+	state_ret = nvt_thp_read_reset_state(nvt->map, &nvt->reset_state);
 	if (ret) {
 		dev_err(&nvt->spi->dev,
-			"THP host command BF %02x failed: %d, command byte %#04x\n",
-			last.sub_command, ret, last.status);
+			"THP host command BF %02x failed: %d, command byte %#04x, last reset state %#04x (read %d)\n",
+			last.sub_command, ret, last.status, nvt->reset_state, state_ret);
 		goto stop;
 	}
 	ret = READ_ONCE(nvt->error);
@@ -339,7 +348,10 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 	dev_info(&nvt->spi->dev,
 		 "THP first frame after %lld ms; stylus disabled, idle-baseline update and op mode 2 accepted\n",
 		 first_frame_ms);
-	dev_info(&nvt->spi->dev, "THP stream ready, payload %u bytes\n", payload_length);
+	dev_info(&nvt->spi->dev,
+		 "THP stream ready, payload %u bytes; reset-to-REK %lld ms, reset-to-first-frame %lld ms, BF sequence %lld ms, last reset state %#04x (read %d)\n",
+		 payload_length, boot.rek_ms, reset_to_frame_ms, commands_ms,
+		 nvt->reset_state, state_ret);
 	return 0;
 stop:
 	nvt_stop_irq(nvt);
@@ -363,7 +375,8 @@ static void nvt_start_work(struct work_struct *work)
 	ret = nvt_start_stream(nvt);
 	if (ret) {
 		WRITE_ONCE(nvt->error, ret);
-		dev_err(&nvt->spi->dev, "THP async restart failed: %d\n", ret);
+		dev_err(&nvt->spi->dev, "THP async restart failed: %d, last reset state %#04x\n",
+			ret, nvt->reset_state);
 		wake_up_interruptible(&nvt->wait);
 	}
 	dev_dbg(&nvt->spi->dev, "THP stream %s: %d after %lld ms\n",
@@ -467,7 +480,8 @@ static int nvt_open(struct inode *inode, struct file *file)
 	if (!nvt->panel_off) {
 		ret = nvt_start_stream(nvt);
 		if (ret) {
-			dev_err(&nvt->spi->dev, "THP stream start failed: %d\n", ret);
+			dev_err(&nvt->spi->dev, "THP stream start failed: %d, last reset state %#04x\n",
+				ret, nvt->reset_state);
 			goto unlock;
 		}
 	}
