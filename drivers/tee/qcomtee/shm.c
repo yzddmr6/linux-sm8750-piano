@@ -5,8 +5,11 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/cma.h>
+#include <linux/dma-map-ops.h>
 #include <linux/firmware/qcom/qcom_tzmem.h>
 #include <linux/mm.h>
+#include <linux/overflow.h>
 
 #include "qcomtee.h"
 
@@ -114,15 +117,72 @@ static int qcomtee_shm_unregister(struct tee_context *ctx, struct tee_shm *shm)
 	return 0;
 }
 
+static bool qcomtee_large_shm(size_t size)
+{
+	return get_order(size) > MAX_PAGE_ORDER;
+}
+
 static int pool_op_alloc(struct tee_shm_pool *pool, struct tee_shm *shm,
 			 size_t size, size_t align)
 {
-	return tee_dyn_shm_alloc_helper(shm, size, align, qcomtee_shm_register);
+	struct page *page;
+	struct page **pages;
+	size_t rounded, nr_pages;
+	size_t i;
+	int ret;
+
+	if (!size || check_add_overflow(size, PAGE_SIZE - 1, &rounded))
+		return -EINVAL;
+	if (!qcomtee_large_shm(size))
+		return tee_dyn_shm_alloc_helper(shm, size, align, qcomtee_shm_register);
+
+	if (!IS_ENABLED(CONFIG_DMA_CMA))
+		return -ENOMEM;
+
+	/*
+	 * Large signed TAs exceed the buddy allocator's maximum order.
+	 * Keep a genuinely contiguous range for QTEE's memory-object ABI.
+	 */
+	nr_pages = rounded >> PAGE_SHIFT;
+	page = cma_alloc(dev_get_cma_area(NULL), nr_pages, 0, false);
+	if (!page)
+		return -ENOMEM;
+	pages = kcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+	if (!pages) {
+		ret = -ENOMEM;
+		goto release_cma;
+	}
+	for (i = 0; i < nr_pages; i++)
+		pages[i] = pfn_to_page(page_to_pfn(page) + i);
+	shm->kaddr = page_address(page);
+	shm->paddr = page_to_phys(page);
+	shm->size = nr_pages << PAGE_SHIFT;
+	shm->pages = pages;
+	shm->num_pages = nr_pages;
+	memset(shm->kaddr, 0, shm->size);
+	ret = qcomtee_shm_register(shm->ctx, shm, pages, nr_pages,
+				  (unsigned long)shm->kaddr);
+	if (!ret)
+		return 0;
+	shm->kaddr = NULL;
+	shm->pages = NULL;
+	kfree(pages);
+release_cma:
+	cma_release(dev_get_cma_area(NULL), page, nr_pages);
+	return ret;
 }
 
 static void pool_op_free(struct tee_shm_pool *pool, struct tee_shm *shm)
 {
-	tee_dyn_shm_free_helper(shm, qcomtee_shm_unregister);
+	if (!qcomtee_large_shm(shm->size)) {
+		tee_dyn_shm_free_helper(shm, qcomtee_shm_unregister);
+		return;
+	}
+	qcomtee_shm_unregister(shm->ctx, shm);
+	cma_release(dev_get_cma_area(NULL), shm->pages[0], shm->num_pages);
+	kfree(shm->pages);
+	shm->pages = NULL;
+	shm->kaddr = NULL;
 }
 
 static void pool_op_destroy_pool(struct tee_shm_pool *pool)
