@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/xiaomi,piano-goodix-control.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Xiaomi Piano secure Goodix fingerprint sensor control
+
+maintainers:
+  - slwyts <slwyts@foxmail.com>
+
+description: |
+  The sensor bus is owned by the secure world. The application processor
+  controls sensor power and reset and receives a GPIO interrupt. Authentication
+  commands are sent separately through Qualcomm QTEE. This device exposes no
+  sensor register window.
+
+properties:
+  compatible:
+    const: xiaomi,piano-goodix-control
+
+  vdd-supply: true
+
+  reset-gpios:
+    maxItems: 1
+
+  irq-gpios:
+    maxItems: 1
+
+required:
+  - compatible
+  - vdd-supply
+  - reset-gpios
+  - irq-gpios
+
+additionalProperties: false

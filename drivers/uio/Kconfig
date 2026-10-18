@@ -13,6 +13,15 @@ menuconfig UIO
 
 if UIO
 
+config UIO_PIANO_FINGERPRINT
+	tristate "Xiaomi Piano secure Goodix sensor control"
+	depends on OF && GPIOLIB && REGULATOR
+	help
+	  Provides power, reset and IRQ notification for the Goodix sensor on
+	  Xiaomi Piano. Sensor communication and authentication use QTEE.
+	  Opening the UIO device powers and resets the sensor; closing it
+	  switches the sensor off. No MMIO region or biometric data is exposed.
+
 config UIO_CIF
 	tristate "generic Hilscher CIF Card driver"
 	depends on PCI
