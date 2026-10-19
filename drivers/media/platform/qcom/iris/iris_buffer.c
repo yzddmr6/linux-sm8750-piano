@@ -898,6 +898,20 @@ int iris_vb2_buffer_done(struct iris_inst *inst, struct iris_buffer *buf)
 
 	vbuf->flags |= buf->flags;
 
+	/* LAST completes the drain even if the final frame has no valid payload.
+	 * Record it before returning an error buffer, otherwise the next capture
+	 * QBUF can emit another LAST into the new resolution's queue.
+	 */
+	if (vbuf->flags & V4L2_BUF_FLAG_LAST) {
+		if (!v4l2_m2m_has_stopped(m2m_ctx)) {
+			const struct v4l2_event ev = { .type = V4L2_EVENT_EOS };
+
+			v4l2_event_queue_fh(&inst->fh, &ev);
+			v4l2_m2m_mark_stopped(m2m_ctx);
+		}
+		inst->last_buffer_dequeued = true;
+	}
+
 	if (buf->flags & V4L2_BUF_FLAG_ERROR) {
 		state = VB2_BUF_STATE_ERROR;
 		vb2_set_plane_payload(vb2, 0, 0);
@@ -912,16 +926,6 @@ int iris_vb2_buffer_done(struct iris_inst *inst, struct iris_buffer *buf)
 		iris_get_ts_metadata(inst, buf->timestamp, vbuf);
 	} else {
 		vbuf->sequence = inst->sequence_out++;
-	}
-
-	if (vbuf->flags & V4L2_BUF_FLAG_LAST) {
-		if (!v4l2_m2m_has_stopped(m2m_ctx)) {
-			const struct v4l2_event ev = { .type = V4L2_EVENT_EOS };
-
-			v4l2_event_queue_fh(&inst->fh, &ev);
-			v4l2_m2m_mark_stopped(m2m_ctx);
-		}
-		inst->last_buffer_dequeued = true;
 	}
 
 	state = VB2_BUF_STATE_DONE;

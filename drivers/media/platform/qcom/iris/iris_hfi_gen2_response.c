@@ -391,7 +391,7 @@ static int iris_hfi_gen2_handle_output_buffer(struct iris_inst *inst,
 	buf->flags = iris_hfi_gen2_get_driver_buffer_flags(inst, hfi_buffer->flags);
 
 	if (!buf->data_size && inst->state == IRIS_INST_STREAMING &&
-	    !(hfi_buffer->flags & HFI_BUF_FW_FLAG_LAST)) {
+	    !(hfi_buffer->flags & (HFI_BUF_FW_FLAG_LAST | HFI_BUF_FW_FLAG_PSC_LAST))) {
 		buf->flags |= V4L2_BUF_FLAG_ERROR;
 	}
 
