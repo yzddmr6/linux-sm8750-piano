@@ -4024,6 +4024,11 @@ static int __clk_core_init(struct clk_core *core)
 	unsigned long rate;
 	int phase;
 
+	/* Pin all registered providers before walking the global orphan list. */
+	ret = clk_pm_runtime_get_all();
+	if (ret)
+		return ret;
+
 	clk_prepare_lock();
 
 	/*
@@ -4033,10 +4038,6 @@ static int __clk_core_init(struct clk_core *core)
 	 * that clks aren't parented until their parent is fully registered.
 	 */
 	core->hw->core = core;
-
-	ret = clk_pm_runtime_get(core);
-	if (ret)
-		goto unlock;
 
 	/* check to see if a clock with this name is already registered */
 	if (clk_core_lookup(core->name)) {
@@ -4201,8 +4202,6 @@ static int __clk_core_init(struct clk_core *core)
 
 	clk_core_reparent_orphans_nolock();
 out:
-	clk_pm_runtime_put(core);
-unlock:
 	if (ret) {
 		hash_del(&core->hashtable_node);
 		hlist_del_init(&core->child_node);
@@ -4210,6 +4209,7 @@ unlock:
 	}
 
 	clk_prepare_unlock();
+	clk_pm_runtime_put_all();
 
 	if (!ret)
 		clk_debug_register(core);
