@@ -64,8 +64,10 @@
 #define FS19XX_START_DELAY_MS	5
 /* 0.375 dB per step, 0xff is 0 dB */
 #define FS19XX_VOLUME_MAX	0xff
-/* About -24 dB: the stack has no speaker protection yet */
-#define FS19XX_VOLUME_DEFAULT	0xc0
+/* No speaker protection: -9 dB is the owner decision of 2026-10-21,
+ * not a proven safety limit (TD-026).
+ */
+#define FS19XX_VOLUME_DEFAULT	0xe7
 
 /* Preset file layout (little endian, packed) */
 #define FSM_HDR_SIZE_OFF	22

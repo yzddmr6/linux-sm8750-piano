@@ -510,9 +510,9 @@ static int xiaomi_piano_snd_prepare(struct snd_pcm_substream *substream)
 
 /*
  * The FS19xx amplifiers run without the speaker protection stock has on the
- * ADSP (VI feedback on the secondary TDM TX port). Cap their gain at -15 dB
- * (215 of 255 steps of 0.375 dB); stock Android runs 235-243 with
- * protection.
+ * ADSP (VI feedback on the secondary TDM TX port). The -9 dB cap
+ * (231 of 255 steps of 0.375 dB) is the owner decision of 2026-10-21,
+ * not a proven safety limit (TD-026). Stock runs 235-243 with protection.
  */
 static const char * const xiaomi_piano_speaker_volume_controls[] = {
 	"Top Left Amp Volume",
@@ -805,7 +805,7 @@ static const struct qcom_snd_soc_common xiaomi_piano_priv_data = {
 	.tdm_channels = 4,
 	.tdm_format = SNDRV_PCM_FORMAT_S32_LE,
 	.speaker_volume_controls = xiaomi_piano_speaker_volume_controls,
-	.speaker_volume_max = 215,
+	.speaker_volume_max = 231,
 	.snd_prepare = xiaomi_piano_snd_prepare,
 };
 
