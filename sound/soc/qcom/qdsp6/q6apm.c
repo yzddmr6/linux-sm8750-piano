@@ -942,8 +942,9 @@ static int apm_probe(gpr_device_t *gdev)
 	idr_init(&apm->modules_idr);
 
 	dev_set_drvdata(dev, apm);
-	q6apm_get_apm_state(apm);
-
+	/* APR installs the response callback only after probe returns.
+	 * q6apm_is_adsp_ready() queries the state once replies can be handled.
+	 */
 	ret = snd_soc_register_component(dev, &q6apm_audio_component, NULL, 0);
 	if (ret < 0) {
 		dev_err(dev, "failed to register q6apm: %d\n", ret);
