@@ -591,6 +591,10 @@ static int nanosic_wn8030_hid_parse(struct hid_device *hid)
 
 static int nanosic_wn8030_hid_start(struct hid_device *hid)
 {
+	/* HID core resets quirks before probe; set this before input mapping. */
+	if (hid->product == 0x00A1)
+		hid->quirks |= HID_QUIRK_NO_INIT_REPORTS;
+
 	return 0;
 }
 
@@ -613,7 +617,8 @@ static int nanosic_wn8030_raw_request(struct hid_device *hid,
 				      __u8 *buf, size_t len,
 				      unsigned char rtype, int reqtype)
 {
-	return len;
+	/* The MCU protocol has no HID feature/output report transport. */
+	return -EOPNOTSUPP;
 }
 
 static inline u8 nanosic_wn8030_checksum8(const u8 *data, int size)
