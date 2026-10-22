@@ -6,6 +6,7 @@
  */
 #include <drm/drm_panel.h>
 #include <linux/firmware.h>
+#include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/kfifo.h>
 #include <linux/kref.h>
@@ -78,6 +79,7 @@ struct nvt_thp {
 	wait_queue_head_t wait;
 	struct kfifo fifo;
 	const char *firmware_name;
+	int lcd_id; /* Panel module ID pin level; -1 without the pin. */
 	u8 *tx, *rx, *record;
 	size_t max_read;
 	u16 frame_length;
@@ -695,6 +697,78 @@ static const struct file_operations nvt_fops = {
 	.poll = nvt_poll,
 };
 
+/* Stock p81 lcd_id levels: 0 is the CSOT panel module, 1 the BOE module. */
+static const char *const nvt_panel_vendors[] = { "csot", "boe" };
+
+/*
+ * firmware-name holds one image per panel module, indexed by the lcd-id
+ * level. Without the ID pin it must name exactly one image.
+ */
+static int nvt_select_firmware(struct device *dev, int lcd_id, const char **name)
+{
+	const char *names[ARRAY_SIZE(nvt_panel_vendors)];
+	int count, index = 0;
+
+	count = device_property_string_array_count(dev, "firmware-name");
+	if (count <= 0)
+		return dev_err_probe(dev, count ?: -ENODATA, "firmware-name is required\n");
+	if (lcd_id >= 0)
+		index = lcd_id;
+	else if (count > 1)
+		return dev_err_probe(dev, -EINVAL, "several firmware names but no lcd-id GPIO\n");
+	if (index >= min_t(int, count, ARRAY_SIZE(names)))
+		return dev_err_probe(dev, -EINVAL, "no firmware-name for lcd-id %d\n", lcd_id);
+	count = device_property_read_string_array(dev, "firmware-name", names, ARRAY_SIZE(names));
+	if (count < 0)
+		return count;
+	*name = names[index];
+	return 0;
+}
+
+static ssize_t panel_vendor_show(struct device *dev, struct device_attribute *attr,
+				 char *buf)
+{
+	struct nvt_thp *nvt = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s\n", nvt_panel_vendors[nvt->lcd_id]);
+}
+static DEVICE_ATTR_RO(panel_vendor);
+
+static struct attribute *nvt_panel_attrs[] = {
+	&dev_attr_panel_vendor.attr,
+	NULL
+};
+
+static const struct attribute_group nvt_panel_group = {
+	.attrs = nvt_panel_attrs,
+};
+
+/* Read the panel module ID pin and select the firmware for that module. */
+static int nvt_probe_panel_module(struct nvt_thp *nvt)
+{
+	struct device *dev = &nvt->spi->dev;
+	struct gpio_desc *lcd_id;
+	int ret;
+
+	nvt->lcd_id = -1;
+	lcd_id = devm_gpiod_get_optional(dev, "novatek,lcd-id", GPIOD_IN);
+	if (IS_ERR(lcd_id))
+		return dev_err_probe(dev, PTR_ERR(lcd_id), "Failed to get lcd-id GPIO\n");
+	if (lcd_id) {
+		ret = gpiod_get_value_cansleep(lcd_id);
+		if (ret < 0)
+			return dev_err_probe(dev, ret, "Failed to read lcd-id GPIO\n");
+		nvt->lcd_id = ret;
+	}
+	ret = nvt_select_firmware(dev, nvt->lcd_id, &nvt->firmware_name);
+	if (ret)
+		return ret;
+	if (lcd_id)
+		dev_info(dev, "lcd-id %d (%s), firmware %s\n", nvt->lcd_id,
+			 nvt_panel_vendors[nvt->lcd_id], nvt->firmware_name);
+	return 0;
+}
+
 static int nvt_probe(struct spi_device *spi)
 {
 	struct regmap_config config = {
@@ -733,9 +807,9 @@ static int nvt_probe(struct spi_device *spi)
 	nvt->charger_state = nvt->charger_sent = -1;
 	mutex_init(&nvt->read_lock);
 	init_waitqueue_head(&nvt->wait);
-	ret = device_property_read_string(&spi->dev, "firmware-name", &nvt->firmware_name);
+	ret = nvt_probe_panel_module(nvt);
 	if (ret)
-		return dev_err_probe(&spi->dev, ret, "firmware-name is required\n");
+		return ret;
 	nvt->tx = kmalloc(NVT_WRITE_SIZE + 1, GFP_KERNEL);
 	nvt->rx = kmalloc(NVT_READ_SIZE, GFP_KERNEL);
 	nvt->record = kmalloc(sizeof(struct nvt_stream_header) + NVT_READ_SIZE, GFP_KERNEL);
@@ -779,6 +853,12 @@ static int nvt_probe(struct spi_device *spi)
 	nvt->misc.fops = &nvt_fops;
 	nvt->misc.parent = &spi->dev;
 	nvt->misc.mode = 0600;
+	/* The panel module is readable before the misc device announces the stream. */
+	if (nvt->lcd_id >= 0) {
+		ret = devm_device_add_group(&spi->dev, &nvt_panel_group);
+		if (ret)
+			return ret;
+	}
 	return misc_register(&nvt->misc);
 }
 

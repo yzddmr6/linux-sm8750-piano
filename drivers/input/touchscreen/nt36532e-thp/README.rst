@@ -103,6 +103,27 @@ Diagnostic reset-state reads preserve the last sample on a bus error and
 report that error separately. Firmware failures report the last state from
 the boot attempt; zero before any sample is not evidence of a completed reset.
 
+Panel module selection
+----------------------
+
+The piano ships with a CSOT or a BOE panel module, told apart by a module ID
+pin. The vendor driver reads it as ``novatek,lcd_id-gpio``
+(``p81/nt36532/nt36xxx.c:2239-2244``; 0 is CSOT, 1 is BOE) and loads
+``novatek_nt36532_piano_fw_csot.bin`` or ``novatek_nt36532_piano_fw_boe.bin``
+accordingly (``nt36xxx_fw_update.c:881-887``). With ``novatek,lcd-id-gpios``
+the transport uses the ``firmware-name`` entry at the index of the pin level,
+logs ``lcd-id N (vendor), firmware NAME`` and exports the module as the
+read-only SPI device attribute ``panel_vendor`` (``csot`` or ``boe``). The
+attribute exists before the misc device is registered. A pin level without a
+matching name fails the probe. Without the pin, ``firmware-name`` must hold
+exactly one name and no attribute is created.
+
+The selection follows ``nvt_select_firmware()`` and the
+``novatek,lcd-id-gpios`` property in https://github.com/blu-sharky/linux-piano
+at ``453bb567f2fc12423ab3338953ca8938a2f06e16``,
+``drivers/input/touchscreen/nt36532e/nt36xxx.c`` (GPL-2.0-or-later). Unlike
+that driver, a single name is not reused for the other module.
+
 Stream contract
 ---------------
 
