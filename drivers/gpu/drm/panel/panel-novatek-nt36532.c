@@ -35,6 +35,7 @@ struct nt36532 {
 };
 
 struct panel_info {
+	const char *name;
 	unsigned int lanes;
 	enum mipi_dsi_pixel_format format;
 	unsigned long mode_flags;
@@ -58,6 +59,11 @@ struct panel_info {
 	void (*reset)(struct nt36532 *ctx);
 
 	bool is_dual_dsi;
+};
+
+/* Panel modules behind one compatible, indexed by the level of the ID GPIO */
+struct nt36532_variants {
+	const struct panel_info *info[2];
 };
 
 static const struct regulator_bulk_data nt36532_supplies[] = {
@@ -679,16 +685,30 @@ static int piano_boe_init_sequence(struct nt36532 *ctx,
 	return piano_init_sequence(ctx, mode, &piano_boe_module);
 }
 
+/* Without an ID GPIO (@id < 0) the first variant applies. */
+static const struct panel_info *
+nt36532_select_variant(const struct nt36532_variants *variants, int id)
+{
+	if (id < 0)
+		id = 0;
+	if (id >= ARRAY_SIZE(variants->info))
+		return NULL;
+
+	return variants->info[id];
+}
+
 static int nt36532_probe(struct mipi_dsi_device *dsi)
 {
 	struct mipi_dsi_device_info dsi_info = {"nt36532-secondary", 0, NULL};
+	const struct nt36532_variants *variants;
 	const struct panel_info *panel_info;
 	struct mipi_dsi_host *dsi1_host;
 	struct device *dev = &dsi->dev;
+	struct gpio_desc *id_gpio;
 	struct device_node *dsi1;
 	struct nt36532 *ctx;
 	int num_dsi = 1;
-	int ret, i;
+	int ret, i, id = -1;
 
 	ctx = devm_drm_panel_alloc(dev, struct nt36532, panel,
 				   &nt36532_panel_funcs,
@@ -696,10 +716,26 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
 
-	ctx->panel_info = of_device_get_match_data(dev);
-	panel_info = ctx->panel_info;
-	if (!panel_info)
+	variants = of_device_get_match_data(dev);
+	if (!variants)
 		return -ENODEV;
+
+	id_gpio = devm_gpiod_get_optional(dev, "id", GPIOD_IN);
+	if (IS_ERR(id_gpio))
+		return dev_err_probe(dev, PTR_ERR(id_gpio),
+				     "Failed to get id-gpios\n");
+	if (id_gpio) {
+		id = gpiod_get_value_cansleep(id_gpio);
+		if (id < 0)
+			return dev_err_probe(dev, id, "Failed to read id-gpios\n");
+	}
+
+	panel_info = nt36532_select_variant(variants, id);
+	if (!panel_info)
+		return dev_err_probe(dev, -ENODEV, "No panel for ID %d\n", id);
+	if (id_gpio)
+		dev_info(dev, "panel ID %d: %s\n", id, panel_info->name);
+	ctx->panel_info = panel_info;
 
 	ret = devm_regulator_bulk_get_const(&dsi->dev,
 					    panel_info->num_supplies,
@@ -782,7 +818,8 @@ static const struct panel_info csot_panel_info = {
 	.is_dual_dsi = true,
 };
 
-#define PIANO_PANEL_INFO(_init) {						\
+#define PIANO_PANEL_INFO(_name, _init) {					\
+	.name = _name,								\
 	.lanes = 4,								\
 	.format = MIPI_DSI_FMT_RGB101010,					\
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS |	\
@@ -817,15 +854,37 @@ static void piano_reset(struct nt36532 *ctx)
 }
 
 static const struct panel_info piano_csot_panel_info =
-	PIANO_PANEL_INFO(piano_csot_init_sequence);
+	PIANO_PANEL_INFO("p81 42-02-0a (CSOT)", piano_csot_init_sequence);
 
 static const struct panel_info piano_boe_panel_info =
-	PIANO_PANEL_INFO(piano_boe_init_sequence);
+	PIANO_PANEL_INFO("p81 35-02-0b (BOE)", piano_boe_init_sequence);
+
+static const struct nt36532_variants csot_variants = {
+	.info = { &csot_panel_info },
+};
+
+/* The stock bootloader and touch driver read the same ID pin. */
+static const struct nt36532_variants piano_variants = {
+	.info = {
+		&piano_csot_panel_info,	/* ID low */
+		&piano_boe_panel_info,	/* ID high */
+	},
+};
+
+/* Inherited single-module compatibles, until the board DT switches. */
+static const struct nt36532_variants piano_csot_only_variants = {
+	.info = { &piano_csot_panel_info },
+};
+
+static const struct nt36532_variants piano_boe_only_variants = {
+	.info = { &piano_boe_panel_info },
+};
 
 static const struct of_device_id nt36532_of_match[] = {
-	{ .compatible = "csot,ppc100hb1-1", .data = &csot_panel_info },
-	{ .compatible = "xiaomi,piano-boe-nt36532", .data = &piano_csot_panel_info },
-	{ .compatible = "xiaomi,piano-csot-nt36532", .data = &piano_boe_panel_info },
+	{ .compatible = "csot,ppc100hb1-1", .data = &csot_variants },
+	{ .compatible = "xiaomi,piano-nt36532", .data = &piano_variants },
+	{ .compatible = "xiaomi,piano-boe-nt36532", .data = &piano_csot_only_variants },
+	{ .compatible = "xiaomi,piano-csot-nt36532", .data = &piano_boe_only_variants },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, nt36532_of_match);
