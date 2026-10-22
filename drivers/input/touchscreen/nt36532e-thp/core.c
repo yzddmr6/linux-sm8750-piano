@@ -29,6 +29,7 @@
 #include "firmware.h"
 
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
+#include <kunit/device.h>
 #include <kunit/test.h>
 #include <linux/kthread.h>
 #endif
@@ -1462,6 +1463,97 @@ static void nvt_test_charger_external_online(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, online, -ENODEV);
 }
 
+static const char *const nvt_test_firmware[] = {
+	"novatek/piano/novatek_nt36532_piano_fw_csot.bin",
+	"novatek/piano/novatek_nt36532_piano_fw_boe.bin",
+};
+
+/* A device whose firmware-name lists the first @count test names. */
+static struct device *nvt_test_names_device(struct kunit *test, const char *name,
+					    unsigned int count)
+{
+	const struct property_entry props[] = {
+		PROPERTY_ENTRY_STRING_ARRAY_LEN("firmware-name", nvt_test_firmware, count),
+		{ }
+	};
+	struct device *dev = kunit_device_register(test, name);
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	KUNIT_ASSERT_EQ(test, device_create_managed_software_node(dev, count ? props : &props[1],
+								  NULL), 0);
+	return dev;
+}
+
+static void nvt_test_select_by_lcd_id(struct kunit *test)
+{
+	struct device *dev = nvt_test_names_device(test, "nvt-select-both", 2);
+	const char *name = NULL;
+
+	KUNIT_EXPECT_EQ(test, nvt_select_firmware(dev, 0, &name), 0);
+	KUNIT_EXPECT_STREQ(test, name, nvt_test_firmware[0]);
+	KUNIT_EXPECT_EQ(test, nvt_select_firmware(dev, 1, &name), 0);
+	KUNIT_EXPECT_STREQ(test, name, nvt_test_firmware[1]);
+}
+
+static void nvt_test_select_without_lcd_id(struct kunit *test)
+{
+	struct device *single = nvt_test_names_device(test, "nvt-select-single", 1);
+	struct device *both = nvt_test_names_device(test, "nvt-select-ambiguous", 2);
+	const char *name = NULL;
+
+	/* The previous single-name binding keeps working unchanged. */
+	KUNIT_EXPECT_EQ(test, nvt_select_firmware(single, -1, &name), 0);
+	KUNIT_EXPECT_STREQ(test, name, nvt_test_firmware[0]);
+	name = NULL;
+	KUNIT_EXPECT_EQ(test, nvt_select_firmware(both, -1, &name), -EINVAL);
+	KUNIT_EXPECT_NULL(test, name);
+}
+
+static void nvt_test_select_errors(struct kunit *test)
+{
+	struct device *single = nvt_test_names_device(test, "nvt-select-short", 1);
+	struct device *none = nvt_test_names_device(test, "nvt-select-none", 0);
+	const char *name = NULL;
+
+	/* A BOE module must not fall back to the CSOT image. */
+	KUNIT_EXPECT_EQ(test, nvt_select_firmware(single, 1, &name), -EINVAL);
+	KUNIT_EXPECT_NULL(test, name);
+	KUNIT_EXPECT_EQ(test, nvt_select_firmware(none, -1, &name), -EINVAL);
+	KUNIT_EXPECT_EQ(test, nvt_select_firmware(none, 0, &name), -EINVAL);
+	KUNIT_EXPECT_NULL(test, name);
+}
+
+static void nvt_test_panel_vendor(struct kunit *test)
+{
+	struct device *dev = kunit_device_register(test, "nvt-panel-vendor");
+	struct nvt_thp *nvt = kunit_kzalloc(test, sizeof(*nvt), GFP_KERNEL);
+	char *buf = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	KUNIT_ASSERT_NOT_NULL(test, nvt);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	dev_set_drvdata(dev, nvt);
+	nvt->lcd_id = 0;
+	KUNIT_EXPECT_EQ(test, panel_vendor_show(dev, &dev_attr_panel_vendor, buf), 5);
+	KUNIT_EXPECT_STREQ(test, buf, "csot\n");
+	nvt->lcd_id = 1;
+	KUNIT_EXPECT_EQ(test, panel_vendor_show(dev, &dev_attr_panel_vendor, buf), 4);
+	KUNIT_EXPECT_STREQ(test, buf, "boe\n");
+}
+
+static struct kunit_case nvt_select_cases[] = {
+	KUNIT_CASE(nvt_test_select_by_lcd_id),
+	KUNIT_CASE(nvt_test_select_without_lcd_id),
+	KUNIT_CASE(nvt_test_select_errors),
+	KUNIT_CASE(nvt_test_panel_vendor),
+	{}
+};
+
+static struct kunit_suite nvt_select_suite = {
+	.name = "nt36532e-select",
+	.test_cases = nvt_select_cases,
+};
+
 static struct kunit_case nvt_panel_cases[] = {
 	KUNIT_CASE(nvt_test_charger_changes),
 	KUNIT_CASE(nvt_test_charger_lifecycle_gates),
@@ -1482,7 +1574,7 @@ static struct kunit_suite nvt_panel_suite = {
 	.test_cases = nvt_panel_cases,
 };
 
-kunit_test_suite(nvt_panel_suite);
+kunit_test_suites(&nvt_panel_suite, &nvt_select_suite);
 #endif
 
 MODULE_DESCRIPTION("NT36532E cascade SPI host-touch transport");
