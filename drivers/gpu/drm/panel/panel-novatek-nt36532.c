@@ -871,20 +871,9 @@ static const struct nt36532_variants piano_variants = {
 	},
 };
 
-/* Inherited single-module compatibles, until the board DT switches. */
-static const struct nt36532_variants piano_csot_only_variants = {
-	.info = { &piano_csot_panel_info },
-};
-
-static const struct nt36532_variants piano_boe_only_variants = {
-	.info = { &piano_boe_panel_info },
-};
-
 static const struct of_device_id nt36532_of_match[] = {
 	{ .compatible = "csot,ppc100hb1-1", .data = &csot_variants },
 	{ .compatible = "xiaomi,piano-nt36532", .data = &piano_variants },
-	{ .compatible = "xiaomi,piano-boe-nt36532", .data = &piano_csot_only_variants },
-	{ .compatible = "xiaomi,piano-csot-nt36532", .data = &piano_boe_only_variants },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, nt36532_of_match);
