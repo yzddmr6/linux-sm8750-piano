@@ -167,33 +167,57 @@ static const unsigned char pogo_kb_hid_keys[256] = {
 #define POGO_KB_HID_MODIFIERS		0xe0
 
 /*
+ * The keyboard has no Fn key, so the key with the magnifier symbol serves as
+ * one and is reported as KEY_FN.  While it is held, the twelve keys of the top
+ * row report F1 to F12 in their order on the row: brightness down and up,
+ * microphone, touchpad, screenshot, lock, previous, play/pause, next, mute,
+ * volume down and up.  The F key of a top row key that sends a media usage is
+ * in pogo_kb_media_keys[]; the microphone, touchpad, screenshot and lock keys
+ * send the keyboard usages below (F13, F17, Print Screen and F24).  A key is
+ * always released with the code it was pressed with.
+ */
+#define POGO_KB_HID_FN			0x72
+
+static const struct {
+	u8 usage;
+	u16 code;
+} pogo_kb_fn_keys[] = {
+	{ 0x46, KEY_F5 },
+	{ 0x68, KEY_F3 },
+	{ 0x6c, KEY_F4 },
+	{ 0x73, KEY_F6 },
+};
+
+/*
  * Usages of the media key report.  The 0x38e..0x399 block is private to the
  * keyboard firmware; the vendor driver gave those keys private key codes,
  * which map to standard ones here where one exists (lock screen, language
  * switch, microphone mute, touchpad toggle, search, full screen and two
  * user-assignable keys).  The split screen and device interconnect keys
- * have no standard equivalent and are not reported.
+ * have no standard equivalent and are not reported.  fn_code is the code
+ * reported while the Fn key is held.
  */
 static const struct {
 	u16 usage;
 	u16 code;
+	u16 fn_code;
 } pogo_kb_media_keys[] = {
-	{ 0x006f, KEY_BRIGHTNESSUP },
-	{ 0x0070, KEY_BRIGHTNESSDOWN },
-	{ 0x00b5, KEY_NEXTSONG },
-	{ 0x00b6, KEY_PREVIOUSSONG },
-	{ 0x00cd, KEY_PLAYPAUSE },
-	{ 0x00e2, KEY_MUTE },
-	{ 0x00e9, KEY_VOLUMEUP },
-	{ 0x00ea, KEY_VOLUMEDOWN },
+	{ 0x006f, KEY_BRIGHTNESSUP, KEY_F2 },
+	{ 0x0070, KEY_BRIGHTNESSDOWN, KEY_F1 },
+	{ 0x00b5, KEY_NEXTSONG, KEY_F9 },
+	{ 0x00b6, KEY_PREVIOUSSONG, KEY_F7 },
+	{ 0x00cd, KEY_PLAYPAUSE, KEY_F8 },
+	{ 0x00e2, KEY_MUTE, KEY_F10 },
+	{ 0x00e9, KEY_VOLUMEUP, KEY_F12 },
+	{ 0x00ea, KEY_VOLUMEDOWN, KEY_F11 },
 	{ 0x01d0, KEY_FN },
 	{ 0x0224, KEY_BACK },
 	{ 0x0244, KEY_APPSELECT },
 	{ 0x02fa, KEY_ASSISTANT },
-	{ 0x038e, KEY_SCREENLOCK },
+	{ 0x038e, KEY_SCREENLOCK, KEY_F6 },
 	{ 0x0390, KEY_LANGUAGE },
-	{ 0x0391, KEY_MICMUTE },
-	{ 0x0392, KEY_TOUCHPAD_TOGGLE },
+	{ 0x0391, KEY_MICMUTE, KEY_F3 },
+	{ 0x0392, KEY_TOUCHPAD_TOGGLE, KEY_F4 },
 	{ 0x0393, KEY_SEARCH },
 	{ 0x0394, KEY_FULL_SCREEN },
 	{ 0x0398, KEY_PROG1 },
@@ -236,6 +260,9 @@ struct pogo_kb {
 	struct input_dev *tp;
 	u8 keys[8];
 	u16 media[2];
+	bool fn;
+	DECLARE_BITMAP(fn_keys, ARRAY_SIZE(pogo_kb_fn_keys));
+	DECLARE_BITMAP(fn_media, ARRAY_SIZE(pogo_kb_media_keys));
 	bool touching;
 	bool caps_on;
 
@@ -288,13 +315,39 @@ static size_t pogo_kb_build_frame(u8 *frame, u8 cmd, const u8 *data, u8 len, u16
 	return p - frame;
 }
 
-static unsigned int pogo_kb_media_code(u16 usage)
+static unsigned int pogo_kb_key_code(struct pogo_kb *kb, u8 usage, bool press)
 {
 	unsigned int i;
 
-	for (i = 0; i < ARRAY_SIZE(pogo_kb_media_keys); i++)
-		if (pogo_kb_media_keys[i].usage == usage)
-			return pogo_kb_media_keys[i].code;
+	for (i = 0; i < ARRAY_SIZE(pogo_kb_fn_keys); i++) {
+		if (pogo_kb_fn_keys[i].usage != usage)
+			continue;
+
+		if (press)
+			__assign_bit(i, kb->fn_keys, kb->fn);
+		if (test_bit(i, kb->fn_keys))
+			return pogo_kb_fn_keys[i].code;
+		break;
+	}
+
+	return kb->keymap[usage];
+}
+
+static unsigned int pogo_kb_media_code(struct pogo_kb *kb, u16 usage, bool press)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(pogo_kb_media_keys); i++) {
+		if (pogo_kb_media_keys[i].usage != usage)
+			continue;
+
+		if (press)
+			__assign_bit(i, kb->fn_media,
+				     kb->fn && pogo_kb_media_keys[i].fn_code);
+		if (test_bit(i, kb->fn_media))
+			return pogo_kb_media_keys[i].fn_code;
+		return pogo_kb_media_keys[i].code;
+	}
 
 	return KEY_RESERVED;
 }
@@ -311,13 +364,16 @@ static void pogo_kb_report_keys(struct pogo_kb *kb, const u8 *report, u8 len)
 		input_report_key(input, kb->keymap[POGO_KB_HID_MODIFIERS + i],
 				 report[0] & BIT(i));
 
+	/* The Fn key also applies to keys pressed in the same report */
+	kb->fn = memchr(report + 2, POGO_KB_HID_FN, 6);
+
 	/* Usages 1..3 are the boot protocol's error codes, not keys */
 	for (i = 2; i < sizeof(kb->keys); i++) {
 		if (kb->keys[i] > 3 && !memchr(report + 2, kb->keys[i], 6))
-			input_report_key(input, kb->keymap[kb->keys[i]], 0);
+			input_report_key(input, pogo_kb_key_code(kb, kb->keys[i], false), 0);
 
 		if (report[i] > 3 && !memchr(kb->keys + 2, report[i], 6))
-			input_report_key(input, kb->keymap[report[i]], 1);
+			input_report_key(input, pogo_kb_key_code(kb, report[i], true), 1);
 	}
 
 	input_sync(input);
@@ -338,10 +394,10 @@ static void pogo_kb_report_media(struct pogo_kb *kb, const u8 *data, u8 len)
 
 	for (i = 0; i < ARRAY_SIZE(usage); i++) {
 		if (kb->media[i] && kb->media[i] != usage[0] && kb->media[i] != usage[1])
-			input_report_key(input, pogo_kb_media_code(kb->media[i]), 0);
+			input_report_key(input, pogo_kb_media_code(kb, kb->media[i], false), 0);
 
 		if (usage[i] && usage[i] != kb->media[0] && usage[i] != kb->media[1])
-			input_report_key(input, pogo_kb_media_code(usage[i]), 1);
+			input_report_key(input, pogo_kb_media_code(kb, usage[i], true), 1);
 	}
 
 	input_sync(input);
@@ -764,6 +820,7 @@ static int pogo_kb_register_inputs(struct pogo_kb *kb, u8 brand)
 	spin_lock(&kb->rx_lock);
 	memset(kb->keys, 0, sizeof(kb->keys));
 	memset(kb->media, 0, sizeof(kb->media));
+	kb->fn = false;
 	kb->touching = false;
 	kb->kbd = kbd;
 	kb->tp = tp;
@@ -1051,6 +1108,7 @@ static int pogo_kb_probe(struct serdev_device *serdev)
 
 	for (i = 0; i < ARRAY_SIZE(kb->keymap); i++)
 		kb->keymap[i] = pogo_kb_hid_keys[i];
+	kb->keymap[POGO_KB_HID_FN] = KEY_FN;
 
 	kb->speed = POGO_KB_SPEED;
 	device_property_read_u32(dev, "current-speed", &kb->speed);
