@@ -482,20 +482,42 @@ static void piano_boe_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbc, 0x77, 0x07);
 }
 
+/*
+ * The stock 42-02-0a and 35-02-0b on-commands differ only in the ESD D1
+ * value, one vendor register block and the order of the refresh rate
+ * register writes.
+ */
+struct piano_module {
+	u8 esd_cfg;
+	void (*vendor_sequence)(struct mipi_dsi_multi_context *dsi_ctx);
+	bool rate_b2_first;
+};
+
+static const struct piano_module piano_csot_module = {
+	.esd_cfg = 0x20,
+	.vendor_sequence = piano_csot_vendor_sequence,
+};
+
+static const struct piano_module piano_boe_module = {
+	.esd_cfg = 0x00,
+	.vendor_sequence = piano_boe_vendor_sequence,
+	.rate_b2_first = true,
+};
+
 static int piano_init_sequence(struct nt36532 *ctx,
 			       const struct drm_display_mode *mode,
-			       u8 esd_cfg,
-			       void (*vendor_sequence)(struct mipi_dsi_multi_context *))
+			       const struct piano_module *module)
 {
 	struct mipi_dsi_multi_context multi_ctx = { .dsi = to_primary_dsi(ctx) };
 	struct mipi_dsi_multi_context *dsi_ctx = &multi_ctx;
 	struct drm_dsc_picture_parameter_set pps;
+	u8 b2, b3;
 
 	/* ESD init */
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x27);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xd0, 0x31);
-	mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, 0xd1, esd_cfg);
+	mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, 0xd1, module->esd_cfg);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xd2, 0x38);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xde, 0x43);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xdf, 0x02);
@@ -580,7 +602,7 @@ static int piano_init_sequence(struct nt36532 *ctx,
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0x14, 0x11);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x2a);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
-	vendor_sequence(dsi_ctx);
+	module->vendor_sequence(dsi_ctx);
 	/* Original init code */
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0xf0);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xfb, 0x01);
@@ -600,18 +622,25 @@ static int piano_init_sequence(struct nt36532 *ctx,
 	/* Panel side refresh rate control */
 	switch (drm_mode_vrefresh(mode)) {
 	case 144:
-		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb3, 0x00);
-		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb2, 0x00);
+		b2 = 0x00;
+		b3 = 0x00;
 		break;
 	case 90:
-		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb3, 0x80);
-		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb2, 0x00);
+		b2 = 0x00;
+		b3 = 0x80;
 		break;
 	default:
 		/* 120 Hz panel timing, also used for 60 Hz */
-		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb3, 0x40);
-		mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xb2, 0x91);
+		b2 = 0x91;
+		b3 = 0x40;
 		break;
+	}
+	if (module->rate_b2_first) {
+		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, 0xb2, b2);
+		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, 0xb3, b3);
+	} else {
+		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, 0xb3, b3);
+		mipi_dsi_dcs_write_var_seq_multi(dsi_ctx, 0xb2, b2);
 	}
 
 	mipi_dsi_dcs_exit_sleep_mode_multi(dsi_ctx);
@@ -641,13 +670,13 @@ static int piano_init_sequence(struct nt36532 *ctx,
 static int piano_csot_init_sequence(struct nt36532 *ctx,
 				    const struct drm_display_mode *mode)
 {
-	return piano_init_sequence(ctx, mode, 0x20, piano_csot_vendor_sequence);
+	return piano_init_sequence(ctx, mode, &piano_csot_module);
 }
 
 static int piano_boe_init_sequence(struct nt36532 *ctx,
 				   const struct drm_display_mode *mode)
 {
-	return piano_init_sequence(ctx, mode, 0x00, piano_boe_vendor_sequence);
+	return piano_init_sequence(ctx, mode, &piano_boe_module);
 }
 
 static int nt36532_probe(struct mipi_dsi_device *dsi)
