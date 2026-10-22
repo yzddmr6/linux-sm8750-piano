@@ -42,6 +42,12 @@ enum qcom_battmgr_variant {
  * can enforce the charge control thresholds itself.
  */
 #define QCOM_BATTMGR_QUIRK_CHARGE_ENABLE		BIT(3)
+/*
+ * The firmware leaves the USB VBUS boost to the OS: once allowed to, it
+ * reports an attached sink with a notification and waits for the OS to
+ * switch the boost on.
+ */
+#define QCOM_BATTMGR_QUIRK_OTG_VBUS			BIT(4)
 
 #define BATTMGR_BAT_STATUS		0x1
 
@@ -55,6 +61,8 @@ enum qcom_battmgr_variant {
 #define NOTIF_BAT_INFO			0x81
 #define NOTIF_BAT_CHARGING_STATE	0x83
 /* OPLUS firmware: USB port events */
+#define NOTIF_OPLUS_OTG_ENABLE		0x50
+#define NOTIF_OPLUS_OTG_DISABLE		0x51
 #define NOTIF_OPLUS_TYPEC_STATE		0x55
 #define NOTIF_OPLUS_PLUGIN		0x57
 #define NOTIF_OPLUS_APSD_DONE		0x58
@@ -109,6 +117,11 @@ enum qcom_battmgr_variant {
 #define USB_ADAP_TYPE			7
 #define USB_MOISTURE_DET_EN		8
 #define USB_MOISTURE_DET_STS		9
+/* OPLUS firmware: VBUS boost control */
+#define USB_OPLUS_OTG_AP_ENABLE		17
+#define USB_OPLUS_OTG_SWITCH		18
+#define USB_OPLUS_OTG_VBUS_ENABLE	24
+#define USB_OPLUS_OTG_BOOST_CURRENT	64
 
 #define BATTMGR_WLS_PROPERTY_GET	0x34
 #define BATTMGR_WLS_PROPERTY_SET	0x35
@@ -132,6 +145,9 @@ enum qcom_battmgr_variant {
 
 /* The vendor kernel waits this long for the answer to a property write */
 #define BATTMGR_SET_TIMEOUT_MS		2500
+
+/* VBUS boost current limit for a USB sink, from the vendor devicetree */
+#define OTG_BOOST_CURRENT_MA		1250
 
 struct qcom_battmgr_enable_request {
 	struct pmic_glink_hdr hdr;
@@ -388,6 +404,15 @@ struct qcom_battmgr {
 	struct delayed_work charge_work;
 	bool charge_inhibited;
 	bool charge_error;
+
+	/*
+	 * USB VBUS boost: @otg_request follows the firmware notifications,
+	 * @otg_work (freezable) switches the boost to match and records the
+	 * result in @otg_vbus.
+	 */
+	struct work_struct otg_work;
+	bool otg_request;
+	bool otg_vbus;
 };
 
 static int __qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data,
@@ -1450,6 +1475,15 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 	case NOTIF_WLS_PROPERTY:
 		power_supply_changed(battmgr->wls_psy);
 		break;
+	case NOTIF_OPLUS_OTG_ENABLE:
+	case NOTIF_OPLUS_OTG_DISABLE:
+		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OTG_VBUS) {
+			WRITE_ONCE(battmgr->otg_request,
+				   notification == NOTIF_OPLUS_OTG_ENABLE);
+			queue_work(system_freezable_wq, &battmgr->otg_work);
+			break;
+		}
+		fallthrough;
 	case NOTIF_OPLUS_TYPEC_STATE:
 	case NOTIF_OPLUS_PLUGIN:
 	case NOTIF_OPLUS_APSD_DONE:
@@ -1873,6 +1907,61 @@ static void qcom_battmgr_callback(const void *data, size_t len, void *priv)
 	}
 }
 
+/*
+ * Let the firmware use the port as a USB source.  It then detects a sink on
+ * the port and asks for VBUS with NOTIF_OPLUS_OTG_ENABLE.  The firmware does
+ * not detect a sink while this is cleared, so it is done once the service
+ * is up, before anything is plugged in; it does not turn VBUS on by itself.
+ */
+static void qcom_battmgr_otg_init(struct qcom_battmgr *battmgr)
+{
+	int ret;
+
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					USB_OPLUS_OTG_AP_ENABLE, 1);
+	if (!ret)
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+						USB_OPLUS_OTG_SWITCH, 1);
+	if (ret)
+		dev_err(battmgr->dev, "failed to enable USB source mode: %d\n", ret);
+}
+
+/*
+ * Switch the VBUS boost to what the firmware asked for last: on while it
+ * reports a sink, that is while the port is the USB source and host, and
+ * off once the sink is gone.  The data role stays with the Type-C driver.
+ */
+static void qcom_battmgr_otg_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, otg_work);
+	bool on = READ_ONCE(battmgr->otg_request);
+	int ret;
+
+	if (!battmgr->service_up || on == battmgr->otg_vbus)
+		return;
+
+	/* The vendor kernel sets the boost current limit before the boost */
+	if (on) {
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+						USB_OPLUS_OTG_BOOST_CURRENT,
+						OTG_BOOST_CURRENT_MA);
+		if (ret)
+			dev_warn(battmgr->dev, "failed to set the VBUS current limit: %d\n",
+				 ret);
+	}
+
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					USB_OPLUS_OTG_VBUS_ENABLE, on);
+	if (ret) {
+		dev_err(battmgr->dev, "failed to turn VBUS %s: %d\n",
+			on ? "on" : "off", ret);
+		return;
+	}
+
+	battmgr->otg_vbus = on;
+	dev_info(battmgr->dev, "VBUS %s for a USB sink\n", on ? "on" : "off");
+}
+
 static void qcom_battmgr_enable_worker(struct work_struct *work)
 {
 	struct qcom_battmgr *battmgr = container_of(work, struct qcom_battmgr, enable_work);
@@ -1886,6 +1975,9 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
+
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OTG_VBUS)
+		qcom_battmgr_otg_init(battmgr);
 
 	qcom_battmgr_charge_kick(battmgr);
 }
@@ -1905,6 +1997,9 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		battmgr->service_up = false;
 		/* A restarted firmware charges again by default */
 		battmgr->charge_inhibited = false;
+		/* ... and starts with the boost off */
+		battmgr->otg_request = false;
+		battmgr->otg_vbus = false;
 	}
 }
 
@@ -1929,7 +2024,8 @@ static const struct of_device_id qcom_battmgr_of_quirks[] = {
 		.data = (void *)(QCOM_BATTMGR_QUIRK_BATT_CURRENT_INVERTED |
 				 QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW |
 				 QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL |
-				 QCOM_BATTMGR_QUIRK_CHARGE_ENABLE),
+				 QCOM_BATTMGR_QUIRK_CHARGE_ENABLE |
+				 QCOM_BATTMGR_QUIRK_OTG_VBUS),
 	},
 	{}
 };
@@ -1993,6 +2089,7 @@ static void qcom_battmgr_cancel_work(void *data)
 	struct qcom_battmgr *battmgr = data;
 
 	cancel_delayed_work_sync(&battmgr->charge_work);
+	cancel_work_sync(&battmgr->otg_work);
 }
 
 static int qcom_battmgr_probe(struct auxiliary_device *adev,
@@ -2021,6 +2118,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.num_supplicants = 1;
 
 	INIT_DELAYED_WORK(&battmgr->charge_work, qcom_battmgr_charge_worker);
+	INIT_WORK(&battmgr->otg_work, qcom_battmgr_otg_worker);
 	mutex_init(&battmgr->lock);
 	spin_lock_init(&battmgr->notify_lock);
 	init_completion(&battmgr->ack);
