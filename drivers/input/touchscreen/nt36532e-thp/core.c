@@ -999,6 +999,7 @@ static void nvt_test_async_cleanup(void *data)
 	if (ctx->misc_registered)
 		misc_deregister(&ctx->nvt.misc);
 	cancel_work_sync(&ctx->nvt.start_work);
+	cancel_work_sync(&ctx->nvt.charger_work);
 }
 
 static struct nvt_async_test *nvt_test_async_init(struct kunit *test)
@@ -1090,6 +1091,7 @@ static void nvt_test_stop_async(struct kunit *test, bool running, bool remove)
 	if (!running)
 		mutex_lock(&nvt->lifecycle_lock);
 	nvt_panel_enabled(&nvt->follower);
+	nvt_charger_notify(&nvt->charger_notifier, PSY_EVENT_PROP_CHANGED, NULL);
 	if (running)
 		KUNIT_ASSERT_NE(test, wait_for_completion_timeout(&ctx->started, HZ), 0UL);
 	ctx->stop_task = kthread_create(nvt_test_disable_thread, ctx, "nvt-kunit-stop");
@@ -1114,6 +1116,7 @@ static void nvt_test_stop_async(struct kunit *test, bool running, bool remove)
 	KUNIT_EXPECT_FALSE(test, nvt->running);
 	KUNIT_EXPECT_FALSE(test, test_bit(NVT_IRQ_ENABLED, &nvt->flags));
 	KUNIT_EXPECT_FALSE(test, work_busy(&nvt->start_work));
+	KUNIT_EXPECT_FALSE(test, work_busy(&nvt->charger_work));
 	if (remove) {
 		KUNIT_EXPECT_TRUE(test, nvt->dead);
 		nvt_panel_enabled(&nvt->follower);
@@ -1167,7 +1170,216 @@ static void nvt_test_async_error(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->nvt.error, -EIO);
 }
 
+struct nvt_charger_test {
+	struct nvt_thp nvt;
+	struct spi_device spi;
+	unsigned int writes;
+	u8 command;
+	bool fail;
+};
+
+static int nvt_test_charger_write(void *context, const void *data, size_t count)
+{
+	struct nvt_charger_test *ctx = context;
+	const u8 *bytes = data;
+
+	if (count != sizeof(u32) + 2 || get_unaligned((const u32 *)data) != 0x11c450 ||
+	    (bytes[4] != 0x51 && bytes[4] != 0x53) || bytes[5])
+		return -EINVAL;
+	ctx->writes++;
+	ctx->command = bytes[4];
+	return ctx->fail ? -EREMOTEIO : 0;
+}
+
+static int nvt_test_charger_read(void *context, const void *reg, size_t reg_size,
+				 void *value, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+
+static void nvt_test_charger_cleanup(void *data)
+{
+	struct nvt_charger_test *ctx = data;
+
+	cancel_work_sync(&ctx->nvt.charger_work);
+	regmap_exit(ctx->nvt.map);
+}
+
+static struct nvt_charger_test *nvt_test_charger_init(struct kunit *test)
+{
+	struct nvt_charger_test *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	const struct regmap_config config = {
+		.reg_bits = 32,
+		.val_bits = 8,
+		.write = nvt_test_charger_write,
+		.read = nvt_test_charger_read,
+		.max_register = 0x7fffff,
+		.max_raw_write = 2,
+		.cache_type = REGCACHE_NONE,
+	};
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	ctx->nvt.spi = &ctx->spi;
+	ctx->spi.dev.init_name = "nvt-charger-test";
+	mutex_init(&ctx->nvt.lifecycle_lock);
+	init_waitqueue_head(&ctx->nvt.wait);
+	INIT_WORK(&ctx->nvt.charger_work, nvt_charger_work);
+	ctx->nvt.test_stop = nvt_test_stop_noop;
+	ctx->nvt.opened = ctx->nvt.running = true;
+	ctx->nvt.charger_state = ctx->nvt.charger_sent = -1;
+	ctx->nvt.map = regmap_init(NULL, NULL, ctx, &config);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ctx->nvt.map);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, nvt_test_charger_cleanup, ctx), 0);
+	return ctx;
+}
+
+static void nvt_test_charger_changes(struct kunit *test)
+{
+	struct nvt_charger_test *ctx = nvt_test_charger_init(test);
+	struct nvt_thp *nvt = &ctx->nvt;
+
+	mutex_lock(&nvt->lifecycle_lock);
+	nvt_charger_state(nvt, 0);
+	KUNIT_EXPECT_EQ(test, ctx->command, (u8)0x51);
+	nvt_charger_state(nvt, 0);
+	KUNIT_EXPECT_EQ(test, ctx->writes, 1U);
+	nvt_charger_state(nvt, 1);
+	KUNIT_EXPECT_EQ(test, ctx->command, (u8)0x53);
+	nvt_charger_state(nvt, 1);
+	nvt_charger_state(nvt, -ENODEV);
+	KUNIT_EXPECT_EQ(test, ctx->writes, 2U);
+	nvt_charger_state(nvt, 0);
+	KUNIT_EXPECT_EQ(test, ctx->command, (u8)0x51);
+	KUNIT_EXPECT_EQ(test, ctx->writes, 3U);
+	mutex_unlock(&nvt->lifecycle_lock);
+}
+
+static void nvt_test_charger_lifecycle_gates(struct kunit *test)
+{
+	struct nvt_charger_test *ctx = nvt_test_charger_init(test);
+	struct nvt_thp *nvt = &ctx->nvt;
+
+	mutex_lock(&nvt->lifecycle_lock);
+	nvt_charger_state(nvt, -ENODEV);
+	nvt->opened = false;
+	nvt_charger_state(nvt, 1);
+	nvt->opened = true;
+	nvt->running = false;
+	nvt_charger_state(nvt, 0);
+	nvt->running = true;
+	nvt->panel_off = true;
+	nvt_charger_state(nvt, 1);
+	nvt->panel_off = false;
+	nvt->suspended = true;
+	nvt_charger_state(nvt, 0);
+	nvt->suspended = false;
+	nvt->dead = true;
+	nvt_charger_state(nvt, 1);
+	KUNIT_EXPECT_EQ(test, ctx->writes, 0U);
+	KUNIT_EXPECT_EQ(test, nvt->charger_sent, -1);
+	KUNIT_EXPECT_EQ(test, nvt->charger_state, 1);
+	nvt->dead = false;
+	nvt_charger_state(nvt, 0);
+	KUNIT_EXPECT_EQ(test, ctx->writes, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->command, (u8)0x51);
+	mutex_unlock(&nvt->lifecycle_lock);
+}
+
+static void nvt_test_charger_restore_and_error(struct kunit *test)
+{
+	struct nvt_charger_test *ctx = nvt_test_charger_init(test);
+	struct nvt_thp *nvt = &ctx->nvt;
+
+	mutex_lock(&nvt->lifecycle_lock);
+	nvt_charger_state(nvt, 1);
+	nvt_stop_irq(nvt);
+	nvt_charger_state(nvt, 1);
+	KUNIT_EXPECT_EQ(test, ctx->writes, 1U);
+	/* A recovered firmware epoch resends the cached ONLINE state once. */
+	nvt->running = true;
+	nvt_charger_state(nvt, -ENODEV);
+	nvt_charger_state(nvt, 1);
+	KUNIT_EXPECT_EQ(test, ctx->writes, 2U);
+	ctx->fail = true;
+	nvt_charger_state(nvt, 0);
+	KUNIT_EXPECT_EQ(test, nvt->error, -EREMOTEIO);
+	KUNIT_EXPECT_FALSE(test, nvt->running);
+	KUNIT_EXPECT_EQ(test, nvt->charger_sent, -1);
+	nvt_charger_state(nvt, 0);
+	KUNIT_EXPECT_EQ(test, ctx->writes, 3U); /* no blind command retry */
+	ctx->fail = false;
+	nvt->running = true;
+	nvt->error = 0;
+	nvt_charger_state(nvt, 0);
+	KUNIT_EXPECT_EQ(test, ctx->writes, 4U);
+	KUNIT_EXPECT_EQ(test, nvt->charger_sent, 0);
+	mutex_unlock(&nvt->lifecycle_lock);
+}
+
+struct nvt_supply_test {
+	struct power_supply psy;
+	struct power_supply_desc desc;
+	int scope, online, error;
+};
+
+static int nvt_test_supply_property(struct power_supply *psy,
+				    enum power_supply_property prop,
+				    union power_supply_propval *value)
+{
+	struct nvt_supply_test *ctx = container_of(psy, struct nvt_supply_test, psy);
+
+	if (prop == POWER_SUPPLY_PROP_SCOPE) {
+		value->intval = ctx->scope;
+		return 0;
+	}
+	value->intval = ctx->online;
+	return ctx->error;
+}
+
+static void nvt_test_charger_external_online(struct kunit *test)
+{
+	static const enum power_supply_property properties[] = {
+		POWER_SUPPLY_PROP_SCOPE, POWER_SUPPLY_PROP_ONLINE,
+	};
+	struct nvt_supply_test *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	int online = -ENODEV;
+
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	ctx->desc.type = POWER_SUPPLY_TYPE_USB;
+	ctx->desc.properties = properties;
+	ctx->desc.num_properties = ARRAY_SIZE(properties);
+	ctx->desc.get_property = nvt_test_supply_property;
+	ctx->psy.desc = &ctx->desc;
+	atomic_set(&ctx->psy.use_cnt, 1);
+	init_rwsem(&ctx->psy.extensions_sem);
+	INIT_LIST_HEAD(&ctx->psy.extensions);
+	ctx->scope = POWER_SUPPLY_SCOPE_SYSTEM;
+	ctx->online = 1;
+	KUNIT_EXPECT_EQ(test, nvt_external_supply(&ctx->psy, &online), 1);
+	KUNIT_EXPECT_EQ(test, online, 1);
+	ctx->online = 0;
+	KUNIT_EXPECT_EQ(test, nvt_external_supply(&ctx->psy, &online), 0);
+	KUNIT_EXPECT_EQ(test, online, 0);
+	ctx->online = 1;
+	ctx->desc.type = POWER_SUPPLY_TYPE_BATTERY;
+	KUNIT_EXPECT_EQ(test, nvt_external_supply(&ctx->psy, &online), 0);
+	KUNIT_EXPECT_EQ(test, online, 0);
+	ctx->desc.type = POWER_SUPPLY_TYPE_USB;
+	ctx->scope = POWER_SUPPLY_SCOPE_DEVICE;
+	KUNIT_EXPECT_EQ(test, nvt_external_supply(&ctx->psy, &online), 0);
+	KUNIT_EXPECT_EQ(test, online, 0);
+	ctx->scope = POWER_SUPPLY_SCOPE_SYSTEM;
+	ctx->error = -EIO;
+	online = -ENODEV;
+	KUNIT_EXPECT_EQ(test, nvt_external_supply(&ctx->psy, &online), 0);
+	KUNIT_EXPECT_EQ(test, online, -ENODEV);
+}
+
 static struct kunit_case nvt_panel_cases[] = {
+	KUNIT_CASE(nvt_test_charger_changes),
+	KUNIT_CASE(nvt_test_charger_lifecycle_gates),
+	KUNIT_CASE(nvt_test_charger_restore_and_error),
+	KUNIT_CASE(nvt_test_charger_external_online),
 	KUNIT_CASE(nvt_test_open_disabled_panel),
 	KUNIT_CASE(nvt_test_suspend_open_stream),
 	KUNIT_CASE(nvt_test_enable_async_coalesces),
