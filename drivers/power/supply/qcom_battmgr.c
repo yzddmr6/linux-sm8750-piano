@@ -3,6 +3,7 @@
  * Copyright (c) 2019-2020, The Linux Foundation. All rights reserved.
  * Copyright (c) 2022, Linaro Ltd
  * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * Copyright (C) 2020-2022 Oplus. All rights reserved.
  */
 #include <linux/auxiliary_bus.h>
 #include <linux/cleanup.h>
@@ -18,6 +19,7 @@
 #include <linux/spinlock.h>
 #include <linux/math.h>
 #include <linux/units.h>
+#include <linux/workqueue.h>
 
 #define BATTMGR_CHEMISTRY_LEN	4
 #define BATTMGR_STRING_LEN	128
@@ -35,6 +37,11 @@ enum qcom_battmgr_variant {
 #define QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW		BIT(1)
 /* The charge control opcode and properties mean something else */
 #define QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL		BIT(2)
+/*
+ * Battery property 24 switches charging on (1) and off (0), so the driver
+ * can enforce the charge control thresholds itself.
+ */
+#define QCOM_BATTMGR_QUIRK_CHARGE_ENABLE		BIT(3)
 
 #define BATTMGR_BAT_STATUS		0x1
 
@@ -47,6 +54,10 @@ enum qcom_battmgr_variant {
 #define NOTIF_BAT_STATUS		0x80
 #define NOTIF_BAT_INFO			0x81
 #define NOTIF_BAT_CHARGING_STATE	0x83
+/* OPLUS firmware: USB port events */
+#define NOTIF_OPLUS_TYPEC_STATE		0x55
+#define NOTIF_OPLUS_PLUGIN		0x57
+#define NOTIF_OPLUS_APSD_DONE		0x58
 
 #define BATTMGR_BAT_INFO		0x9
 
@@ -83,6 +94,8 @@ enum qcom_battmgr_variant {
 #define BATT_CHG_CTRL_EN		24
 #define BATT_CHG_CTRL_START_THR		25
 #define BATT_CHG_CTRL_END_THR		26
+/* OPLUS firmware: set to 0 to stop charging, the system keeps running on input */
+#define BATT_OPLUS_CHG_EN		24
 
 #define BATTMGR_USB_PROPERTY_GET	0x32
 #define BATTMGR_USB_PROPERTY_SET	0x33
@@ -113,6 +126,12 @@ enum qcom_battmgr_variant {
 #define CHARGE_CTRL_END_THR_MIN		55
 #define CHARGE_CTRL_END_THR_MAX		100
 #define CHARGE_CTRL_DELTA_SOC		5
+
+/* Interval of the state of charge check while an end threshold is set */
+#define CHARGE_CTRL_POLL_MS		30000
+
+/* The vendor kernel waits this long for the answer to a property write */
+#define BATTMGR_SET_TIMEOUT_MS		2500
 
 struct qcom_battmgr_enable_request {
 	struct pmic_glink_hdr hdr;
@@ -356,9 +375,23 @@ struct qcom_battmgr {
 	 */
 	spinlock_t notify_lock;
 	bool removing;
+
+	/* Property id named in the answer to the last accepted property write */
+	u32 resp_property;
+
+	/*
+	 * Charge control thresholds enforced by the driver: @charge_work runs
+	 * on a freezable workqueue, so no request is sent while the system
+	 * is suspended.  @charge_inhibited is set while the driver holds
+	 * charging off, @charge_error while the firmware refuses to switch.
+	 */
+	struct delayed_work charge_work;
+	bool charge_inhibited;
+	bool charge_error;
 };
 
-static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
+static int __qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data,
+				  size_t len, unsigned long timeout)
 {
 	unsigned long left;
 	int ret;
@@ -371,11 +404,16 @@ static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t
 	if (ret < 0)
 		return ret;
 
-	left = wait_for_completion_timeout(&battmgr->ack, HZ);
+	left = wait_for_completion_timeout(&battmgr->ack, timeout);
 	if (!left)
 		return -ETIMEDOUT;
 
 	return battmgr->error;
+}
+
+static int qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data, size_t len)
+{
+	return __qcom_battmgr_request(battmgr, data, len, HZ);
 }
 
 static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcode,
@@ -391,6 +429,36 @@ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcod
 	};
 
 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
+}
+
+/*
+ * Write a battery (BATTMGR_BAT_PROPERTY_SET) or USB (BATTMGR_USB_PROPERTY_SET)
+ * property and wait until the firmware has accepted it.  The answer must
+ * name the written property, so a late answer to an earlier request that
+ * timed out is not taken for this one.
+ */
+static int qcom_battmgr_set_property(struct qcom_battmgr *battmgr, int opcode,
+				     u32 property, u32 value)
+{
+	struct qcom_battmgr_property_request request = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+		.hdr.opcode = cpu_to_le32(opcode),
+		.battery = cpu_to_le32(0),
+		.property = cpu_to_le32(property),
+		.value = cpu_to_le32(value),
+	};
+	int ret;
+
+	mutex_lock(&battmgr->lock);
+	battmgr->resp_property = U32_MAX;
+	ret = __qcom_battmgr_request(battmgr, &request, sizeof(request),
+				     msecs_to_jiffies(BATTMGR_SET_TIMEOUT_MS));
+	if (!ret && battmgr->resp_property != property)
+		ret = -EIO;
+	mutex_unlock(&battmgr->lock);
+
+	return ret;
 }
 
 static int qcom_battmgr_update_status(struct qcom_battmgr *battmgr)
@@ -487,6 +555,20 @@ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
 	return ret;
 }
 
+/*
+ * With QCOM_BATTMGR_QUIRK_CHARGE_ENABLE the thresholds live in the driver;
+ * reading them must not send the firmware a request for their property ids.
+ */
+static bool qcom_battmgr_charge_ctrl_local(struct qcom_battmgr *battmgr,
+					   enum power_supply_property psp)
+{
+	if (!(battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE))
+		return false;
+
+	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
+	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
+}
+
 static int qcom_battmgr_bat_sc8280xp_update(struct qcom_battmgr *battmgr,
 					    enum power_supply_property psp)
 {
@@ -537,8 +619,10 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	if (!battmgr->service_up)
 		return -EAGAIN;
 
-	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
-	    battmgr->variant == QCOM_BATTMGR_X1E80100)
+	if (qcom_battmgr_charge_ctrl_local(battmgr, psp))
+		ret = 0;
+	else if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
+		 battmgr->variant == QCOM_BATTMGR_X1E80100)
 		ret = qcom_battmgr_bat_sc8280xp_update(battmgr, psp);
 	else
 		ret = qcom_battmgr_bat_sm8350_update(battmgr, psp);
@@ -690,6 +774,10 @@ static int qcom_battmgr_set_charge_control(struct qcom_battmgr *battmgr,
 		.delta_soc = cpu_to_le32(delta_soc),
 	};
 
+	/* The driver enforces the thresholds, see qcom_battmgr_charge_worker() */
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE)
+		return 0;
+
 	return qcom_battmgr_request(battmgr, &request, sizeof(request));
 }
 
@@ -776,12 +864,123 @@ static int qcom_battmgr_charge_control_thresholds_init(struct qcom_battmgr *batt
 	return 0;
 }
 
+/* Charge control is unavailable if its request means something else */
+static bool qcom_battmgr_no_charge_ctrl(struct qcom_battmgr *battmgr)
+{
+	return (battmgr->quirks & QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL) &&
+	       !(battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE);
+}
+
+static bool qcom_battmgr_charge_limited(struct qcom_battmgr *battmgr)
+{
+	unsigned int end = READ_ONCE(battmgr->info.charge_ctrl_end);
+
+	return end && end < CHARGE_CTRL_END_THR_MAX;
+}
+
+static int qcom_battmgr_charge_enable(struct qcom_battmgr *battmgr, bool enable)
+{
+	int ret;
+
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+					BATT_OPLUS_CHG_EN, enable);
+
+	/* Report a refusal once, not on every check */
+	if (ret && !battmgr->charge_error)
+		dev_warn(battmgr->dev, "failed to turn charging %s: %d\n",
+			 enable ? "on" : "off", ret);
+	battmgr->charge_error = !!ret;
+
+	return ret;
+}
+
+/*
+ * Stop charging once the state of charge reaches the end threshold and
+ * resume once it has fallen to the start threshold.  Nothing is sent while
+ * no end threshold below 100 % is set, so charging is then left entirely
+ * to the firmware.
+ */
+static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
+{
+	unsigned int start = READ_ONCE(battmgr->info.charge_ctrl_start);
+	unsigned int end = READ_ONCE(battmgr->info.charge_ctrl_end);
+	unsigned int soc;
+	int ret;
+
+	if (!qcom_battmgr_charge_limited(battmgr)) {
+		if (battmgr->charge_inhibited &&
+		    !qcom_battmgr_charge_enable(battmgr, true)) {
+			battmgr->charge_inhibited = false;
+			dev_info(battmgr->dev, "charge limit removed, charging resumed\n");
+		}
+		return;
+	}
+
+	ret = qcom_battmgr_bat_sm8350_update(battmgr, POWER_SUPPLY_PROP_CAPACITY);
+	if (ret)
+		return;
+
+	soc = battmgr->status.percent;
+	if (soc >= end) {
+		/*
+		 * Repeat the request on every check: the firmware may turn
+		 * charging back on by itself, for example on a new charger.
+		 */
+		if (!qcom_battmgr_charge_enable(battmgr, false) &&
+		    !battmgr->charge_inhibited) {
+			battmgr->charge_inhibited = true;
+			dev_info(battmgr->dev, "charging stopped at %u%% (end threshold %u%%)\n",
+				 soc, end);
+		}
+	} else if (soc <= start && battmgr->charge_inhibited) {
+		if (!qcom_battmgr_charge_enable(battmgr, true)) {
+			battmgr->charge_inhibited = false;
+			dev_info(battmgr->dev, "charging resumed at %u%% (start threshold %u%%)\n",
+				 soc, start);
+		}
+	}
+}
+
+static void qcom_battmgr_charge_worker(struct work_struct *work)
+{
+	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
+						    struct qcom_battmgr, charge_work);
+
+	/* Kicked again by qcom_battmgr_enable_worker() once the service is up */
+	if (!battmgr->service_up)
+		return;
+
+	qcom_battmgr_charge_limit_update(battmgr);
+
+	/* Also retry turning charging back on after the limit was removed */
+	if (qcom_battmgr_charge_limited(battmgr) || battmgr->charge_inhibited)
+		queue_delayed_work(system_freezable_wq, &battmgr->charge_work,
+				   msecs_to_jiffies(CHARGE_CTRL_POLL_MS));
+}
+
+/* Check the charge state now, may be called in atomic context */
+static void qcom_battmgr_charge_kick(struct qcom_battmgr *battmgr)
+{
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE)
+		mod_delayed_work(system_freezable_wq, &battmgr->charge_work, 0);
+}
+
+/*
+ * A charger came or went: the firmware may have turned charging back on, so
+ * check right away instead of at the next poll.  Called in atomic context.
+ */
+static void qcom_battmgr_usb_event(struct qcom_battmgr *battmgr)
+{
+	if (qcom_battmgr_charge_limited(battmgr) || battmgr->charge_inhibited)
+		qcom_battmgr_charge_kick(battmgr);
+}
+
 static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
 					 enum power_supply_property psp)
 {
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 
-	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL)
+	if (qcom_battmgr_no_charge_ctrl(battmgr))
 		return 0;
 
 	switch (psp) {
@@ -800,8 +999,9 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 					 const union power_supply_propval *pval)
 {
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
+	int ret;
 
-	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL)
+	if (qcom_battmgr_no_charge_ctrl(battmgr))
 		return -EOPNOTSUPP;
 
 	if (!battmgr->service_up)
@@ -809,14 +1009,18 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
-		return qcom_battmgr_set_charge_start_threshold(battmgr, pval->intval);
+		ret = qcom_battmgr_set_charge_start_threshold(battmgr, pval->intval);
+		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
-		return qcom_battmgr_set_charge_end_threshold(battmgr, pval->intval);
+		ret = qcom_battmgr_set_charge_end_threshold(battmgr, pval->intval);
+		break;
 	default:
 		return -EINVAL;
 	}
 
-	return 0;
+	qcom_battmgr_charge_kick(battmgr);
+
+	return ret;
 }
 
 static const enum power_supply_property sc8280xp_bat_props[] = {
@@ -1241,10 +1445,20 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 		break;
 	case NOTIF_USB_PROPERTY:
 		power_supply_changed(battmgr->usb_psy);
+		qcom_battmgr_usb_event(battmgr);
 		break;
 	case NOTIF_WLS_PROPERTY:
 		power_supply_changed(battmgr->wls_psy);
 		break;
+	case NOTIF_OPLUS_TYPEC_STATE:
+	case NOTIF_OPLUS_PLUGIN:
+	case NOTIF_OPLUS_APSD_DONE:
+		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE) {
+			power_supply_changed(battmgr->usb_psy);
+			qcom_battmgr_usb_event(battmgr);
+			break;
+		}
+		fallthrough;
 	default:
 		dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
 		break;
@@ -1614,6 +1828,24 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 	case BATTMGR_CHG_CTRL_LIMIT_EN:
 		battmgr->error = 0;
 		break;
+	case BATTMGR_BAT_PROPERTY_SET:
+	case BATTMGR_USB_PROPERTY_SET:
+		if (payload_len != sizeof(resp->intval)) {
+			dev_warn(battmgr->dev,
+				 "invalid payload length for %#x response: %zd\n",
+				 opcode, payload_len);
+			battmgr->error = -ENODATA;
+			break;
+		}
+
+		/* The firmware answers a write with a nonzero code if it refused it */
+		if (le32_to_cpu(resp->intval.result)) {
+			battmgr->error = -EREMOTEIO;
+			break;
+		}
+
+		battmgr->resp_property = le32_to_cpu(resp->intval.property);
+		break;
 	default:
 		dev_warn(battmgr->dev, "unknown message %#x\n", opcode);
 		break;
@@ -1654,6 +1886,8 @@ static void qcom_battmgr_enable_worker(struct work_struct *work)
 	ret = qcom_battmgr_request(battmgr, &req, sizeof(req));
 	if (ret)
 		dev_err(battmgr->dev, "failed to request power notifications\n");
+
+	qcom_battmgr_charge_kick(battmgr);
 }
 
 static void qcom_battmgr_pdr_notify(void *priv, int state)
@@ -1669,6 +1903,8 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		schedule_work(&battmgr->enable_work);
 	} else {
 		battmgr->service_up = false;
+		/* A restarted firmware charges again by default */
+		battmgr->charge_inhibited = false;
 	}
 }
 
@@ -1692,7 +1928,8 @@ static const struct of_device_id qcom_battmgr_of_quirks[] = {
 		.compatible = "oneplus,pad2pro-pmic-glink",
 		.data = (void *)(QCOM_BATTMGR_QUIRK_BATT_CURRENT_INVERTED |
 				 QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW |
-				 QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL),
+				 QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL |
+				 QCOM_BATTMGR_QUIRK_CHARGE_ENABLE),
 	},
 	{}
 };
@@ -1707,7 +1944,7 @@ static bool qcom_battmgr_bat_prop_hidden(struct qcom_battmgr *battmgr,
 	/* Never send a request that the firmware reads as another command */
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
-		return battmgr->quirks & QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL;
+		return qcom_battmgr_no_charge_ctrl(battmgr);
 	default:
 		return false;
 	}
@@ -1751,6 +1988,13 @@ static void qcom_battmgr_stop_notifications(void *data)
 	battmgr->removing = true;
 }
 
+static void qcom_battmgr_cancel_work(void *data)
+{
+	struct qcom_battmgr *battmgr = data;
+
+	cancel_delayed_work_sync(&battmgr->charge_work);
+}
+
 static int qcom_battmgr_probe(struct auxiliary_device *adev,
 			      const struct auxiliary_device_id *id)
 {
@@ -1776,6 +2020,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.supplied_to = qcom_battmgr_battery;
 	psy_cfg_supply.num_supplicants = 1;
 
+	INIT_DELAYED_WORK(&battmgr->charge_work, qcom_battmgr_charge_worker);
 	mutex_init(&battmgr->lock);
 	spin_lock_init(&battmgr->notify_lock);
 	init_completion(&battmgr->ack);
@@ -1805,6 +2050,11 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 						       battmgr);
 	if (IS_ERR(battmgr->client))
 		return PTR_ERR(battmgr->client);
+
+	/* Without a configured end threshold, charge to full */
+	if ((battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE) &&
+	    !battmgr->info.charge_ctrl_end)
+		battmgr->info.charge_ctrl_end = CHARGE_CTRL_END_THR_MAX;
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
 	    battmgr->variant == QCOM_BATTMGR_X1E80100) {
@@ -1868,6 +2118,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 
 	ret = devm_work_autocancel(dev, &battmgr->enable_work,
 				   qcom_battmgr_enable_worker);
+	if (ret)
+		return ret;
+
+	ret = devm_add_action_or_reset(dev, qcom_battmgr_cancel_work, battmgr);
 	if (ret)
 		return ret;
 
