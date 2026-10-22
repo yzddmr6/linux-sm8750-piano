@@ -14,8 +14,11 @@
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
+#include <linux/workqueue.h>
 
 #define PMIC_GLINK_SEND_TIMEOUT (5 * HZ)
+#define PMIC_GLINK_MAX_DEFERRED	64
 
 enum {
 	PMIC_GLINK_CLIENT_BATT = 0,
@@ -50,6 +53,14 @@ struct pmic_glink {
 	/* serializing clients list updates */
 	spinlock_t client_lock;
 	struct list_head clients;
+
+	/* notifications held back over system sleep */
+	spinlock_t defer_lock;
+	bool defer;
+	struct list_head deferred;
+	unsigned int num_deferred;
+	unsigned int num_dropped;
+	struct work_struct deliver_work;
 };
 
 static struct pmic_glink *__pmic_glink;
@@ -64,6 +75,12 @@ struct pmic_glink_client {
 	void (*cb)(const void *data, size_t len, void *priv);
 	void (*pdr_notify)(void *priv, int state);
 	void *priv;
+};
+
+struct pmic_glink_deferred_msg {
+	struct list_head node;
+	size_t len;
+	u8 data[] __counted_by(len);
 };
 
 static void _devm_pmic_glink_release_client(struct device *dev, void *res)
@@ -149,13 +166,77 @@ int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len)
 }
 EXPORT_SYMBOL_GPL(pmic_glink_send);
 
+static void pmic_glink_dispatch(struct pmic_glink *pg, const void *data, size_t len)
+{
+	const struct pmic_glink_hdr *hdr = data;
+	struct pmic_glink_client *client;
+	unsigned long flags;
+
+	spin_lock_irqsave(&pg->client_lock, flags);
+	list_for_each_entry(client, &pg->clients, node) {
+		if (client->id == le32_to_cpu(hdr->owner))
+			client->cb(data, len, client->priv);
+	}
+	spin_unlock_irqrestore(&pg->client_lock, flags);
+}
+
+static bool pmic_glink_defer(struct pmic_glink *pg, const void *data, size_t len)
+{
+	struct pmic_glink_deferred_msg *msg;
+
+	guard(spinlock_irqsave)(&pg->defer_lock);
+
+	if (!pg->defer)
+		return false;
+
+	/* An identical notification brings nothing new, keep the latest copy */
+	list_for_each_entry(msg, &pg->deferred, node) {
+		if (msg->len == len && !memcmp(msg->data, data, len)) {
+			list_move_tail(&msg->node, &pg->deferred);
+			return true;
+		}
+	}
+
+	if (pg->num_deferred == PMIC_GLINK_MAX_DEFERRED) {
+		msg = list_first_entry(&pg->deferred, struct pmic_glink_deferred_msg, node);
+		list_del(&msg->node);
+		kfree(msg);
+		pg->num_deferred--;
+		pg->num_dropped++;
+	}
+
+	msg = kmalloc_flex(*msg, data, len, GFP_ATOMIC);
+	if (!msg) {
+		pg->num_dropped++;
+		return true;
+	}
+
+	msg->len = len;
+	memcpy(msg->data, data, len);
+	list_add_tail(&msg->node, &pg->deferred);
+	pg->num_deferred++;
+
+	return true;
+}
+
+static void pmic_glink_drop_deferred(struct pmic_glink *pg)
+{
+	struct pmic_glink_deferred_msg *msg, *tmp;
+
+	guard(spinlock_irqsave)(&pg->defer_lock);
+
+	list_for_each_entry_safe(msg, tmp, &pg->deferred, node) {
+		list_del(&msg->node);
+		kfree(msg);
+	}
+	pg->num_deferred = 0;
+}
+
 static int pmic_glink_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 				     int len, void *priv, u32 addr)
 {
-	struct pmic_glink_client *client;
 	struct pmic_glink_hdr *hdr;
 	struct pmic_glink *pg = dev_get_drvdata(&rpdev->dev);
-	unsigned long flags;
 
 	if (len < sizeof(*hdr)) {
 		dev_warn(pg->dev, "ignoring truncated message\n");
@@ -164,12 +245,12 @@ static int pmic_glink_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 
 	hdr = data;
 
-	spin_lock_irqsave(&pg->client_lock, flags);
-	list_for_each_entry(client, &pg->clients, node) {
-		if (client->id == le32_to_cpu(hdr->owner))
-			client->cb(data, len, client->priv);
-	}
-	spin_unlock_irqrestore(&pg->client_lock, flags);
+	/* The sender of a request is waiting for the response */
+	if (le32_to_cpu(hdr->type) != PMIC_GLINK_REQ_RESP &&
+	    pmic_glink_defer(pg, data, len))
+		return 0;
+
+	pmic_glink_dispatch(pg, data, len);
 
 	return 0;
 }
@@ -210,6 +291,13 @@ static void pmic_glink_del_aux_device(struct pmic_glink *pg,
 	auxiliary_device_uninit(aux);
 }
 
+static bool pmic_glink_deferring(struct pmic_glink *pg)
+{
+	guard(spinlock_irqsave)(&pg->defer_lock);
+
+	return pg->defer;
+}
+
 static void pmic_glink_state_notify_clients(struct pmic_glink *pg)
 {
 	struct pmic_glink_client *client;
@@ -217,12 +305,17 @@ static void pmic_glink_state_notify_clients(struct pmic_glink *pg)
 	unsigned long flags;
 
 	if (pg->client_state != SERVREG_SERVICE_STATE_UP) {
-		if (pg->pdr_state == SERVREG_SERVICE_STATE_UP && pg->ept)
+		/* On UP the clients use the remote, hold that back as well */
+		if (pg->pdr_state == SERVREG_SERVICE_STATE_UP && pg->ept &&
+		    !pmic_glink_deferring(pg))
 			new_state = SERVREG_SERVICE_STATE_UP;
 	} else {
 		if (pg->pdr_state == SERVREG_SERVICE_STATE_DOWN || !pg->ept)
 			new_state = SERVREG_SERVICE_STATE_DOWN;
 	}
+
+	if (pg->pdr_state == SERVREG_SERVICE_STATE_DOWN || !pg->ept)
+		pmic_glink_drop_deferred(pg);
 
 	if (new_state != pg->client_state) {
 		spin_lock_irqsave(&pg->client_lock, flags);
@@ -231,6 +324,40 @@ static void pmic_glink_state_notify_clients(struct pmic_glink *pg)
 		spin_unlock_irqrestore(&pg->client_lock, flags);
 		pg->client_state = new_state;
 	}
+}
+
+static void pmic_glink_deliver_work(struct work_struct *work)
+{
+	struct pmic_glink *pg = container_of(work, struct pmic_glink, deliver_work);
+	struct pmic_glink_deferred_msg *msg;
+	unsigned int dropped;
+	unsigned long flags;
+
+	guard(mutex)(&pg->state_lock);
+
+	for (;;) {
+		spin_lock_irqsave(&pg->defer_lock, flags);
+		msg = list_first_entry_or_null(&pg->deferred, struct pmic_glink_deferred_msg, node);
+		if (!msg) {
+			pg->defer = false;
+			dropped = pg->num_dropped;
+			pg->num_dropped = 0;
+			spin_unlock_irqrestore(&pg->defer_lock, flags);
+			break;
+		}
+
+		list_del(&msg->node);
+		pg->num_deferred--;
+		spin_unlock_irqrestore(&pg->defer_lock, flags);
+
+		pmic_glink_dispatch(pg, msg->data, msg->len);
+		kfree(msg);
+	}
+
+	pmic_glink_state_notify_clients(pg);
+
+	if (dropped)
+		dev_warn(pg->dev, "%u notifications lost during system sleep\n", dropped);
 }
 
 static void pmic_glink_pdr_callback(int state, char *svc_path, void *priv)
@@ -315,6 +442,10 @@ static int pmic_glink_probe(struct platform_device *pdev)
 	spin_lock_init(&pg->client_lock);
 	mutex_init(&pg->state_lock);
 
+	INIT_LIST_HEAD(&pg->deferred);
+	spin_lock_init(&pg->defer_lock);
+	INIT_WORK(&pg->deliver_work, pmic_glink_deliver_work);
+
 	pg->data = of_device_get_match_data(&pdev->dev);
 	if (!pg->data)
 		return -EINVAL;
@@ -377,6 +508,8 @@ static void pmic_glink_remove(struct platform_device *pdev)
 {
 	struct pmic_glink *pg = dev_get_drvdata(&pdev->dev);
 
+	cancel_work_sync(&pg->deliver_work);
+
 	pdr_handle_release(pg->pdr);
 
 	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_BATT))
@@ -386,9 +519,34 @@ static void pmic_glink_remove(struct platform_device *pdev)
 	if (pg->data->client_mask & BIT(PMIC_GLINK_CLIENT_UCSI))
 		pmic_glink_del_aux_device(pg, &pg->ucsi_aux);
 
+	pmic_glink_drop_deferred(pg);
+
 	guard(mutex)(&__pmic_glink_lock);
 	__pmic_glink = NULL;
 }
+
+static int pmic_glink_prepare(struct device *dev)
+{
+	struct pmic_glink *pg = dev_get_drvdata(dev);
+
+	guard(spinlock_irqsave)(&pg->defer_lock);
+	pg->defer = true;
+
+	return 0;
+}
+
+static void pmic_glink_complete(struct device *dev)
+{
+	struct pmic_glink *pg = dev_get_drvdata(dev);
+
+	/* Runs once the tasks are thawed, all devices have resumed by then */
+	queue_work(system_freezable_wq, &pg->deliver_work);
+}
+
+static const struct dev_pm_ops pmic_glink_pm_ops = {
+	.prepare = pmic_glink_prepare,
+	.complete = pmic_glink_complete,
+};
 
 static const struct pmic_glink_data pmic_glink_adsp_data = {
 	.client_mask = BIT(PMIC_GLINK_CLIENT_BATT) |
@@ -418,6 +576,7 @@ static struct platform_driver pmic_glink_driver = {
 	.driver = {
 		.name = "qcom_pmic_glink",
 		.of_match_table = pmic_glink_of_match,
+		.pm = pm_sleep_ptr(&pmic_glink_pm_ops),
 	},
 };
 
