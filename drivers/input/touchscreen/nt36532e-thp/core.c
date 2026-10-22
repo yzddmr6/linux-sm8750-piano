@@ -276,7 +276,8 @@ static int nvt_external_supply(struct power_supply *psy, void *data)
 	union power_supply_propval value;
 	int *online = data;
 
-	if (psy->desc->type == POWER_SUPPLY_TYPE_BATTERY)
+	if (psy->desc->type == POWER_SUPPLY_TYPE_BATTERY ||
+	    psy->desc->type == POWER_SUPPLY_TYPE_UNKNOWN)
 		return 0;
 	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_SCOPE, &value) &&
 	    value.intval == POWER_SUPPLY_SCOPE_DEVICE)
@@ -322,7 +323,7 @@ static void nvt_charger_work(struct work_struct *work)
 	int online = -ENODEV;
 
 	mutex_lock(&nvt->lifecycle_lock);
-	if (!READ_ONCE(nvt->dead)) {
+	if (!READ_ONCE(nvt->dead) && !READ_ONCE(nvt->suspended)) {
 		power_supply_for_each_psy(&online, nvt_external_supply);
 		nvt_charger_state(nvt, online);
 	}
@@ -334,7 +335,7 @@ static int nvt_charger_notify(struct notifier_block *nb, unsigned long event, vo
 	struct nvt_thp *nvt = container_of(nb, struct nvt_thp, charger_notifier);
 
 	if (event == PSY_EVENT_PROP_CHANGED)
-		schedule_work(&nvt->charger_work);
+		queue_work(system_freezable_wq, &nvt->charger_work);
 	return NOTIFY_OK;
 }
 
@@ -472,7 +473,7 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 		 nvt->reset_state, state_ret, first_frame_state, normal_run_ms);
 	/* Firmware reload loses the setting, even if ONLINE has not changed. */
 	nvt->charger_sent = -1;
-	schedule_work(&nvt->charger_work);
+	queue_work(system_freezable_wq, &nvt->charger_work);
 	return 0;
 stop:
 	nvt_stop_irq(nvt);
@@ -773,7 +774,7 @@ static int nvt_probe(struct spi_device *spi)
 	if (ret)
 		return ret;
 	/* Cache the initial state without starting the transport or issuing I/O. */
-	schedule_work(&nvt->charger_work);
+	queue_work(system_freezable_wq, &nvt->charger_work);
 	nvt->misc.minor = MISC_DYNAMIC_MINOR;
 	nvt->misc.fops = &nvt_fops;
 	nvt->misc.parent = &spi->dev;
@@ -824,6 +825,9 @@ static int nvt_suspend(struct device *dev)
 	/* A disabled panel has already cancelled work and stopped its IRQ. */
 	if (!nvt->dead && !panel_off)
 		nvt_quiesce(nvt);
+	else
+		/* ONLINE callbacks may query other devices: drain even with panel off. */
+		cancel_work_sync(&nvt->charger_work);
 	mutex_unlock(&nvt->transition_lock);
 	return 0;
 }
@@ -1362,6 +1366,9 @@ static void nvt_test_charger_external_online(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, online, 0);
 	ctx->online = 1;
 	ctx->desc.type = POWER_SUPPLY_TYPE_BATTERY;
+	KUNIT_EXPECT_EQ(test, nvt_external_supply(&ctx->psy, &online), 0);
+	KUNIT_EXPECT_EQ(test, online, 0);
+	ctx->desc.type = POWER_SUPPLY_TYPE_UNKNOWN;
 	KUNIT_EXPECT_EQ(test, nvt_external_supply(&ctx->psy, &online), 0);
 	KUNIT_EXPECT_EQ(test, online, 0);
 	ctx->desc.type = POWER_SUPPLY_TYPE_USB;

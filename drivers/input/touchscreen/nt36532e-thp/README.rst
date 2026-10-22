@@ -186,13 +186,18 @@ in https://github.com/blu-sharky/linux-piano at
 ``drivers/input/touchscreen/nt36532e/nt36xxx.c`` (GPL-2.0-or-later).
 
 Only a readable external, system-scope power supply's ONLINE property determines
-the state. Batteries, device-scope supplies and USB enumeration do not count.
+the state. Batteries, UNKNOWN-type internal charge pumps, device-scope supplies
+and USB enumeration do not count. In particular, SC8541 ONLINE is CHG_EN,
+not cable presence.
 With no readable ONLINE property, the previous state is retained. Notifications
-queue work under the existing lifecycle mutex; regmap protects each page/write
+queue freezable work under the existing lifecycle mutex; regmap protects each page/write
 transaction from concurrent frame reads. The wire sequence is ``ff 23 88`` then
 ``d0 53 00`` (online) or ``d0 51 00`` (offline), at register ``0x11c450``.
 
-A closed, disabled, suspended or failed stream only caches the current state.
+A closed, disabled or failed stream only caches the current state. System
+suspend also drains and gates the supply-query work, because an ONLINE getter
+may itself access a bus. The freezable queue excludes supply queries across
+the system-wide device PM phase; resume samples the current state again.
 Every successful firmware start queues a fresh ONLINE sample after REK, the
 first valid frame, NORMAL_RUN and all three BF commands. It resends once even
 when the state is unchanged; repeated notifications otherwise send nothing.
