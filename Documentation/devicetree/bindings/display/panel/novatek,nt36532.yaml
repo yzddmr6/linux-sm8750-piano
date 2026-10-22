@@ -20,8 +20,7 @@ properties:
     items:
       - enum:
           - csot,ppc100hb1-1
-          - xiaomi,piano-boe-nt36532
-          - xiaomi,piano-csot-nt36532
+          - xiaomi,piano-nt36532
       - const: novatek,nt36532
 
   reg:
@@ -30,6 +29,14 @@ properties:
   reset-gpios:
     maxItems: 1
     description: phandle of gpio for reset line - This should be 8mA
+
+  id-gpios:
+    maxItems: 1
+    description:
+      Input reading the panel module ID strap. The Xiaomi Pad 8 Pro ships
+      two modules behind one board design; the level selects the module
+      initialization, low for the CSOT 42-02-0a module and high for the
+      BOE 35-02-0b module.
 
   vddio-supply:
     description: regulator that supplies the I/O voltage
@@ -53,17 +60,17 @@ if:
   properties:
     compatible:
       contains:
-        enum:
-          - xiaomi,piano-boe-nt36532
-          - xiaomi,piano-csot-nt36532
+        const: xiaomi,piano-nt36532
 then:
   required:
     - avdd-supply
     - avee-supply
+    - id-gpios
 else:
   properties:
     avdd-supply: false
     avee-supply: false
+    id-gpios: false
 
 unevaluatedProperties: false
 
@@ -97,6 +104,45 @@ examples:
                 port@1 {
                     reg = <1>;
                     panel_in_1: endpoint {
+                        remote-endpoint = <&dsi1_out>;
+                    };
+                };
+            };
+        };
+    };
+
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    dsi {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        panel@0 {
+            compatible = "xiaomi,piano-nt36532", "novatek,nt36532";
+            reg = <0>;
+
+            reset-gpios = <&tlmm 98 GPIO_ACTIVE_LOW>;
+            id-gpios = <&tlmm 100 GPIO_ACTIVE_HIGH>;
+
+            vddio-supply = <&vreg_l12b_1p8>;
+            avdd-supply = <&panel_vsp>;
+            avee-supply = <&panel_vsn>;
+
+            ports {
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                port@0 {
+                    reg = <0>;
+                    endpoint {
+                        remote-endpoint = <&dsi0_out>;
+                    };
+                };
+
+                port@1 {
+                    reg = <1>;
+                    endpoint {
                         remote-endpoint = <&dsi1_out>;
                     };
                 };
