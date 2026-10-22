@@ -1826,6 +1826,18 @@ static void _dpu_encoder_kickoff_phys(struct dpu_encoder_virt *dpu_enc)
 		ctl = phys->hw_ctl;
 
 		/*
+		 * Bonded video interfaces can share one active CTL. Its pending
+		 * mask already includes both interfaces, and only the master
+		 * receives the vblank that completes this kickoff. Flushing the
+		 * slave again races the same CTL and leaves its count unretired.
+		 */
+		if (phys->intf_mode == INTF_MODE_VIDEO &&
+		    phys->split_role == ENC_ROLE_SLAVE &&
+		    dpu_enc->cur_master &&
+		    ctl == dpu_enc->cur_master->hw_ctl)
+			continue;
+
+		/*
 		 * This is cleared in frame_done worker, which isn't invoked
 		 * for async commits. So don't set this for async, since it'll
 		 * roll over to the next commit.
