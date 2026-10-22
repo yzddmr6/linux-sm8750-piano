@@ -174,10 +174,12 @@ live framing, or real gestures.
 External-power notification
 ---------------------------
 
-The charger notification follows the GPL-2.0-or-later vendor
-``xiaomi/xiaomi_touch_core.c:xiaomi_power_supply_work`` and
+The charger command protocol follows the GPL-2.0-or-later Novatek driver
 ``p81/nt36532/nt36xxx.c:nvt_set_charge_state`` at the MiCode commit above.
-The notifier/work and restore pattern also follows ianchb's adaptation at
+The vendor ``xiaomi/xiaomi_touch_core.c:xiaomi_power_supply_work`` is a
+behavior reference only: that file carries Xiaomi's proprietary notice and
+none of its code is copied. The notifier/work and restore pattern follows
+ianchb's GPL-2.0-or-later adaptation at
 ``42f3b40c702abbc37c3a04c95af008cd283aeaf3`` and the explicit event-page selection
 in https://github.com/blu-sharky/linux-piano at
 ``453bb567f2fc12423ab3338953ca8938a2f06e16``,
