@@ -36,8 +36,18 @@ properties:
   spi-cpha: false
 
   firmware-name:
+    minItems: 1
+    maxItems: 2
+    description:
+      Board and panel-specific normal application firmware. With
+      novatek,lcd-id-gpios the entry at the index of the ID level is used.
+
+  novatek,lcd-id-gpios:
     maxItems: 1
-    description: Board and panel-specific normal application firmware.
+    description:
+      Input reading the panel module ID strap, low for the CSOT module and
+      high for the BOE module on the Xiaomi Pad 8 Pro. It selects the
+      firmware-name entry for the module.
 
 required:
   - compatible
@@ -46,10 +56,19 @@ required:
   - spi-max-frequency
   - firmware-name
 
+if:
+  properties:
+    firmware-name:
+      minItems: 2
+then:
+  required:
+    - novatek,lcd-id-gpios
+
 unevaluatedProperties: false
 
 examples:
   - |
+    #include <dt-bindings/gpio/gpio.h>
     #include <dt-bindings/interrupt-controller/irq.h>
 
     spi {
@@ -62,6 +81,8 @@ examples:
             spi-max-frequency = <19200000>;
             interrupt-parent = <&tlmm>;
             interrupts = <162 IRQ_TYPE_EDGE_RISING>;
-            firmware-name = "novatek/piano/novatek_nt36532_piano_fw_csot.bin";
+            novatek,lcd-id-gpios = <&tlmm 100 GPIO_ACTIVE_HIGH>;
+            firmware-name = "novatek/piano/novatek_nt36532_piano_fw_csot.bin",
+                            "novatek/piano/novatek_nt36532_piano_fw_boe.bin";
         };
     };
