@@ -16,6 +16,7 @@
 #include <linux/of.h>
 #include <linux/poll.h>
 #include <linux/pm.h>
+#include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
@@ -64,6 +65,9 @@ struct nvt_thp {
 	struct mutex transition_lock;
 	struct mutex lifecycle_lock; /* Serializes synchronous open and the worker. */
 	struct work_struct start_work;
+	struct work_struct charger_work;
+	struct notifier_block charger_notifier;
+	int charger_state, charger_sent; /* lifecycle_lock; -1 means unknown. */
 	bool start_requested; /* transition_lock; one attempt until the next stop. */
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
 	int (*test_start)(struct nvt_thp *nvt);
@@ -253,6 +257,7 @@ static irqreturn_t nvt_irq(int irq, void *data)
 static void nvt_stop_irq(struct nvt_thp *nvt)
 {
 	WRITE_ONCE(nvt->running, false);
+	nvt->charger_sent = -1;
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
 	if (nvt->test_stop) {
 		nvt->test_stop(nvt);
@@ -263,6 +268,82 @@ static void nvt_stop_irq(struct nvt_thp *nvt)
 		disable_irq(nvt->spi->irq);
 	else
 		synchronize_irq(nvt->spi->irq);
+}
+
+/* Only ONLINE from an external system supply counts, never USB enumeration. */
+static int nvt_external_supply(struct power_supply *psy, void *data)
+{
+	union power_supply_propval value;
+	int *online = data;
+
+	if (psy->desc->type == POWER_SUPPLY_TYPE_BATTERY)
+		return 0;
+	if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_SCOPE, &value) &&
+	    value.intval == POWER_SUPPLY_SCOPE_DEVICE)
+		return 0;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &value))
+		return 0;
+	*online = !!value.intval;
+	return *online;
+}
+
+static void nvt_charger_state(struct nvt_thp *nvt, int online)
+{
+	u8 command[] = { 0x51, 0x00 };
+	int ret;
+
+	lockdep_assert_held(&nvt->lifecycle_lock);
+	if (online >= 0)
+		nvt->charger_state = !!online;
+	if (nvt->charger_state < 0)
+		return; /* No readable supply and no cached state. */
+	if (READ_ONCE(nvt->dead) || READ_ONCE(nvt->panel_off) ||
+	    READ_ONCE(nvt->suspended) || !READ_ONCE(nvt->opened) ||
+	    !READ_ONCE(nvt->running) || nvt->charger_sent == nvt->charger_state)
+		return;
+	command[0] = nvt->charger_state ? 0x53 : 0x51;
+	/* regmap serializes page selection and the write against IRQ frame reads. */
+	ret = regmap_bulk_write(nvt->map, 0x11c450, command, sizeof(command));
+	if (ret) {
+		dev_err(&nvt->spi->dev, "THP charger state %d failed: %d\n",
+			nvt->charger_state, ret);
+		WRITE_ONCE(nvt->error, ret);
+		nvt_stop_irq(nvt);
+		wake_up_interruptible(&nvt->wait);
+		return; /* The existing reader/service error path owns recovery. */
+	}
+	nvt->charger_sent = nvt->charger_state;
+	dev_info(&nvt->spi->dev, "THP charger state %d sent\n", nvt->charger_sent);
+}
+
+static void nvt_charger_work(struct work_struct *work)
+{
+	struct nvt_thp *nvt = container_of(work, struct nvt_thp, charger_work);
+	int online = -ENODEV;
+
+	mutex_lock(&nvt->lifecycle_lock);
+	if (!READ_ONCE(nvt->dead)) {
+		power_supply_for_each_psy(&online, nvt_external_supply);
+		nvt_charger_state(nvt, online);
+	}
+	mutex_unlock(&nvt->lifecycle_lock);
+}
+
+static int nvt_charger_notify(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct nvt_thp *nvt = container_of(nb, struct nvt_thp, charger_notifier);
+
+	if (event == PSY_EVENT_PROP_CHANGED)
+		schedule_work(&nvt->charger_work);
+	return NOTIFY_OK;
+}
+
+static void nvt_charger_unregister(void *data)
+{
+	struct nvt_thp *nvt = data;
+
+	power_supply_unreg_notifier(&nvt->charger_notifier);
+	cancel_work_sync(&nvt->charger_work);
 }
 
 /* Negative entries are read errors, never firmware values. */
@@ -389,6 +470,9 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 		 "THP stream ready, payload %u bytes; reset-to-REK %lld ms, reset-to-first-frame %lld ms, BF sequence %lld ms, last reset state %#04x (read %d); first-frame reset state %#04x, first-frame-to-NORMAL_RUN %lld ms\n",
 		 payload_length, boot.rek_ms, reset_to_frame_ms, commands_ms,
 		 nvt->reset_state, state_ret, first_frame_state, normal_run_ms);
+	/* Firmware reload loses the setting, even if ONLINE has not changed. */
+	nvt->charger_sent = -1;
+	schedule_work(&nvt->charger_work);
 	return 0;
 stop:
 	nvt_stop_irq(nvt);
@@ -448,6 +532,7 @@ static void nvt_quiesce(struct nvt_thp *nvt)
 		complete(nvt->test_quiescing);
 #endif
 	cancel_work_sync(&nvt->start_work);
+	cancel_work_sync(&nvt->charger_work);
 	nvt->start_requested = false;
 	mutex_lock(&nvt->lifecycle_lock);
 	nvt_stop_irq(nvt);
@@ -643,6 +728,8 @@ static int nvt_probe(struct spi_device *spi)
 	mutex_init(&nvt->transition_lock);
 	mutex_init(&nvt->lifecycle_lock);
 	INIT_WORK(&nvt->start_work, nvt_start_work);
+	INIT_WORK(&nvt->charger_work, nvt_charger_work);
+	nvt->charger_state = nvt->charger_sent = -1;
 	mutex_init(&nvt->read_lock);
 	init_waitqueue_head(&nvt->wait);
 	ret = device_property_read_string(&spi->dev, "firmware-name", &nvt->firmware_name);
@@ -678,6 +765,15 @@ static int nvt_probe(struct spi_device *spi)
 		if (ret)
 			return dev_err_probe(&spi->dev, ret, "Failed to follow panel\n");
 	}
+	nvt->charger_notifier.notifier_call = nvt_charger_notify;
+	ret = power_supply_reg_notifier(&nvt->charger_notifier);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(&spi->dev, nvt_charger_unregister, nvt);
+	if (ret)
+		return ret;
+	/* Cache the initial state without starting the transport or issuing I/O. */
+	schedule_work(&nvt->charger_work);
 	nvt->misc.minor = MISC_DYNAMIC_MINOR;
 	nvt->misc.fops = &nvt_fops;
 	nvt->misc.parent = &spi->dev;
@@ -783,6 +879,8 @@ static void nvt_test_open_disabled_panel(struct kunit *test)
 	mutex_init(&nvt->transition_lock);
 	mutex_init(&nvt->lifecycle_lock);
 	INIT_WORK(&nvt->start_work, nvt_start_work);
+	INIT_WORK(&nvt->charger_work, nvt_charger_work);
+	nvt->charger_state = nvt->charger_sent = -1;
 	nvt->test_stop = nvt_test_stop_noop;
 	init_waitqueue_head(&nvt->wait);
 	kref_init(&nvt->ref);
@@ -825,6 +923,8 @@ static void nvt_test_suspend_open_stream(struct kunit *test)
 	mutex_init(&nvt->transition_lock);
 	mutex_init(&nvt->lifecycle_lock);
 	INIT_WORK(&nvt->start_work, nvt_start_work);
+	INIT_WORK(&nvt->charger_work, nvt_charger_work);
+	nvt->charger_state = nvt->charger_sent = -1;
 	nvt->test_stop = nvt_test_stop_noop;
 	init_waitqueue_head(&nvt->wait);
 	dev_set_drvdata(&dev, nvt);
@@ -912,6 +1012,8 @@ static struct nvt_async_test *nvt_test_async_init(struct kunit *test)
 	mutex_init(&nvt->transition_lock);
 	mutex_init(&nvt->lifecycle_lock);
 	INIT_WORK(&nvt->start_work, nvt_start_work);
+	INIT_WORK(&nvt->charger_work, nvt_charger_work);
+	nvt->charger_state = nvt->charger_sent = -1;
 	init_waitqueue_head(&nvt->wait);
 	init_completion(&ctx->started);
 	init_completion(&ctx->finish_start);

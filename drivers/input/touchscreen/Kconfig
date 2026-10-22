@@ -1412,7 +1412,7 @@ config TOUCHSCREEN_NT36532E_THP_KUNIT_TEST
 
 config TOUCHSCREEN_NT36532E_THP
 	tristate "Novatek NT36532E host-processed touch transport"
-	depends on SPI
+	depends on SPI && POWER_SUPPLY
 	depends on DRM || !DRM
 	select REGMAP
 	select FW_LOADER

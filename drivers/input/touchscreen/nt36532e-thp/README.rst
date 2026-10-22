@@ -170,3 +170,35 @@ preservation of the last state on a bus error. Readback tests cover byte order, 
 The standalone state-wait and command tests need no firmware fixture. KUnit
 does not test physical SPI, IRQs, the first-frame wait in open, panel power,
 live framing, or real gestures.
+
+External-power notification
+---------------------------
+
+The charger notification follows the GPL-2.0-or-later vendor
+``xiaomi/xiaomi_touch_core.c:xiaomi_power_supply_work`` and
+``p81/nt36532/nt36xxx.c:nvt_set_charge_state`` at the MiCode commit above.
+The notifier/work and restore pattern also follows ianchb's adaptation at
+``42f3b40c702abbc37c3a04c95af008cd283aeaf3`` and the explicit event-page selection
+in https://github.com/blu-sharky/linux-piano at
+``453bb567f2fc12423ab3338953ca8938a2f06e16``,
+``drivers/input/touchscreen/nt36532e/nt36xxx.c`` (GPL-2.0-or-later).
+
+Only a readable external, system-scope power supply's ONLINE property determines
+the state. Batteries, device-scope supplies and USB enumeration do not count.
+With no readable ONLINE property, the previous state is retained. Notifications
+queue work under the existing lifecycle mutex; regmap protects each page/write
+transaction from concurrent frame reads. The wire sequence is ``ff 23 88`` then
+``d0 53 00`` (online) or ``d0 51 00`` (offline), at register ``0x11c450``.
+
+A closed, disabled, suspended or failed stream only caches the current state.
+Every successful firmware start queues a fresh ONLINE sample after REK, the
+first valid frame, NORMAL_RUN and all three BF commands. It resends once even
+when the state is unchanged; repeated notifications otherwise send nothing.
+Stop drains both workers before panel power can disappear, and teardown removes
+the notifier before its final work cancellation. A failed write stops capture
+and reports the error to the existing reader/service backoff path, without a
+new retry loop. Successful writes log ``THP charger state N sent``.
+
+This aligns the command protocol with the vendor. It does not establish that
+charger notifications eliminate a visible display flash; that needs the bounded
+owner-attended plug/unplug comparison on this candidate.
