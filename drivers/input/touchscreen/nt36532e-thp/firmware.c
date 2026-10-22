@@ -351,8 +351,8 @@ int nvt_thp_get_extend_command(struct regmap *map, u8 sub_command, u16 *value,
  * freshly loaded firmware's pen state implicit. A pen input implementation
  * must manage that state explicitly when it is added.
  *
- * TD-047 isolation experiment: use the original three-write sequence after
- * the caller has waited for NORMAL_RUN, without pre-command mode readback.
+ * Use the original three-write sequence after the caller has waited for
+ * NORMAL_RUN, without pre-command mode readback.
  */
 int nvt_thp_apply_host_commands(struct regmap *map, struct nvt_thp_command_status *last)
 {

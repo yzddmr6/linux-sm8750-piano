@@ -227,6 +227,4 @@ the notifier before its final work cancellation. A failed write stops capture
 and reports the error to the existing reader/service backoff path, without a
 new retry loop. Successful writes log ``THP charger state N sent``.
 
-This aligns the command protocol with the vendor. It does not establish that
-charger notifications eliminate a visible display flash; that needs the bounded
-owner-attended plug/unplug comparison on this candidate.
+This aligns the command protocol with the vendor driver.

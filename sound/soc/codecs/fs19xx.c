@@ -64,8 +64,8 @@
 #define FS19XX_START_DELAY_MS	5
 /* 0.375 dB per step, 0xff is 0 dB */
 #define FS19XX_VOLUME_MAX	0xff
-/* No speaker protection: -9 dB is the owner decision of 2026-10-21,
- * not a proven safety limit (TD-026).
+/* No speaker protection: -9 dB is a chosen default, not a proven
+ * safety limit.
  */
 #define FS19XX_VOLUME_DEFAULT	0xe7
 
