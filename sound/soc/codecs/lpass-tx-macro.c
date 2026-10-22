@@ -92,6 +92,7 @@
 #define CDC_TXn_PH_EN_MASK		BIT(0)
 #define CDC_TXn_ADC_MODE_MASK		GENMASK(2, 1)
 #define CDC_TXn_HPF_CUT_FREQ_MASK	GENMASK(6, 5)
+#define CDC_TXn_HPF_CUT_FREQ_SHIFT	5
 #define CDC_TXn_ADC_DMIC_SEL_MASK	BIT(7)
 #define CDC_TX0_TX_PATH_CFG1		(0x0408)
 #define CDC_TXn_TX_VOL_CTL(n)		(0x040C + 0x80 * n)
@@ -1389,6 +1390,29 @@ static const struct soc_enum dec_mode_mux_enum[] = {
 			dec_mode_mux_text),
 };
 
+static const char * const hpf_cut_off_text[] = {
+	"CF_NEG_3DB_4HZ", "CF_NEG_3DB_75HZ", "CF_NEG_3DB_150HZ",
+};
+
+static const struct soc_enum hpf_cut_off_enum[] = {
+	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(0), CDC_TXn_HPF_CUT_FREQ_SHIFT,
+			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
+	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(1), CDC_TXn_HPF_CUT_FREQ_SHIFT,
+			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
+	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(2), CDC_TXn_HPF_CUT_FREQ_SHIFT,
+			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
+	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(3), CDC_TXn_HPF_CUT_FREQ_SHIFT,
+			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
+	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(4), CDC_TXn_HPF_CUT_FREQ_SHIFT,
+			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
+	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(5), CDC_TXn_HPF_CUT_FREQ_SHIFT,
+			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
+	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(6), CDC_TXn_HPF_CUT_FREQ_SHIFT,
+			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
+	SOC_ENUM_SINGLE(CDC_TXn_TX_PATH_CFG0(7), CDC_TXn_HPF_CUT_FREQ_SHIFT,
+			ARRAY_SIZE(hpf_cut_off_text), hpf_cut_off_text),
+};
+
 static const struct snd_kcontrol_new tx_aif1_cap_mixer[] = {
 	SOC_SINGLE_EXT("DEC0", SND_SOC_NOPM, TX_MACRO_DEC0, 1, 0,
 			tx_macro_tx_mixer_get, tx_macro_tx_mixer_put),
@@ -2103,6 +2127,15 @@ static const struct snd_kcontrol_new tx_macro_snd_controls[] = {
 
 	SOC_ENUM_EXT("DEC7 MODE", dec_mode_mux_enum[7],
 			tx_macro_dec_mode_get, tx_macro_dec_mode_put),
+
+	SOC_ENUM("TX0 HPF cut off", hpf_cut_off_enum[0]),
+	SOC_ENUM("TX1 HPF cut off", hpf_cut_off_enum[1]),
+	SOC_ENUM("TX2 HPF cut off", hpf_cut_off_enum[2]),
+	SOC_ENUM("TX3 HPF cut off", hpf_cut_off_enum[3]),
+	SOC_ENUM("TX4 HPF cut off", hpf_cut_off_enum[4]),
+	SOC_ENUM("TX5 HPF cut off", hpf_cut_off_enum[5]),
+	SOC_ENUM("TX6 HPF cut off", hpf_cut_off_enum[6]),
+	SOC_ENUM("TX7 HPF cut off", hpf_cut_off_enum[7]),
 
 	SOC_SINGLE_EXT("DEC0_BCS Switch", SND_SOC_NOPM, 0, 1, 0,
 		       tx_macro_get_bcs, tx_macro_set_bcs),
