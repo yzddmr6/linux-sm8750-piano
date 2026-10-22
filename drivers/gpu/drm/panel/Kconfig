@@ -703,6 +703,18 @@ config DRM_PANEL_NOVATEK_NT36536
 	  display panels, such as the one found in the LENOVO Legion Y700
 	  Gen4.
 
+config DRM_PANEL_NOVATEK_NT36532_KUNIT_TEST
+	bool "Novatek NT36532 panel tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && DRM_PANEL_NOVATEK_NT36532=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test the selection of the Xiaomi Pad 8 Pro panel module by the ID
+	  pin, the shared reset and the DSI commands of both modules on a
+	  recording DSI host. One test logs every command, so the streams
+	  can be compared with the stock panel descriptions.
+
+	  If unsure, say N.
+
 config DRM_PANEL_NOVATEK_NT36672A
 	tristate "Novatek NT36672A DSI panel"
 	depends on GPIOLIB

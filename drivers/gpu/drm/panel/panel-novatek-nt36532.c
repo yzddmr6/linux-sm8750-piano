@@ -887,6 +887,10 @@ static struct mipi_dsi_driver nt36532_driver = {
 };
 module_mipi_dsi_driver(nt36532_driver);
 
+#if IS_ENABLED(CONFIG_DRM_PANEL_NOVATEK_NT36532_KUNIT_TEST)
+#include "panel-novatek-nt36532-test.c"
+#endif
+
 MODULE_AUTHOR("Junjie Cao <junjie.cao@linux.dev>");
 MODULE_DESCRIPTION("DRM driver for Novatek NT36532 based MIPI DSI panels");
 MODULE_LICENSE("GPL");
