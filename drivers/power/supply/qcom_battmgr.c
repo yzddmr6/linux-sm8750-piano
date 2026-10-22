@@ -18,6 +18,7 @@
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/spinlock.h>
 #include <linux/math.h>
+#include <linux/suspend.h>
 #include <linux/units.h>
 #include <linux/workqueue.h>
 
@@ -48,6 +49,8 @@ enum qcom_battmgr_variant {
  * switch the boost on.
  */
 #define QCOM_BATTMGR_QUIRK_OTG_VBUS			BIT(4)
+/* The OS can ask the firmware for a USB PD PPS contract and its limits */
+#define QCOM_BATTMGR_QUIRK_PPS				BIT(5)
 
 #define BATTMGR_BAT_STATUS		0x1
 
@@ -104,6 +107,8 @@ enum qcom_battmgr_variant {
 #define BATT_CHG_CTRL_END_THR		26
 /* OPLUS firmware: set to 0 to stop charging, the system keeps running on input */
 #define BATT_OPLUS_CHG_EN		24
+/* OPLUS firmware: allow the charge current of a raised input voltage */
+#define BATT_OPLUS_FASTCHG_ALLOW	46
 
 #define BATTMGR_USB_PROPERTY_GET	0x32
 #define BATTMGR_USB_PROPERTY_SET	0x33
@@ -117,11 +122,18 @@ enum qcom_battmgr_variant {
 #define USB_ADAP_TYPE			7
 #define USB_MOISTURE_DET_EN		8
 #define USB_MOISTURE_DET_STS		9
+#define USB_REAL_TYPE			11
 /* OPLUS firmware: VBUS boost control */
 #define USB_OPLUS_OTG_AP_ENABLE		17
 #define USB_OPLUS_OTG_SWITCH		18
 #define USB_OPLUS_OTG_VBUS_ENABLE	24
 #define USB_OPLUS_OTG_BOOST_CURRENT	64
+/* OPLUS firmware: USB PD PPS, voltage in mV and current in mA */
+#define USB_OPLUS_PPS_TYPE		32
+#define USB_OPLUS_PPS_VOLT		34
+#define USB_OPLUS_PPS_CURR		35
+#define USB_OPLUS_PPS_MAX_CURR		36
+#define USB_OPLUS_PPS_ENABLE		49
 
 #define BATTMGR_WLS_PROPERTY_GET	0x34
 #define BATTMGR_WLS_PROPERTY_SET	0x35
@@ -148,6 +160,79 @@ enum qcom_battmgr_variant {
 
 /* VBUS boost current limit for a USB sink, from the vendor devicetree */
 #define OTG_BOOST_CURRENT_MA		1250
+
+/*
+ * PPS contract: 8.4 V at up to 3 A from the charger, with an input current
+ * limit of 3 A and a battery charge current limit of 4.4 A.  At most
+ * 25.2 W, far below the 67 W charging limit of the device (vendor
+ * devicetree oplus,vooc_power_max_w = <0x43>).
+ */
+#define PPS_VOLT_MV			8400
+#define PPS_CURR_START_MA		1000
+#define PPS_CURR_MA			3000
+#define PPS_CURR_STEP_MA		250
+#define PPS_INPUT_LIMIT_UA		3000000
+#define PPS_CHARGE_LIMIT_UA		4400000
+#define PPS_POWER_MAX_MW		67000
+static_assert(PPS_VOLT_MV * PPS_CURR_MA <= PPS_POWER_MAX_MW * 1000);
+
+/* Values written to leave the contract */
+#define PPS_END_VOLT_MV			5000
+#define PPS_END_CURR_MA			2000
+
+/* Polling while a PPS contract is pending or active */
+#define PPS_POLL_MS			2000
+/* Time for the firmware to finish its own charger setup after plug-in */
+#define PPS_SETTLE_MS			10000
+/* VBUS must have left 5 V after this many polls, and never collapse */
+#define PPS_RISE_POLLS			6
+#define PPS_VBUS_RISEN_UV		5500000
+#define PPS_VBUS_COLLAPSE_UV		3800000
+/* Polls at a raised VBUS without input current before giving up */
+#define PPS_VBUS_HIGH_UV		7000000
+#define PPS_STALL_UA			100000
+#define PPS_STALL_POLLS			15
+
+/*
+ * Battery limits for the contract, from the vendor PPS settings: it ends at
+ * 90 % (oplus,pps_charge_strategy_soc), at 4.49 V
+ * (oplus,pps_full_normal_sw_vbat), above 43.0 C (the highest step of
+ * oplus,pps_strategy_batt_high_temp) and below 0 C.  Starting needs a
+ * margin: at most 85 %, 4.4 V and 40.0 C (the vendor recovery
+ * temperature), and at least 5.0 C.
+ */
+#define PPS_SOC_MAX			90
+#define PPS_SOC_MARGIN			5
+#define PPS_VBAT_MAX_UV			4490000
+#define PPS_VBAT_START_UV		4400000
+#define PPS_VBAT_MIN_UV			3300000
+#define PPS_TEMP_MAX			430
+#define PPS_TEMP_START_MAX		400
+#define PPS_TEMP_START_MIN		50
+#define PPS_TEMP_MIN			0
+
+static bool pps_enable;
+module_param(pps_enable, bool, 0644);
+MODULE_PARM_DESC(pps_enable,
+		 "Request a USB PD PPS contract from PPS chargers where supported (default: off)");
+
+enum qcom_battmgr_pps_state {
+	PPS_IDLE,	/* no PPS charger, or PPS disabled */
+	PPS_SETTLE,	/* PPS charger present, waiting for its setup to finish */
+	PPS_ACTIVE,	/* contract requested */
+	PPS_HOLD,	/* ended for the battery, may start again with margin */
+	PPS_FAILED,	/* charger or firmware refused, not retried until unplugged */
+};
+
+struct qcom_battmgr_pps_sample {
+	unsigned int soc;
+	unsigned int vbat_uv;
+	int ibat_ua;		/* positive while charging */
+	int temp;		/* tenths of a degree Celsius */
+	unsigned int health;
+	unsigned int vbus_uv;
+	unsigned int ibus_ua;
+};
 
 struct qcom_battmgr_enable_request {
 	struct pmic_glink_hdr hdr;
@@ -392,8 +477,9 @@ struct qcom_battmgr {
 	spinlock_t notify_lock;
 	bool removing;
 
-	/* Property id named in the answer to the last accepted property write */
+	/* Property id and value in the answer to the last accepted request */
 	u32 resp_property;
+	u32 resp_value;
 
 	/*
 	 * Charge control thresholds enforced by the driver: @charge_work runs
@@ -413,6 +499,23 @@ struct qcom_battmgr {
 	struct work_struct otg_work;
 	bool otg_request;
 	bool otg_vbus;
+
+	/*
+	 * USB PD PPS, run from @charge_work under @charge_lock; @pm_nb ends
+	 * the contract before system suspend, since it is not monitored
+	 * while suspended.
+	 */
+	struct mutex charge_lock;
+	struct notifier_block pm_nb;
+	enum qcom_battmgr_pps_state pps_state;
+	unsigned long pps_since;
+	unsigned int pps_polls;
+	unsigned int pps_stalls;
+	u32 pps_curr_ma;
+	u32 pps_target_ma;
+	/* Limits found before the contract, restored when it ends */
+	u32 pps_input_limit_ua;
+	u32 pps_charge_limit_ua;
 };
 
 static int __qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data,
@@ -481,6 +584,24 @@ static int qcom_battmgr_set_property(struct qcom_battmgr *battmgr, int opcode,
 				     msecs_to_jiffies(BATTMGR_SET_TIMEOUT_MS));
 	if (!ret && battmgr->resp_property != property)
 		ret = -EIO;
+	mutex_unlock(&battmgr->lock);
+
+	return ret;
+}
+
+/* Read the raw value of a battery or USB property */
+static int qcom_battmgr_get_property(struct qcom_battmgr *battmgr, int opcode,
+				     u32 property, u32 *value)
+{
+	int ret;
+
+	mutex_lock(&battmgr->lock);
+	battmgr->resp_property = U32_MAX;
+	ret = qcom_battmgr_request_property(battmgr, opcode, property, 0);
+	if (!ret && battmgr->resp_property != property)
+		ret = -EIO;
+	if (!ret)
+		*value = battmgr->resp_value;
 	mutex_unlock(&battmgr->lock);
 
 	return ret;
@@ -966,21 +1087,356 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 	}
 }
 
+static bool qcom_battmgr_pps_enabled(struct qcom_battmgr *battmgr)
+{
+	return (battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS) && READ_ONCE(pps_enable);
+}
+
+/* A charger that offers PPS, as detected by the firmware */
+static bool qcom_battmgr_pps_charger(struct qcom_battmgr *battmgr)
+{
+	u32 type, pps;
+
+	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+				      USB_REAL_TYPE, &type) ||
+	    type != POWER_SUPPLY_USB_TYPE_PD_PPS)
+		return false;
+
+	return !qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+					  USB_OPLUS_PPS_TYPE, &pps) && pps == 1;
+}
+
+static int qcom_battmgr_pps_sample(struct qcom_battmgr *battmgr,
+				   struct qcom_battmgr_pps_sample *s)
+{
+	u32 soc, curr, temp;
+	int ret;
+
+	ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+					BATT_CAPACITY, &soc);
+	if (!ret)
+		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						BATT_VOLT_NOW, &s->vbat_uv);
+	if (!ret)
+		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						BATT_CURR_NOW, &curr);
+	if (!ret)
+		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						BATT_TEMP, &temp);
+	if (!ret)
+		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						BATT_HEALTH, &s->health);
+	if (!ret)
+		ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+						USB_VOLT_NOW, &s->vbus_uv);
+	if (!ret)
+		ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+						USB_CURR_NOW, &s->ibus_ua);
+	if (ret)
+		return ret;
+
+	s->soc = soc / 100;
+	s->ibat_ua = (s32)curr;
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_BATT_CURRENT_INVERTED)
+		s->ibat_ua = -s->ibat_ua;
+	s->temp = DIV_ROUND_CLOSEST((s32)temp, 10);
+
+	return 0;
+}
+
+/* The contract ends at the end threshold if that is below the PPS limit */
+static unsigned int qcom_battmgr_pps_soc_max(struct qcom_battmgr *battmgr)
+{
+	unsigned int end = READ_ONCE(battmgr->info.charge_ctrl_end);
+
+	if (qcom_battmgr_charge_limited(battmgr) && end < PPS_SOC_MAX)
+		return end;
+
+	return PPS_SOC_MAX;
+}
+
+static const char *qcom_battmgr_pps_stop_reason(struct qcom_battmgr *battmgr,
+						const struct qcom_battmgr_pps_sample *s)
+{
+	if (battmgr->charge_inhibited)
+		return "charging stopped for the end threshold";
+	if (s->health != POWER_SUPPLY_HEALTH_GOOD)
+		return "battery health";
+	if (s->temp < PPS_TEMP_MIN || s->temp >= PPS_TEMP_MAX)
+		return "battery temperature";
+	if (s->vbat_uv < PPS_VBAT_MIN_UV || s->vbat_uv >= PPS_VBAT_MAX_UV)
+		return "battery voltage";
+	if (s->soc >= qcom_battmgr_pps_soc_max(battmgr))
+		return "battery charge level";
+
+	return NULL;
+}
+
+static bool qcom_battmgr_pps_may_start(struct qcom_battmgr *battmgr)
+{
+	struct qcom_battmgr_pps_sample s;
+
+	if (qcom_battmgr_pps_sample(battmgr, &s) ||
+	    qcom_battmgr_pps_stop_reason(battmgr, &s))
+		return false;
+
+	return s.temp >= PPS_TEMP_START_MIN && s.temp <= PPS_TEMP_START_MAX &&
+	       s.vbat_uv <= PPS_VBAT_START_UV &&
+	       s.soc + PPS_SOC_MARGIN <= qcom_battmgr_pps_soc_max(battmgr);
+}
+
+/*
+ * Leave the contract: back to 5 V first, then release the limits and the
+ * PPS mode.  The limits found before the contract are restored, and
+ * charging stays off if the end threshold holds it off.
+ */
+static void qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr,
+				  enum qcom_battmgr_pps_state next,
+				  const char *reason)
+{
+	int ret, err = 0;
+
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					USB_OPLUS_PPS_CURR, PPS_END_CURR_MA);
+	err = err ?: ret;
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					USB_OPLUS_PPS_VOLT, PPS_END_VOLT_MV);
+	err = err ?: ret;
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+					BATT_OPLUS_FASTCHG_ALLOW, 0);
+	err = err ?: ret;
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+					BATT_CHG_CTRL_LIM, battmgr->pps_charge_limit_ua);
+	err = err ?: ret;
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+					BATT_OPLUS_CHG_EN, !battmgr->charge_inhibited);
+	err = err ?: ret;
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					USB_INPUT_CURR_LIMIT, battmgr->pps_input_limit_ua);
+	err = err ?: ret;
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					USB_OPLUS_PPS_ENABLE, 0);
+	err = err ?: ret;
+
+	/* Writes to a port without a charger may be refused */
+	if (err && next != PPS_IDLE)
+		dev_warn(battmgr->dev, "PPS: failed to restore 5 V charging: %d\n", err);
+
+	dev_info(battmgr->dev, "PPS contract ended: %s\n", reason);
+	battmgr->pps_state = next;
+}
+
+/*
+ * Request the contract, in the order the firmware needs: PPS mode, the
+ * voltage before the current, the input limit, and only then the charge
+ * current permission and limit.  Other orders leave VBUS at about 6.6 V
+ * or the input current at about 1.3 A.
+ */
+static int qcom_battmgr_pps_start(struct qcom_battmgr *battmgr)
+{
+	u32 max_ma;
+	int ret;
+
+	/*
+	 * Both limits are put back when the contract ends.  Do not start
+	 * without them, and not while either is 0: an input current limit
+	 * of 0 suspends the input.
+	 */
+	ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+					USB_INPUT_CURR_LIMIT,
+					&battmgr->pps_input_limit_ua);
+	if (!ret)
+		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						BATT_CHG_CTRL_LIM,
+						&battmgr->pps_charge_limit_ua);
+	if (!ret && (!battmgr->pps_input_limit_ua || !battmgr->pps_charge_limit_ua))
+		ret = -ENODATA;
+	if (ret) {
+		dev_warn(battmgr->dev, "PPS: current limits unavailable: %d\n", ret);
+		battmgr->pps_state = PPS_FAILED;
+		return ret;
+	}
+
+	/* Stay within the current the charger offers */
+	battmgr->pps_target_ma = PPS_CURR_MA;
+	if (!qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+				       USB_OPLUS_PPS_MAX_CURR, &max_ma) &&
+	    max_ma >= PPS_CURR_START_MA && max_ma < PPS_CURR_MA)
+		battmgr->pps_target_ma = max_ma;
+	battmgr->pps_curr_ma = PPS_CURR_START_MA;
+
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					USB_OPLUS_PPS_ENABLE, 1);
+	if (!ret)
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+						USB_OPLUS_PPS_VOLT, PPS_VOLT_MV);
+	if (!ret)
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+						USB_OPLUS_PPS_CURR, battmgr->pps_curr_ma);
+	if (!ret)
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+						USB_INPUT_CURR_LIMIT, PPS_INPUT_LIMIT_UA);
+	if (!ret)
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+						BATT_OPLUS_FASTCHG_ALLOW, 1);
+	if (!ret)
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+						BATT_OPLUS_CHG_EN, 1);
+	if (!ret)
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+						BATT_CHG_CTRL_LIM, PPS_CHARGE_LIMIT_UA);
+	if (ret) {
+		qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "request refused");
+		return ret;
+	}
+
+	battmgr->pps_state = PPS_ACTIVE;
+	battmgr->pps_polls = 0;
+	battmgr->pps_stalls = 0;
+	dev_info(battmgr->dev, "PPS contract requested: %u mV, up to %u mA\n",
+		 PPS_VOLT_MV, battmgr->pps_target_ma);
+
+	return 0;
+}
+
+static void qcom_battmgr_pps_monitor(struct qcom_battmgr *battmgr)
+{
+	struct qcom_battmgr_pps_sample s;
+	const char *reason;
+	u32 curr;
+
+	if (qcom_battmgr_pps_sample(battmgr, &s)) {
+		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "no battery data");
+		return;
+	}
+
+	reason = qcom_battmgr_pps_stop_reason(battmgr, &s);
+	if (reason) {
+		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, reason);
+		return;
+	}
+
+	battmgr->pps_polls++;
+	if (s.vbus_uv < PPS_VBUS_COLLAPSE_UV) {
+		qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "VBUS collapsed");
+		return;
+	}
+	if (battmgr->pps_polls >= PPS_RISE_POLLS && s.vbus_uv < PPS_VBUS_RISEN_UV) {
+		qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "VBUS did not rise");
+		return;
+	}
+
+	if (s.vbus_uv > PPS_VBUS_HIGH_UV && s.ibus_ua < PPS_STALL_UA) {
+		if (++battmgr->pps_stalls >= PPS_STALL_POLLS) {
+			qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "no input current");
+			return;
+		}
+	} else {
+		battmgr->pps_stalls = 0;
+	}
+
+	if (battmgr->pps_curr_ma >= battmgr->pps_target_ma)
+		return;
+
+	curr = min(battmgr->pps_curr_ma + PPS_CURR_STEP_MA, battmgr->pps_target_ma);
+	if (qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+				      USB_OPLUS_PPS_CURR, curr)) {
+		qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "current request refused");
+		return;
+	}
+
+	battmgr->pps_curr_ma = curr;
+	if (curr == battmgr->pps_target_ma)
+		dev_info(battmgr->dev, "PPS: VBUS %u mV %u mA, battery %d mA\n",
+			 s.vbus_uv / 1000, s.ibus_ua / 1000, s.ibat_ua / 1000);
+}
+
+/*
+ * Run the PPS state machine once; returns the delay to the next run in
+ * milliseconds, or 0 if nothing has to be watched.
+ */
+static unsigned int qcom_battmgr_pps_update(struct qcom_battmgr *battmgr)
+{
+	u32 online;
+
+	if (!qcom_battmgr_pps_enabled(battmgr)) {
+		if (battmgr->pps_state == PPS_ACTIVE)
+			qcom_battmgr_pps_stop(battmgr, PPS_IDLE, "disabled");
+		battmgr->pps_state = PPS_IDLE;
+		return 0;
+	}
+
+	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+				      USB_ONLINE, &online))
+		return CHARGE_CTRL_POLL_MS;
+
+	if (!online) {
+		if (battmgr->pps_state == PPS_ACTIVE)
+			qcom_battmgr_pps_stop(battmgr, PPS_IDLE, "charger removed");
+		battmgr->pps_state = PPS_IDLE;
+		return CHARGE_CTRL_POLL_MS;
+	}
+
+	switch (battmgr->pps_state) {
+	case PPS_IDLE:
+	case PPS_HOLD:
+		if (!qcom_battmgr_pps_charger(battmgr) ||
+		    !qcom_battmgr_pps_may_start(battmgr))
+			return CHARGE_CTRL_POLL_MS;
+
+		battmgr->pps_state = PPS_SETTLE;
+		battmgr->pps_since = jiffies;
+		return PPS_POLL_MS;
+	case PPS_SETTLE:
+		if (!qcom_battmgr_pps_charger(battmgr) ||
+		    !qcom_battmgr_pps_may_start(battmgr)) {
+			battmgr->pps_state = PPS_IDLE;
+			return CHARGE_CTRL_POLL_MS;
+		}
+
+		if (time_before(jiffies, battmgr->pps_since +
+				msecs_to_jiffies(PPS_SETTLE_MS)))
+			return PPS_POLL_MS;
+
+		if (qcom_battmgr_pps_start(battmgr))
+			return CHARGE_CTRL_POLL_MS;
+
+		return PPS_POLL_MS;
+	case PPS_ACTIVE:
+		qcom_battmgr_pps_monitor(battmgr);
+		return battmgr->pps_state == PPS_ACTIVE ? PPS_POLL_MS : CHARGE_CTRL_POLL_MS;
+	case PPS_FAILED:
+	default:
+		return CHARGE_CTRL_POLL_MS;
+	}
+}
+
 static void qcom_battmgr_charge_worker(struct work_struct *work)
 {
 	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
 						    struct qcom_battmgr, charge_work);
+	unsigned int delay = 0;
 
 	/* Kicked again by qcom_battmgr_enable_worker() once the service is up */
 	if (!battmgr->service_up)
 		return;
 
+	mutex_lock(&battmgr->charge_lock);
+
 	qcom_battmgr_charge_limit_update(battmgr);
 
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS)
+		delay = qcom_battmgr_pps_update(battmgr);
+
 	/* Also retry turning charging back on after the limit was removed */
-	if (qcom_battmgr_charge_limited(battmgr) || battmgr->charge_inhibited)
+	if (!delay && (qcom_battmgr_charge_limited(battmgr) || battmgr->charge_inhibited))
+		delay = CHARGE_CTRL_POLL_MS;
+
+	mutex_unlock(&battmgr->charge_lock);
+
+	if (delay)
 		queue_delayed_work(system_freezable_wq, &battmgr->charge_work,
-				   msecs_to_jiffies(CHARGE_CTRL_POLL_MS));
+				   msecs_to_jiffies(delay));
 }
 
 /* Check the charge state now, may be called in atomic context */
@@ -996,8 +1452,37 @@ static void qcom_battmgr_charge_kick(struct qcom_battmgr *battmgr)
  */
 static void qcom_battmgr_usb_event(struct qcom_battmgr *battmgr)
 {
-	if (qcom_battmgr_charge_limited(battmgr) || battmgr->charge_inhibited)
+	if (qcom_battmgr_charge_limited(battmgr) || battmgr->charge_inhibited ||
+	    qcom_battmgr_pps_enabled(battmgr))
 		qcom_battmgr_charge_kick(battmgr);
+}
+
+/*
+ * A PPS contract is not monitored while the system is suspended, so end it
+ * before and let the work start it again after resume.
+ */
+static int qcom_battmgr_pm_notify(struct notifier_block *nb,
+				  unsigned long action, void *data)
+{
+	struct qcom_battmgr *battmgr = container_of(nb, struct qcom_battmgr, pm_nb);
+
+	switch (action) {
+	case PM_HIBERNATION_PREPARE:
+	case PM_SUSPEND_PREPARE:
+		cancel_delayed_work_sync(&battmgr->charge_work);
+		mutex_lock(&battmgr->charge_lock);
+		if (battmgr->pps_state == PPS_ACTIVE)
+			qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "system suspend");
+		mutex_unlock(&battmgr->charge_lock);
+		break;
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+	case PM_POST_SUSPEND:
+		qcom_battmgr_charge_kick(battmgr);
+		break;
+	}
+
+	return NOTIFY_DONE;
 }
 
 static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
@@ -1704,6 +2189,9 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->error = le32_to_cpu(resp->intval.result);
 			if (battmgr->error)
 				goto out_complete;
+
+			battmgr->resp_property = property;
+			battmgr->resp_value = le32_to_cpu(resp->intval.value);
 		}
 
 		switch (property) {
@@ -1777,6 +2265,9 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 		case BATT_CHG_CTRL_END_THR:
 			battmgr->info.charge_ctrl_end = le32_to_cpu(resp->intval.value);
 			break;
+		case BATT_CHG_CTRL_LIM:
+			/* Only read through qcom_battmgr_get_property() */
+			break;
 		default:
 			dev_warn(battmgr->dev, "unknown property %#x\n", property);
 			break;
@@ -1795,6 +2286,9 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 		battmgr->error = le32_to_cpu(resp->intval.result);
 		if (battmgr->error)
 			goto out_complete;
+
+		battmgr->resp_property = property;
+		battmgr->resp_value = le32_to_cpu(resp->intval.value);
 
 		switch (property) {
 		case USB_ONLINE:
@@ -1817,6 +2311,11 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			break;
 		case USB_ADAP_TYPE:
 			battmgr->usb.usb_type = le32_to_cpu(resp->intval.value);
+			break;
+		case USB_REAL_TYPE:
+		case USB_OPLUS_PPS_TYPE:
+		case USB_OPLUS_PPS_MAX_CURR:
+			/* Only read through qcom_battmgr_get_property() */
 			break;
 		default:
 			dev_warn(battmgr->dev, "unknown property %#x\n", property);
@@ -1997,9 +2496,10 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		battmgr->service_up = false;
 		/* A restarted firmware charges again by default */
 		battmgr->charge_inhibited = false;
-		/* ... and starts with the boost off */
+		/* ... and starts with the boost off and without a PPS contract */
 		battmgr->otg_request = false;
 		battmgr->otg_vbus = false;
+		battmgr->pps_state = PPS_IDLE;
 	}
 }
 
@@ -2025,7 +2525,8 @@ static const struct of_device_id qcom_battmgr_of_quirks[] = {
 				 QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW |
 				 QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL |
 				 QCOM_BATTMGR_QUIRK_CHARGE_ENABLE |
-				 QCOM_BATTMGR_QUIRK_OTG_VBUS),
+				 QCOM_BATTMGR_QUIRK_OTG_VBUS |
+				 QCOM_BATTMGR_QUIRK_PPS),
 	},
 	{}
 };
@@ -2092,6 +2593,13 @@ static void qcom_battmgr_cancel_work(void *data)
 	cancel_work_sync(&battmgr->otg_work);
 }
 
+static void qcom_battmgr_unregister_pm_notifier(void *data)
+{
+	struct qcom_battmgr *battmgr = data;
+
+	unregister_pm_notifier(&battmgr->pm_nb);
+}
+
 static int qcom_battmgr_probe(struct auxiliary_device *adev,
 			      const struct auxiliary_device_id *id)
 {
@@ -2121,6 +2629,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	INIT_WORK(&battmgr->otg_work, qcom_battmgr_otg_worker);
 	mutex_init(&battmgr->lock);
 	spin_lock_init(&battmgr->notify_lock);
+	mutex_init(&battmgr->charge_lock);
 	init_completion(&battmgr->ack);
 
 	match = of_match_device(qcom_battmgr_of_variants, dev->parent);
@@ -2153,6 +2662,18 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	if ((battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE) &&
 	    !battmgr->info.charge_ctrl_end)
 		battmgr->info.charge_ctrl_end = CHARGE_CTRL_END_THR_MAX;
+
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS) {
+		battmgr->pm_nb.notifier_call = qcom_battmgr_pm_notify;
+		ret = register_pm_notifier(&battmgr->pm_nb);
+		if (ret)
+			return ret;
+
+		ret = devm_add_action_or_reset(dev, qcom_battmgr_unregister_pm_notifier,
+					       battmgr);
+		if (ret)
+			return ret;
+	}
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
 	    battmgr->variant == QCOM_BATTMGR_X1E80100) {
