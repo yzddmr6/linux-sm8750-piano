@@ -542,7 +542,10 @@ static int dpu_encoder_phys_vid_wait_for_commit_done(
 		(hw_ctl->ops.get_flush_register(hw_ctl) == 0),
 		msecs_to_jiffies(50));
 	if (ret <= 0) {
-		DPU_ERROR("vblank timeout: %x\n", hw_ctl->ops.get_flush_register(hw_ctl));
+		DPU_ERROR("vblank timeout: ctl=%d intf=%d flush=%x pending=%x\n",
+			  hw_ctl->idx, phys_enc->hw_intf->idx,
+			  hw_ctl->ops.get_flush_register(hw_ctl),
+			  hw_ctl->ops.get_pending_flush(hw_ctl));
 		return -ETIMEDOUT;
 	}
 
