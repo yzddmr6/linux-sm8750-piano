@@ -402,8 +402,8 @@ static const struct drm_dsc_config csot_dsc_cfg = {
 };
 
 /*
- * Xiaomi Pad 8 Pro panels, following the downstream "p81 42 02 0a" (BOE)
- * and "p81 35 02 0b" (CSOT) video mode dual-DSI DSC panel descriptions.
+ * Xiaomi Pad 8 Pro panels, following the downstream "p81 42 02 0a" (CSOT)
+ * and "p81 35 02 0b" (BOE) video mode dual-DSI DSC panel descriptions.
  *
  * The link runs at a fixed 1197.5 Mbps per lane and the refresh rate is
  * selected by the horizontal front porch. With RGB101010 and 8 bpp DSC the
@@ -463,7 +463,8 @@ static const struct drm_dsc_config piano_dsc_cfg = {
 	.block_pred_enable = true,
 };
 
-static void piano_boe_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
+/* 42-02-0a */
+static void piano_csot_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
 {
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc4, 0x82);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x26);
@@ -475,7 +476,8 @@ static void piano_boe_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc4, 0x06);
 }
 
-static void piano_csot_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
+/* 35-02-0b */
+static void piano_boe_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
 {
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbc, 0x77, 0x07);
 }
@@ -636,16 +638,16 @@ static int piano_init_sequence(struct nt36532 *ctx,
 	return dsi_ctx->accum_err;
 }
 
-static int piano_boe_init_sequence(struct nt36532 *ctx,
-				   const struct drm_display_mode *mode)
-{
-	return piano_init_sequence(ctx, mode, 0x20, piano_boe_vendor_sequence);
-}
-
 static int piano_csot_init_sequence(struct nt36532 *ctx,
 				    const struct drm_display_mode *mode)
 {
-	return piano_init_sequence(ctx, mode, 0x00, piano_csot_vendor_sequence);
+	return piano_init_sequence(ctx, mode, 0x20, piano_csot_vendor_sequence);
+}
+
+static int piano_boe_init_sequence(struct nt36532 *ctx,
+				   const struct drm_display_mode *mode)
+{
+	return piano_init_sequence(ctx, mode, 0x00, piano_boe_vendor_sequence);
 }
 
 static int nt36532_probe(struct mipi_dsi_device *dsi)
@@ -770,7 +772,7 @@ static const struct panel_info csot_panel_info = {
 }
 
 /* P81 42-02-0a physical 0/10 ms, 1/3, 0/3, 1/15; reset is active-low. */
-static void piano_boe_reset(struct nt36532 *ctx)
+static void piano_csot_reset(struct nt36532 *ctx)
 {
 	gpiod_set_value_cansleep(ctx->reset_gpio, 1);
 	usleep_range(10000, 10100);
@@ -782,16 +784,16 @@ static void piano_boe_reset(struct nt36532 *ctx)
 	usleep_range(15000, 15100);
 }
 
-static const struct panel_info piano_boe_panel_info =
-	PIANO_PANEL_INFO(piano_boe_init_sequence, piano_boe_reset);
-
 static const struct panel_info piano_csot_panel_info =
-	PIANO_PANEL_INFO(piano_csot_init_sequence, NULL);
+	PIANO_PANEL_INFO(piano_csot_init_sequence, piano_csot_reset);
+
+static const struct panel_info piano_boe_panel_info =
+	PIANO_PANEL_INFO(piano_boe_init_sequence, NULL);
 
 static const struct of_device_id nt36532_of_match[] = {
 	{ .compatible = "csot,ppc100hb1-1", .data = &csot_panel_info },
-	{ .compatible = "xiaomi,piano-boe-nt36532", .data = &piano_boe_panel_info },
-	{ .compatible = "xiaomi,piano-csot-nt36532", .data = &piano_csot_panel_info },
+	{ .compatible = "xiaomi,piano-boe-nt36532", .data = &piano_csot_panel_info },
+	{ .compatible = "xiaomi,piano-csot-nt36532", .data = &piano_boe_panel_info },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, nt36532_of_match);
