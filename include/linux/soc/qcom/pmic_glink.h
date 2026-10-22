@@ -28,6 +28,8 @@ struct pmic_glink_client *devm_pmic_glink_client_alloc(struct device *dev,
 						       void (*cb)(const void *, size_t, void *),
 						       void (*pdr)(void *, int),
 						       void *priv);
+void pmic_glink_client_set_wakeup_filter(struct pmic_glink_client *client,
+					 bool (*filter)(const void *, size_t, void *));
 void pmic_glink_client_register(struct pmic_glink_client *client);
 
 #endif

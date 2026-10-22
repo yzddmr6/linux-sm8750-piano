@@ -9,12 +9,14 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/rpmsg.h>
 #include <linux/slab.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/suspend.h>
 #include <linux/workqueue.h>
 
 #define PMIC_GLINK_SEND_TIMEOUT (5 * HZ)
@@ -70,11 +72,15 @@ struct pmic_glink_client {
 	struct list_head node;
 
 	struct pmic_glink *pg;
+	struct device *dev;
 	unsigned int id;
 
 	void (*cb)(const void *data, size_t len, void *priv);
 	void (*pdr_notify)(void *priv, int state);
+	bool (*wakeup_filter)(const void *data, size_t len, void *priv);
 	void *priv;
+
+	bool stay_awake;
 };
 
 struct pmic_glink_deferred_msg {
@@ -82,6 +88,16 @@ struct pmic_glink_deferred_msg {
 	size_t len;
 	u8 data[] __counted_by(len);
 };
+
+static void pmic_glink_client_relax(struct pmic_glink_client *client)
+{
+	lockdep_assert_held(&client->pg->client_lock);
+
+	if (client->stay_awake) {
+		client->stay_awake = false;
+		pm_relax(client->dev);
+	}
+}
 
 static void _devm_pmic_glink_release_client(struct device *dev, void *res)
 {
@@ -91,9 +107,26 @@ static void _devm_pmic_glink_release_client(struct device *dev, void *res)
 
 	spin_lock_irqsave(&pg->client_lock, flags);
 	list_del(&client->node);
+	pmic_glink_client_relax(client);
 	spin_unlock_irqrestore(&pg->client_lock, flags);
 }
 
+/**
+ * devm_pmic_glink_client_alloc() - allocate a client of the PMIC GLINK service
+ * @dev:	client device, a child of the pmic_glink device
+ * @id:		owner of the messages for the client
+ * @cb:		called, in atomic context, with each message for the client
+ * @pdr:	called, in atomic context, with the state of the remote service
+ * @priv:	passed to @cb, @pdr and the wakeup filter
+ *
+ * A notification for a client whose @dev may wake up the system, see
+ * device_may_wakeup(), is a wakeup event, unless the wakeup filter of the
+ * client rejects it. Notifications that arrive during system sleep reach @cb
+ * once the system has resumed.
+ *
+ * Return: the client, to be registered with pmic_glink_client_register(), or
+ * an ERR_PTR() on failure.
+ */
 struct pmic_glink_client *devm_pmic_glink_client_alloc(struct device *dev,
 						       unsigned int id,
 						       void (*cb)(const void *, size_t, void *),
@@ -108,6 +141,7 @@ struct pmic_glink_client *devm_pmic_glink_client_alloc(struct device *dev,
 		return ERR_PTR(-ENOMEM);
 
 	client->pg = pg;
+	client->dev = dev;
 	client->id = id;
 	client->cb = cb;
 	client->pdr_notify = pdr;
@@ -119,6 +153,22 @@ struct pmic_glink_client *devm_pmic_glink_client_alloc(struct device *dev,
 	return client;
 }
 EXPORT_SYMBOL_GPL(devm_pmic_glink_client_alloc);
+
+/**
+ * pmic_glink_client_set_wakeup_filter() - select the wakeup notifications
+ * @client:	client from devm_pmic_glink_client_alloc(), not registered yet
+ * @filter:	called, in atomic context, with each notification for the client
+ *		while its device may wake up the system; returns true to wake
+ *		the system up
+ *
+ * Without a filter, every notification for the client is a wakeup event.
+ */
+void pmic_glink_client_set_wakeup_filter(struct pmic_glink_client *client,
+					 bool (*filter)(const void *, size_t, void *))
+{
+	client->wakeup_filter = filter;
+}
+EXPORT_SYMBOL_GPL(pmic_glink_client_set_wakeup_filter);
 
 void pmic_glink_client_register(struct pmic_glink_client *client)
 {
@@ -166,6 +216,15 @@ int pmic_glink_send(struct pmic_glink_client *client, void *data, size_t len)
 }
 EXPORT_SYMBOL_GPL(pmic_glink_send);
 
+static bool pmic_glink_is_wakeup_event(struct pmic_glink_client *client,
+				       const void *data, size_t len)
+{
+	if (!device_may_wakeup(client->dev))
+		return false;
+
+	return !client->wakeup_filter || client->wakeup_filter(data, len, client->priv);
+}
+
 static void pmic_glink_dispatch(struct pmic_glink *pg, const void *data, size_t len)
 {
 	const struct pmic_glink_hdr *hdr = data;
@@ -174,8 +233,12 @@ static void pmic_glink_dispatch(struct pmic_glink *pg, const void *data, size_t 
 
 	spin_lock_irqsave(&pg->client_lock, flags);
 	list_for_each_entry(client, &pg->clients, node) {
-		if (client->id == le32_to_cpu(hdr->owner))
-			client->cb(data, len, client->priv);
+		if (client->id != le32_to_cpu(hdr->owner))
+			continue;
+
+		/* From here on, the client keeps the system awake if it needs to */
+		pmic_glink_client_relax(client);
+		client->cb(data, len, client->priv);
 	}
 	spin_unlock_irqrestore(&pg->client_lock, flags);
 }
@@ -235,8 +298,11 @@ static void pmic_glink_drop_deferred(struct pmic_glink *pg)
 static int pmic_glink_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 				     int len, void *priv, u32 addr)
 {
+	struct pmic_glink_client *client;
 	struct pmic_glink_hdr *hdr;
 	struct pmic_glink *pg = dev_get_drvdata(&rpdev->dev);
+	bool notification, deferred;
+	unsigned long flags;
 
 	if (len < sizeof(*hdr)) {
 		dev_warn(pg->dev, "ignoring truncated message\n");
@@ -246,11 +312,30 @@ static int pmic_glink_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	hdr = data;
 
 	/* The sender of a request is waiting for the response */
-	if (le32_to_cpu(hdr->type) != PMIC_GLINK_REQ_RESP &&
-	    pmic_glink_defer(pg, data, len))
-		return 0;
+	notification = le32_to_cpu(hdr->type) != PMIC_GLINK_REQ_RESP;
 
-	pmic_glink_dispatch(pg, data, len);
+	/* Defer under client_lock, to set stay_awake before it is delivered */
+	spin_lock_irqsave(&pg->client_lock, flags);
+	deferred = notification && pmic_glink_defer(pg, data, len);
+	list_for_each_entry(client, &pg->clients, node) {
+		if (client->id != le32_to_cpu(hdr->owner))
+			continue;
+
+		if (deferred) {
+			if (pmic_glink_is_wakeup_event(client, data, len)) {
+				pm_stay_awake(client->dev);
+				pm_system_wakeup();
+				client->stay_awake = true;
+			}
+			continue;
+		}
+
+		if (notification && pmic_glink_is_wakeup_event(client, data, len))
+			pm_wakeup_hard_event(client->dev);
+
+		client->cb(data, len, client->priv);
+	}
+	spin_unlock_irqrestore(&pg->client_lock, flags);
 
 	return 0;
 }
@@ -330,6 +415,7 @@ static void pmic_glink_deliver_work(struct work_struct *work)
 {
 	struct pmic_glink *pg = container_of(work, struct pmic_glink, deliver_work);
 	struct pmic_glink_deferred_msg *msg;
+	struct pmic_glink_client *client;
 	unsigned int dropped;
 	unsigned long flags;
 
@@ -353,6 +439,12 @@ static void pmic_glink_deliver_work(struct work_struct *work)
 		pmic_glink_dispatch(pg, msg->data, msg->len);
 		kfree(msg);
 	}
+
+	/* Release the clients whose notifications were dropped */
+	spin_lock_irqsave(&pg->client_lock, flags);
+	list_for_each_entry(client, &pg->clients, node)
+		pmic_glink_client_relax(client);
+	spin_unlock_irqrestore(&pg->client_lock, flags);
 
 	pmic_glink_state_notify_clients(pg);
 
