@@ -117,6 +117,9 @@ struct msm_dsi_phy {
 	/* Board-provided TIMING_CTRL_0..13 (qcom,phy-timings), D-PHY only */
 	u8 dt_timings[MSM_DSI_PHY_DT_TIMINGS];
 	bool has_dt_timings;
+	/* Board-provided HS TX strength (qcom,phy-hstx-strength), D-PHY only */
+	u8 dt_hstx_strength;
+	bool has_dt_hstx_strength;
 	const struct msm_dsi_phy_cfg *cfg;
 	void *tuning_cfg;
 	void *pll_data;
