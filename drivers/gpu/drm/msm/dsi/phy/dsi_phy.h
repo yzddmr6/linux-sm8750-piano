@@ -22,6 +22,8 @@ struct msm_dsi_phy_ops {
 	int (*restore_pll_state)(struct msm_dsi_phy *phy);
 	bool (*set_continuous_clock)(struct msm_dsi_phy *phy, bool enable);
 	int (*parse_dt_properties)(struct msm_dsi_phy *phy);
+	void (*toggle_resync_fifo)(struct msm_dsi_phy *phy);
+	void (*reset_clk_en_sel)(struct msm_dsi_phy *phy);
 };
 
 struct msm_dsi_phy_cfg {
@@ -128,6 +130,9 @@ struct msm_dsi_phy {
 
 	struct clk *ahb_clk;
 };
+
+void msm_dsi_phy_toggle_resync_fifo(struct msm_dsi_phy *phy);
+void msm_dsi_phy_reset_clk_en_sel(struct msm_dsi_phy *phy);
 
 /*
  * PHY internal functions
