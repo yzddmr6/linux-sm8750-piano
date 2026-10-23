@@ -188,6 +188,14 @@ config VIDEO_SC1300CS
 	  To compile this driver as a module, choose M here: the module
 	  will be called sc1300cs.
 
+config VIDEO_SC820CS
+	tristate "SmartSens SC820CS sensor support"
+	select V4L2_CCI_I2C
+	help
+	  V4L2 driver for the SmartSens SC820CS RAW10 camera sensor.
+	  To compile this driver as a module, choose M here: the module
+	  will be called sc820cs.
+
 config VIDEO_IMX219
 	tristate "Sony IMX219 sensor support"
 	select V4L2_CCI_I2C
