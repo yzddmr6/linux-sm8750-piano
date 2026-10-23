@@ -1075,6 +1075,15 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
 		lane_ctrl0 = 0x1f;
 	}
 
+	/*
+	 * Vendor panels may ship a stronger HS transmitter setting; the
+	 * downstream driver then also selects the strength calibration path.
+	 */
+	if (phy->has_dt_hstx_strength && !phy->cphy_mode) {
+		glbl_hstx_str_ctrl_0 = phy->dt_hstx_strength;
+		glbl_str_swi_cal_sel_ctrl = 0x01;
+	}
+
 	if ((phy->cfg->quirks & DSI_PHY_7NM_QUIRK_V7_2)) {
 		if (phy->cphy_mode) {
 			/* TODO: different for second phy */
