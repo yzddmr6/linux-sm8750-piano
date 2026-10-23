@@ -97,6 +97,7 @@ struct msm_dsi_dphy_timing {
 #define NUM_PROVIDED_CLKS		(DSI_PIXEL_PLL_CLK + 1)
 
 #define DSI_LANE_MAX			5
+#define MSM_DSI_PHY_DT_TIMINGS		14
 
 struct msm_dsi_phy {
 	struct platform_device *pdev;
@@ -113,6 +114,9 @@ struct msm_dsi_phy {
 	struct regulator_bulk_data *supplies;
 
 	struct msm_dsi_dphy_timing timing;
+	/* Board-provided TIMING_CTRL_0..13 (qcom,phy-timings), D-PHY only */
+	u8 dt_timings[MSM_DSI_PHY_DT_TIMINGS];
+	bool has_dt_timings;
 	const struct msm_dsi_phy_cfg *cfg;
 	void *tuning_cfg;
 	void *pll_data;
