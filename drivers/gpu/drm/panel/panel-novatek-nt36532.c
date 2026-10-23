@@ -6,6 +6,7 @@
  * Copyright (c) 2025, 2026 Junjie Cao <junjie.cao@linux.dev>
  */
 
+#include <linux/debugfs.h>
 #include <linux/delay.h>
 #include <linux/device-id/of.h>
 #include <linux/gpio/consumer.h>
@@ -13,6 +14,7 @@
 #include <linux/of.h>
 #include <linux/of_graph.h>
 #include <linux/regulator/consumer.h>
+#include <linux/seq_file.h>
 
 #include <video/mipi_display.h>
 
@@ -226,10 +228,55 @@ static int nt36532_get_modes(struct drm_panel *panel,
 	return panel_info->num_modes;
 }
 
+/*
+ * Link health readback for the flicker investigation: the DCS status
+ * registers every DDIC implements. 0x05 counts DSI packets the panel
+ * rejected (ECC/checksum/...), 0x0e bit 0 latches "error on DSI".
+ */
+static int nt36532_dsi_errors_show(struct seq_file *m, void *data)
+{
+	static const u8 regs[] = { MIPI_DCS_GET_ERROR_COUNT_ON_DSI,
+				   MIPI_DCS_GET_POWER_MODE,
+				   MIPI_DCS_GET_SIGNAL_MODE,
+				   MIPI_DCS_GET_DIAGNOSTIC_RESULT };
+	struct nt36532 *ctx = m->private;
+	unsigned int i, link;
+
+	if (!ctx->panel.prepared)
+		return -ENODEV;
+
+	for (link = 0; link < (ctx->panel_info->is_dual_dsi ? 2 : 1); link++) {
+		seq_printf(m, "dsi%u:", link);
+		for (i = 0; i < ARRAY_SIZE(regs); i++) {
+			u8 val = 0;
+			int ret;
+
+			ret = mipi_dsi_dcs_read(ctx->dsi[link], regs[i], &val, 1);
+			if (ret < 0)
+				seq_printf(m, " %02x=err%d", regs[i], ret);
+			else
+				seq_printf(m, " %02x=%02x", regs[i], val);
+		}
+		seq_putc(m, '\n');
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nt36532_dsi_errors);
+
+static void nt36532_debugfs_init(struct drm_panel *panel, struct dentry *root)
+{
+	struct nt36532 *ctx = to_nt36532(panel);
+
+	debugfs_create_file("dsi_errors", 0400, root, ctx,
+			    &nt36532_dsi_errors_fops);
+}
+
 static const struct drm_panel_funcs nt36532_panel_funcs = {
 	.prepare = nt36532_prepare,
 	.unprepare = nt36532_unprepare,
 	.get_modes = nt36532_get_modes,
+	.debugfs_init = nt36532_debugfs_init,
 };
 
 static int csot_init_sequence(struct nt36532 *ctx,
