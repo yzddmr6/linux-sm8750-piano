@@ -1154,6 +1154,14 @@
 &mdss_dsi0_phy {
 	/* Stock vdda-0p9 on both PHYs: L3I, 98 mA. */
 	vdds-supply = <&vreg_l3i_0p88>;
+	/*
+	 * Panel-tuned D-PHY TIMING_CTRL_0..13 from the stock panel node
+	 * (qcom,mdss-dsi-panel-phy-timings, 1197.5 Mbps/lane). The generic
+	 * calculation yields a shorter hs_rqst and longer hs_zero/hs_exit/
+	 * clk_trail/clk_pre/clk_post than the vendor tuning.
+	 */
+	qcom,phy-timings = /bits/ 8 <0x00 0x27 0x0a 0x0a 0x1b 0x19 0x0a
+				     0x0b 0x0a 0x02 0x04 0x00 0x20 0x0f>;
 };
 
 &mdss_dsi1 {
@@ -1184,6 +1192,8 @@
 
 &mdss_dsi1_phy {
 	vdds-supply = <&vreg_l3i_0p88>;
+	qcom,phy-timings = /bits/ 8 <0x00 0x27 0x0a 0x0a 0x1b 0x19 0x0a
+				     0x0b 0x0a 0x02 0x04 0x00 0x20 0x0f>;
 };
 
 &mpss_mem {

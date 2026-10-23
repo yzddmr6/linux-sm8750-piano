@@ -1213,6 +1213,28 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
 		writel(0x02, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_9);
 		writel(0x04, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_10);
 		writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_11);
+	} else if (phy->has_dt_timings) {
+		const u8 *t = phy->dt_timings;
+
+		/* Keep the host-side clk_pre/clk_post in step with the PHY. */
+		timing->shared_timings.clk_pre = t[12];
+		timing->shared_timings.clk_post = t[13];
+		timing->shared_timings.clk_pre_inc_by_2 = false;
+
+		writel(t[0], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0);
+		writel(t[1], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_1);
+		writel(t[2], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_2);
+		writel(t[3], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_3);
+		writel(t[4], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_4);
+		writel(t[5], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_5);
+		writel(t[6], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_6);
+		writel(t[7], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_7);
+		writel(t[8], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_8);
+		writel(t[9], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_9);
+		writel(t[10], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_10);
+		writel(t[11], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_11);
+		writel(t[12], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_12);
+		writel(t[13], base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_13);
 	} else {
 		writel(0x00, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_0);
 		writel(timing->clk_zero, base + REG_DSI_7nm_PHY_CMN_TIMING_CTRL_1);
