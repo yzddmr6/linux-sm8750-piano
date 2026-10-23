@@ -69,6 +69,10 @@ enum qcom_battmgr_variant {
 #define NOTIF_OPLUS_TYPEC_STATE		0x55
 #define NOTIF_OPLUS_PLUGIN		0x57
 #define NOTIF_OPLUS_APSD_DONE		0x58
+/* OPLUS firmware: UFCS and reverse charging events */
+#define NOTIF_OPLUS_UFCS_DISABLE_MOS	0x73
+#define NOTIF_OPLUS_POWER_ROLE		0x7d
+#define NOTIF_OPLUS_PD_HARD_RESET	0x7f
 
 #define BATTMGR_BAT_INFO		0x9
 
@@ -1977,6 +1981,17 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 			qcom_battmgr_usb_event(battmgr);
 			break;
 		}
+		fallthrough;
+	case NOTIF_OPLUS_UFCS_DISABLE_MOS:
+	case NOTIF_OPLUS_POWER_ROLE:
+	case NOTIF_OPLUS_PD_HARD_RESET:
+		/*
+		 * UFCS charge pump and reverse charging events, for features
+		 * this driver does not have; the power role reaches the OS
+		 * through UCSI.
+		 */
+		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE)
+			break;
 		fallthrough;
 	default:
 		dev_err(battmgr->dev, "unknown notification: %#x\n", notification);
