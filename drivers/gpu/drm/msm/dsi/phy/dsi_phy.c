@@ -659,6 +659,20 @@ static int dsi_phy_driver_probe(struct platform_device *pdev)
 		DRM_DEV_ERROR(dev, "invalid qcom,phy-timings (%d)\n", ret);
 	}
 
+	/*
+	 * Optional board-tuned HS transmitter strength (GLBL_HSTX_STR_CTRL_0),
+	 * as shipped in the vendor panel configuration (clk-strength).
+	 */
+	ret = of_property_read_u8(dev->of_node, "qcom,phy-hstx-strength",
+				  &phy->dt_hstx_strength);
+	if (!ret && !phy->cphy_mode) {
+		phy->has_dt_hstx_strength = true;
+		DRM_DEV_INFO(dev, "using board HS TX strength 0x%02x\n",
+			     phy->dt_hstx_strength);
+	} else if (ret != -EINVAL) {
+		DRM_DEV_ERROR(dev, "invalid qcom,phy-hstx-strength (%d)\n", ret);
+	}
+
 	phy->base = msm_ioremap_size(pdev, "dsi_phy", &phy->base_size);
 	if (IS_ERR(phy->base))
 		return dev_err_probe(dev, PTR_ERR(phy->base),
