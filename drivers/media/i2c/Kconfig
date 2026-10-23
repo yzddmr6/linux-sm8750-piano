@@ -1020,6 +1020,13 @@ config VIDEO_DW9768
 	  capability. This is designed for linear control of
 	  voice coil motors, controlled via I2C serial interface.
 
+config VIDEO_CN3927
+	tristate "Chipnext CN3927 lens voice coil support"
+	help
+	  V4L2 driver for the Chipnext CN3927 10-bit lens actuator.
+	  To compile this driver as a module, choose M here: the module
+	  will be called cn3927.
+
 config VIDEO_DW9807_VCM
 	tristate "DW9807 lens voice coil support"
 	help
