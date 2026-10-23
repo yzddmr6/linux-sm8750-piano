@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/i2c/chipnext,cn3927.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Chipnext CN3927 voice coil lens actuator
+
+maintainers:
+  - Erwin <46088090+yzddmr6@users.noreply.github.com>
+
+description:
+  The CN3927 controls a camera lens voice coil through a 10-bit DAC
+  and an I2C control interface.
+
+properties:
+  compatible:
+    const: chipnext,cn3927
+
+  reg:
+    maxItems: 1
+
+  vio-supply:
+    description: I/O supply, 1.8 V.
+
+  vaf-supply:
+    description: Voice coil supply, 2.8 V.
+
+required:
+  - compatible
+  - reg
+  - vio-supply
+  - vaf-supply
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        lens@c {
+            compatible = "chipnext,cn3927";
+            reg = <0x0c>;
+            vio-supply = <&camera_vio>;
+            vaf-supply = <&camera_vaf>;
+        };
+    };

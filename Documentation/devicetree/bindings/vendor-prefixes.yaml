@@ -325,6 +325,8 @@ patternProperties:
     description: Chefree Technology Corp.
   "^chipidea,.*":
     description: Chipidea, Inc
+  "^chipnext,.*":
+    description: Chipnext Technology Inc.
   "^chipone,.*":
     description: ChipOne
   "^chipspark,.*":
@@ -1589,6 +1591,8 @@ patternProperties:
     description: SKOV A/S
   "^skyworks,.*":
     description: Skyworks Solutions, Inc.
+  "^smartsens,.*":
+    description: SmartSens Technology Co., Ltd.
   "^smartfiber,.*":
     description: ShenZhen Smartfiber Technology Co, Ltd.
   "^smartlabs,.*":
