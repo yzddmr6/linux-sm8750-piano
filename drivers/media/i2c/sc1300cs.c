@@ -4,6 +4,7 @@
  *
  * Based on TheMojoMan's sc1320cs driver in
  * https://github.com/TheMojoMan/oneplus-erhai-linux
+ * revision 74ba8ddb4dc8fd930841b6802053b4362b59ce46.
  * Register sequences originate from Android bus captures, not a datasheet.
  * The original attribution is retained:
  * Copyright (c) Qualcomm Innovation Center, Inc. All rights reserved.
@@ -325,7 +326,7 @@ static int sc1300cs_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	if (ctrl->id == V4L2_CID_VBLANK) {
 		exposure_max = (SC1300CS_HEIGHT + ctrl->val - SC1300CS_EXPOSURE_MARGIN) & ~1;
-		ret = __v4l2_ctrl_modify_range(sensor->exposure, 2, exposure_max,
+		ret = __v4l2_ctrl_modify_range(sensor->exposure, 4, exposure_max,
 					       2, min(exposure_max, 1000));
 		if (ret)
 			return ret;
@@ -390,7 +391,7 @@ static int sc1300cs_init_controls(struct sc1300cs *sensor)
 					 SC1300CS_VTS_MAX - SC1300CS_HEIGHT, 2,
 					 SC1300CS_VTS - SC1300CS_HEIGHT);
 	sensor->exposure = v4l2_ctrl_new_std(hdl, &sc1300cs_ctrl_ops, V4L2_CID_EXPOSURE,
-					   2, (SC1300CS_VTS - SC1300CS_EXPOSURE_MARGIN) & ~1,
+					   4, (SC1300CS_VTS - SC1300CS_EXPOSURE_MARGIN) & ~1,
 					   2, 1000);
 	v4l2_ctrl_new_std(hdl, &sc1300cs_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
 			  1024, 16384, 8, 1024);

@@ -5,6 +5,7 @@
  *
  * Based on TheMojoMan's CN3927 driver in
  * https://github.com/TheMojoMan/oneplus-erhai-linux
+ * revision 74ba8ddb4dc8fd930841b6802053b4362b59ce46.
  * The unlock sequence and split DAC writes match the OnePlus Android
  * actuator configuration. The focus DAC is 10 bits at registers 0x03/0x04.
  */

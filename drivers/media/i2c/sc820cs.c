@@ -4,6 +4,7 @@
  *
  * Based on TheMojoMan's sc820cs driver in
  * https://github.com/TheMojoMan/oneplus-erhai-linux
+ * revision 74ba8ddb4dc8fd930841b6802053b4362b59ce46.
  * Register sequences originate from Android bus captures, not a datasheet.
  * The original attribution is retained:
  * Copyright (c) Qualcomm Innovation Center, Inc. All rights reserved.
