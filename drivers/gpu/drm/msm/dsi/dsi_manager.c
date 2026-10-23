@@ -241,6 +241,16 @@ static int dsi_mgr_bridge_power_on(struct drm_bridge *bridge)
 		}
 	}
 
+	/* Both HS clock paths are ready: synchronize both PHYs first. */
+	msm_dsi_phy_toggle_resync_fifo(msm_dsi->phy);
+	if (is_bonded_dsi && msm_dsi1)
+		msm_dsi_phy_toggle_resync_fifo(msm_dsi1->phy);
+
+	/* Release D-PHY CLK_EN_SEL only after both FIFOs are synchronized. */
+	msm_dsi_phy_reset_clk_en_sel(msm_dsi->phy);
+	if (is_bonded_dsi && msm_dsi1)
+		msm_dsi_phy_reset_clk_en_sel(msm_dsi1->phy);
+
 	/*
 	 * Enable before preparing the panel, disable after unpreparing, so
 	 * that the panel can communicate over the DSI link.
