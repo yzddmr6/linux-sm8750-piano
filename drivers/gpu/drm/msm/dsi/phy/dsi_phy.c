@@ -644,6 +644,21 @@ static int dsi_phy_driver_probe(struct platform_device *pdev)
 	if (!of_property_read_u32(dev->of_node, "phy-type", &phy_type))
 		phy->cphy_mode = (phy_type == PHY_TYPE_CPHY);
 
+	/*
+	 * Optional board-tuned D-PHY timing registers (TIMING_CTRL_0..13),
+	 * as shipped in the vendor panel configuration. When present they
+	 * replace the generic timing calculation for the D-PHY case.
+	 */
+	ret = of_property_read_u8_array(dev->of_node, "qcom,phy-timings",
+					phy->dt_timings, MSM_DSI_PHY_DT_TIMINGS);
+	if (!ret && !phy->cphy_mode) {
+		phy->has_dt_timings = true;
+		DRM_DEV_INFO(dev, "using board D-PHY timings %*ph\n",
+			     MSM_DSI_PHY_DT_TIMINGS, phy->dt_timings);
+	} else if (ret != -EINVAL) {
+		DRM_DEV_ERROR(dev, "invalid qcom,phy-timings (%d)\n", ret);
+	}
+
 	phy->base = msm_ioremap_size(pdev, "dsi_phy", &phy->base_size);
 	if (IS_ERR(phy->base))
 		return dev_err_probe(dev, PTR_ERR(phy->base),
