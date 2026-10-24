@@ -19,6 +19,7 @@
 #include <linux/panic_notifier.h>
 #include <linux/platform_device.h>
 #include <linux/pm_opp.h>
+#include <linux/pm_qos.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/soc/qcom/geni-se.h>
@@ -90,8 +91,17 @@ struct geni_spi_desc {
 	int (*power_off)(struct geni_se *se);
 };
 
+/*
+ * CPU latency limit held while a GPI DMA message is in flight. On SM8750 the
+ * system low power domain (exit latency 4400 us in the DT) is otherwise
+ * entered with the DMA running and stalls it; the cluster state (1983 us)
+ * is harmless. Measured on piano, see the commit message.
+ */
+#define SPI_GENI_GPI_QOS_US	2000
+
 struct spi_geni_master {
 	struct geni_se se;
+	struct pm_qos_request pm_qos;
 	struct device *dev;
 	u32 tx_fifo_depth;
 	u32 fifo_width_bits;
@@ -570,12 +580,34 @@ static int spi_geni_prepare_message(struct spi_controller *spi,
 		return 0;
 
 	case GENI_GPI_DMA:
-		/* nothing to do for GPI DMA */
+		/*
+		 * The DMA engine moves the data to DDR on its own while every
+		 * CPU may be idle waiting for the completion interrupt. Keep
+		 * the system out of the low power mode that stalls it.
+		 */
+		cpu_latency_qos_update_request(&mas->pm_qos, SPI_GENI_GPI_QOS_US);
 		return 0;
 	}
 
 	dev_err(mas->dev, "Mode not supported %d", mas->cur_xfer_mode);
 	return -EINVAL;
+}
+
+static int spi_geni_unprepare_message(struct spi_controller *spi,
+				      struct spi_message *spi_msg)
+{
+	struct spi_geni_master *mas = spi_controller_get_devdata(spi);
+
+	if (mas->cur_xfer_mode == GENI_GPI_DMA)
+		cpu_latency_qos_update_request(&mas->pm_qos, PM_QOS_DEFAULT_VALUE);
+	return 0;
+}
+
+static void spi_geni_remove_qos(void *data)
+{
+	struct spi_geni_master *mas = data;
+
+	cpu_latency_qos_remove_request(&mas->pm_qos);
 }
 
 static void spi_geni_release_dma_chan(void *data)
@@ -1189,6 +1221,7 @@ static int spi_geni_probe(struct platform_device *pdev)
 	spi->max_speed_hz = 50000000;
 	spi->max_dma_len = 0xffff0; /* 24 bits for tx/rx dma length */
 	spi->prepare_message = spi_geni_prepare_message;
+	spi->unprepare_message = spi_geni_unprepare_message;
 	spi->transfer_one = spi_geni_transfer_one;
 	spi->can_dma = geni_can_dma;
 	spi->dma_map_dev = dev->parent;
@@ -1211,6 +1244,11 @@ static int spi_geni_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, PTR_ERR(mas->ready_gpio),
 					      "Failed to request GPIO\n");
 	}
+
+	cpu_latency_qos_add_request(&mas->pm_qos, PM_QOS_DEFAULT_VALUE);
+	ret = devm_add_action_or_reset(dev, spi_geni_remove_qos, mas);
+	if (ret)
+		return ret;
 
 	pm_runtime_use_autosuspend(&pdev->dev);
 	pm_runtime_set_autosuspend_delay(&pdev->dev, 250);
