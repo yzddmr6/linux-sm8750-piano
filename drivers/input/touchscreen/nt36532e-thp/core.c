@@ -83,6 +83,8 @@ struct nvt_thp {
 	int lcd_id; /* Panel module ID pin level; -1 without the pin. */
 	u8 *tx, *rx, *record;
 	size_t max_read;
+	u32 page; /* Last page selected while page_cached; the IC keeps it. */
+	bool page_cached;
 	u16 frame_length;
 	u8 reset_state; /* Last successful reset-state sample for this start. */
 	u64 sequence;
@@ -131,12 +133,25 @@ static int nvt_transfer(struct nvt_thp *nvt, size_t size, bool read)
 	return spi_sync(nvt->spi, &message);
 }
 
+/*
+ * The vendor driver selects the page once per address change; the stream
+ * reads and host commands all live in the event buffer page, so it never
+ * writes the page register per frame. Cache it while streaming only: the
+ * resets of the download sequence clear the IC's page register.
+ */
 static int nvt_select_page(struct nvt_thp *nvt, u32 address)
 {
+	int ret;
+
+	if (nvt->page_cached && nvt->page == address >> 7)
+		return 0;
 	nvt->tx[0] = 0xff;
 	nvt->tx[1] = address >> 15;
 	nvt->tx[2] = address >> 7;
-	return nvt_transfer(nvt, 3, false);
+	ret = nvt_transfer(nvt, 3, false);
+	nvt->page = address >> 7;
+	nvt->page_cached = !ret && READ_ONCE(nvt->running);
+	return ret;
 }
 
 static int nvt_spi_read(void *context, const void *reg, size_t reg_size,
@@ -260,6 +275,7 @@ static irqreturn_t nvt_irq(int irq, void *data)
 static void nvt_stop_irq(struct nvt_thp *nvt)
 {
 	WRITE_ONCE(nvt->running, false);
+	nvt->page_cached = false;
 	nvt->charger_sent = -1;
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
 	if (nvt->test_stop) {
