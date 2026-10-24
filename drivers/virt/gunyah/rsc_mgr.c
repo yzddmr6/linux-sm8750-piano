@@ -1000,15 +1000,17 @@ static int __init gunyah_rm_init(void)
 		if (ret)
 			pr_err("Failed to register pm notifier\n");
 	}
-	if (ret)
+	if (ret) {
+		rm->pm_nb.notifier_call = NULL;
 		return ret;
+	}
 
 	enable_irq_wake(rm->tx_ghrsc.irq);
 	ret = request_threaded_irq(rm->tx_ghrsc.irq, NULL,
 					 gunyah_rm_tx, IRQF_ONESHOT,
 					 "gunyah_rm_tx", rm);
 	if (ret)
-		return ret;
+		goto unregister_pm;
 	/* assume RM is ready to receive messages from us */
 	complete(&rm->send_ready);
 
@@ -1051,6 +1053,9 @@ free_rx_irq:
 	free_irq(rm->rx_ghrsc.irq, rm);
 free_tx_irq:
 	free_irq(rm->tx_ghrsc.irq, rm);
+unregister_pm:
+	if (rm->pm_nb.notifier_call)
+		unregister_pm_notifier(&rm->pm_nb);
 	return ret;
 }
 module_init(gunyah_rm_init);
@@ -1064,6 +1069,9 @@ static void __exit gunyah_rm_exit(void)
 	if (!rm)
 		return;
 
+	/* the PM notifier lives in this module: never leave it on the chain */
+	if (rm->pm_nb.notifier_call)
+		unregister_pm_notifier(&rm->pm_nb);
 	gunyah_rm_sysfs_unregister();
 	gunyah_cma_mem_exit();
 	auxiliary_device_delete(&rm->adev);
