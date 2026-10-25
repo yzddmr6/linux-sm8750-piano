@@ -217,7 +217,7 @@ static int gunyah_vm_pshare_submit(struct gunyah_vm *ghvm,
 
 	for (tries = 0; tries < GUNYAH_PSHARE_SHARE_TRIES; tries++) {
 		ret = gunyah_rm_mem_share(ghvm->rm, &ps->parcel);
-		if (!ret)
+		if (!ret || ret == -ENOTRECOVERABLE)
 			break;
 		usleep_range(500, 1500);
 	}
@@ -299,6 +299,12 @@ int gunyah_vm_pshare_user(struct gunyah_vm *ghvm,
 					   PAGE_SIZE);
 
 	ret = gunyah_vm_pshare_submit(ghvm, ps, &args->mem_handle);
+	if (ret == -ENOTRECOVERABLE) {
+		/* memory still assigned away: keep the pins and the accounting */
+		dev_err(ghvm->parent, "share label %u not rolled back: keeping %lu pinned pages\n",
+			args->label, npages);
+		goto free_parcel;
+	}
 	if (ret)
 		goto unaccount;
 
@@ -400,6 +406,13 @@ int gunyah_vm_pshare_dmabuf(struct gunyah_vm *ghvm,
 		goto free_parcel;
 
 	ret = gunyah_vm_pshare_submit(ghvm, ps, &args->mem_handle);
+	if (ret == -ENOTRECOVERABLE) {
+		/* memory still assigned away: keep the exporter's buffer mapped and referenced */
+		dev_err(ghvm->parent, "dmabuf share label %u not rolled back: keeping the buffer\n",
+			args->label);
+		gunyah_vm_pshare_free_parcel(ps);
+		return ret;
+	}
 	if (ret)
 		goto free_parcel;
 	return 0;
