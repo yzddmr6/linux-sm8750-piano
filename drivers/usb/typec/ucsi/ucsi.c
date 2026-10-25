@@ -2428,6 +2428,7 @@ void ucsi_unregister(struct ucsi *ucsi)
 	}
 
 	kfree(ucsi->connector);
+	ucsi->connector = NULL;
 }
 EXPORT_SYMBOL_GPL(ucsi_unregister);
 
