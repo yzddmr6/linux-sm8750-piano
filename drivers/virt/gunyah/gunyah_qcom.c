@@ -104,13 +104,22 @@ qcom_scm_gunyah_rm_post_mem_reclaim(struct gunyah_rm *rm,
 	}
 
 	for (i = 0; i < mem_parcel->n_mem_entries; i++) {
+		int err;
+
 		src_cpy = src;
-		ret = qcom_scm_assign_mem(
-			le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
-			le64_to_cpu(mem_parcel->mem_entries[i].size), &src_cpy,
-			&new_perms, 1);
-		WARN_ON_ONCE(ret);
+		err = qcom_scm_assign_mem(le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
+					  le64_to_cpu(mem_parcel->mem_entries[i].size),
+					  &src_cpy, &new_perms, 1);
+		if (err) {
+			pr_err("gunyah: failed to give %#llx (+%#llx) back to HLOS: %d\n",
+			       le64_to_cpu(mem_parcel->mem_entries[i].phys_addr),
+			       le64_to_cpu(mem_parcel->mem_entries[i].size), err);
+			/* report the first failure, try every entry */
+			if (!ret)
+				ret = err;
+		}
 	}
+	WARN_ON_ONCE(ret);
 
 	return ret;
 }
