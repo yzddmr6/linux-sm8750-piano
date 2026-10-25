@@ -80,10 +80,6 @@
 #define ADC5_GEN4_V_CHAN_BUS_INDEX_MASK		GENMASK(14, 13)
 #define ADC5_GEN4_V_CHAN_SID_MASK		GENMASK(12, 8)
 #define ADC5_GEN4_V_CHAN_CHANNEL_MASK		GENMASK(7, 0)
-#define ADC5_GEN4_V_CHAN(x) \
-	(FIELD_PREP(ADC5_GEN4_V_CHAN_BUS_INDEX_MASK, (x).bus_index) | \
-	 FIELD_PREP(ADC5_GEN4_V_CHAN_SID_MASK, (x).sid) | \
-	 FIELD_PREP(ADC5_GEN4_V_CHAN_CHANNEL_MASK, (x).channel))
 
 /* ADC channels for PMIC5 Gen3 */
 #define ADC5_GEN3_REF_GND			0x00
@@ -186,6 +182,9 @@ struct adc5_device_data {
  *	that is an average of multiple measurements.
  * @scale_fn_type: Represents the scaling function to convert voltage
  *	physical units desired by the client for the channel.
+ * @generation: ADC generation of the PMIC owning the channel.
+ * @bus_index: SPMI bus containing the PMIC owning the channel.
+ * @data: Conversion parameters for this channel's ADC generation.
  */
 struct adc5_channel_common_prop {
 	unsigned int channel;
@@ -201,6 +200,13 @@ struct adc5_channel_common_prop {
 	unsigned int bus_index;
 	const struct adc5_data *data;
 };
+
+static inline unsigned int adc5_gen4_v_chan(const struct adc5_channel_common_prop *prop)
+{
+	return FIELD_PREP(ADC5_GEN4_V_CHAN_BUS_INDEX_MASK, prop->bus_index) |
+	       FIELD_PREP(ADC5_GEN4_V_CHAN_SID_MASK, prop->sid) |
+	       FIELD_PREP(ADC5_GEN4_V_CHAN_CHANNEL_MASK, prop->channel);
+}
 
 /**
  * struct tm5_aux_dev_wrapper - wrapper structure around TM auxiliary device

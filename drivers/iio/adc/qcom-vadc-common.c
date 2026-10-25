@@ -301,10 +301,9 @@ static const struct u32_fract adc5_prescale_ratios[] = {
 	{ .numerator =  1, .denominator = 16 },
 };
 
-static int qcom_adc5_gen4_scale_hw_calib_therm(
-				const struct u32_fract *prescale,
-				const struct adc5_data *data,
-				u16 adc_code, int *result_mdec);
+static int qcom_adc5_gen4_scale_hw_calib_therm(const struct u32_fract *prescale,
+					       const struct adc5_data *data,
+					       u16 adc_code, int *result_mdec);
 static int qcom_vadc_scale_hw_calib_volt(
 				const struct u32_fract *prescale,
 				const struct adc5_data *data,
@@ -562,10 +561,9 @@ static int qcom_vadc7_scale_hw_calib_therm(
 	return 0;
 }
 
-static int qcom_adc5_gen4_scale_hw_calib_therm(
-				const struct u32_fract *prescale,
-				const struct adc5_data *data,
-				u16 adc_code, int *result_mdec)
+static int qcom_adc5_gen4_scale_hw_calib_therm(const struct u32_fract *prescale,
+					       const struct adc5_data *data,
+					       u16 adc_code, int *result_mdec)
 {
 	s64 resistance = adc_code;
 	int ret, result;

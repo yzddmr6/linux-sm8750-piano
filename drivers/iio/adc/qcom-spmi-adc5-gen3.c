@@ -100,11 +100,10 @@ static int adc5_gen3_read_voltage_data(struct adc5_chip *adc,
 
 	*data = get_unaligned_le16(rslt);
 
-	if (*data == ADC5_USR_DATA_CHECK) {
-		if (!(prop->generation == ADC5_GEN4 && prop->cal_method == ADC5_RATIOMETRIC_CAL)) {
-			dev_err(adc->dev, "Invalid data:%#x\n", *data);
-			return -EINVAL;
-		}
+	if (*data == ADC5_USR_DATA_CHECK &&
+	    !(prop->generation == ADC5_GEN4 && prop->cal_method == ADC5_RATIOMETRIC_CAL)) {
+		dev_err(adc->dev, "Invalid data:%#x\n", *data);
+		return -EINVAL;
 	}
 
 	dev_dbg(adc->dev, "voltage raw code:%#x\n", *data);
@@ -135,7 +134,7 @@ static int adc5_gen3_configure(struct adc5_chip *adc,
 	if (ret)
 		return ret;
 
-	/* Write SID and bus_id*/
+	/* Write SID and bus index */
 	buf[0] = FIELD_PREP(ADC5_GEN4_BUS_INDEX_MASK, prop->bus_index) |
 		 FIELD_PREP(ADC5_GEN4_SID_MASK, prop->sid);
 
@@ -330,7 +329,7 @@ static int adc5_gen3_fwnode_xlate(struct iio_dev *indio_dev,
 	int i, v_channel;
 
 	for (i = 0; i < adc->nchannels; i++) {
-		v_channel = ADC5_GEN4_V_CHAN(adc->chan_props[i].common_props);
+		v_channel = adc5_gen4_v_chan(&adc->chan_props[i].common_props);
 		if (v_channel == iiospec->args[0])
 			return i;
 	}
@@ -663,7 +662,7 @@ static int adc5_get_fw_data(struct adc5_chip *adc)
 		adc_chan = &data->adc_chans[chan_props->common_props.channel];
 		chan_props->common_props.scale_fn_type = adc_chan->scale_fn_type;
 
-		iio_chan->channel = ADC5_GEN4_V_CHAN(chan_props->common_props);
+		iio_chan->channel = adc5_gen4_v_chan(&chan_props->common_props);
 		iio_chan->info_mask_separate = adc_chan->info_mask;
 		iio_chan->type = adc_chan->type;
 		iio_chan->address = index;
