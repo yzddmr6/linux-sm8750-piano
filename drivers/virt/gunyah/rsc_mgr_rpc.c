@@ -298,7 +298,12 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
 	kfree(msg);
 
 	if (ret) {
-		gunyah_rm_platform_post_mem_reclaim(rm, p);
+		/*
+		 * If the platform cannot give the memory back to HLOS, the
+		 * caller must not release it: report that apart.
+		 */
+		if (gunyah_rm_platform_post_mem_reclaim(rm, p))
+			return -ENOTRECOVERABLE;
 		return ret;
 	}
 

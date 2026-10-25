@@ -239,20 +239,37 @@ memextent_reclaim:
 	gunyah_error = gunyah_hypercall_memextent_donate(
 		reclaim_flags(share, true), guest_extent->capid,
 		host_extent->capid, pa, size);
-	if (gunyah_error != GUNYAH_ERROR_OK)
+	if (gunyah_error != GUNYAH_ERROR_OK) {
 		pr_err("Failed to reclaim memory donation for guest address 0x%016llx: %d\n",
 		       gpa, gunyah_error);
+		/* still donated: it must not get back to the host's allocator */
+		goto quarantine;
+	}
 platform_release:
 	tmp = gunyah_rm_platform_reclaim_demand_page(ghvm->rm, ghvm->vmid,
 						     access, folio);
 	if (tmp) {
 		pr_err("Platform failed to reclaim memory for guest address 0x%016llx: %d",
 		       gpa, tmp);
-		return ret;
+		goto quarantine;
 	}
 reclaim_host:
 	gunyah_folio_host_reclaim(folio);
 	mtree_erase(&ghvm->mm, gfn);
+	return ret;
+
+quarantine:
+	/*
+	 * The folio may still be donated to the guest or assigned away from
+	 * HLOS. The caller unpins it on error, so hold a plain reference
+	 * forever instead: it must never be handed out again by the page
+	 * allocator (the next user's own assign would fail, or worse). Drop
+	 * it from the VM's tracking so teardown does not touch it.
+	 */
+	folio_get(folio);
+	mtree_erase(&ghvm->mm, gfn);
+	pr_err("gunyah: quarantined pfn %#lx (%zu bytes) still owned by the guest / secure world\n",
+	       folio_pfn(folio), size);
 	return ret;
 }
 
@@ -592,6 +609,15 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 	parcel->mem_entries[entries].size = entry_size;
 	parcel->n_mem_entries = entries + 1;
 	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
+	if (ret == -ENOTRECOVERABLE) {
+		/* some memory is still assigned away: keep every pin */
+		dev_err(ghvm->parent, "share failed and not rolled back: keeping %d pinned pages\n",
+			pinned);
+		kfree(parcel->mem_entries);
+		parcel->mem_entries = NULL;
+		parcel->n_mem_entries = 0;
+		goto free_pages;
+	}
 	if (ret)
 		goto free_mem_entries;
 
@@ -738,7 +764,6 @@ static int gunyah_gup_reclaim_parcel(struct gunyah_vm *ghvm,
 		struct gunyah_vm_parcel *vm_parcel, struct gunyah_vm_binding *b)
 {
 	struct gunyah_rm_mem_parcel *parcel = &vm_parcel->parcel;
-	struct gunyah_rm_mem_entry *entry;
 	struct folio *folio;
 	pgoff_t i;
 	int ret;
@@ -758,15 +783,24 @@ static int gunyah_gup_reclaim_parcel(struct gunyah_vm *ghvm,
 	}
 
 	for (i = 0; i < parcel->n_mem_entries; i++) {
-		entry = &parcel->mem_entries[i];
+		phys_addr_t pa = le64_to_cpu(parcel->mem_entries[i].phys_addr);
+		phys_addr_t end = pa + le64_to_cpu(parcel->mem_entries[i].size);
 
-		folio = pfn_folio(PHYS_PFN(le64_to_cpu(entry->phys_addr)));
+		/*
+		 * An entry covers physically contiguous folios, each pinned
+		 * once through its head page and accounted as one page by
+		 * gunyah_gup_share_parcel().
+		 */
+		while (pa < end) {
+			folio = pfn_folio(PHYS_PFN(pa));
 
-		if (folio_test_private(folio))
-			gunyah_folio_host_reclaim(folio);
+			if (folio_test_private(folio))
+				gunyah_folio_host_reclaim(folio);
 
-		unpin_user_page(folio_page(folio, 0));
-		account_locked_vm(ghvm->mm_s, 1, false);
+			pa += folio_size(folio);
+			unpin_user_page(folio_page(folio, 0));
+			account_locked_vm(ghvm->mm_s, 1, false);
+		}
 	}
 
 	parcel->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
