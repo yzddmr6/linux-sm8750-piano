@@ -167,6 +167,8 @@ struct xiaomi_mca_pdo {
 #define MCA_PROP_VDM_REMOVE_COMP 0x21009
 #define MCA_PROP_VDM_REVERSE	0x2100a
 #define MCA_PROP_DATA_ROLE	0x2100c	/* 1 UFP, 2 DFP; write asks a swap */
+#define MCA_PROP_PD_STATE	0x2100d
+#define MCA_PD_SNK_READY		2
 #define MCA_PROP_ADAPTER_ID	0x2100e
 #define MCA_PROP_ADAPTER_SVID	0x2100f
 #define MCA_PROP_PD_VERIFIED	0x21010
@@ -705,6 +707,8 @@ struct xiaomi_mca {
 	size_t reply_len;
 	struct xiaomi_mca_stats stats;
 };
+
+static int xiaomi_mca_read_type(struct xiaomi_mca *mca, u32 *type);
 
 /* A write carries @value in the first four bytes of the data area, a read nothing. */
 static void xiaomi_mca_build_request(struct xiaomi_mca_request *req, u32 opcode,
@@ -1341,6 +1345,77 @@ static bool xiaomi_mca_is_pd(u32 real_type)
 	return real_type == MCA_TYPE_PD || real_type == MCA_TYPE_PD_VERIFY ||
 	       real_type == MCA_TYPE_PD_PPS;
 }
+
+/* The UCSI supply belongs to another child of this PMIC GLINK instance. */
+static int xiaomi_mca_pd_supply(struct power_supply *psy, void *data)
+{
+	struct xiaomi_mca *mca = data;
+	struct device *parent = psy->dev.parent;
+	union power_supply_propval val;
+
+	/* UCSI frees its connector data after unregistering this supply. */
+	guard(rwsem_read)(&psy->epc_sem);
+	if (psy->removing)
+		return 0;
+	if (psy == mca->psy || !parent || parent->parent != mca->dev->parent ||
+	    psy->desc->type != POWER_SUPPLY_TYPE_USB)
+		return 0;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val) ||
+	    !val.intval)
+		return 0;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_USB_TYPE, &val) ||
+	    (val.intval != POWER_SUPPLY_USB_TYPE_PD &&
+	     val.intval != POWER_SUPPLY_USB_TYPE_PD_PPS))
+		return 0;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &val) ||
+	    val.intval != POWER_SUPPLY_STATUS_CHARGING)
+		return 0;
+	return 1;
+}
+
+/*
+ * REAL_TYPE can remain Unknown after a PD reconnect. The stock
+ * qcom_adsp_pd_protocol driver names PD_STATE 2 "SNK_Ready", but the state
+ * and cached PDOs alone do not establish a current PD connection. Also
+ * require UCSI to report an online PD sink with its charging path enabled.
+ * Classify it conservatively as ordinary PD; the existing policy still
+ * checks source PDOs and temperature before negotiating voltage/current.
+ */
+static int xiaomi_mca_read_type(struct xiaomi_mca *mca, u32 *type)
+{
+	struct xiaomi_mca_pdo pdos[MCA_PD_MAX_PDOS];
+	__le32 val;
+	int ret, i;
+
+	ret = xiaomi_mca_read_blob(mca, MCA_PROP_USB_REAL_TYPE, &val, sizeof(val));
+	if (ret)
+		return ret;
+	*type = le32_to_cpu(val);
+	if (*type != MCA_TYPE_UNKNOWN)
+		return 0;
+	if (power_supply_for_each_psy(mca, xiaomi_mca_pd_supply) != 1)
+		return 0;
+
+	ret = xiaomi_mca_read_blob(mca, MCA_PROP_PD_STATE, &val, sizeof(val));
+	if (ret || le32_to_cpu(val) != MCA_PD_SNK_READY)
+		return ret;
+	ret = xiaomi_mca_read_blob(mca, MCA_PROP_PDOS, pdos, sizeof(pdos));
+	if (ret)
+		return ret;
+
+	for (i = 0; i < MCA_PD_MAX_PDOS; i++) {
+		u32 ma = le32_to_cpu(pdos[i].max_ma);
+
+		if (le32_to_cpu(pdos[i].min_mv) == 5000 &&
+		    le32_to_cpu(pdos[i].max_mv) == 5000 &&
+		    ma >= MCA_ICL_MIN_MA && ma <= 5000) {
+			*type = MCA_TYPE_PD;
+			break;
+		}
+	}
+	return 0;
+}
+
 
 /*
  * Current a PD source offers at 9 V, 0 if none: its fixed 9 V PDO when it
@@ -2720,7 +2795,10 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 	if (online) {
 		mca->ibus_ua = xiaomi_mca_read_u32(mca, MCA_PROP_USB_CURRENT_NOW);
 		mca->icl_ma = xiaomi_mca_read_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT);
-		real_type = xiaomi_mca_read_u32(mca, MCA_PROP_USB_REAL_TYPE);
+		if (xiaomi_mca_read_type(mca, &real_type)) {
+			xiaomi_mca_cp_stop(mca, "charger type read failed");
+			return;
+		}
 		if (mca->ibus_ua == -1 || mca->icl_ma == -1) {
 			xiaomi_mca_cp_stop(mca, "telemetry read failed");
 			return;
@@ -2752,6 +2830,18 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 			xiaomi_mca_reset_icl(mca);
 		if (mca->fcc_written)
 			xiaomi_mca_reset_fcc(mca);
+	}
+	/* A restored PD classification must not stay blocked by an earlier
+	 * Unknown sample. Keep the same bounded retry budget until detach.
+	 */
+	if (online && xiaomi_mca_is_pd(real_type) &&
+	    !xiaomi_mca_is_pd(mca->real_type) && mca->hv == MCA_HV_BLOCKED &&
+	    mca->hv_renegs < MCA_HV_RENEG_MAX) {
+		mca->hv_renegs++;
+		mca->hv = MCA_HV_OFF;
+		if (time_before(mca->hv_retry,
+				jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS)))
+			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS);
 	}
 	mca->online = online;
 	mca->real_type = real_type;
