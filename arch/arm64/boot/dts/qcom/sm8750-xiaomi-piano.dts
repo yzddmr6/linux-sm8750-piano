@@ -326,8 +326,6 @@
 		vddrfa1p2-supply = <&vreg_s7i_1p31>;
 		vddrfa1p8-supply = <&vreg_s3g_1p86>;
 
-		clocks = <&rpmhcc RPMH_RF_CLK1>;
-
 		status = "disabled";
 
 		regulators {
