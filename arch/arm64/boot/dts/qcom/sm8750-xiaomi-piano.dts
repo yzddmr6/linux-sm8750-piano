@@ -527,6 +527,17 @@
 	status = "disabled";
 };
 
+/*
+ * The inline crypto engine is only used through UFS inline encryption,
+ * which this board's kernel does not build (SCSI_UFS_CRYPTO=n). No driver
+ * ever binds the node, which would hold the GCC sync_state. Disable it and
+ * drop the UFS reference below, so enabling UFS crypto later runs without
+ * ICE instead of failing the UFS probe on a missing ICE device.
+ */
+&ice {
+	status = "disabled";
+};
+
 &apps_rsc {
 	/*
 	 * Only stock-verified output rails (USB, UFS, PCIe0 PHY, WCN7860 PMU
@@ -1626,6 +1637,8 @@
  * upstream consumer and stay as the boot firmware left them.
  */
 &ufs_mem_hc {
+	/delete-property/ qcom,ice;
+
 	reset-gpios = <&tlmm 215 GPIO_ACTIVE_LOW>;
 
 	vcc-supply = <&vreg_l17b_2p5>;
