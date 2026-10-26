@@ -1379,18 +1379,6 @@
 	};
 };
 
-&pmk8550 {
-	/* Diagnostic SDAM2 window only; no RTC offset or writable cells. */
-	nvram@7200 {
-		compatible = "qcom,spmi-sdam";
-		reg = <0x7200>;
-		#address-cells = <1>;
-		#size-cells = <1>;
-		ranges = <0 0x7200 0x80>;
-		read-only;
-	};
-};
-
 &pmih0108_eusb2_repeater {
 	vdd18-supply = <&vreg_l15b_1p8>;
 	vdd3-supply = <&vreg_l5b_3p1>;
@@ -1400,6 +1388,17 @@
 	qcom,tune-usb2-disc-thres = /bits/ 8 <0x7>;
 	qcom,tune-usb2-preem = /bits/ 8 <0x6>;
 	qcom,squelch-detector-bp = <(-3000)>;
+};
+
+&pmk8550_rtc {
+	nvmem-cells = <&rtc_offset>;
+	nvmem-cell-names = "offset";
+};
+
+&pmk8550_sdam_2 {
+	rtc_offset: rtc-offset@72 {
+		reg = <0x72 0x4>;
+	};
 };
 
 &pon_pwrkey {
