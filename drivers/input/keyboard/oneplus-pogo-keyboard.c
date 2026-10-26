@@ -173,7 +173,7 @@ static const unsigned char pogo_kb_hid_keys[256] = {
  * microphone, touchpad, screenshot, lock, previous, play/pause, next, mute,
  * volume down and up.  The F key of a top row key that sends a media usage is
  * in pogo_kb_media_keys[]; the microphone, touchpad, screenshot and lock keys
- * send the keyboard usages below (F13, F17, Print Screen and F24).  A key is
+ * send the keyboard usages below (F13, F16/F17, Print Screen and F24).  A key is
  * always released with the code it was pressed with.
  */
 #define POGO_KB_HID_FN			0x72
@@ -184,6 +184,7 @@ static const struct {
 } pogo_kb_fn_keys[] = {
 	{ 0x46, KEY_F5 },
 	{ 0x68, KEY_F3 },
+	{ 0x6b, KEY_F4 },
 	{ 0x6c, KEY_F4 },
 	{ 0x73, KEY_F6 },
 };
