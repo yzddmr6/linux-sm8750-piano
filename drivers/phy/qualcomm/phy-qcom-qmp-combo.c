@@ -4374,6 +4374,10 @@ static int qmp_combo_usb_power_on(struct phy *phy)
 		tx_tbl_num = cfg->tx_tbl_num;
 	}
 
+	/* The common block may outlive the USB3 PCS power state. */
+	if (qmp->qmpphy_mode != QMPPHY_MODE_USB4)
+		qphy_setbits(pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL], SW_PWRDN);
+
 	qmp_configure(qmp->dev, serdes, serdes_tbl, serdes_tbl_num);
 
 	/* Tx, Rx, and PCS configurations */
