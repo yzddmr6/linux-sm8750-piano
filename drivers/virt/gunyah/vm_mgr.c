@@ -807,7 +807,7 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 {
 	struct gunyah_rm_hyp_resources *resources = NULL;
 	struct gunyah_resource *ghrsc;
-	int ret, i, n;
+	int ret, tmp, i, n;
 	u16 vmid = 0;
 
 	down_write(&ghvm->status_lock);
@@ -939,10 +939,11 @@ static int gunyah_vm_start(struct gunyah_vm *ghvm)
 	kfree(resources);
 	return ret;
 err_dealloc_vmid:
-	ret = gunyah_rm_dealloc_vmid(ghvm->rm, ghvm->vmid);
-	if (ret)
+	/* keep the start error in ret */
+	tmp = gunyah_rm_dealloc_vmid(ghvm->rm, ghvm->vmid);
+	if (tmp)
 		dev_warn(ghvm->parent,
-			 "Failed to deallocate vmid: %d\n", ret);
+			 "Failed to deallocate vmid: %d\n", tmp);
 err_rm_notifier_unregister:
 	gunyah_rm_notifier_unregister(ghvm->rm, &ghvm->nb);
 err:
