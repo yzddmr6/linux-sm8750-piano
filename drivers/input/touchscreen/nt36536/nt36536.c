@@ -2142,6 +2142,11 @@ resume_fail:
 
 static int nvt_pm_suspend(struct device *dev)
 {
+	/* Finish firmware I/O before the SPI controller suspends. */
+	flush_work(&ts->resume_work);
+	if (READ_ONCE(ts->touch_awake) && !ts->db_wakeup)
+		nvt_ts_suspend(dev);
+
 	if (device_may_wakeup(dev) && ts->db_wakeup) {
 		NVT_LOG("enable touch irq wake\n");
 		enable_irq_wake(ts->client->irq);
@@ -2160,6 +2165,10 @@ static int nvt_pm_resume(struct device *dev)
 	}
 	ts->dev_pm_suspend = false;
 	complete(&ts->dev_pm_suspend_completion);
+
+	/* A panel that stayed prepared will not send another prepare callback. */
+	if (nvt_panel_resume_allowed(ts))
+		queue_work(ts->event_wq, &ts->resume_work);
 
 	return 0;
 }
