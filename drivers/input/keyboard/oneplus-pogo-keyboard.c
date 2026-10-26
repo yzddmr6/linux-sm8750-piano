@@ -256,6 +256,8 @@ struct pogo_kb {
 	unsigned int rx_len;
 	unsigned int rx_sync;
 	unsigned long last_rx;
+	bool heartbeat_seen;
+	bool wake_pending;
 	u8 brand;
 	struct input_dev *kbd;
 	struct input_dev *tp;
@@ -495,19 +497,27 @@ static void pogo_kb_rx_sync(struct pogo_kb *kb, const u8 *data, u8 len)
 			kb->brand = data[2];
 		else if (heartbeat && len >= 4)
 			kb->brand = data[3];
+		kb->wake_pending = true;
 		queue_work(system_freezable_wq, &kb->attach_work);
 		return;
 	}
 
-	if (data[0] == POGO_KB_SYNC_POWER_ON) {
-		/* The keyboard restarted while it stayed powered */
-		dev_dbg(kb->dev, "keyboard restarted\n");
-		pogo_kb_release_all(kb);
+	if (data[0] == POGO_KB_SYNC_POWER_ON && data[1] == POGO_KB_SYNC_FORMAT) {
+		/* Initial sync repeats until the host sends its awake state. */
+		if (kb->heartbeat_seen) {
+			kb->heartbeat_seen = false;
+			kb->wake_pending = true;
+			dev_dbg(kb->dev, "keyboard restarted\n");
+			pogo_kb_release_all(kb);
+			queue_work(system_freezable_wq, &kb->attach_work);
+		}
 		return;
 	}
 
 	if (!heartbeat)
 		return;
+
+	kb->heartbeat_seen = true;
 
 	/* Like the vendor driver, end any contact still open on a heartbeat */
 	pogo_kb_release_touches(kb);
@@ -862,10 +872,29 @@ static void pogo_kb_schedule(struct pogo_kb *kb, unsigned int ms)
 
 static void pogo_kb_enter_idle(struct pogo_kb *kb)
 {
+	int attached;
+
 	kb->state = POGO_KB_IDLE;
 	if (!kb->irq_enabled) {
 		kb->irq_enabled = true;
 		enable_irq(kb->irq);
+	}
+
+	/* Do not lose an attach edge between the last sample and IRQ enable. */
+	attached = gpiod_get_value_cansleep(kb->detect);
+	if (attached < 0) {
+		dev_err(kb->dev, "failed to read the sense line: %d\n", attached);
+		return;
+	}
+
+	/* Exhausting the power budget still requires a new physical edge. */
+	if (attached && kb->power_cycles < POGO_KB_MAX_POWER_CYCLES) {
+		disable_irq_nosync(kb->irq);
+		kb->irq_enabled = false;
+		kb->state = POGO_KB_DETECT;
+		kb->asserted = 0;
+		kb->released = 0;
+		pogo_kb_schedule(kb, POGO_KB_DETECT_PERIOD_MS);
 	}
 }
 
@@ -913,6 +942,8 @@ static void pogo_kb_power_up(struct pogo_kb *kb)
 	spin_lock(&kb->rx_lock);
 	kb->rx_len = 0;
 	kb->rx_sync = 0;
+	kb->heartbeat_seen = false;
+	kb->wake_pending = false;
 	spin_unlock(&kb->rx_lock);
 
 	ret = regulator_enable(kb->vdd);
@@ -952,6 +983,7 @@ static void pogo_kb_sample(struct pogo_kb *kb, unsigned int attach,
 	}
 
 	if (kb->released >= detach) {
+		kb->power_cycles = 0;
 		pogo_kb_enter_idle(kb);
 	} else if (kb->asserted < attach) {
 		pogo_kb_schedule(kb, period_ms);
@@ -1017,6 +1049,9 @@ static void pogo_kb_attach_work(struct work_struct *work)
 
 	mutex_lock(&kb->lock);
 
+	if (kb->state == POGO_KB_CONNECTED)
+		goto wake;
+
 	if (kb->state != POGO_KB_POWERED)
 		goto out;
 
@@ -1038,6 +1073,19 @@ static void pogo_kb_attach_work(struct work_struct *work)
 	WRITE_ONCE(kb->led_sent,
 		   kb->grace_start - msecs_to_jiffies(POGO_KB_LED_RESYNC_MS));
 	pogo_kb_log_version(kb);
+wake:
+	spin_lock(&kb->rx_lock);
+	if (!kb->wake_pending) {
+		spin_unlock(&kb->rx_lock);
+		goto out;
+	}
+	kb->wake_pending = false;
+	spin_unlock(&kb->rx_lock);
+
+	/* Finish the MCU's sync phase, including a restart without power loss. */
+	ret = pogo_kb_set_awake(kb, true);
+	if (ret)
+		dev_warn(kb->dev, "keyboard did not confirm wake-up: %d\n", ret);
 out:
 	mutex_unlock(&kb->lock);
 }
@@ -1239,7 +1287,9 @@ static int pogo_kb_resume(struct device *dev)
 		WRITE_ONCE(kb->last_rx, kb->grace_start);
 	}
 
-	if (kb->state != POGO_KB_IDLE)
+	if (kb->state == POGO_KB_IDLE)
+		pogo_kb_enter_idle(kb);
+	else
 		pogo_kb_schedule(kb, POGO_KB_MONITOR_PERIOD_MS);
 
 	mutex_unlock(&kb->lock);
