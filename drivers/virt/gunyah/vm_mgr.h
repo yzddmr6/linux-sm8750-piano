@@ -279,6 +279,7 @@ int gunyah_demand_page(struct gunyah_vm *ghvm, u64 gpa, bool write);
 int gunyah_setup_demand_paging(struct gunyah_vm *ghvm, u64 start_gfn,
 				u64 end_gfn);
 int gunyah_vm_set_protected(struct gunyah_vm *ghvm);
+int gunyah_vm_check_share_backing(struct gunyah_vm *ghvm);
 
 /* Runtime shares a protected guest accepts itself (vm_mgr_pshare.c) */
 int gunyah_vm_pshare_user(struct gunyah_vm *ghvm,

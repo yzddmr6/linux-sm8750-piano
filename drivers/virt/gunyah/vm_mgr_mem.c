@@ -516,6 +516,15 @@ static int gunyah_gup_demand_page(struct gunyah_vm *ghvm, struct gunyah_vm_bindi
 		goto unpin_page;
 	}
 
+	/* Mapped as anonymous after VM start: see gunyah_vm_check_share_backing() */
+	if (ghvm->is_protected && b->share_type == VM_MEM_SHARE &&
+	    folio_test_anon(folio)) {
+		pr_warn_ratelimited("cannot share private anonymous memory with a protected VM (guest addr %016llx)\n",
+				    gpa);
+		ret = -EACCES;
+		goto unpin_page;
+	}
+
 	folio_lock(folio);
 	ret = gunyah_vm_provide_folio(ghvm, folio, gfn - folio_page_idx(folio, page),
 				      !(b->share_type == VM_MEM_LEND),
@@ -769,6 +778,56 @@ int gunyah_vm_set_protected(struct gunyah_vm *ghvm)
 	ghvm->is_protected = b->share_type == VM_MEM_LEND;
 	up_read(&ghvm->bindings_lock);
 	return 0;
+}
+
+/*
+ * A protected VM's shared (not lent) user memory is demand-shared one folio
+ * at a time: gunyah_vm_provide_folio() asks the secure world to add the
+ * resource manager to the folio's owners. On Qualcomm platforms that request
+ * is refused (-EINVAL) for folios of private anonymous memory; the guest then
+ * faults on the same address forever. Shared memory (memfd, shmem) works.
+ * Refuse such a VM at start with a clear message instead.
+ */
+int gunyah_vm_check_share_backing(struct gunyah_vm *ghvm)
+{
+	struct gunyah_vm_binding *b;
+	struct vm_area_struct *vma;
+	unsigned long index = 0;
+	unsigned long addr, end;
+	int ret = 0;
+
+	if (!ghvm->is_protected)
+		return 0;
+
+	if (!mmget_not_zero(ghvm->mm_s))
+		return -ESRCH;
+
+	/* same order as gunyah_demand_page(): bindings_lock, then mmap_lock */
+	down_read(&ghvm->bindings_lock);
+	mmap_read_lock(ghvm->mm_s);
+	mt_for_each(&ghvm->bindings, b, index, ULONG_MAX) {
+		if (b->share_type != VM_MEM_SHARE || b->mem_type != VM_MEM_USER ||
+		    gunyah_vm_is_fw_binding(ghvm, b))
+			continue;
+
+		end = b->userspace_addr + b->size;
+		for (addr = b->userspace_addr; addr < end; addr = vma->vm_end) {
+			vma = vma_lookup(ghvm->mm_s, addr);
+			if (vma && (vma->vm_flags & VM_SHARED))
+				continue;
+
+			dev_warn(ghvm->parent,
+				 "shared guest memory 0x%llx+0x%llx is not backed by shared memory (use a memfd): protected VMs cannot demand-share private anonymous pages\n",
+				 b->guest_phys_addr, b->size);
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+out:
+	mmap_read_unlock(ghvm->mm_s);
+	up_read(&ghvm->bindings_lock);
+	mmput(ghvm->mm_s);
+	return ret;
 }
 
 /*
