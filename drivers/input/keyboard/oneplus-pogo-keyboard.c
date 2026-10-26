@@ -107,6 +107,7 @@
 #define POGO_KB_TX_TIMEOUT_MS		20
 #define POGO_KB_ECHO_TIMEOUT_MS		50
 #define POGO_KB_REPLY_TIMEOUT_MS	100
+#define POGO_KB_WAKE_ATTEMPTS		3
 #define POGO_KB_LED_DELAY_MS		15
 #define POGO_KB_LED_RESYNC_MS		1000
 
@@ -714,9 +715,20 @@ static int pogo_kb_send_leds(struct pogo_kb *kb)
 static int pogo_kb_set_awake(struct pogo_kb *kb, bool awake)
 {
 	const u8 data[] = { POGO_KB_GENERAL_SLEEP, 0x01, awake ? 0x00 : 0x01 };
+	unsigned int attempt, attempts = awake ? POGO_KB_WAKE_ATTEMPTS : 1;
 	int ret;
 
-	ret = pogo_kb_xfer(kb, POGO_KB_CMD_GENERAL, data, sizeof(data), true);
+	/*
+	 * Like the vendor's write-and-read exchange, allow the sleeping MCU
+	 * another command after an echoed frame received no acknowledgement.
+	 * An echo only confirms the host UART loopback, not that the MCU was
+	 * ready to receive. Keep transport and protocol errors terminal.
+	 */
+	for (attempt = 0; attempt < attempts; attempt++) {
+		ret = pogo_kb_xfer(kb, POGO_KB_CMD_GENERAL, data, sizeof(data), true);
+		if (ret != -ETIMEDOUT)
+			break;
+	}
 	if (ret)
 		return ret;
 
