@@ -518,6 +518,15 @@
 	};
 };
 
+/*
+ * Nothing on this board uses the Qualcomm Crypto Engine; the CPU crypto
+ * extensions serve the kernel crypto API. Leaving the node enabled without a
+ * bound driver would hold the interconnect providers' sync_state.
+ */
+&crypto {
+	status = "disabled";
+};
+
 &apps_rsc {
 	/*
 	 * Only stock-verified output rails (USB, UFS, PCIe0 PHY, WCN7860 PMU
