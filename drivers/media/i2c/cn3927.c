@@ -147,7 +147,7 @@ static int cn3927_runtime_suspend(struct device *dev)
 	struct cn3927_device *cn3927 = to_cn3927(subdev);
 	int focus;
 	int err;
-	int ret = 0;
+	int ret;
 
 	focus = cn3927->focus & ~(CN3927_PARK_STEP - 1);
 	if (focus < CN3927_PARK_POSITION)
@@ -158,12 +158,12 @@ static int cn3927_runtime_suspend(struct device *dev)
 
 		if (err) {
 			dev_warn(dev, "failed to park lens: %d\n", err);
-			break;
+			return -EBUSY;
 		}
 		usleep_range(CN3927_MOVE_DELAY_US, CN3927_MOVE_DELAY_US + 100);
 	}
 
-	/* Once powered off, runtime PM must also consider the device off. */
+	/* A failed park leaves the device active and its supplies enabled. */
 	ret = regulator_bulk_disable(ARRAY_SIZE(cn3927->supplies), cn3927->supplies);
 	return ret;
 }
@@ -283,8 +283,12 @@ static void cn3927_remove(struct i2c_client *client)
 
 	v4l2_async_unregister_subdev(subdev);
 	pm_runtime_disable(&client->dev);
-	if (!pm_runtime_status_suspended(&client->dev))
-		cn3927_runtime_suspend(&client->dev);
+	if (!pm_runtime_status_suspended(&client->dev)) {
+		/* Unbind cannot defer parking: balance the remaining rail votes. */
+		if (cn3927_runtime_suspend(&client->dev))
+			regulator_bulk_disable(ARRAY_SIZE(cn3927->supplies),
+					       cn3927->supplies);
+	}
 	pm_runtime_set_suspended(&client->dev);
 	cn3927_cleanup(cn3927);
 }
