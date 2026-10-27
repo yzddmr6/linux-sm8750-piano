@@ -275,19 +275,16 @@ static int sc1300cs_power_on(struct device *dev)
 		usleep_range(1000, 1500);
 	}
 
-	/* The reset pin is active low: deassert it before starting MCLK. */
-	gpiod_set_value_cansleep(sensor->reset, 0);
-	usleep_range(1000, 1500);
+	/* Keep reset asserted until the input clock is running. */
 	ret = clk_prepare_enable(sensor->xclk);
 	if (ret)
-		goto assert_reset;
-	usleep_range(5000, 5500);
+		goto disable_supplies;
+	usleep_range(1000, 1500);
+	gpiod_set_value_cansleep(sensor->reset, 0);
+	usleep_range(10000, 12000);
 
 	return 0;
 
-assert_reset:
-	gpiod_set_value_cansleep(sensor->reset, 1);
-	usleep_range(1000, 1500);
 disable_supplies:
 	while (i--) {
 		regulator_disable(sensor->supplies[i].consumer);
@@ -603,7 +600,14 @@ static int sc1300cs_probe(struct i2c_client *client)
 	ret = sc1300cs_power_on(dev);
 	if (ret)
 		return ret;
-	ret = cci_read(sensor->regmap, CCI_REG16(0x3107), &id, NULL);
+	/* The sensor may NACK while leaving reset; bound the readiness wait. */
+	for (i = 0; i < 8; i++) {
+		ret = cci_read(sensor->regmap, CCI_REG16(0x3107), &id, NULL);
+		if (!ret)
+			break;
+		if (i < 7)
+			msleep(20);
+	}
 	if (ret)
 		goto power_off;
 	if (id != SC1300CS_CHIP_ID) {
