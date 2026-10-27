@@ -180,6 +180,48 @@ static void nt36532_test_piano_preferred(struct kunit *test)
 }
 
 /*
+ * The DPU can only change the vertical front porch between modes that
+ * share the link clock, the horizontal timing and the active area. The
+ * 90 Hz and 144 Hz modes have their own horizontal timing and keep a full
+ * modeset, so they must not be in that family.
+ */
+static void nt36532_test_piano_timing_family(struct kunit *test)
+{
+	static const unsigned int same_family[] = { 60, 50, 48, 30 };
+	const struct drm_display_mode *ref = &piano_display_modes[1];
+	unsigned int i;
+
+	/* The 120 Hz mode is the reference of the family. */
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(ref), 120U);
+
+	for (i = 0; i < ARRAY_SIZE(same_family); i++) {
+		const struct drm_display_mode *mode = NULL;
+		unsigned int j;
+
+		for (j = 0; j < ARRAY_SIZE(piano_display_modes); j++)
+			if (drm_mode_vrefresh(&piano_display_modes[j]) == same_family[i])
+				mode = &piano_display_modes[j];
+		KUNIT_ASSERT_NOT_NULL(test, mode);
+
+		KUNIT_EXPECT_EQ(test, mode->clock, ref->clock);
+		KUNIT_EXPECT_EQ(test, mode->hdisplay, ref->hdisplay);
+		KUNIT_EXPECT_EQ(test, mode->htotal, ref->htotal);
+		KUNIT_EXPECT_EQ(test, mode->hsync_start, ref->hsync_start);
+		KUNIT_EXPECT_EQ(test, mode->hsync_end, ref->hsync_end);
+		KUNIT_EXPECT_EQ(test, mode->vdisplay, ref->vdisplay);
+		KUNIT_EXPECT_EQ(test, mode->flags, ref->flags);
+		/* Only the vertical total differs. */
+		KUNIT_EXPECT_NE(test, mode->vtotal, ref->vtotal);
+	}
+
+	/* The 144 Hz and 90 Hz modes have a different horizontal timing. */
+	KUNIT_EXPECT_NE(test, piano_display_modes[0].htotal, ref->htotal);
+	KUNIT_EXPECT_NE(test, piano_display_modes[2].htotal, ref->htotal);
+	KUNIT_EXPECT_NE(test, piano_display_modes[0].clock, ref->clock);
+	KUNIT_EXPECT_NE(test, piano_display_modes[2].clock, ref->clock);
+}
+
+/*
  * The low refresh rates keep the 120 Hz pixel clock and the horizontal
  * timing, and only extend the vertical blanking, so neither the link rate
  * nor the DSC PPS changes.
@@ -316,6 +358,7 @@ static struct kunit_case nt36532_test_cases[] = {
 	KUNIT_CASE(nt36532_test_piano_reset),
 	KUNIT_CASE(nt36532_test_piano_preferred),
 	KUNIT_CASE(nt36532_test_piano_low_rates),
+	KUNIT_CASE(nt36532_test_piano_timing_family),
 	KUNIT_CASE(nt36532_test_piano_modules),
 	KUNIT_CASE(nt36532_test_log_sequences),
 	{}
