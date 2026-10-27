@@ -518,6 +518,25 @@
 	};
 };
 
+/*
+ * The sensor bus of the fingerprint belongs to the secure world. The
+ * application processor controls the power and the reset of the sensor and
+ * receives its interrupt; the sensor registers are not mapped here.
+ */
+fingerprint {
+	compatible = "xiaomi,piano-goodix-control";
+	status = "okay";
+
+	vdd-supply = <&piano_fp_vdd>;
+
+	/* The reset of the sensor is active low. */
+	reset-gpios = <&tlmm 73 GPIO_ACTIVE_LOW>;
+	irq-gpios = <&tlmm 85 GPIO_ACTIVE_HIGH>;
+
+	pinctrl-0 = <&fp_reset_state &fp_irq_state>;
+	pinctrl-names = "default";
+};
+
 &apps_rsc {
 	/*
 	 * Only stock-verified output rails (USB, UFS, PCIe0 PHY, WCN7860 PMU
@@ -534,6 +553,18 @@
 			regulator-name = "vreg_l5b_3p1";
 			regulator-min-microvolt = <3100000>;
 			regulator-max-microvolt = <3148000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/* The fingerprint sensor of the pad runs on the 3.3 V rail of
+		 * PMIC B, the ninth low dropout output. Stay below the factory
+		 * ceiling of 3.3 V; the nearest lower selector of the active grid
+		 * is 3.296 V.
+		 */
+		piano_fp_vdd: ldo9 {
+			regulator-name = "piano_fp_vdd";
+			regulator-min-microvolt = <3296000>;
+			regulator-max-microvolt = <3300000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
 
@@ -1439,6 +1470,22 @@
 
 &tlmm {
 	gpio-reserved-ranges = <36 4>, <48 4>, <74 1>;
+
+	/* The fingerprint sensor: its reset line and its interrupt line. */
+	fp_reset_state: fingerprint-reset-state {
+		pins = "gpio73";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-low;
+	};
+
+	fp_irq_state: fingerprint-irq-state {
+		pins = "gpio85";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
 
 	usb_orientation_default: usb-orientation-default-state {
 		pins = "gpio61";
