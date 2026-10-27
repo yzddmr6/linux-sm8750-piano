@@ -467,6 +467,29 @@ static void dsi_pll_cmn_clk_cfg1_update(struct dsi_pll_7nm *pll, u32 mask,
 	spin_unlock_irqrestore(&pll->pclk_mux_lock, flags);
 }
 
+static void dsi_7nm_phy_toggle_resync_fifo(struct msm_dsi_phy *phy)
+{
+	void __iomem *base = phy->base;
+
+	writel(0, base + REG_DSI_7nm_PHY_CMN_RBUF_CTRL);
+	wmb();
+	writel(1, base + REG_DSI_7nm_PHY_CMN_RBUF_CTRL);
+	wmb();
+}
+
+static void dsi_7nm_phy_reset_clk_en_sel(struct msm_dsi_phy *phy)
+{
+	struct dsi_pll_7nm *pll = phy->pll_data;
+
+	/* C-PHY retains CLK_EN_SEL after retime synchronization. */
+	if (phy->cphy_mode)
+		return;
+
+	dsi_pll_cmn_clk_cfg1_update(pll,
+			DSI_7nm_PHY_CMN_CLK_CFG1_CLK_EN_SEL, 0);
+	wmb();
+}
+
 static void dsi_pll_disable_global_clk(struct dsi_pll_7nm *pll)
 {
 	dsi_pll_cmn_clk_cfg1_update(pll, DSI_7nm_PHY_CMN_CLK_CFG1_CLK_EN, 0);
@@ -1554,6 +1577,8 @@ const struct msm_dsi_phy_cfg dsi_phy_3nm_8750_cfgs = {
 		.save_pll_state = dsi_7nm_pll_save_state,
 		.restore_pll_state = dsi_7nm_pll_restore_state,
 		.set_continuous_clock = dsi_7nm_set_continuous_clock,
+		.toggle_resync_fifo = dsi_7nm_phy_toggle_resync_fifo,
+		.reset_clk_en_sel = dsi_7nm_phy_reset_clk_en_sel,
 	},
 	.min_pll_rate = 600000000UL,
 #ifdef CONFIG_64BIT

@@ -821,6 +821,18 @@ void msm_dsi_phy_disable(struct msm_dsi_phy *phy)
 	pm_runtime_put(&phy->pdev->dev);
 }
 
+void msm_dsi_phy_toggle_resync_fifo(struct msm_dsi_phy *phy)
+{
+	if (phy && phy->cfg->ops.toggle_resync_fifo)
+		phy->cfg->ops.toggle_resync_fifo(phy);
+}
+
+void msm_dsi_phy_reset_clk_en_sel(struct msm_dsi_phy *phy)
+{
+	if (phy && phy->cfg->ops.reset_clk_en_sel)
+		phy->cfg->ops.reset_clk_en_sel(phy);
+}
+
 void msm_dsi_phy_set_usecase(struct msm_dsi_phy *phy,
 			     enum msm_dsi_phy_usecase uc)
 {
