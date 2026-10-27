@@ -179,6 +179,37 @@ static void nt36532_test_piano_preferred(struct kunit *test)
 				    &piano_display_modes[i]);
 }
 
+/*
+ * The low refresh rates keep the 120 Hz pixel clock and the horizontal
+ * timing, and only extend the vertical blanking, so neither the link rate
+ * nor the DSC PPS changes.
+ */
+static void nt36532_test_piano_low_rates(struct kunit *test)
+{
+	static const unsigned int rates[] = { 60, 50, 48, 30 };
+	unsigned int i;
+
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(piano_display_modes), 7U);
+
+	/* The 120 Hz mode is the one the low rates are derived from. */
+	for (i = 3; i < ARRAY_SIZE(piano_display_modes); i++) {
+		struct drm_display_mode *mode = &piano_display_modes[i];
+
+		KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(mode), rates[i - 3]);
+		KUNIT_EXPECT_EQ(test, mode->clock, piano_display_modes[1].clock);
+		KUNIT_EXPECT_EQ(test, mode->htotal, piano_display_modes[1].htotal);
+		KUNIT_EXPECT_EQ(test, mode->hsync_start, piano_display_modes[1].hsync_start);
+		KUNIT_EXPECT_EQ(test, mode->vdisplay, piano_display_modes[1].vdisplay);
+		/* The vertical total grows as the rate falls. */
+		KUNIT_EXPECT_GT(test, mode->vtotal, piano_display_modes[1].vtotal);
+	}
+
+	/* The 60 Hz mode keeps the vertical total it had before. */
+	KUNIT_EXPECT_EQ(test, piano_display_modes[3].vtotal,
+			PIANO_VDISPLAY + PIANO_VFP + PIANO_VTOTAL + PIANO_VSYNC +
+			PIANO_VBP);
+}
+
 static bool nt36532_test_msg_is(const struct nt36532_test_msg *m,
 				const u8 *data, size_t len)
 {
@@ -284,6 +315,7 @@ static struct kunit_case nt36532_test_cases[] = {
 	KUNIT_CASE(nt36532_test_select),
 	KUNIT_CASE(nt36532_test_piano_reset),
 	KUNIT_CASE(nt36532_test_piano_preferred),
+	KUNIT_CASE(nt36532_test_piano_low_rates),
 	KUNIT_CASE(nt36532_test_piano_modules),
 	KUNIT_CASE(nt36532_test_log_sequences),
 	{}

@@ -440,9 +440,9 @@ static const struct drm_dsc_config csot_dsc_cfg = {
  *
  * The link runs at a fixed 1197.5 Mbps per lane and the refresh rate is
  * selected by the horizontal front porch. With RGB101010 and 8 bpp DSC the
- * modes below reproduce exactly that link rate. The 60 Hz mode keeps the
- * 120 Hz panel timing with a doubled vertical total, like the downstream
- * dynamic refresh rate implementation.
+ * modes below reproduce exactly that link rate. The lower refresh rates
+ * keep the 120 Hz panel timing and extend vertical blanking, as specified
+ * by the downstream dfps_immediate_porch_mode_vfp configuration.
  */
 #define PIANO_HDISPLAY	3200
 #define PIANO_HSYNC	32
@@ -469,11 +469,22 @@ static const struct drm_dsc_config csot_dsc_cfg = {
 	.height_mm = 163,							\
 }
 
+/* All low-rate modes retain the 120 Hz pixel clock and horizontal timing.
+ * Both P81_35 and P81_42 advertise 30/48/50/60/90/120/144 in the stock DT.
+ * These are fixed modes; seamless updates require DSI host/DPU support.
+ */
+#define PIANO_VFP_MODE(_vrefresh) \
+	PIANO_MODE(234, PIANO_VFP + PIANO_VTOTAL * 120 / (_vrefresh) - \
+		   PIANO_VTOTAL, (_vrefresh))
+
 static const struct drm_display_mode piano_display_modes[] = {
 	PIANO_MODE(42, PIANO_VFP, 144),
 	PIANO_MODE(234, PIANO_VFP, 120),
 	PIANO_MODE(618, PIANO_VFP, 90),
-	PIANO_MODE(234, PIANO_VFP + PIANO_VTOTAL, 60),
+	PIANO_VFP_MODE(60),
+	PIANO_VFP_MODE(50),
+	PIANO_VFP_MODE(48),
+	PIANO_VFP_MODE(30),
 };
 
 static const struct regulator_bulk_data piano_supplies[] = {
@@ -663,7 +674,7 @@ static int piano_init_sequence(struct nt36532 *ctx,
 		b3 = 0x80;
 		break;
 	default:
-		/* 120 Hz panel timing, also used for 60 Hz */
+		/* 120 Hz panel timing, also used for 30/48/50/60 Hz */
 		b2 = 0x91;
 		b3 = 0x40;
 		break;
