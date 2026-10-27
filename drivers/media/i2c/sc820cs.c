@@ -439,6 +439,10 @@ static int sc820cs_set_format(struct v4l2_subdev *sd,
 		.xfer_func = V4L2_XFER_FUNC_NONE,
 	};
 	*v4l2_subdev_state_get_format(state, 0) = fmt->format;
+	*v4l2_subdev_state_get_crop(state, 0) = (struct v4l2_rect) {
+		.width = SC820CS_WIDTH,
+		.height = SC820CS_HEIGHT,
+	};
 	return 0;
 }
 
@@ -471,6 +475,24 @@ static int sc820cs_enum_frame_size(struct v4l2_subdev *sd,
 	return 0;
 }
 
+static int sc820cs_get_selection(struct v4l2_subdev *sd,
+			       struct v4l2_subdev_state *state,
+			       struct v4l2_subdev_selection *sel)
+{
+	if (sel->pad)
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		sel->r = *v4l2_subdev_state_get_crop(state, 0);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static const struct v4l2_subdev_core_ops sc820cs_core_ops = {
 	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
@@ -485,6 +507,7 @@ static const struct v4l2_subdev_pad_ops sc820cs_pad_ops = {
 	.enum_frame_size = sc820cs_enum_frame_size,
 	.get_fmt = v4l2_subdev_get_fmt,
 	.set_fmt = sc820cs_set_format,
+	.get_selection = sc820cs_get_selection,
 	.enable_streams = sc820cs_enable_streams,
 	.disable_streams = sc820cs_disable_streams,
 };
