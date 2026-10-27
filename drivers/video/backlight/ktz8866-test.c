@@ -288,6 +288,54 @@ static void ktz8866_test_boot_sync(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ktz8866_get_boot_brightness(&ctx->ktz, &brightness, &sync), -EIO);
 }
 
+/*
+ * The fade time comes from the register, because the bootloader may have
+ * programmed it, and the slower chip of a mirrored pair decides how long
+ * the panel stays lit.
+ */
+static void ktz8866_test_off_ramp(struct kunit *test)
+{
+	struct ktz8866_test_context *ctx = test->priv;
+	unsigned int ramp;
+
+	/* Code 0 means 512 us, codes 1..15 mean 1..16384 ms. */
+	KUNIT_EXPECT_EQ(test, ktz8866_off_ramp_delay(0), 512U);
+	KUNIT_EXPECT_EQ(test, ktz8866_off_ramp_delay(1), 1000U);
+	KUNIT_EXPECT_EQ(test, ktz8866_off_ramp_delay(2), 2000U);
+	KUNIT_EXPECT_EQ(test, ktz8866_off_ramp_delay(15), 16384000U);
+
+	ctx->chip.registers[BL_DIMMING] = 0x40 | 3;
+	KUNIT_ASSERT_EQ(test, ktz8866_get_off_ramp(&ctx->ktz, &ramp), 0);
+	KUNIT_EXPECT_EQ(test, ramp, 3U);
+
+	ctx->ktz.secondary = &ctx->secondary;
+	ctx->chip2.registers[BL_DIMMING] = 0x70 | 7;
+	KUNIT_ASSERT_EQ(test, ktz8866_get_off_ramp(&ctx->ktz, &ramp), 0);
+	KUNIT_EXPECT_EQ(test, ramp, 7U);
+
+	/* A register error is reported instead of guessing a fade time. */
+	ctx->chip.fail_read = BL_DIMMING;
+	KUNIT_EXPECT_EQ(test, ktz8866_get_off_ramp(&ctx->ktz, &ramp), -EIO);
+}
+
+/*
+ * The fade time is read before the light is turned off, so a register error
+ * cannot leave the panel lit after the video link is already gone.
+ */
+static void ktz8866_test_disable_ramp_error(struct kunit *test)
+{
+	struct ktz8866_test_context *ctx = test->priv;
+
+	ctx->ktz.led_on = true;
+	ctx->chip.registers[BL_EN] = 0x7f;
+	ctx->backlight.props.brightness = 0;
+	ctx->chip.fail_read = BL_DIMMING;
+
+	KUNIT_EXPECT_EQ(test, ktz8866_backlight_update_status(&ctx->backlight), -EIO);
+	KUNIT_EXPECT_EQ(test, ctx->chip.writes, 0U);
+	KUNIT_EXPECT_TRUE(test, ctx->ktz.led_on);
+}
+
 static struct kunit_case ktz8866_test_cases[] = {
 	KUNIT_CASE(ktz8866_test_brightness),
 	KUNIT_CASE_PARAM(ktz8866_test_error, ktz8866_error_gen_params),
@@ -296,6 +344,8 @@ static struct kunit_case ktz8866_test_cases[] = {
 	KUNIT_CASE(ktz8866_test_secondary_error),
 	KUNIT_CASE(ktz8866_test_boot_brightness),
 	KUNIT_CASE(ktz8866_test_boot_sync),
+	KUNIT_CASE(ktz8866_test_off_ramp),
+	KUNIT_CASE(ktz8866_test_disable_ramp_error),
 	{}
 };
 

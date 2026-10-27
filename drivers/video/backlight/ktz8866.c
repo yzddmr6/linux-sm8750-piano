@@ -118,17 +118,75 @@ static int ktz8866_set_brightness(struct ktz8866 *ktz, unsigned int brightness)
 	return 0;
 }
 
+/*
+ * Read the LED fade time the chip will use when BL_EN is cleared. The ramp
+ * may have been programmed by the bootloader, so the register is the only
+ * source of truth. A mirrored pair fades at its own pace, so the slower
+ * chip decides how long the panel stays lit.
+ */
+static int ktz8866_get_off_ramp(struct ktz8866 *ktz, unsigned int *ramp)
+{
+	unsigned int dimming;
+	int ret;
+
+	ret = regmap_read(ktz->regmap, BL_DIMMING, &dimming);
+	if (ret)
+		return ret;
+	*ramp = dimming & 0xf;
+
+	if (!ktz->secondary)
+		return 0;
+
+	ret = regmap_read(ktz->secondary->regmap, BL_DIMMING, &dimming);
+	if (ret)
+		return ret;
+	*ramp = max(*ramp, dimming & 0xf);
+
+	return 0;
+}
+
+/* Code 0 means 512 us, then codes 1..15 mean 1..16384 ms. */
+static unsigned int ktz8866_off_ramp_delay(unsigned int ramp)
+{
+	return ramp ? 1000U << (ramp - 1) : 512;
+}
+
 static int ktz8866_backlight_update_status(struct backlight_device *backlight_dev)
 {
 	struct ktz8866 *ktz = bl_get_data(backlight_dev);
 	unsigned int brightness = backlight_get_brightness(backlight_dev);
+	unsigned int ramp = 0;
+	bool fading = false;
 	int ret;
 
-	ret = ktz8866_set_brightness(ktz, brightness);
-	if (ret || !ktz->secondary)
-		return ret;
+	if (!brightness) {
+		fading = ktz->led_on ||
+			 (ktz->secondary && ktz->secondary->led_on);
+		if (fading) {
+			ret = ktz8866_get_off_ramp(ktz, &ramp);
+			if (ret)
+				return ret;
+		}
+	}
 
-	return ktz8866_set_brightness(ktz->secondary, brightness);
+	ret = ktz8866_set_brightness(ktz, brightness);
+	if (ret)
+		return ret;
+	if (ktz->secondary) {
+		ret = ktz8866_set_brightness(ktz->secondary, brightness);
+		if (ret)
+			return ret;
+	}
+
+	/*
+	 * Clearing BL_EN starts the programmed fade; it does not make the
+	 * panel dark immediately. Keep the display pipeline intact until
+	 * both chips have finished, before drm_panel_disable() returns.
+	 */
+	if (fading)
+		fsleep(ktz8866_off_ramp_delay(ramp));
+
+	return 0;
 }
 
 static const struct backlight_ops ktz8866_backlight_ops = {
