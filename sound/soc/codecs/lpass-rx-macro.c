@@ -3999,6 +3999,7 @@ static int rx_macro_runtime_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops rx_macro_pm_ops = {
+	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	RUNTIME_PM_OPS(rx_macro_runtime_suspend, rx_macro_runtime_resume, NULL)
 };
 
