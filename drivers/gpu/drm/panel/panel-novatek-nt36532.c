@@ -197,25 +197,39 @@ static int nt36532_unprepare(struct drm_panel *panel)
 	return 0;
 }
 
+/*
+ * The index of the mode to mark preferred. Piano's validated pen scan
+ * uses a 120 Hz cold-start display mode; every other board keeps the
+ * first mode of its table.
+ */
+static unsigned int nt36532_preferred_mode(const struct panel_info *info,
+					    bool piano)
+{
+	unsigned int i;
+
+	if (!piano)
+		return 0;
+
+	for (i = 0; i < info->num_modes; i++)
+		if (drm_mode_vrefresh(&info->modes[i]) == 120)
+			return i;
+
+	return 0;
+}
+
 static int nt36532_get_modes(struct drm_panel *panel,
 			     struct drm_connector *connector)
 {
 	struct nt36532 *ctx = to_nt36532(panel);
 	const struct panel_info *panel_info = ctx->panel_info;
-	unsigned int preferred = 0;
+	unsigned int preferred;
 	unsigned int i;
 
 	/* Piano's validated pen scan uses a 120 Hz cold-start display mode.
 	 * Keep every advertised mode and each panel vendor's own sequence.
 	 */
-	if (of_machine_is_compatible("xiaomi,piano")) {
-		for (i = 0; i < panel_info->num_modes; i++) {
-			if (drm_mode_vrefresh(&panel_info->modes[i]) == 120) {
-				preferred = i;
-				break;
-			}
-		}
-	}
+	preferred = nt36532_preferred_mode(panel_info,
+					   of_machine_is_compatible("xiaomi,piano"));
 
 	for (i = 0; i < panel_info->num_modes; i++) {
 		struct drm_display_mode *mode;

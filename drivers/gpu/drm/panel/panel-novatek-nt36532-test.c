@@ -148,6 +148,37 @@ static void nt36532_test_piano_reset(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, piano_boe_panel_info.reset, &piano_reset);
 }
 
+/*
+ * The Piano table starts with the 144 Hz mode, whose horizontal timing
+ * differs from the 120 Hz one, and the 120 Hz mode is the one whose
+ * display path has been validated. Every mode stays advertised.
+ */
+static void nt36532_test_piano_preferred(struct kunit *test)
+{
+	unsigned int i;
+
+	/* The table carries the rate in the pixel clock, not in .vrefresh. */
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&piano_display_modes[0]), 144);
+	KUNIT_EXPECT_EQ(test, drm_mode_vrefresh(&piano_display_modes[1]), 120);
+
+	KUNIT_EXPECT_EQ(test, nt36532_preferred_mode(&piano_csot_panel_info, true),
+			1);
+	KUNIT_EXPECT_EQ(test, nt36532_preferred_mode(&piano_boe_panel_info, true),
+			1);
+
+	/* Other boards keep the first mode of their table. */
+	KUNIT_EXPECT_EQ(test, nt36532_preferred_mode(&piano_csot_panel_info, false),
+			0);
+	KUNIT_EXPECT_EQ(test, nt36532_preferred_mode(&csot_panel_info, false), 0);
+
+	/* No mode is dropped by the choice. */
+	KUNIT_EXPECT_EQ(test, piano_csot_panel_info.num_modes,
+			ARRAY_SIZE(piano_display_modes));
+	for (i = 0; i < piano_csot_panel_info.num_modes; i++)
+		KUNIT_EXPECT_PTR_EQ(test, &piano_csot_panel_info.modes[i],
+				    &piano_display_modes[i]);
+}
+
 static bool nt36532_test_msg_is(const struct nt36532_test_msg *m,
 				const u8 *data, size_t len)
 {
@@ -252,6 +283,7 @@ static void nt36532_test_piano_modules(struct kunit *test)
 static struct kunit_case nt36532_test_cases[] = {
 	KUNIT_CASE(nt36532_test_select),
 	KUNIT_CASE(nt36532_test_piano_reset),
+	KUNIT_CASE(nt36532_test_piano_preferred),
 	KUNIT_CASE(nt36532_test_piano_modules),
 	KUNIT_CASE(nt36532_test_log_sequences),
 	{}
