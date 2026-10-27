@@ -516,25 +516,25 @@
 			thermal-sensors = <&xo_therm>;
 		};
 	};
-};
 
-/*
- * The sensor bus of the fingerprint belongs to the secure world. The
- * application processor controls the power and the reset of the sensor and
- * receives its interrupt; the sensor registers are not mapped here.
- */
-fingerprint {
-	compatible = "xiaomi,piano-goodix-control";
-	status = "okay";
+	/*
+	 * The sensor bus of the fingerprint belongs to the secure world. The
+	 * application processor controls the power and the reset of the sensor
+	 * and receives its interrupt; the sensor registers are not mapped here.
+	 */
+	fingerprint {
+		compatible = "xiaomi,piano-goodix-control";
+		status = "okay";
 
-	vdd-supply = <&piano_fp_vdd>;
+		vdd-supply = <&piano_fp_vdd>;
 
-	/* The reset of the sensor is active low. */
-	reset-gpios = <&tlmm 73 GPIO_ACTIVE_LOW>;
-	irq-gpios = <&tlmm 85 GPIO_ACTIVE_HIGH>;
+		/* The reset of the sensor is active low. */
+		reset-gpios = <&tlmm 73 GPIO_ACTIVE_LOW>;
+		irq-gpios = <&tlmm 85 GPIO_ACTIVE_HIGH>;
 
-	pinctrl-0 = <&fp_reset_state &fp_irq_state>;
-	pinctrl-names = "default";
+		pinctrl-0 = <&fp_reset_state &fp_irq_state>;
+		pinctrl-names = "default";
+	};
 };
 
 &apps_rsc {
