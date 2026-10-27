@@ -2550,6 +2550,54 @@ unlock_ret:
 	return ret;
 }
 
+/*
+ * SM8750 bonded video requires a controller reset after both HS clock paths
+ * and PHY retime FIFOs have settled. Do not reset the PHY here: that would
+ * discard the synchronization which the manager has just completed.
+ */
+int msm_dsi_host_reset_after_phy_sync(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	u32 ctrl, clk_ctrl;
+	int ret = 0;
+
+	if (!of_device_is_compatible(msm_host->pdev->dev.of_node,
+				     "qcom,sm8750-dsi-ctrl") ||
+	    !(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO))
+		return 0;
+
+	mutex_lock(&msm_host->dev_mutex);
+	/* The manager calls before IRQs, panel commands or video are enabled. */
+	if (!msm_host->power_on || msm_host->enabled) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+
+	ctrl = dsi_read(msm_host, REG_DSI_CTRL);
+	clk_ctrl = dsi_read(msm_host, REG_DSI_CLK_CTRL);
+	dsi_write(msm_host, REG_DSI_CTRL,
+		  ctrl & ~(DSI_CTRL_ENABLE | DSI_CTRL_VID_MODE_EN |
+			   DSI_CTRL_CMD_MODE_EN));
+	wmb();
+
+	/* MiCode v7.2 dynamic force-on mask; preserve every existing bit. */
+	dsi_write(msm_host, REG_DSI_CLK_CTRL,
+		  clk_ctrl | 0x23f | BIT(8) | BIT(9) | BIT(11) | BIT(21));
+	wmb();
+	dsi_write(msm_host, REG_DSI_RESET, 1);
+	wmb();
+	udelay(1);
+	dsi_write(msm_host, REG_DSI_RESET, 0);
+	wmb();
+	dsi_write(msm_host, REG_DSI_CLK_CTRL, clk_ctrl);
+	wmb();
+	dsi_write(msm_host, REG_DSI_CTRL, ctrl);
+	wmb();
+unlock:
+	mutex_unlock(&msm_host->dev_mutex);
+	return ret;
+}
+
 int msm_dsi_host_power_off(struct mipi_dsi_host *host)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
