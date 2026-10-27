@@ -201,3 +201,16 @@ config DRM_MSM_HDMI_HDCP
 	default y
 	help
 	  Choose this option to enable HDCP state machine
+
+config DRM_MSM_DPU_IGCV5_KUNIT_TEST
+	bool "IGCv5 hardware LUT tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && DRM_MSM=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test the packing of the IGCv5 hardware LUT into a REGDMA command
+	  stream: the opcodes, the mapping of the uniform DRM degamma LUT
+	  onto the main and dark hardware grids, and the offset of the
+	  trailing descriptor. These tests cover the command preparation
+	  only and do not validate the hardware transfer.
+
+	  If unsure, say N.

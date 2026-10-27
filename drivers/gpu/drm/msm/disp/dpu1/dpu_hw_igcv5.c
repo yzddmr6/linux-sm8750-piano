@@ -78,3 +78,7 @@ int dpu_hw_igcv5_pack_regdma(__le32 *words, size_t capacity,
 	words[n++] = cpu_to_le32(lut ? IGC_ENABLE | IGC_HIGH_PRECISION : 0);
 	return n;
 }
+
+#if IS_ENABLED(CONFIG_DRM_MSM_DPU_IGCV5_KUNIT_TEST)
+#include "dpu_hw_igcv5-test.c"
+#endif
