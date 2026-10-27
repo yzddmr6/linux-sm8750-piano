@@ -541,6 +541,7 @@ int msm_dsi_manager_connector_init(struct msm_dsi *msm_dsi,
 	struct drm_bridge *bridge;
 	struct dsi_bridge *dsi_bridge;
 	struct drm_connector *connector;
+	struct drm_dsc_config *dsc;
 	int ret;
 
 	dsi_bridge = devm_drm_bridge_alloc(msm_dsi->dev->dev, struct dsi_bridge, base,
@@ -564,6 +565,25 @@ int msm_dsi_manager_connector_init(struct msm_dsi *msm_dsi,
 	if (IS_ERR(connector)) {
 		DRM_ERROR("Unable to create bridge connector\n");
 		return PTR_ERR(connector);
+	}
+
+	/* DSC uses one fixed component depth from the attached panel. Expose
+	 * that exact depth; changing it would also require changing the PPS
+	 * and panel configuration. This does not advertise HDR or panel FRC.
+	 */
+	dsc = msm_dsi_host_get_dsc_config(msm_dsi->host);
+	if (connector->connector_type == DRM_MODE_CONNECTOR_DSI &&
+	    dsc && dsc->bits_per_component) {
+		if (!connector->state)
+			connector->funcs->reset(connector);
+		if (!connector->state)
+			return -ENOMEM;
+		ret = drm_connector_attach_max_bpc_property(connector,
+						     dsc->bits_per_component,
+						     dsc->bits_per_component);
+		if (ret)
+			return ret;
+		connector->max_bpc = dsc->bits_per_component;
 	}
 
 	return 0;

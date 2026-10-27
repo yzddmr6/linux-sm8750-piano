@@ -20,6 +20,7 @@
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
+#include <drm/drm_property.h>
 #include <drm/display/drm_hdcp_helper.h>
 #include <drm/display/drm_hdmi_audio_helper.h>
 #include <drm/display/drm_hdmi_cec_helper.h>
@@ -269,8 +270,18 @@ static void drm_bridge_connector_reset(struct drm_connector *connector)
 {
 	struct drm_bridge_connector *bridge_connector =
 		to_drm_bridge_connector(connector);
+	struct drm_property *max_bpc = connector->max_bpc_property;
 
 	drm_atomic_helper_connector_reset(connector);
+	/* The generic reset creates a zeroed state. Keep an attached fixed
+	 * DSI depth across mode_config_reset without modifying HDMI policy.
+	 */
+	if (!bridge_connector->bridge_hdmi && connector->state &&
+	    connector->connector_type == DRM_MODE_CONNECTOR_DSI && max_bpc &&
+	    max_bpc->values[0] == max_bpc->values[1]) {
+		connector->state->max_requested_bpc = max_bpc->values[1];
+		connector->state->max_bpc = max_bpc->values[1];
+	}
 	if (bridge_connector->bridge_hdmi)
 		__drm_atomic_helper_connector_hdmi_reset(connector,
 							 connector->state);
