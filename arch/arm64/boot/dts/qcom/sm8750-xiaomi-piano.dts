@@ -147,10 +147,21 @@
 			     "qcom,sm8550-pmic-glink", "qcom,pmic-glink";
 		xiaomi,charge-pump = <&sc8541>;
 		orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;
+
 		pinctrl-0 = <&usb_orientation_default>;
 		pinctrl-names = "default";
 		#address-cells = <1>;
 		#size-cells = <0>;
+
+		/* The firmware of the charger switches the supply of the pen
+		 * transmitter in its dock.
+		 */
+		regulators {
+			pen_boost: pen-boost {
+				regulator-min-microvolt = <6500000>;
+				regulator-max-microvolt = <6500000>;
+			};
+		};
 
 		connector@0 {
 			compatible = "usb-c-connector";
