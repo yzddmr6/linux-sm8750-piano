@@ -379,12 +379,13 @@ static void nt36532_test_piano_modules(struct kunit *test)
 			if (n == d1 || n == vendor)
 				continue;
 			/* The two panels send the rate commands in the
-			 * opposite order, so compare them swapped.
+			 * opposite order, so pair them by command and not
+			 * by position.
 			 */
 			if (n == csot_b2)
-				c = boe_b3;
-			else if (n == csot_b3)
 				c = boe_b2;
+			else if (n == csot_b3)
+				c = boe_b3;
 			nt36532_test_expect_same(test, &csot->msg[n], &boe->msg[c]);
 		}
 	}
