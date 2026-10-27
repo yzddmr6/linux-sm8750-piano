@@ -1343,7 +1343,10 @@ static void qcom_battmgr_pps_monitor(struct qcom_battmgr *battmgr)
 		return;
 
 	curr = min(battmgr->pps_curr_ma + PPS_CURR_STEP_MA, battmgr->pps_target_ma);
+	/* The firmware expects a voltage/current pair for each PDO update. */
 	if (qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+				      USB_OPLUS_PPS_VOLT, PPS_VOLT_MV) ||
+	    qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
 				      USB_OPLUS_PPS_CURR, curr)) {
 		qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "current request refused");
 		return;
