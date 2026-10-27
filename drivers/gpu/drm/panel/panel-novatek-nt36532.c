@@ -743,6 +743,14 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
 
+	/*
+	 * The DSI host has to be initialised before the panel is powered up,
+	 * and it has to stay alive until the panel has been told to go to
+	 * sleep, otherwise the display off and sleep commands never reach
+	 * the panel.
+	 */
+	ctx->panel.prepare_prev_first = true;
+
 	variants = of_device_get_match_data(dev);
 	if (!variants)
 		return -ENODEV;
