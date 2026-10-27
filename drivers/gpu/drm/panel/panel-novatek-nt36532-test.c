@@ -304,20 +304,20 @@ static unsigned int nt36532_test_find(struct kunit *test, struct nt36532_test *t
 }
 
 /*
- * The stock 35-02-0b (BOE) on-command is the 42-02-0a (CSOT) one with ESD
+ * The stock 35-02-0b (CSOT) on-command is the 42-02-0a (BOE) one with ESD
  * D1 0x00 instead of 0x20, BC 77 07 in place of an eight-command vendor
  * block, and B2 sent before B3 instead of after it.
  */
 static void nt36532_test_piano_modules(struct kunit *test)
 {
-	static const u8 csot_vendor[][2] = {
+	static const u8 csot_vendor[] = { 0xbc, 0x77, 0x07 };
+	static const u8 boe_vendor[][2] = {
 		{ 0xc4, 0x82 }, { 0xff, 0x26 }, { 0xfb, 0x01 }, { 0x3b, 0x06 },
 		{ 0x4b, 0x06 }, { 0xff, 0x22 }, { 0xfb, 0x01 }, { 0xc4, 0x06 },
 	};
-	static const u8 boe_vendor[] = { 0xbc, 0x77, 0x07 };
-	static const u8 csot_d1[] = { 0xd1, 0x20 }, boe_d1[] = { 0xd1, 0x00 };
+	static const u8 csot_d1[] = { 0xd1, 0x00 }, boe_d1[] = { 0xd1, 0x20 };
 	const struct drm_display_mode *modes = piano_display_modes;
-	unsigned int mode, n, d1, vendor, b2, b3;
+	unsigned int mode, n, d1, vendor, csot_b2, csot_b3, boe_b2, boe_b3;
 	u8 rate[2];
 
 	for (mode = 0; mode < ARRAY_SIZE(piano_display_modes); mode++) {
@@ -327,21 +327,23 @@ static void nt36532_test_piano_modules(struct kunit *test)
 		kunit_info(test, "%d Hz\n", hz);
 		csot = nt36532_test_init(test, &piano_csot_panel_info, &modes[mode]);
 		boe = nt36532_test_init(test, &piano_boe_panel_info, &modes[mode]);
-		KUNIT_ASSERT_EQ(test, csot->count,
-				boe->count + ARRAY_SIZE(csot_vendor) - 1);
+		/* The BOE sends an eight-command vendor block where the CSOT
+		 * sends a single command.
+		 */
+		KUNIT_ASSERT_EQ(test, boe->count,
+				csot->count + ARRAY_SIZE(boe_vendor) - 1);
 
 		d1 = nt36532_test_find(test, csot, 0, csot_d1, sizeof(csot_d1));
 		KUNIT_ASSERT_LT(test, d1, csot->count);
 		KUNIT_EXPECT_TRUE(test, nt36532_test_msg_is(&boe->msg[d1], boe_d1,
 							    sizeof(boe_d1)));
 
-		vendor = nt36532_test_find(test, csot, d1, csot_vendor[0], 2);
-		KUNIT_ASSERT_LT(test, vendor + ARRAY_SIZE(csot_vendor), csot->count);
-		for (n = 0; n < ARRAY_SIZE(csot_vendor); n++)
-			KUNIT_EXPECT_TRUE(test, nt36532_test_msg_is(&csot->msg[vendor + n],
-								    csot_vendor[n], 2));
-		KUNIT_EXPECT_TRUE(test, nt36532_test_msg_is(&boe->msg[vendor], boe_vendor,
-							    sizeof(boe_vendor)));
+		vendor = nt36532_test_find(test, csot, d1, csot_vendor,
+					   sizeof(csot_vendor));
+		KUNIT_ASSERT_LT(test, vendor + 1, csot->count);
+		for (n = 0; n < ARRAY_SIZE(boe_vendor); n++)
+			KUNIT_EXPECT_TRUE(test, nt36532_test_msg_is(&boe->msg[vendor + n],
+								    boe_vendor[n], 2));
 
 		switch (hz) {
 		case 144:
@@ -357,21 +359,33 @@ static void nt36532_test_piano_modules(struct kunit *test)
 			rate[1] = 0x40;
 			break;
 		}
-		b3 = nt36532_test_find(test, csot, vendor,
-				       (const u8[]){ 0xb3, rate[1] }, 2);
-		b2 = nt36532_test_find(test, csot, vendor,
-				       (const u8[]){ 0xb2, rate[0] }, 2);
-		KUNIT_ASSERT_EQ(test, b2, b3 + 1);
+		csot_b2 = nt36532_test_find(test, csot, vendor,
+					   (const u8[]){ 0xb2, rate[0] }, 2);
+		csot_b3 = nt36532_test_find(test, csot, vendor,
+					   (const u8[]){ 0xb3, rate[1] }, 2);
+		boe_b2 = nt36532_test_find(test, boe, vendor,
+					  (const u8[]){ 0xb2, rate[0] }, 2);
+		boe_b3 = nt36532_test_find(test, boe, vendor,
+					  (const u8[]){ 0xb3, rate[1] }, 2);
+		/* The CSOT sends B2 before B3, the BOE the other way round. */
+		KUNIT_ASSERT_EQ(test, csot_b3, csot_b2 + 1);
+		KUNIT_ASSERT_EQ(test, boe_b2, boe_b3 + 1);
 
 		/* Everything else is byte-identical, including the PPS. */
-		for (n = 0; n < boe->count; n++) {
-			unsigned int c = n < vendor ? n : n + ARRAY_SIZE(csot_vendor) - 1;
+		for (n = 0; n < csot->count; n++) {
+			unsigned int c = n < vendor ? n :
+					 n + ARRAY_SIZE(boe_vendor) - 1;
 
 			if (n == d1 || n == vendor)
 				continue;
-			if (c == b3 || c == b2)
-				c = c == b3 ? b2 : b3;
-			nt36532_test_expect_same(test, &csot->msg[c], &boe->msg[n]);
+			/* The two panels send the rate commands in the
+			 * opposite order, so compare them swapped.
+			 */
+			if (n == csot_b2)
+				c = boe_b3;
+			else if (n == csot_b3)
+				c = boe_b2;
+			nt36532_test_expect_same(test, &csot->msg[n], &boe->msg[c]);
 		}
 	}
 }
