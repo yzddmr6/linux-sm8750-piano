@@ -40,7 +40,7 @@
 #define SC1300CS_VTS_MAX		0x7ffe
 #define SC1300CS_EXPOSURE_MARGIN	5
 #define SC1300CS_PIXEL_RATE	480000000
-#define SC1300CS_XCLK_RATE	24000000
+#define SC1300CS_XCLK_RATE	19200000
 
 static const s64 sc1300cs_link_freqs[] = { 600000000 };
 /* Power-on order: I/O, digital core, analogue. */
@@ -243,6 +243,7 @@ static const struct cci_reg_sequence sc1300cs_mode[] = {
 	{ CCI_REG8(0x3213), 0x08 },
 	{ CCI_REG8(0x3215), 0x11 },
 	{ CCI_REG8(0x3220), 0x00 },
+	/* Both flips: the captured mode starts with an RGGB pixel. */
 	{ CCI_REG8(0x3221), 0x66 },
 	{ CCI_REG8(0x5000), 0x1e },
 	{ CCI_REG8(0x5900), 0x01 },
@@ -465,7 +466,7 @@ static int sc1300cs_set_format(struct v4l2_subdev *sd,
 	fmt->format = (struct v4l2_mbus_framefmt) {
 		.width = SC1300CS_WIDTH,
 		.height = SC1300CS_HEIGHT,
-		.code = MEDIA_BUS_FMT_SBGGR10_1X10,
+		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.field = V4L2_FIELD_NONE,
 		.colorspace = V4L2_COLORSPACE_RAW,
 		.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT,
@@ -490,7 +491,7 @@ static int sc1300cs_enum_mbus_code(struct v4l2_subdev *sd,
 {
 	if (code->index)
 		return -EINVAL;
-	code->code = MEDIA_BUS_FMT_SBGGR10_1X10;
+	code->code = MEDIA_BUS_FMT_SRGGB10_1X10;
 	return 0;
 }
 
@@ -498,7 +499,7 @@ static int sc1300cs_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *state,
 				  struct v4l2_subdev_frame_size_enum *fse)
 {
-	if (fse->index || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
+	if (fse->index || fse->code != MEDIA_BUS_FMT_SRGGB10_1X10)
 		return -EINVAL;
 	fse->min_width = fse->max_width = SC1300CS_WIDTH;
 	fse->min_height = fse->max_height = SC1300CS_HEIGHT;
@@ -589,7 +590,7 @@ static int sc1300cs_probe(struct i2c_client *client)
 	if (IS_ERR(sensor->xclk))
 		return dev_err_probe(dev, PTR_ERR(sensor->xclk), "failed to get clock\n");
 	if (clk_get_rate(sensor->xclk) != SC1300CS_XCLK_RATE)
-		return dev_err_probe(dev, -EINVAL, "24 MHz clock required\n");
+		return dev_err_probe(dev, -EINVAL, "19.2 MHz clock required\n");
 	sensor->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(sensor->reset))
 		return dev_err_probe(dev, PTR_ERR(sensor->reset), "failed to get reset\n");

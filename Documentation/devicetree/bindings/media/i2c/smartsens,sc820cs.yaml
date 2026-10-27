@@ -12,7 +12,7 @@ maintainers:
 description:
   The SC820CS is a RAW image sensor with an I2C control interface
   and a MIPI CSI-2 output. The supported configuration uses four D-PHY
-  data lanes and a 24 MHz input clock.
+  data lanes and a 19.2 MHz input clock.
 
 allOf:
   - $ref: /schemas/media/video-interface-devices.yaml#
@@ -80,12 +80,12 @@ examples:
         #address-cells = <1>;
         #size-cells = <0>;
 
-        camera@20 {
+        camera@10 {
             compatible = "smartsens,sc820cs";
-            reg = <0x20>;
+            reg = <0x10>;
             clocks = <&camera_clk>;
             assigned-clocks = <&camera_clk>;
-            assigned-clock-rates = <24000000>;
+            assigned-clock-rates = <19200000>;
             avdd-supply = <&camera_avdd>;
             dvdd-supply = <&camera_dvdd>;
             dovdd-supply = <&camera_dovdd>;
