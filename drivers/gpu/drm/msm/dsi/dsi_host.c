@@ -187,6 +187,7 @@ struct msm_dsi_host {
 	bool registered;
 	bool power_on;
 	bool enabled;
+	bool video_enabled;
 	int irq;
 };
 
@@ -1165,6 +1166,7 @@ static void dsi_op_mode_config(struct msm_dsi_host *msm_host,
 	u32 dsi_ctrl;
 
 	dsi_ctrl = dsi_read(msm_host, REG_DSI_CTRL);
+	dsi_ctrl &= ~(DSI_CTRL_VID_MODE_EN | DSI_CTRL_CMD_MODE_EN);
 
 	if (!enable) {
 		dsi_ctrl &= ~(DSI_CTRL_ENABLE | DSI_CTRL_VID_MODE_EN |
@@ -1174,6 +1176,7 @@ static void dsi_op_mode_config(struct msm_dsi_host *msm_host,
 	} else {
 		if (video_mode) {
 			dsi_ctrl |= DSI_CTRL_VID_MODE_EN;
+			dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_CMD_MDP_DONE, 0);
 		} else {		/* command mode */
 			dsi_ctrl |= DSI_CTRL_CMD_MODE_EN;
 			dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_CMD_MDP_DONE, 1);
@@ -1181,6 +1184,18 @@ static void dsi_op_mode_config(struct msm_dsi_host *msm_host,
 		dsi_ctrl |= DSI_CTRL_ENABLE;
 	}
 
+	dsi_write(msm_host, REG_DSI_CTRL, dsi_ctrl);
+}
+
+/* Keep the controller available for DMA commands without a timing engine. */
+static void dsi_video_idle(struct msm_dsi_host *msm_host)
+{
+	u32 dsi_ctrl = dsi_read(msm_host, REG_DSI_CTRL);
+
+	dsi_ctrl &= ~(DSI_CTRL_VID_MODE_EN | DSI_CTRL_CMD_MODE_EN);
+	dsi_ctrl |= DSI_CTRL_ENABLE;
+	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_CMD_MDP_DONE |
+				DSI_IRQ_MASK_VIDEO_DONE, 0);
 	dsi_write(msm_host, REG_DSI_CTRL, dsi_ctrl);
 }
 
@@ -1233,7 +1248,7 @@ static void dsi_wait4video_eng_busy(struct msm_dsi_host *msm_host)
 	if (!(data & DSI_STATUS0_VIDEO_MODE_ENGINE_BUSY))
 		return;
 
-	if (msm_host->power_on && msm_host->enabled) {
+	if (msm_host->power_on && msm_host->video_enabled) {
 		dsi_wait4video_done(msm_host);
 		/* delay 4 ms to skip BLLP */
 		usleep_range(2000, 4000);
@@ -1573,7 +1588,9 @@ static void dsi_err_worker(struct work_struct *work)
 		container_of(work, struct msm_dsi_host, err_work);
 	u32 status = msm_host->err_work_state;
 
-	pr_err_ratelimited("%s: status=%x\n", __func__, status);
+	pr_err_ratelimited("%s: host=%d status=%x power_on=%u enabled=%u video=%u\n",
+			   __func__, msm_host->id, status, READ_ONCE(msm_host->power_on),
+			   READ_ONCE(msm_host->enabled), READ_ONCE(msm_host->video_enabled));
 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
 		dsi_sw_reset(msm_host);
 
@@ -1635,6 +1652,9 @@ static void dsi_fifo_status(struct msm_dsi_host *msm_host)
 	/* fifo underflow, overflow */
 	if (status) {
 		trace_msm_dsi_fifo_error(msm_host->id, status);
+		pr_err_ratelimited("%s: host=%d raw_fifo=%08x power_on=%u enabled=%u video=%u\n",
+				   __func__, msm_host->id, status, READ_ONCE(msm_host->power_on),
+				   READ_ONCE(msm_host->enabled), READ_ONCE(msm_host->video_enabled));
 		dsi_write(msm_host, REG_DSI_FIFO_STATUS, status);
 		msm_host->err_work_state |= DSI_ERR_STATE_FIFO;
 		if (status & DSI_FIFO_STATUS_CMD_MDP_FIFO_UNDERFLOW)
@@ -2439,20 +2459,60 @@ void msm_dsi_host_disable_irq(struct mipi_dsi_host *host)
 int msm_dsi_host_enable(struct mipi_dsi_host *host)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	int ret = 0;
 
-	dsi_op_mode_config(msm_host,
-		!!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO), true);
-
-	/* TODO: clock should be turned off for command mode,
-	 * and only turned on before MDP START.
-	 * This part of code should be enabled once mdp driver support it.
-	 */
-	/* if (msm_panel->mode == MSM_DSI_CMD_MODE) {
-	 *	dsi_link_clk_disable(msm_host);
-	 *	pm_runtime_put(&msm_host->pdev->dev);
-	 * }
-	 */
+	mutex_lock(&msm_host->dev_mutex);
+	if (!msm_host->power_on) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	/* DMA transfers enable command mode temporarily in xfer_prepare. */
+	if (msm_host->mode_flags & MIPI_DSI_MODE_VIDEO)
+		dsi_video_idle(msm_host);
+	else
+		dsi_op_mode_config(msm_host, false, true);
 	msm_host->enabled = true;
+	msm_host->video_enabled = false;
+unlock:
+	mutex_unlock(&msm_host->dev_mutex);
+	return ret;
+}
+
+int msm_dsi_host_enable_video(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	int ret = 0;
+
+	mutex_lock(&msm_host->dev_mutex);
+	if (!msm_host->power_on || !msm_host->enabled) {
+		ret = -EINVAL;
+		goto unlock;
+	}
+	if (msm_host->mode_flags & MIPI_DSI_MODE_VIDEO) {
+		dsi_op_mode_config(msm_host, true, true);
+		msm_host->video_enabled = true;
+	}
+unlock:
+	mutex_unlock(&msm_host->dev_mutex);
+	return ret;
+}
+
+int msm_dsi_host_disable_video(struct mipi_dsi_host *host)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+
+	mutex_lock(&msm_host->dev_mutex);
+	if (!msm_host->power_on || !msm_host->video_enabled)
+		goto unlock;
+	/* Stop video before INTF stops; reset removes its command-engine block.
+	 * Keep command/IRQ/clock access for the panel's later unprepare DCS.
+	 */
+	dsi_op_mode_config(msm_host, true, false);
+	dsi_sw_reset(msm_host);
+	dsi_video_idle(msm_host);
+	msm_host->video_enabled = false;
+unlock:
+	mutex_unlock(&msm_host->dev_mutex);
 	return 0;
 }
 
@@ -2460,16 +2520,16 @@ int msm_dsi_host_disable(struct mipi_dsi_host *host)
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 
+	mutex_lock(&msm_host->dev_mutex);
+	if (msm_host->power_on) {
+		dsi_op_mode_config(msm_host, false, false);
+		/* Command-mode panels retain the existing final controller reset. */
+		if (!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO))
+			dsi_sw_reset(msm_host);
+	}
 	msm_host->enabled = false;
-	dsi_op_mode_config(msm_host,
-		!!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO), false);
-
-	/* Since we have disabled INTF, the video engine won't stop so that
-	 * the cmd engine will be blocked.
-	 * Reset to disable video engine so that we can send off cmd.
-	 */
-	dsi_sw_reset(msm_host);
-
+	msm_host->video_enabled = false;
+	mutex_unlock(&msm_host->dev_mutex);
 	return 0;
 }
 
@@ -2610,6 +2670,8 @@ int msm_dsi_host_power_off(struct mipi_dsi_host *host)
 	}
 
 	dsi_ctrl_disable(msm_host);
+	msm_host->enabled = false;
+	msm_host->video_enabled = false;
 
 	pinctrl_pm_select_sleep_state(&msm_host->pdev->dev);
 
