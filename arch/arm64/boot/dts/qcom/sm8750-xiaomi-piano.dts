@@ -1084,8 +1084,8 @@
 	 * Two panel modules share this board. The stock bootloader picks the
 	 * P81 profile from the module ID pin that the stock touch driver also
 	 * reads (novatek,lcd_id-gpio, TLMM GPIO100, no pinctrl state): low is
-	 * qcom,mdss_dsi_p81_42_02_0a_dualdsi_dsc_vid (CSOT), high is
-	 * qcom,mdss_dsi_p81_35_02_0b_dualdsi_dsc_vid (BOE).
+	 * qcom,mdss_dsi_p81_35_02_0b_dualdsi_dsc_vid (CSOT), high is
+	 * qcom,mdss_dsi_p81_42_02_0a_dualdsi_dsc_vid (BOE).
 	 */
 	panel: panel@0 {
 		compatible = "xiaomi,piano-nt36532", "novatek,nt36532";

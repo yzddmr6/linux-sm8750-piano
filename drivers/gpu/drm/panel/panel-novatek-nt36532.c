@@ -507,8 +507,8 @@ static const struct drm_dsc_config piano_dsc_cfg = {
 	.block_pred_enable = true,
 };
 
-/* 42-02-0a */
-static void piano_csot_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
+/* 42-02-0a (BOE) */
+static void piano_boe_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
 {
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc4, 0x82);
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xff, 0x26);
@@ -520,8 +520,8 @@ static void piano_csot_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xc4, 0x06);
 }
 
-/* 35-02-0b */
-static void piano_boe_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
+/* 35-02-0b (CSOT) */
+static void piano_csot_vendor_sequence(struct mipi_dsi_multi_context *dsi_ctx)
 {
 	mipi_dsi_dcs_write_seq_multi(dsi_ctx, 0xbc, 0x77, 0x07);
 }
@@ -537,14 +537,14 @@ struct piano_module {
 	bool rate_b2_first;
 };
 
-static const struct piano_module piano_csot_module = {
+static const struct piano_module piano_boe_module = {
 	.esd_cfg = 0x20,
-	.vendor_sequence = piano_csot_vendor_sequence,
+	.vendor_sequence = piano_boe_vendor_sequence,
 };
 
-static const struct piano_module piano_boe_module = {
+static const struct piano_module piano_csot_module = {
 	.esd_cfg = 0x00,
-	.vendor_sequence = piano_boe_vendor_sequence,
+	.vendor_sequence = piano_csot_vendor_sequence,
 	.rate_b2_first = true,
 };
 
@@ -900,20 +900,23 @@ static void piano_reset(struct nt36532 *ctx)
 }
 
 static const struct panel_info piano_csot_panel_info =
-	PIANO_PANEL_INFO("p81 42-02-0a (CSOT)", piano_csot_init_sequence);
+	PIANO_PANEL_INFO("p81 35-02-0b (CSOT)", piano_csot_init_sequence);
 
 static const struct panel_info piano_boe_panel_info =
-	PIANO_PANEL_INFO("p81 35-02-0b (BOE)", piano_boe_init_sequence);
+	PIANO_PANEL_INFO("p81 42-02-0a (BOE)", piano_boe_init_sequence);
 
 static const struct nt36532_variants csot_variants = {
 	.info = { &csot_panel_info },
 };
 
-/* The stock bootloader and touch driver read the same ID pin. */
+/*
+ * The stock bootloader and the touch driver read the same ID pin:
+ * low is the CSOT module (P81_35), high is the BOE module (P81_42).
+ */
 static const struct nt36532_variants piano_variants = {
 	.info = {
-		&piano_csot_panel_info,	/* ID low */
-		&piano_boe_panel_info,	/* ID high */
+		&piano_csot_panel_info,	/* ID low: p81 35-02-0b (CSOT) */
+		&piano_boe_panel_info,	/* ID high: p81 42-02-0a (BOE) */
 	},
 };
 
