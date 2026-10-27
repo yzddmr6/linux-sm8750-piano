@@ -8,6 +8,7 @@
 struct dpu_hw_dspp;
 struct dpu_hw_ctl;
 struct dpu_lutdma;
+struct drm_color_lut;
 
 /**
  * struct dpu_hw_pcc_coeff - PCC coefficient structure for each color
@@ -74,6 +75,11 @@ struct dpu_hw_dspp_ops {
 	 */
 	int (*setup_gc)(struct dpu_hw_dspp *ctx, struct dpu_hw_gc_lut *gc_lut,
 			struct dpu_hw_ctl *ctl, u32 dspp_mask);
+
+	/* Complete GC/IGC state in one shared REGDMA submission. */
+	int (*setup_color)(struct dpu_hw_dspp *ctx, struct dpu_hw_gc_lut *gc_lut,
+			   const struct drm_color_lut *igc_lut,
+			   struct dpu_hw_ctl *ctl, u32 dspp_mask);
 
 };
 

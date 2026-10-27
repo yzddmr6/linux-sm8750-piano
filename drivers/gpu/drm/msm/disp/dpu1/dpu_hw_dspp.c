@@ -124,6 +124,13 @@ static int dpu_setup_dspp_gcv2(struct dpu_hw_dspp *ctx,
 	return dpu_lutdma_submit_gc(ctx->lutdma, ctl, dspp_mask, lut);
 }
 
+static int dpu_setup_dspp_color(struct dpu_hw_dspp *ctx,
+		struct dpu_hw_gc_lut *gc_lut, const struct drm_color_lut *igc_lut,
+		struct dpu_hw_ctl *ctl, u32 dspp_mask)
+{
+	return dpu_lutdma_submit_color(ctx->lutdma, ctl, dspp_mask, gc_lut, igc_lut, true);
+}
+
 void dpu_hw_dspp_bind_regdma(struct dpu_hw_dspp *ctx, struct dpu_lutdma *dma)
 {
 	if (ctx->cap->sblk->gc.version != 0x20000 ||
@@ -131,6 +138,9 @@ void dpu_hw_dspp_bind_regdma(struct dpu_hw_dspp *ctx, struct dpu_lutdma *dma)
 		return;
 	ctx->lutdma = dma;
 	ctx->ops.setup_gc = dpu_setup_dspp_gcv2;
+	if (ctx->cap->sblk->igc.version == 0x50000 &&
+	    ctx->cap->sblk->igc.base == 0x1260)
+		ctx->ops.setup_color = dpu_setup_dspp_color;
 }
 
 /**

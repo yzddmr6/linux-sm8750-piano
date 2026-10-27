@@ -19,4 +19,7 @@ struct dpu_hw_gc_lut;
 int dpu_hw_gcv2_pack_regdma(__le32 *words, size_t capacity,
 			  u32 dspp_mask, const struct dpu_hw_gc_lut *lut);
 
+int dpu_hw_color_regdma_last_offset(size_t command_words, size_t buffer_bytes,
+				    size_t *offset);
+
 #endif

@@ -14,6 +14,7 @@
 #include "msm_drv.h"
 #include "msm_gem.h"
 #include "dpu_hw_gcv2.h"
+#include "dpu_hw_igcv5.h"
 #include "dpu_hw_vbif.h"
 #include "dpu_kms.h"
 #include "dpu_hw_dspp.h"
@@ -36,8 +37,8 @@
 #define REGDMA_LAST BIT(24)
 #define REGDMA_CMD_WORDS GENMASK(13, 0)
 #define REGDMA_ALIGN 256
-#define REGDMA_BUFFER_SIZE SZ_8K
-#define REGDMA_LAST_OFFSET ALIGN(DPU_GCV2_LUT_WORDS * sizeof(u32), REGDMA_ALIGN)
+#define REGDMA_BUFFER_SIZE SZ_16K
+#define REGDMA_LAST_SIZE (2 * sizeof(u32))
 
 struct dpu_lutdma {
 	struct dpu_kms *kms;
@@ -145,12 +146,20 @@ static void retire_reference(struct dpu_lutdma *dma)
 	}
 }
 
-int dpu_lutdma_submit_gc(struct dpu_lutdma *dma, struct dpu_hw_ctl *ctl,
-			u32 dspp_mask, const struct dpu_hw_gc_lut *lut)
+bool dpu_lutdma_ctl_valid(struct dpu_lutdma *dma, struct dpu_hw_ctl *ctl)
+{
+	return ctl && queue_reg(dma, ctl->idx, REGDMA_QUEUE_RESET);
+}
+
+int dpu_lutdma_submit_color(struct dpu_lutdma *dma, struct dpu_hw_ctl *ctl,
+			u32 dspp_mask, const struct dpu_hw_gc_lut *gc_lut,
+			const struct drm_color_lut *igc_lut, bool update_igc)
 {
 	u32 done, errors, descriptor;
 	__le32 *last;
-	int words, ret;
+	size_t capacity = (REGDMA_BUFFER_SIZE - REGDMA_LAST_SIZE) / sizeof(u32);
+	size_t last_offset;
+	int words, igc_words, ret;
 
 	might_sleep(); /* Called by the process-context atomic commit, never IRQ. */
 	if (!dma || !ctl || ctl->idx < CTL_0 || ctl->idx >= CTL_MAX ||
@@ -162,12 +171,23 @@ int dpu_lutdma_submit_gc(struct dpu_lutdma *dma, struct dpu_hw_ctl *ctl,
 		ret = -EIO;
 		goto unlock;
 	}
-	words = dpu_hw_gcv2_pack_regdma(dma->commands, REGDMA_LAST_OFFSET / sizeof(u32),
-				       dspp_mask, lut);
+	words = dpu_hw_gcv2_pack_regdma(dma->commands, capacity, dspp_mask, gc_lut);
 	if (words < 0) {
 		ret = words;
 		goto unlock;
 	}
+	if (update_igc) {
+		igc_words = dpu_hw_igcv5_pack_regdma(dma->commands + words,
+						capacity - words, dspp_mask, igc_lut);
+		if (igc_words < 0) {
+			ret = igc_words;
+			goto unlock;
+		}
+		words += igc_words;
+	}
+	ret = dpu_hw_color_regdma_last_offset(words, REGDMA_BUFFER_SIZE, &last_offset);
+	if (ret)
+		goto unlock;
 	ret = clocks_get(dma);
 	if (ret)
 		goto unlock;
@@ -178,7 +198,7 @@ int dpu_lutdma_submit_gc(struct dpu_lutdma *dma, struct dpu_hw_ctl *ctl,
 		goto unlock;
 	}
 	dma->module_held = true;
-	last = (__le32 *)((u8 *)dma->commands + REGDMA_LAST_OFFSET);
+	last = (__le32 *)((u8 *)dma->commands + last_offset);
 	last[0] = cpu_to_le32(0x18180114);
 	last[1] = 0; /* Real downstream final descriptor: decode-select no blocks. */
 	dma_wmb(); /* WC GEM writes must precede descriptor publication. */
@@ -187,12 +207,12 @@ int dpu_lutdma_submit_gc(struct dpu_lutdma *dma, struct dpu_hw_ctl *ctl,
 	writel(REGDMA_DONE, queue_reg(dma, ctl->idx, REGDMA_DONE_CLEAR));
 	dma->active_ctl = ctl->idx;
 	WRITE_ONCE(dma->inflight, true);
-	drm_dbg_kms(dma->kms->dev, "GC2 REGDMA ctl=%u dspp_mask=%#x iova=%#llx words=%d\n",
+	drm_dbg_kms(dma->kms->dev, "color REGDMA ctl=%u dspp_mask=%#x iova=%#llx words=%d\n",
 		    ctl->idx, dspp_mask, dma->iova, words);
 	writel(lower_32_bits(dma->iova), queue_reg(dma, ctl->idx, 0));
 	writel(REGDMA_WRITE | (words & REGDMA_CMD_WORDS), queue_reg(dma, ctl->idx, 4));
 	wmb();
-	writel(lower_32_bits(dma->iova + REGDMA_LAST_OFFSET), queue_reg(dma, ctl->idx, 0));
+	writel(lower_32_bits(dma->iova + last_offset), queue_reg(dma, ctl->idx, 0));
 	descriptor = REGDMA_WRITE | REGDMA_LAST | 2;
 	writel(descriptor, queue_reg(dma, ctl->idx, 4));
 	wmb();
@@ -202,7 +222,7 @@ int dpu_lutdma_submit_gc(struct dpu_lutdma *dma, struct dpu_hw_ctl *ctl,
 	errors = readl(dma->mmio + dma->cfg->db_base + REGDMA_ERROR_STATUS) & REGDMA_ERROR_MASK;
 	if (ret || errors) {
 		WRITE_ONCE(dma->faulted, true);
-		drm_err(dma->kms->dev, "GC2 REGDMA failure ctl=%u done=%#x error=%#x ret=%d\n",
+		drm_err(dma->kms->dev, "color REGDMA failure ctl=%u done=%#x error=%#x ret=%d\n",
 			ctl->idx, done, errors, ret);
 		ret = ret ? ret : -EIO;
 		if (queue_reset(dma, ctl->idx)) {
@@ -210,12 +230,18 @@ int dpu_lutdma_submit_gc(struct dpu_lutdma *dma, struct dpu_hw_ctl *ctl,
 			goto unlock;
 		}
 	} else {
-		drm_dbg_kms(dma->kms->dev, "GC2 REGDMA completed ctl=%u status=%#x\n", ctl->idx, done);
+		drm_dbg_kms(dma->kms->dev, "color REGDMA completed ctl=%u status=%#x\n", ctl->idx, done);
 	}
 	retire_reference(dma);
 unlock:
 	mutex_unlock(&dma->lock);
 	return ret;
+}
+
+int dpu_lutdma_submit_gc(struct dpu_lutdma *dma, struct dpu_hw_ctl *ctl,
+			u32 dspp_mask, const struct dpu_hw_gc_lut *lut)
+{
+	return dpu_lutdma_submit_color(dma, ctl, dspp_mask, lut, NULL, false);
 }
 
 struct dpu_lutdma *dpu_lutdma_init(struct dpu_kms *kms)

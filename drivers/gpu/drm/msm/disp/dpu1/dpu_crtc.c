@@ -25,6 +25,7 @@
 
 #include "dpu_kms.h"
 #include "dpu_lutdma.h"
+#include "dpu_hw_igcv5.h"
 #include "dpu_hw_lm.h"
 #include "dpu_hw_ctl.h"
 #include "dpu_hw_dspp.h"
@@ -886,9 +887,26 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			else
 				_dpu_crtc_get_gc_lut(state, gc_lut);
 		}
-		if (!gcv2_ret)
-			gcv2_ret = gc_master->ops.setup_gc(gc_master, gc_lut, mixer[0].lm_ctl, gc_mask);
+		if (!gcv2_ret) {
+			if (gc_master->ops.setup_color) {
+				const struct drm_color_lut *igc_lut = state->degamma_lut ?
+					state->degamma_lut->data : NULL;
+
+				gcv2_ret = gc_master->ops.setup_color(gc_master, gc_lut,
+						igc_lut, mixer[0].lm_ctl, gc_mask);
+			} else {
+				gcv2_ret = gc_master->ops.setup_gc(gc_master, gc_lut,
+						mixer[0].lm_ctl, gc_mask);
+			}
+		}
 		kfree(gc_lut);
+		if (gcv2_ret) {
+			drm_err(crtc->dev, "color REGDMA programming failed: %d\n", gcv2_ret);
+			if (state->event && state->event->base.fence)
+				dma_fence_set_error(state->event->base.fence, gcv2_ret);
+			/* Do not apply only PCC after the combined LUT update failed. */
+			return;
+		}
 	}
 
 	for (i = 0; i < cstate->num_mixers; i++) {
@@ -935,6 +953,9 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			/* stage config flush mask */
 			ctl->ops.update_pending_flush_dspp(ctl,
 				mixer[i].hw_dspp->idx, DPU_DSPP_GC);
+			if (gc_master && gc_master->ops.setup_color)
+				ctl->ops.update_pending_flush_dspp(ctl,
+					mixer[i].hw_dspp->idx, DPU_DSPP_IGC);
 		}
 	}
 }
@@ -1417,6 +1438,39 @@ static int dpu_crtc_reassign_planes(struct drm_crtc *crtc, struct drm_crtc_state
 #define MAX_CHANNELS_PER_CRTC PIPES_PER_PLANE
 #define MAX_HDISPLAY_SPLIT 1080
 
+static bool dpu_crtc_has_regdma_color(struct dpu_kms *kms)
+{
+	struct dpu_hw_blk *block = kms->catalog->dspp_count ? kms->rm.dspp_blks[0] : NULL;
+	struct dpu_hw_dspp *dspp = block ? to_dpu_hw_dspp(block) : NULL;
+
+	return dspp && dspp->ops.setup_color;
+}
+
+static int dpu_crtc_check_regdma_color(struct drm_crtc *crtc,
+				     struct drm_crtc_state *state)
+{
+	struct dpu_kms *kms = _dpu_crtc_get_kms(crtc);
+	struct dpu_crtc_state *cstate = to_dpu_crtc_state(state);
+	u32 mask = 0;
+	int i;
+
+	if (!dpu_crtc_has_regdma_color(kms) ||
+	    (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state)))
+		return 0;
+	if (!dpu_lutdma_ready(kms->lutdma) || !cstate->num_mixers)
+		return -EIO;
+	for (i = 0; i < cstate->num_mixers; i++) {
+		struct dpu_hw_dspp *dspp = cstate->mixers[i].hw_dspp;
+
+		if (!dspp || dspp->idx < DSPP_0 || dspp->idx >= DSPP_MAX ||
+		    !dspp->ops.setup_color || dspp->lutdma != kms->lutdma ||
+		    !dpu_lutdma_ctl_valid(kms->lutdma, cstate->mixers[i].lm_ctl))
+			return -EINVAL;
+		mask |= BIT(17 + dspp->idx - DSPP_0);
+	}
+	return hweight32(mask) == cstate->num_mixers ? 0 : -EINVAL;
+}
+
 static struct msm_display_topology dpu_crtc_get_topology(
 		struct drm_crtc *crtc,
 		struct dpu_kms *dpu_kms,
@@ -1468,7 +1522,8 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	 * Keep the attached DSPPs reserved for the enabled CRTC, including an
 	 * empty LUT, instead of releasing them before the disable command.
 	 */
-	if (dpu_kms->lutdma || crtc_state->ctm || crtc_state->gamma_lut)
+	if (dpu_kms->lutdma || crtc_state->ctm || crtc_state->gamma_lut ||
+	    crtc_state->degamma_lut)
 		topology.num_dspp = topology.num_lm;
 
 	return topology;
@@ -1525,8 +1580,8 @@ static int dpu_crtc_assign_resources(struct drm_crtc *crtc,
 
 		cstate->mixers[i].hw_lm = to_dpu_hw_mixer(hw_lm[i]);
 		cstate->mixers[i].lm_ctl = to_dpu_hw_ctl(hw_ctl[ctl_idx]);
-		if (i < num_dspp)
-			cstate->mixers[i].hw_dspp = to_dpu_hw_dspp(hw_dspp[i]);
+		cstate->mixers[i].hw_dspp = i < num_dspp ?
+			to_dpu_hw_dspp(hw_dspp[i]) : NULL;
 	}
 
 	cstate->num_mixers = num_lm;
@@ -1583,8 +1638,8 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
 	/* A hardware failure latches the engine unusable. Do not accept a
 	 * later gamma update as though its transport were still initialized.
 	 */
-	if (crtc_state->color_mgmt_changed && kms->lutdma &&
-	    !dpu_lutdma_ready(kms->lutdma))
+	if ((crtc_state->color_mgmt_changed || drm_atomic_crtc_needs_modeset(crtc_state)) &&
+	    kms->lutdma && !dpu_lutdma_ready(kms->lutdma))
 		return -EIO;
 
 
@@ -1614,6 +1669,10 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
 	}
 
 	DRM_DEBUG_ATOMIC("%s: check\n", dpu_crtc->name);
+
+	rc = dpu_crtc_check_regdma_color(crtc, crtc_state);
+	if (rc)
+		return rc;
 
 	if (cstate->num_mixers) {
 		rc = _dpu_crtc_check_and_setup_lm_bounds(crtc, crtc_state);
@@ -1982,7 +2041,9 @@ struct drm_crtc *dpu_crtc_init(struct drm_device *dev, struct drm_plane *plane,
 		 */
 		if (dspp && dspp->ops.setup_gc) {
 			drm_mode_crtc_set_gamma_size(crtc, DPU_GAMMA_LUT_SIZE);
-			drm_crtc_enable_color_mgmt(crtc, 0, true, DPU_GAMMA_LUT_SIZE);
+			drm_crtc_enable_color_mgmt(crtc,
+					dspp->ops.setup_color ? DPU_IGCV5_LUT_SIZE : 0,
+					true, DPU_GAMMA_LUT_SIZE);
 		} else {
 			drm_crtc_enable_color_mgmt(crtc, 0, true, 0);
 		}

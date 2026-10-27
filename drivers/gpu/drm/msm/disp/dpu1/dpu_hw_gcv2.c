@@ -75,3 +75,19 @@ int dpu_hw_gcv2_pack_regdma(__le32 *words, size_t capacity,
 	words[n++] = cpu_to_le32(GC_ENABLE);
 	return n;
 }
+
+int dpu_hw_color_regdma_last_offset(size_t command_words, size_t buffer_bytes,
+				    size_t *offset)
+{
+	size_t last;
+
+	if (!offset || !command_words || command_words > 0x3fff)
+		return -EINVAL;
+	if (buffer_bytes < 8 || command_words > (buffer_bytes - 8) / sizeof(u32))
+		return -ENOSPC;
+	last = (command_words * sizeof(u32) + 255) & ~(size_t)255;
+	if (last > buffer_bytes - 8)
+		return -ENOSPC;
+	*offset = last;
+	return 0;
+}
