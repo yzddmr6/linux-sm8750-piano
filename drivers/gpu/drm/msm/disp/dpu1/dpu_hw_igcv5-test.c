@@ -122,7 +122,7 @@ static void igcv5_test_grid(struct kunit *test)
 {
 	struct drm_color_lut *lut;
 	__le32 words[DPU_IGCV5_LUT_WORDS];
-	unsigned int hw, word, comp;
+	unsigned int i;
 
 	lut = kunit_kzalloc(test, sizeof(*lut) * DPU_IGCV5_LUT_SIZE, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, lut);
@@ -132,30 +132,22 @@ static void igcv5_test_grid(struct kunit *test)
 						       BIT(17), lut),
 			DPU_IGCV5_LUT_WORDS);
 
-	/* Walk the hardware points and check the word each one lands in. */
-	for (hw = 0; hw < DPU_IGCV5_HW_ENTRIES; hw++) {
-		unsigned int entry = igcv5_test_entry(hw);
-
-		for (comp = 0; comp < 3; comp++) {
-			unsigned int index = hw * 3 + comp;
-
-			word = 4 + index / 2;
-			KUNIT_EXPECT_EQ(test, le32_to_cpu(words[word]) & 0xffff,
-					entry & 0xffff);
-			if (index % 2 == 0)
-				continue;
-			KUNIT_EXPECT_EQ(test, le32_to_cpu(words[word]) >> 16,
-					entry & 0xffff);
-		}
-	}
+	/* Every data word holds the two components at index 2i and 2i+1. */
+	for (i = 0; i < DPU_IGCV5_DATA_WORDS; i++)
+		KUNIT_EXPECT_EQ(test, le32_to_cpu(words[4 + i]),
+				igcv5_test_word(lut, i * 2));
 
 	/* The first word holds the first entry in red and green. */
-	KUNIT_EXPECT_EQ(test, le32_to_cpu(words[4]) & 0xffff, 0u);
-	KUNIT_EXPECT_EQ(test, le32_to_cpu(words[4]) >> 16, 0u);
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(words[4]), 0u);
 
-	/* The second word crosses into the fourth entry. */
-	KUNIT_EXPECT_EQ(test, le32_to_cpu(words[5]) & 0xffff, 0u);
-	KUNIT_EXPECT_EQ(test, le32_to_cpu(words[5]) >> 16, 4u);
+	/* The second word crosses into the fourth entry of the main grid. */
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(words[5]), 4u << 16);
+
+	/* The last point of the dark grid is the 128th entry. */
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(words[4 + DPU_IGCV5_DATA_WORDS - 2]), 127u);
+
+	/* The transfer is padded to a whole number of LUTBUS words. */
+	KUNIT_EXPECT_EQ(test, le32_to_cpu(words[4 + DPU_IGCV5_DATA_WORDS - 1]), 0u);
 }
 
 /* Without a LUT the block is only switched off again. */
