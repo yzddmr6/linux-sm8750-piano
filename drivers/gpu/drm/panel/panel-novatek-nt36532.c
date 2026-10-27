@@ -202,7 +202,20 @@ static int nt36532_get_modes(struct drm_panel *panel,
 {
 	struct nt36532 *ctx = to_nt36532(panel);
 	const struct panel_info *panel_info = ctx->panel_info;
+	unsigned int preferred = 0;
 	unsigned int i;
+
+	/* Piano's validated pen scan uses a 120 Hz cold-start display mode.
+	 * Keep every advertised mode and each panel vendor's own sequence.
+	 */
+	if (of_machine_is_compatible("xiaomi,piano")) {
+		for (i = 0; i < panel_info->num_modes; i++) {
+			if (drm_mode_vrefresh(&panel_info->modes[i]) == 120) {
+				preferred = i;
+				break;
+			}
+		}
+	}
 
 	for (i = 0; i < panel_info->num_modes; i++) {
 		struct drm_display_mode *mode;
@@ -212,7 +225,7 @@ static int nt36532_get_modes(struct drm_panel *panel,
 			return -ENOMEM;
 
 		mode->type = DRM_MODE_TYPE_DRIVER;
-		if (i == 0)
+		if (i == preferred)
 			mode->type |= DRM_MODE_TYPE_PREFERRED;
 
 		drm_mode_set_name(mode);
