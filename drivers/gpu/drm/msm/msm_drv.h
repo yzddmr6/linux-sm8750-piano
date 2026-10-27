@@ -303,6 +303,8 @@ bool msm_dsi_is_cmd_mode(struct msm_dsi *msm_dsi);
 bool msm_dsi_is_bonded_dsi(struct msm_dsi *msm_dsi);
 bool msm_dsi_is_master_dsi(struct msm_dsi *msm_dsi);
 bool msm_dsi_wide_bus_enabled(struct msm_dsi *msm_dsi);
+void msm_dsi_update_vfp(struct msm_dsi *dsi,
+			const struct drm_display_mode *mode, bool stage);
 struct drm_dsc_config *msm_dsi_get_dsc_config(struct msm_dsi *msm_dsi);
 const char *msm_dsi_get_te_source(struct msm_dsi *msm_dsi);
 #else
@@ -336,6 +338,11 @@ static inline bool msm_dsi_is_master_dsi(struct msm_dsi *msm_dsi)
 static inline bool msm_dsi_wide_bus_enabled(struct msm_dsi *msm_dsi)
 {
 	return false;
+}
+
+static inline void msm_dsi_update_vfp(struct msm_dsi *dsi,
+				     const struct drm_display_mode *mode, bool stage)
+{
 }
 
 static inline struct drm_dsc_config *msm_dsi_get_dsc_config(struct msm_dsi *msm_dsi)

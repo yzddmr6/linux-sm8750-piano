@@ -272,6 +272,16 @@ static void dpu_hw_intf_setup_timing_engine(struct dpu_hw_intf *intf,
 	}
 }
 
+static void dpu_hw_intf_update_vtotal(struct dpu_hw_intf *intf, u32 vtotal)
+{
+	u32 htotal = DPU_REG_READ(&intf->hw, INTF_HSYNC_CTL) >> 16;
+
+	/* Active start/end stay fixed for a VFP-only update. The regular
+	 * CTL interface flush commits this shadow register at a frame boundary.
+	 */
+	DPU_REG_WRITE(&intf->hw, INTF_VSYNC_PERIOD_F0, vtotal * htotal);
+}
+
 static void dpu_hw_intf_enable_timing_engine(
 		struct dpu_hw_intf *intf,
 		u8 enable)
@@ -637,6 +647,8 @@ struct dpu_hw_intf *dpu_hw_intf_init(struct drm_device *dev,
 	c->mdss_ver = mdss_rev;
 
 	c->ops.setup_timing_gen = dpu_hw_intf_setup_timing_engine;
+	if (mdss_rev->core_major_ver == 12 && cfg->type == INTF_DSI)
+		c->ops.update_vtotal = dpu_hw_intf_update_vtotal;
 	c->ops.setup_prg_fetch  = dpu_hw_intf_setup_prg_fetch;
 	c->ops.get_status = dpu_hw_intf_get_status;
 	c->ops.enable_timing = dpu_hw_intf_enable_timing_engine;

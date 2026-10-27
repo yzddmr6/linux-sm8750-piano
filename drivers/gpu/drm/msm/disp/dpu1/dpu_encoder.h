@@ -21,6 +21,11 @@
 
 #define MAX_H_TILES_PER_DISPLAY 2
 
+bool dpu_encoder_can_update_vfp(struct drm_encoder *encoder,
+			       const struct drm_display_mode *mode);
+void dpu_encoder_update_vfp(struct drm_encoder *encoder,
+			   const struct drm_display_mode *mode, bool stage);
+
 /**
  * struct msm_display_info - defines display properties
  * @intf_type:          INTF_ type

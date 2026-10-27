@@ -10,6 +10,7 @@
 #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
 #include <linux/debugfs.h>
 #include <linux/kthread.h>
+#include <linux/of.h>
 #include <linux/seq_file.h>
 
 #include <drm/display/drm_dsc_helper.h>
@@ -713,6 +714,58 @@ void dpu_encoder_update_topology(struct drm_encoder *drm_enc,
 	} else if (disp_info->intf_type == INTF_DP) {
 		if (drm_mode_is_420_only(&connector->display_info, adj_mode))
 			topology->num_cdm++;
+	}
+}
+
+bool dpu_encoder_can_update_vfp(struct drm_encoder *encoder,
+			       const struct drm_display_mode *mode)
+{
+	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
+	unsigned int i;
+
+	/* Both Piano panel variants advertise stock immediate-VFP updates.
+	 * Do not infer this panel capability from the SoC alone.
+	 */
+	if (!of_machine_is_compatible("xiaomi,piano") ||
+	    enc->disp_info.intf_type != INTF_DSI || enc->disp_info.is_cmd_mode ||
+	    !enc->num_phys_encs)
+		return false;
+
+	for (i = 0; i < enc->num_phys_encs; i++) {
+		struct dpu_encoder_phys *phys = enc->phys_encs[i];
+
+		if (!phys->hw_intf || !phys->hw_intf->ops.update_vtotal ||
+		    !phys->hw_ctl || !phys->hw_ctl->ops.update_pending_flush_intf)
+			return false;
+		/* Keep prefetch disabled, as on Piano's stock 120 Hz family.
+		 * Supporting a changing prefetch offset needs its own update.
+		 */
+		if (mode->vtotal - mode->vsync_start <
+		    phys->hw_intf->cap->prog_fetch_lines_worst_case)
+			return false;
+	}
+	return true;
+}
+
+void dpu_encoder_update_vfp(struct drm_encoder *encoder,
+			   const struct drm_display_mode *mode, bool stage)
+{
+	struct dpu_encoder_virt *enc = to_dpu_encoder_virt(encoder);
+	struct msm_drm_private *priv = encoder->dev->dev_private;
+	unsigned int index = enc->disp_info.h_tile_instance[0];
+	unsigned int i;
+
+	msm_dsi_update_vfp(priv->kms->dsi[index], mode, stage);
+	if (!stage)
+		return;
+
+	for (i = 0; i < enc->num_phys_encs; i++) {
+		struct dpu_encoder_phys *phys = enc->phys_encs[i];
+
+		phys->cached_mode = *mode;
+		phys->hw_intf->ops.update_vtotal(phys->hw_intf, mode->vtotal);
+		phys->hw_ctl->ops.update_pending_flush_intf(phys->hw_ctl,
+							  phys->hw_intf->idx);
 	}
 }
 

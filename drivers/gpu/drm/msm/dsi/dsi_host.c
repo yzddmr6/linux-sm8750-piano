@@ -2692,6 +2692,33 @@ unlock_ret:
 	return 0;
 }
 
+/*
+ * SM8750 video timing shadow registers, as used by the downstream
+ * dsi_ctrl_async_timing_update()/dsi_ctrl_timing_db_update() sequence.
+ * Only VFP changes are accepted by the DPU atomic check: horizontal timing,
+ * DSC, active area, sync widths and link clocks stay unchanged.
+ */
+#define DSI_TIMING_FLUSH	0x1e4
+#define DSI_TIMING_DB_MODE	0x1e8
+
+void msm_dsi_host_update_vfp(struct mipi_dsi_host *host,
+			    const struct drm_display_mode *mode, bool stage)
+{
+	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
+	u32 total;
+
+	if (stage) {
+		dsi_write(msm_host, DSI_TIMING_DB_MODE, 1);
+		total = dsi_read(msm_host, REG_DSI_TOTAL);
+		total = (total & 0xffff) | DSI_TOTAL_V_TOTAL(mode->vtotal - 1);
+		dsi_write(msm_host, REG_DSI_TOTAL, total);
+		dsi_write(msm_host, DSI_TIMING_FLUSH, 1);
+		drm_mode_copy(msm_host->mode, mode);
+	} else {
+		dsi_write(msm_host, DSI_TIMING_DB_MODE, 0);
+	}
+}
+
 int msm_dsi_host_set_display_mode(struct mipi_dsi_host *host,
 				  const struct drm_display_mode *mode)
 {

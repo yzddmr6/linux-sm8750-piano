@@ -45,6 +45,21 @@ static inline struct msm_dsi *dsi_mgr_get_other_dsi(int id)
 	return msm_dsim_glb.dsi[(id + 1) % DSI_MAX];
 }
 
+void msm_dsi_update_vfp(struct msm_dsi *dsi,
+			const struct drm_display_mode *mode, bool stage)
+{
+	struct msm_dsi *master = dsi_mgr_get_dsi(DSI_CLOCK_MASTER);
+	struct msm_dsi *slave = dsi_mgr_get_dsi(DSI_CLOCK_SLAVE);
+
+	/* The stock split-DSI sequence updates the clock master first. */
+	if (IS_BONDED_DSI()) {
+		msm_dsi_host_update_vfp(master->host, mode, stage);
+		msm_dsi_host_update_vfp(slave->host, mode, stage);
+	} else {
+		msm_dsi_host_update_vfp(dsi->host, mode, stage);
+	}
+}
+
 static int dsi_mgr_parse_of(struct device_node *np, int id)
 {
 	struct msm_dsi_manager *msm_dsim = &msm_dsim_glb;

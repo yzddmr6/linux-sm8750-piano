@@ -70,6 +70,8 @@ void msm_dsi_host_cmd_xfer_commit(struct mipi_dsi_host *host,
 					u32 dma_base, u32 len);
 int msm_dsi_host_enable(struct mipi_dsi_host *host);
 int msm_dsi_host_enable_video(struct mipi_dsi_host *host);
+void msm_dsi_host_update_vfp(struct mipi_dsi_host *host,
+			    const struct drm_display_mode *mode, bool stage);
 int msm_dsi_host_disable_video(struct mipi_dsi_host *host);
 int msm_dsi_host_disable(struct mipi_dsi_host *host);
 void msm_dsi_host_enable_irq(struct mipi_dsi_host *host);

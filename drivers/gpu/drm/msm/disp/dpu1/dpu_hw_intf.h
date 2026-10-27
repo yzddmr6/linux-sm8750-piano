@@ -78,6 +78,8 @@ struct dpu_hw_intf_cmd_mode_cfg {
  * @program_intf_cmd_cfg:       Program the DPU to interface datapath for command mode
  */
 struct dpu_hw_intf_ops {
+	void (*update_vtotal)(struct dpu_hw_intf *intf, u32 vtotal);
+
 	void (*setup_timing_gen)(struct dpu_hw_intf *intf,
 			const struct dpu_hw_intf_timing_params *p,
 			const struct msm_format *fmt);

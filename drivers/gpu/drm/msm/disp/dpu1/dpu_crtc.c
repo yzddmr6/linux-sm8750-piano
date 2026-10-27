@@ -754,6 +754,20 @@ void dpu_crtc_frame_event_cb(struct drm_crtc *crtc, u32 event)
  */
 void dpu_crtc_complete_commit(struct drm_crtc *crtc)
 {
+	struct dpu_crtc_state *cstate = to_dpu_crtc_state(crtc->state);
+	struct drm_encoder *encoder;
+
+	if (cstate->vfp_update) {
+		/* The normal CTL flush has completed at the new frame boundary.
+		 * Release DSI timing double buffering only after that flush.
+		 */
+		drm_for_each_encoder_mask(encoder, crtc->dev,
+					 crtc->state->encoder_mask)
+			dpu_encoder_update_vfp(encoder,
+					      &crtc->state->adjusted_mode, false);
+		drm_calc_timestamping_constants(crtc, &crtc->state->adjusted_mode);
+		cstate->vfp_update = false;
+	}
 	trace_dpu_crtc_complete_commit(DRMID(crtc));
 	dpu_core_perf_crtc_update(crtc, 0);
 	_dpu_crtc_complete_flip(crtc);
@@ -1160,6 +1174,14 @@ void dpu_crtc_commit_kickoff(struct drm_crtc *crtc)
 
 		dpu_vbif_clear_errors(dpu_kms);
 
+		if (cstate->vfp_update) {
+			drm_crtc_wait_one_vblank(crtc);
+			drm_for_each_encoder_mask(encoder, crtc->dev,
+						 crtc->state->encoder_mask)
+				dpu_encoder_update_vfp(encoder,
+						      &crtc->state->adjusted_mode, true);
+		}
+
 		drm_for_each_encoder_mask(encoder, crtc->dev,
 				crtc->state->encoder_mask) {
 			dpu_encoder_kickoff(encoder);
@@ -1210,6 +1232,7 @@ static struct drm_crtc_state *dpu_crtc_duplicate_state(struct drm_crtc *crtc)
 
 	/* duplicate base helper */
 	__drm_atomic_helper_crtc_duplicate_state(crtc, &cstate->base);
+	cstate->vfp_update = false;
 
 	return &cstate->base;
 }
@@ -1564,6 +1587,45 @@ int dpu_crtc_check_mode_changed(struct drm_crtc_state *old_crtc_state,
 	return 0;
 }
 
+static bool dpu_crtc_can_update_vfp(struct drm_crtc_state *old,
+				   struct drm_crtc_state *new)
+{
+	const struct drm_display_mode *a, *b;
+	struct drm_encoder *encoder;
+
+	/* The old state is absent when the CRTC comes up. */
+	if (!old || !new)
+		return false;
+
+	a = &old->adjusted_mode;
+	b = &new->adjusted_mode;
+
+	if (!old->active || !new->active || !new->mode_changed ||
+	    new->active_changed || new->connectors_changed ||
+	    !!old->ctm != !!new->ctm ||
+	    old->encoder_mask != new->encoder_mask ||
+	    hweight32(new->encoder_mask) != 1 || old->self_refresh_active ||
+	    new->self_refresh_active)
+		return false;
+
+	/* Same link/panel timing family; only vertical front porch may change.
+	 * 90/144 Hz have different horizontal timing and keep a full modeset.
+	 */
+	if (a->clock != b->clock || a->flags != b->flags ||
+	    a->hdisplay != b->hdisplay || a->htotal != b->htotal ||
+	    a->hsync_start != b->hsync_start || a->hsync_end != b->hsync_end ||
+	    a->hskew != b->hskew || a->vdisplay != b->vdisplay ||
+	    a->vscan != b->vscan || a->vtotal == b->vtotal ||
+	    a->vtotal - a->vsync_start != b->vtotal - b->vsync_start ||
+	    a->vtotal - a->vsync_end != b->vtotal - b->vsync_end)
+		return false;
+
+	drm_for_each_encoder_mask(encoder, new->crtc->dev, new->encoder_mask)
+		if (!dpu_encoder_can_update_vfp(encoder, b))
+			return false;
+	return true;
+}
+
 static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
 		struct drm_atomic_commit *state)
 {
@@ -1646,6 +1708,11 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
 				crtc->base.id, rc);
 		return rc;
 	}
+
+	cstate->vfp_update = dpu_crtc_can_update_vfp(
+		drm_atomic_get_old_crtc_state(state, crtc), crtc_state);
+	if (cstate->vfp_update)
+		crtc_state->mode_changed = false;
 
 	return 0;
 }
