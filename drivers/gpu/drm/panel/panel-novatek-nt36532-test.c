@@ -180,6 +180,29 @@ static void nt36532_test_piano_preferred(struct kunit *test)
 }
 
 /*
+ * The stock bootloader and the touch driver read the same ID pin: low is
+ * the CSOT module, high is the BOE module. The stock device tree names
+ * the profiles p81_35_02_0b for CSOT and p81_42_02_0a for BOE. Each
+ * profile must carry its own vendor command set.
+ */
+static void nt36532_test_piano_vendor_mapping(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(piano_variants.info), 2U);
+
+	/* ID low is the CSOT module. */
+	KUNIT_EXPECT_STREQ(test, piano_variants.info[0]->name,
+			   "p81 35-02-0b (CSOT)");
+	KUNIT_EXPECT_EQ(test, piano_csot_module.esd_cfg, 0x00);
+	KUNIT_EXPECT_TRUE(test, piano_csot_module.rate_b2_first);
+
+	/* ID high is the BOE module. */
+	KUNIT_EXPECT_STREQ(test, piano_variants.info[1]->name,
+			   "p81 42-02-0a (BOE)");
+	KUNIT_EXPECT_EQ(test, piano_boe_module.esd_cfg, 0x20);
+	KUNIT_EXPECT_FALSE(test, piano_boe_module.rate_b2_first);
+}
+
+/*
  * The DPU can only change the vertical front porch between modes that
  * share the link clock, the horizontal timing and the active area. The
  * 90 Hz and 144 Hz modes have their own horizontal timing and keep a full
@@ -359,6 +382,7 @@ static struct kunit_case nt36532_test_cases[] = {
 	KUNIT_CASE(nt36532_test_piano_preferred),
 	KUNIT_CASE(nt36532_test_piano_low_rates),
 	KUNIT_CASE(nt36532_test_piano_timing_family),
+	KUNIT_CASE(nt36532_test_piano_vendor_mapping),
 	KUNIT_CASE(nt36532_test_piano_modules),
 	KUNIT_CASE(nt36532_test_log_sequences),
 	{}
