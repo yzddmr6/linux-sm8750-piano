@@ -3043,7 +3043,26 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 	int ret, wait_ret;
 
 	ret = xiaomi_mca_cp_stop(mca, "system sleep");
-	ret = ret ?: xiaomi_mca_restore_icl(mca);
+	if (ret)
+		return ret;
+
+	/*
+	 * With no source attached there is nothing to hand back: the limits
+	 * and voltage only matter for the next source, and the attach path in
+	 * xiaomi_mca_policy_poll() resets them before any policy runs.
+	 * Refusing system sleep here kept a tablet that had been charged once
+	 * from ever suspending on battery. An attached source of unknown type
+	 * still refuses it, as no automatic write is allowed for that one.
+	 */
+	if (mca->icl_written || mca->fcc_written || mca->voltage_written) {
+		ret = xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus);
+		if (ret)
+			return ret;
+		if (vbus < MCA_VBUS_ONLINE_UV)
+			goto out;
+	}
+
+	ret = xiaomi_mca_restore_icl(mca);
 	if (!ret && mca->fcc_written)
 		ret = xiaomi_mca_reset_fcc(mca);
 	if (ret)
@@ -3065,6 +3084,7 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 			return ret ?: wait_ret;
 	}
 
+out:
 	mca->cp = MCA_CP_OFF;
 	mca->hv = MCA_HV_OFF;
 	mca->voltage_written = false;

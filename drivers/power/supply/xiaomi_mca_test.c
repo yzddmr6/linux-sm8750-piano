@@ -941,15 +941,48 @@ static void xiaomi_mca_test_pm_refused(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->mca.sleeping);
 	KUNIT_EXPECT_EQ(test, f->mca.fcc_set_ma, 900);
 	KUNIT_EXPECT_TRUE(test, schedule_delayed_work(&f->mca.poll_work, 60 * HZ));
-	/* An unknown source must not silently drop a pending ICL restore. */
+	/* An attached source of unknown type must not silently drop a pending ICL restore. */
 	f->mca.fcc_set_ma = 0;
 	f->mca.fcc_written = false;
 	f->mca.icl_written = true;
+	f->write_error = 0;
 	f->type = MCA_TYPE_UNKNOWN;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_prepare(f->mca.dev), -EOPNOTSUPP);
 	cancel_delayed_work_sync(&f->mca.poll_work);
 	KUNIT_EXPECT_TRUE(test, f->mca.icl_written);
 	KUNIT_EXPECT_FALSE(test, f->mca.sleeping);
+}
+
+/* Charged once, then unplugged: no VBUS, and the firmware reports an Unknown source. */
+static void xiaomi_mca_test_pm_no_source(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+
+	f->type = MCA_TYPE_UNKNOWN;
+	f->vbus = 0;
+	f->icl = 500;
+	f->fcc = 900;
+	f->mca.icl_written = true;
+	f->mca.icl_set_ma = 500;
+	f->mca.fcc_set_ma = 900;
+	f->mca.fcc_written = true;
+	f->mca.voltage_written = true;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_prepare(f->mca.dev), 0);
+	KUNIT_EXPECT_TRUE(test, f->mca.sleeping);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	/* Nothing is dropped: the next recognized source gets the defaults. */
+	KUNIT_EXPECT_TRUE(test, f->mca.icl_written);
+	KUNIT_EXPECT_TRUE(test, f->mca.fcc_written);
+	xiaomi_mca_complete(f->mca.dev);
+	cancel_delayed_work_sync(&f->mca.poll_work);
+	f->type = MCA_TYPE_SDP;
+	f->vbus = 5000000;
+	scoped_guard(mutex, &f->mca.lock)
+		xiaomi_mca_policy_poll(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->icl, MCA_ICL_DEFAULT_MA);
+	KUNIT_EXPECT_EQ(test, f->fcc, MCA_FCC_DEFAULT_MA);
+	KUNIT_EXPECT_FALSE(test, f->mca.icl_written);
+	KUNIT_EXPECT_FALSE(test, f->mca.fcc_written);
 }
 
 static void xiaomi_mca_test_pm_voltage_timeout(struct kunit *test)
@@ -1432,6 +1465,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_pm_quiesce),
 	KUNIT_CASE(xiaomi_mca_test_cp_stop_failure),
 	KUNIT_CASE(xiaomi_mca_test_pm_refused),
+	KUNIT_CASE(xiaomi_mca_test_pm_no_source),
 	KUNIT_CASE_SLOW(xiaomi_mca_test_pm_voltage_timeout),
 	KUNIT_CASE(xiaomi_mca_test_pm_lost_ack),
 
