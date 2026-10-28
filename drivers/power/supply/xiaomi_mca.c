@@ -32,6 +32,7 @@
 #include <linux/ktime.h>
 #include <linux/power/sc8541_charger.h>
 #include <linux/mutex.h>
+#include <linux/regulator/driver.h>
 #include <linux/pm.h>
 #include <linux/pm_wakeup.h>
 #include <linux/power_supply.h>
@@ -655,6 +656,9 @@ struct xiaomi_mca_notify_record {
 	u32 data[4];
 };
 
+#define MCA_PROP_PEN_BOOST_ENABLE 0x200f
+#define MCA_PROP_PEN_BOOST_VOLTAGE 0x2010
+
 struct xiaomi_mca {
 	struct device *dev;
 	struct pmic_glink_client *client;
@@ -675,6 +679,10 @@ struct xiaomi_mca {
 	bool voltage_written;	/* a raised voltage request may have reached firmware */
 	struct xiaomi_mca_state icl_source;
 
+	struct regulator_dev *pen_rdev;
+	bool pen_requested, pen_on, pen_dirty;
+	u32 pen_generation, pen_attempt_generation;
+	bool pen_attempted;
 	bool piano_otg;
 	bool config_attempted;
 	u32 config_generation;
@@ -1083,6 +1091,12 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	u32 val = len == sizeof(u32) ? get_unaligned_le32(data) : 0;
 
 	switch (prop) {
+	case MCA_PROP_PEN_BOOST_ENABLE:
+		return len == sizeof(u32) && (val == 0x20100 || val == 0x20101);
+	case MCA_PROP_PEN_BOOST_VOLTAGE:
+		return len == sizeof(u32) && (val == (BIT(16) | 5000) ||
+			val == (BIT(16) | 5200) || val == (BIT(16) | 5500) ||
+			val == (BIT(16) | 6000) || val == (BIT(16) | 6500));
 	case MCA_PROP_CID_CFG:
 		return len == sizeof(u32) && val == MCA_PIANO_CID_CFG;
 	case MCA_PROP_CHARGING_ENABLED:
@@ -1197,7 +1211,8 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		}
 		return buf[0] == *(const u8 *)data ? 0 : -EIO;
 	}
-	if (prop == MCA_PROP_CP_STATE || prop == MCA_PROP_OTG_CFG || prop == MCA_PROP_CID_CFG) {
+	if (prop == MCA_PROP_CP_STATE || prop == MCA_PROP_OTG_CFG || prop == MCA_PROP_CID_CFG ||
+	    prop == MCA_PROP_PEN_BOOST_ENABLE || prop == MCA_PROP_PEN_BOOST_VOLTAGE) {
 		if (!mca->piano_otg)
 			return -EOPNOTSUPP;
 		memcpy(buf, data, len);
@@ -2984,6 +2999,158 @@ static int xiaomi_mca_otg_cp(struct xiaomi_mca *mca, enum sc8541_otg_action acti
 	return ret;
 }
 
+/* No independent timer: only an explicit consumer or an ADSP epoch applies it. */
+static void xiaomi_mca_pen_delay(unsigned int ms)
+{
+#if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(xiaomi_mca_pen_delay, ms);
+#endif
+	msleep(ms);
+}
+
+static int xiaomi_mca_pen_off(struct xiaomi_mca *mca)
+{
+	int ret;
+
+	lockdep_assert_held(&mca->lock);
+	if (!mca->pen_dirty)
+		return 0;
+	/* Even a failed voltage write must not prevent an attempt to stop. */
+	xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_VOLTAGE, BIT(16) | 5200);
+	xiaomi_mca_pen_delay(10);
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_ENABLE, 0x20100);
+	if (ret)
+		return ret;
+	mca->pen_on = false;
+	ret = xiaomi_mca_otg_cp(mca, SC8541_PEN_RESTORE);
+	if (!ret)
+		mca->pen_dirty = false;
+	return ret;
+}
+
+static int xiaomi_mca_pen_on(struct xiaomi_mca *mca)
+{
+	u32 generation, vbus, mv;
+	int ret;
+
+	lockdep_assert_held(&mca->lock);
+	if (mca->sleeping || mca->otg_active)
+		return -EBUSY;
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		if (!mca->service_up)
+			return -ENOTCONN;
+		generation = mca->service_generation;
+	}
+	mca->pen_attempted = true;
+	mca->pen_attempt_generation = generation;
+	/* Do not disconnect a wired charger for an unverified source switch. */
+	ret = xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus);
+	if (ret || vbus >= MCA_VBUS_ONLINE_UV)
+		return ret ?: -EBUSY;
+	if (mca->pen_on && mca->pen_generation == generation)
+		return 0;
+	ret = xiaomi_mca_otg_cp(mca, SC8541_PEN_ISOLATE);
+	if (ret) {
+		xiaomi_mca_otg_cp(mca, SC8541_PEN_RESTORE);
+		return ret;
+	}
+	mca->pen_dirty = true;
+	xiaomi_mca_pen_delay(100);
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_VOLTAGE, BIT(16) | 5000);
+	ret = ret ?: xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_ENABLE, 0x20101);
+	for (mv = 5500; !ret && mv <= 6500; mv += 500) {
+		xiaomi_mca_pen_delay(20);
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_VOLTAGE, BIT(16) | mv);
+	}
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		if (!mca->service_up || generation != mca->service_generation)
+			ret = -ECONNRESET;
+	}
+	if (ret)
+		goto fail;
+	mca->pen_on = true;
+	mca->pen_generation = generation;
+	return 0;
+fail:
+	xiaomi_mca_pen_off(mca);
+	return ret;
+}
+
+static void xiaomi_mca_pen_supply_failed(struct xiaomi_mca *mca)
+{
+	if (mca->pen_requested && mca->pen_rdev) {
+		mca->pen_requested = false;
+		regulator_notifier_call_chain(mca->pen_rdev, REGULATOR_EVENT_FAIL, NULL);
+	}
+}
+
+static int xiaomi_mca_pen_enable(struct regulator_dev *rdev)
+{
+	struct xiaomi_mca *mca = rdev_get_drvdata(rdev);
+	int ret;
+
+	guard(mutex)(&mca->lock);
+	ret = xiaomi_mca_pen_on(mca);
+	if (!ret)
+		mca->pen_requested = true;
+	return ret;
+}
+
+static int xiaomi_mca_pen_disable(struct regulator_dev *rdev)
+{
+	struct xiaomi_mca *mca = rdev_get_drvdata(rdev);
+
+	guard(mutex)(&mca->lock);
+	mca->pen_requested = false;
+	return xiaomi_mca_pen_off(mca);
+}
+
+static int xiaomi_mca_pen_is_enabled(struct regulator_dev *rdev)
+{
+	struct xiaomi_mca *mca = rdev_get_drvdata(rdev);
+
+	guard(mutex)(&mca->lock);
+	return mca->pen_on && mca->pen_generation == READ_ONCE(mca->service_generation);
+}
+
+static const struct regulator_ops xiaomi_mca_pen_ops = {
+	.enable = xiaomi_mca_pen_enable,
+	.disable = xiaomi_mca_pen_disable,
+	.is_enabled = xiaomi_mca_pen_is_enabled,
+	.list_voltage = regulator_list_voltage_linear,
+};
+
+static const struct regulator_desc xiaomi_mca_pen_desc = {
+	.name = "piano-pen-boost",
+	.of_match = "pen-boost",
+	.regulators_node = "regulators",
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.ops = &xiaomi_mca_pen_ops,
+	.n_voltages = 1,
+	.min_uV = 6500000,
+	.fixed_uV = 6500000,
+};
+
+static int xiaomi_mca_register_pen(struct xiaomi_mca *mca)
+{
+	struct regulator_config cfg = { .dev = mca->dev, .driver_data = mca };
+	struct device_node *regulators, *pen;
+	struct regulator_dev *rdev;
+
+	regulators = of_get_child_by_name(mca->dev->of_node, "regulators");
+	pen = of_get_child_by_name(regulators, "pen-boost");
+	of_node_put(regulators);
+	if (!pen)
+		return 0;
+	of_node_put(pen);
+	rdev = devm_regulator_register(mca->dev, &xiaomi_mca_pen_desc, &cfg);
+	if (IS_ERR(rdev))
+		return PTR_ERR(rdev);
+	mca->pen_rdev = rdev;
+	return 0;
+}
+
 static void xiaomi_mca_cp_missing(struct xiaomi_mca *mca, int ret)
 {
 	if ((ret == -ENODEV || ret == -EOPNOTSUPP) && !mca->cp_absent_warned) {
@@ -3356,6 +3523,25 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->online = false;
 			mca->policy_generation = generation;
 		}
+		if (mca->pen_requested && (!mca->pen_attempted ||
+		    mca->pen_attempt_generation != generation)) {
+			int ret = xiaomi_mca_pen_on(mca);
+
+			if (ret) {
+				dev_warn(mca->dev, "pen supply restore failed: %d\n", ret);
+				xiaomi_mca_pen_supply_failed(mca);
+			}
+		}
+		/* A newly attached source has priority over optional pen charging. */
+		if (mca->pen_dirty) {
+			u32 vbus;
+
+			if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus) ||
+			    vbus >= MCA_VBUS_ONLINE_UV) {
+				xiaomi_mca_pen_off(mca);
+				xiaomi_mca_pen_supply_failed(mca);
+			}
+		}
 		if (xiaomi_mca_clear_auth(mca))
 			goto out;
 		ret = xiaomi_mca_full_charge_poll(mca);
@@ -3372,10 +3558,10 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		}
 		if (mca->charge_blocked)
 			goto out;
-		if (charge_policy && !mca->otg_active) {
+		if (charge_policy && !mca->otg_active && !mca->pen_dirty) {
 			mca->policy_active = true;
 			xiaomi_mca_policy_poll(mca);
-		} else if (!mca->otg_active && mca->policy_active) {
+		} else if (!mca->otg_active && !mca->pen_dirty && mca->policy_active) {
 			if (xiaomi_mca_cp_stop(mca, "policy disabled"))
 				goto out;
 			xiaomi_mca_restore_icl(mca);
@@ -3864,6 +4050,7 @@ static void xiaomi_mca_unbind_restore(void *data)
 	int ret;
 
 	guard(mutex)(&mca->lock);
+	xiaomi_mca_pen_off(mca);
 	ret = xiaomi_mca_clear_auth(mca);
 	if (ret)
 		dev_warn(mca->dev, "failed to clear authentication interlock: %d\n", ret);
@@ -3933,6 +4120,9 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 	u32 vbus;
 	int ret;
 
+	ret = xiaomi_mca_pen_off(mca);
+	if (ret)
+		return ret;
 	ret = xiaomi_mca_cp_stop(mca, "system sleep");
 	if (ret)
 		return ret;
@@ -4023,6 +4213,7 @@ static void xiaomi_mca_complete(struct device *dev)
 		if (!mca->sleeping)
 			return;
 		mca->sleeping = false;
+		mca->pen_attempted = false;
 	}
 	enable_delayed_work(&mca->poll_work);
 	schedule_delayed_work(&mca->poll_work, 0);
@@ -4186,6 +4377,10 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 	 * longer write then, and before the client it sends through.
 	 */
 	ret = devm_add_action(dev, xiaomi_mca_unbind_restore, mca);
+	if (ret)
+		return ret;
+
+	ret = xiaomi_mca_register_pen(mca);
 	if (ret)
 		return ret;
 

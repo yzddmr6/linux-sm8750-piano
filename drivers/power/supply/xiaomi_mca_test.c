@@ -1253,9 +1253,9 @@ static void xiaomi_mca_test_pm_lost_ack(struct kunit *test)
 
 struct mca_otg_fixture {
 	struct xiaomi_mca mca;
-	u32 props[8];
-	u8 data[8][16];
-	size_t lengths[8];
+	u32 props[32];
+	u8 data[32][16];
+	size_t lengths[32];
 	int writes;
 	int fail_write;
 	int cp_result;
@@ -1269,6 +1269,9 @@ struct mca_otg_fixture {
 	u32 read_prop;
 	size_t read_len;
 	int polls;
+	u32 pen_vbus;
+	int pen_restart_write;
+	unsigned int delays[16], delay_count;
 };
 
 static void mca_otg_test_poll(struct work_struct *work)
@@ -1301,6 +1304,10 @@ static int mca_otg_test_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 		f->read_len = len;
 		if (f->read_error)
 			return f->read_error;
+		if (prop == MCA_PROP_USB_VOLTAGE_NOW && len == sizeof(u32)) {
+			put_unaligned_le32(f->pen_vbus, data);
+			return 0;
+		}
 		if (prop == MCA_PROP_CC_TOGGLE && len == 1) {
 			*(u8 *)data = f->cc_toggle;
 			if (f->restart_on_read)
@@ -1322,6 +1329,8 @@ static int mca_otg_test_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 	f->lengths[i] = len;
 	memcpy(f->data[i], data, len);
 	f->writes++;
+	if (f->pen_restart_write == f->writes)
+		mca->service_generation++;
 	return f->fail_write == f->writes ? -EIO : 0;
 }
 
@@ -2550,7 +2559,111 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_read_type(&f->mca, &type), -EIO);
 }
 
+static void mca_pen_test_delay(unsigned int ms)
+{
+	struct mca_otg_fixture *f = kunit_get_current_test()->priv;
+
+	if (f->delay_count < ARRAY_SIZE(f->delays))
+		f->delays[f->delay_count++] = ms;
+}
+
+static void xiaomi_mca_test_pen_boost(struct kunit *test)
+{
+	static const unsigned int delays[] = { 100, 20, 20, 20, 10 };
+	static const u32 values[] = { 0x11388, 0x20101, 0x1157c, 0x11770,
+				      0x11964, 0x11450, 0x20100 };
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+	int i;
+
+	test->priv = f;
+	kunit_activate_static_stub(test, xiaomi_mca_pen_delay, mca_pen_test_delay);
+	mutex_lock(&f->mca.lock);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_pen_off(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	KUNIT_EXPECT_EQ(test, f->calls, 0);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_pen_on(&f->mca), 0);
+	KUNIT_EXPECT_TRUE(test, f->mca.pen_on);
+	KUNIT_EXPECT_EQ(test, f->mca.pen_generation, 1U);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_pen_on(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, f->writes, 5);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_pen_off(&f->mca), 0);
+	KUNIT_EXPECT_FALSE(test, f->mca.pen_on);
+	KUNIT_EXPECT_FALSE(test, f->mca.pen_dirty);
+	KUNIT_EXPECT_EQ(test, f->actions[0], SC8541_PEN_ISOLATE);
+	KUNIT_EXPECT_EQ(test, f->actions[1], SC8541_PEN_RESTORE);
+	KUNIT_EXPECT_MEMEQ(test, f->delays, delays, sizeof(delays));
+	for (i = 0; i < ARRAY_SIZE(values); i++) {
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->data[i]), values[i]);
+		KUNIT_EXPECT_EQ(test, f->props[i], (i == 1 || i == 6) ?
+			MCA_PROP_PEN_BOOST_ENABLE : MCA_PROP_PEN_BOOST_VOLTAGE);
+	}
+	mutex_unlock(&f->mca.lock);
+}
+
+static void xiaomi_mca_test_pen_failures(struct kunit *test)
+{
+	struct mca_otg_fixture *f = mca_otg_fixture(test);
+	int i;
+
+	test->priv = f;
+	kunit_activate_static_stub(test, xiaomi_mca_pen_delay, mca_pen_test_delay);
+	mutex_lock(&f->mca.lock);
+	/* Failed ramp writes are rolled back, including a lost enable ACK. */
+	for (i = 1; i <= 5; i++) {
+		f->writes = f->calls = f->delay_count = 0;
+		f->fail_write = i;
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_pen_on(&f->mca), -EIO);
+		KUNIT_EXPECT_FALSE(test, f->mca.pen_on);
+		KUNIT_EXPECT_FALSE(test, f->mca.pen_dirty);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->data[f->writes - 1]), 0x20100U);
+	}
+	f->fail_write = f->writes = f->calls = 0;
+	f->cp_result = -EBUSY;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_pen_on(&f->mca), -EBUSY);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	f->cp_result = 0;
+	f->pen_vbus = 5000000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_pen_on(&f->mca), -EBUSY);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	f->pen_vbus = 0;
+	f->pen_restart_write = 3;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_pen_on(&f->mca), -ECONNRESET);
+	KUNIT_EXPECT_FALSE(test, f->mca.pen_on);
+	f->pen_restart_write = 0;
+	f->writes = 0;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_pen_on(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, f->mca.pen_generation, f->mca.service_generation);
+	f->mca.service_generation++;
+	f->writes = 0;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_pen_on(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, f->writes, 5);
+	KUNIT_EXPECT_EQ(test, f->mca.pen_generation, f->mca.service_generation);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_pen_off(&f->mca), 0);
+	mutex_unlock(&f->mca.lock);
+}
+
+static void xiaomi_mca_test_pen_allowlist(struct kunit *test)
+{
+	__le32 value = cpu_to_le32(0x20101);
+
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_write_allowed(MCA_PROP_PEN_BOOST_ENABLE,
+						      &value, sizeof(value)));
+	value = cpu_to_le32(0x20102);
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(MCA_PROP_PEN_BOOST_ENABLE,
+						       &value, sizeof(value)));
+	value = cpu_to_le32(BIT(16) | 6600);
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(MCA_PROP_PEN_BOOST_VOLTAGE,
+						       &value, sizeof(value)));
+	value = cpu_to_le32(6500);
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(MCA_PROP_PEN_BOOST_VOLTAGE,
+						       &value, sizeof(value)));
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_pen_boost),
+	KUNIT_CASE(xiaomi_mca_test_pen_failures),
+	KUNIT_CASE(xiaomi_mca_test_pen_allowlist),
+
 	KUNIT_CASE(xiaomi_mca_test_profile_switch),
 	KUNIT_CASE(xiaomi_mca_test_pd_recovery),
 	KUNIT_CASE(xiaomi_mca_test_mipps_exchange),

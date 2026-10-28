@@ -239,7 +239,7 @@ config CHARGER_SC8541_KUNIT_TEST
 
 config CHARGER_XIAOMI_MCA
 	tristate "Xiaomi MCA charger firmware over PMIC GLINK"
-	depends on QCOM_PMIC_GLINK
+	depends on QCOM_PMIC_GLINK && REGULATOR
 	depends on CHARGER_SC8541 || !CHARGER_SC8541
 	select AUXILIARY_BUS
 	select CRYPTO_LIB_SHA256
