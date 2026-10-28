@@ -147,10 +147,21 @@
 			     "qcom,sm8550-pmic-glink", "qcom,pmic-glink";
 		xiaomi,charge-pump = <&sc8541>;
 		orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;
+
 		pinctrl-0 = <&usb_orientation_default>;
 		pinctrl-names = "default";
 		#address-cells = <1>;
 		#size-cells = <0>;
+
+		/* The firmware of the charger switches the supply of the pen
+		 * transmitter in its dock.
+		 */
+		regulators {
+			pen_boost: pen-boost {
+				regulator-min-microvolt = <6500000>;
+				regulator-max-microvolt = <6500000>;
+			};
+		};
 
 		connector@0 {
 			compatible = "usb-c-connector";
@@ -918,6 +929,31 @@
 	};
 };
 
+&i2c13 {
+	status = "okay";
+
+	/* The wireless transmitter of the pen in its dock. */
+	pen-transmitter@38 {
+		compatible = "southchip,sc96231";
+		reg = <0x38>;
+
+		vin-supply = <&pen_boost>;
+
+		enable-gpios = <&tlmm 14 GPIO_ACTIVE_HIGH>;
+		lp-enable-gpios = <&tlmm 99 GPIO_ACTIVE_HIGH>;
+		hall-gpios = <&tlmm 200 GPIO_ACTIVE_LOW>,
+			     <&tlmm 196 GPIO_ACTIVE_LOW>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <78 IRQ_TYPE_EDGE_FALLING>;
+
+		pinctrl-0 = <&sc96231_default_state>;
+		pinctrl-names = "default";
+
+		wakeup-source;
+	};
+};
+
 &i2c6 {
 	/* Stock qcom,clk-freq-out on the keyboard bridge bus. */
 	clock-frequency = <1000000>;
@@ -1446,6 +1482,50 @@
 		drive-strength = <2>;
 		bias-pull-down;
 		output-disable;
+	};
+
+	/* The pen transmitter of the dock: its interrupt, the switch of the
+	 * transmitter, its low power control and the two Hall sensors.
+	 */
+	sc96231_default_state: sc96231-default-state {
+		int-pins {
+			pins = "gpio78";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-up;
+		};
+
+		enable-pins {
+			pins = "gpio14";
+			function = "gpio";
+			drive-strength = <2>;
+			output-low;
+			bias-disable;
+		};
+
+		lp-enable-pins {
+			pins = "gpio99";
+			function = "gpio";
+			drive-strength = <2>;
+			output-high;
+			bias-disable;
+		};
+
+		hall3-pins {
+			pins = "gpio200";
+			function = "gpio";
+			drive-strength = <2>;
+			input-enable;
+			bias-pull-up;
+		};
+
+		hall4-pins {
+			pins = "gpio196";
+			function = "gpio";
+			drive-strength = <2>;
+			input-enable;
+			bias-pull-up;
+		};
 	};
 
 	/* Stock xiaomi_keyboard_{sleep_,}default: wake, reset and status pins. */

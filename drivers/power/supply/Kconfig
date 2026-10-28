@@ -1244,4 +1244,13 @@ config MACSMC_POWER
 
 	  Say Y or M here if you have an Apple Silicon based Mac.
 
+config CHARGER_SC96231
+	tristate "Southchip SC96231 wireless pen transmitter"
+	depends on I2C && GPIOLIB && INPUT && REGULATOR
+	select REGMAP_I2C
+	help
+	  Supply and control an SC96231 pen transmitter using standard regulator,
+	  input switch and power supply interfaces. The device's installed
+	  firmware handles the wireless link; no firmware update is performed.
+
 endif # POWER_SUPPLY
