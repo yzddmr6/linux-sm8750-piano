@@ -905,6 +905,26 @@
 	status = "okay";
 };
 
+/* The two factory wired outputs of the flash controller of the camera.
+ * The factory uses them as one lamp: the flash and the torch both drive
+ * the two channels together.
+ */
+&pm8550_flash {
+	status = "okay";
+
+	piano_camera_flash: led-0 {
+		function = "flash";
+		function-enumerator = <0>;
+		/* Factory qcom,id 0 is standard channel 1, qcom,id 1 is
+		 * standard channel 2.
+		 */
+		led-sources = <1 2>;
+		led-max-microamp = <100000>;
+		flash-max-microamp = <400000>;
+		flash-max-timeout-us = <300000>;
+	};
+};
+
 &i2c5 {
 	/* This unit's stock SE5 / sc8541_master@6a. Policy is opt-in. */
 	sc8541: charger@6a {

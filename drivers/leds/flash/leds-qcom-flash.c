@@ -654,7 +654,11 @@ qcom_flash_intensity_to_led_brightness(struct v4l2_flash *v4l2_flash, s32 intens
 	if (!current_ma)
 		return LED_OFF;
 
-	return (current_ma * LED_FULL) / led->max_torch_current_ma;
+	/* brightness_set() converts back with integer division. Round this
+	 * encoding up so an exact 5mA/channel control step is not lost to a
+	 * second truncation. The PMIC still rounds current down to its step.
+	 */
+	return DIV_ROUND_UP(current_ma * LED_FULL, led->max_torch_current_ma);
 }
 
 static s32 qcom_flash_brightness_to_led_intensity(struct v4l2_flash *v4l2_flash,
@@ -662,8 +666,19 @@ static s32 qcom_flash_brightness_to_led_intensity(struct v4l2_flash *v4l2_flash,
 {
 	struct led_classdev_flash *fled_cdev = v4l2_flash->fled_cdev;
 	struct qcom_flash_led *led = flcdev_to_qcom_fled(fled_cdev);
+	u32 current_ma, steps;
 
-	return (brightness * led->max_torch_current_ma * UA_PER_MA) / LED_FULL;
+	if (!brightness)
+		return 0;
+
+	/* Mirror brightness_set() then set_flash_current(): the total mA are
+	 * split per channel, and ITARGET=0 is a nonzero 5mA minimum. Return the
+	 * quantized total, not the unrepresentable LED scale fraction. Thermal
+	 * limiting can still reduce the current during brightness_set().
+	 */
+	current_ma = brightness * led->max_torch_current_ma / LED_FULL;
+	steps = (current_ma * UA_PER_MA / led->chan_count + 1) / TORCH_IRES_UA;
+	return max_t(u32, steps, 1) * TORCH_IRES_UA * led->chan_count;
 }
 
 static const struct v4l2_flash_ops qcom_v4l2_flash_ops = {
