@@ -347,9 +347,9 @@ int nvt_thp_get_extend_command(struct regmap *map, u8 sub_command, u16 *value,
 /*
  * The piano stock stack first disables stylus scanning when no pen consumer
  * is connected (update_pen_status()/nvt_xm_htc_set_stylus_enable(), sub-command
- * 0x04). This transport currently exposes fingers only; do not leave the
- * freshly loaded firmware's pen state implicit. A pen input implementation
- * must manage that state explicitly when it is added.
+ * 0x04). Start with pen scanning disabled. The stream owner's runtime pen
+ * request is applied after this sequence; leave the default finger path
+ * unchanged when no owner has requested pen scanning.
  *
  * Use the original three-write sequence after the caller has waited for
  * NORMAL_RUN, without pre-command mode readback.
@@ -365,4 +365,28 @@ int nvt_thp_apply_host_commands(struct regmap *map, struct nvt_thp_command_statu
 	if (ret)
 		return ret;
 	return nvt_extend_command(map, 0x01, 0x02, last);
+}
+
+/* Vendor nvt_set_pen_switch(): write once while 0x7b is pending. */
+int nvt_thp_set_pen(struct regmap *map, u32 model,
+		    struct nvt_thp_command_status *last)
+{
+	u8 command[] = { 0x7b, model };
+	unsigned int status = command[0];
+	int ret;
+
+	if (model > 3)
+		return -EINVAL;
+	ret = nvt_extend_command(map, 0x04, !!model, last);
+	if (ret || !model)
+		return ret;
+	last->sub_command = command[0];
+	last->status = status;
+	ret = regmap_bulk_write(map, NVT_HOST_COMMAND, command, sizeof(command));
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(map, NVT_HOST_COMMAND, status, !status,
+				      10000, 110000);
+	last->status = status;
+	return ret;
 }

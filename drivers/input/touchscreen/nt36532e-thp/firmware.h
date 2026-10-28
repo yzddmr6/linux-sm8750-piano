@@ -55,4 +55,7 @@ int nvt_thp_get_extend_command(struct regmap *map, u8 sub_command, u16 *value,
 
 int nvt_thp_apply_host_commands(struct regmap *map, struct nvt_thp_command_status *last);
 
+int nvt_thp_set_pen(struct regmap *map, u32 model,
+		    struct nvt_thp_command_status *last);
+
 #endif
