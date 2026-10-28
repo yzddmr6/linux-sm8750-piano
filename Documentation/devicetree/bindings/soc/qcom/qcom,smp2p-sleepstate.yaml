@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/qcom/qcom,smp2p-sleepstate.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm SMP2P sleep-state notifier
+
+maintainers:
+  - Bjorn Andersson <bjorn.andersson@linaro.org>
+
+description:
+  Some Qualcomm SoCs publish an SMP2P entry that the remote processors use
+  to follow the sleep state of the application processor. The firmware
+  writes the application processor awake indication into that entry.
+
+  This driver owns the sleepstate SMP2P entry. It clears the awake
+  indication when the system suspends and sets it again after the resume,
+  and it keeps the inbound sleepstate interrupt as a wakeup source so that
+  a remote initiated wake still reaches the power management core.
+
+  The entry is an additional entry of an existing SMP2P edge, so the node
+  refers to the outbound entry that carries the state and to the inbound
+  entry that carries the interrupt.
+
+properties:
+  compatible:
+    const: qcom,smp2p-sleepstate
+
+  qcom,smem-states:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - description: phandle to the outbound SMP2P entry that carries the
+          sleep state
+      - description: index of the sleep state within that entry
+
+  interrupt-parent:
+    description: phandle to the inbound SMP2P entry that carries the
+      sleepstate interrupt
+    $ref: /schemas/types.yaml#/definitions/phandle
+
+  interrupts:
+    maxItems: 1
+
+  interrupt-names:
+    items:
+      - const: smp2p-sleepstate-in
+
+required:
+  - compatible
+  - qcom,smem-states
+  - interrupt-parent
+  - interrupts
+  - interrupt-names
+
+additionalProperties: false

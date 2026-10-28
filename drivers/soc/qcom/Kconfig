@@ -240,6 +240,19 @@ config QCOM_SMP2P
 	  Say yes here to support the Qualcomm Shared Memory Point to Point
 	  protocol.
 
+config QCOM_SMP2P_SLEEPSTATE
+	tristate "Qualcomm SMP2P sleep-state notifier"
+	depends on QCOM_SMP2P
+	help
+	  Say yes here to notify the remote processors over SMP2P that the
+	  application processor is entering or leaving system sleep. Firmware
+	  that publishes a qcom,smp2p-sleepstate entry needs this: without
+	  the notification the remote processors are not told that the
+	  application processor is going to sleep.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called smp2p_sleepstate.
+
 config QCOM_SMSM
 	tristate "Qualcomm Shared Memory State Machine"
 	depends on MAILBOX
