@@ -850,6 +850,21 @@ static void dsi_ctrl_enable(struct msm_dsi_host *msm_host,
 		/* Do not swap RGB colors */
 		data = DSI_VID_CFG1_RGB_SWAP(SWAP_RGB);
 		dsi_write(msm_host, REG_DSI_VID_CFG1, 0);
+
+		if (cfg_hnd->major == MSM_DSI_VER_MAJOR_6G) {
+			/*
+			 * Vendor video-mode engine setup: a coarse HS TX
+			 * timeout (status only, STOP_EN clear) and the
+			 * per-frame video MISR so the controller output of
+			 * each link can be checked.
+			 */
+			dsi_write(msm_host, REG_DSI_HS_TIMER_CTRL,
+				  DSI_HS_TIMER_CTRL_TIMER_RESOLUTION(3) |
+				  DSI_HS_TIMER_CTRL_HS_TX_TO(0xfd08));
+			dsi_write(msm_host, REG_DSI_MISR_VIDEO_CTRL,
+				  DSI_MISR_VIDEO_CTRL_ENABLE |
+				  DSI_MISR_VIDEO_CTRL_FRAME_COUNT(1));
+		}
 	} else {
 		/* Do not swap RGB colors */
 		data = DSI_CMD_CFG0_RGB_SWAP(SWAP_RGB);
