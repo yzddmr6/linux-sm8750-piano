@@ -97,10 +97,15 @@ static int dsi_mgr_setup_components(int id)
 		 * Set the usecase before calling msm_dsi_host_register(), which would
 		 * already program the PLL source mux based on a default usecase.
 		 */
+		/*
+		 * The piano P81 panel is wired like the downstream dual-DSI
+		 * design: each link runs its own PLL. The mainline external
+		 * slave-PLL mode leaves the second link's pixel clock off.
+		 */
 		msm_dsi_phy_set_usecase(clk_master_dsi->phy,
-					MSM_DSI_PHY_MASTER);
+					MSM_DSI_PHY_STANDALONE);
 		msm_dsi_phy_set_usecase(clk_slave_dsi->phy,
-					MSM_DSI_PHY_SLAVE);
+					MSM_DSI_PHY_STANDALONE);
 		msm_dsi_host_set_phy_mode(msm_dsi->host, msm_dsi->phy);
 		msm_dsi_host_set_phy_mode(other_dsi->host, other_dsi->phy);
 
@@ -127,10 +132,29 @@ static int enable_phy(struct msm_dsi *msm_dsi,
 {
 	struct msm_dsi_phy_clk_request clk_req;
 	bool is_bonded_dsi = IS_BONDED_DSI();
+	int ret;
 
 	msm_dsi_host_get_phy_clk_req(msm_dsi->host, &clk_req, is_bonded_dsi);
 
-	return msm_dsi_phy_enable(msm_dsi->phy, &clk_req, shared_timings);
+	ret = msm_dsi_phy_enable(msm_dsi->phy, &clk_req, shared_timings);
+
+	/*
+	 * In the independent-PLL configuration the slave VCO is not started
+	 * by the master PLL's enable path. The host reparent that follows
+	 * needs the slave PLL output to be live, so start it here outside the
+	 * clock framework's prepare/reparent callbacks.
+	 */
+	if (!ret && msm_dsi->id == DSI_1 &&
+	    msm_dsi->phy->usecase == MSM_DSI_PHY_STANDALONE &&
+	    msm_dsi->phy->vco_hw) {
+		struct clk *vco = msm_dsi->phy->vco_hw->clk;
+
+		ret = clk_set_rate(vco, clk_req.bitclk_rate);
+		if (!ret)
+			ret = clk_prepare_enable(vco);
+	}
+
+	return ret;
 }
 
 static int
