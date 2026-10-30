@@ -221,7 +221,7 @@ EXPORT_SYMBOL_GPL(sc8547a_prepare);
 int sc8547a_start(struct sc8547a *cp)
 {
 	struct sc8547a_sample sample;
-	int target, ret;
+	int ret;
 
 	mutex_lock(&cp->lock);
 	if (cp->active) {
@@ -231,12 +231,7 @@ int sc8547a_start(struct sc8547a *cp)
 	ret = sc8547a_read_locked(cp, &sample);
 	if (ret)
 		goto fail;
-	/* Stock CP_GET_VOUT uses VBAT (0x1b), not the separate VOUT ADC (0x19). */
-	target = sample.vbat_mv * 2 / 100 * 100 + 450;
-	if (sample.vbus_mv < target || sample.vbus_mv > target + 200) {
-		ret = -ERANGE;
-		goto fail;
-	}
+	/* The policy checks initial entry; a parallel pump joins a running bus. */
 	ret = regmap_write(cp->regmap, SC_MODE_WATCHDOG, SC_MODE_2_TO_1 | SC_WATCHDOG_1S);
 	if (!ret)
 		ret = regmap_write(cp->regmap, SC_CONTROL, cp->control_off | SC_CHARGE_ENABLE);
