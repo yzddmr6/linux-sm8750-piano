@@ -137,3 +137,4 @@ obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
 obj-$(CONFIG_MACSMC_POWER)	+= macsmc-power.o
 obj-$(CONFIG_CHARGER_MAX77759)	+= max77759_charger.o
 obj-$(CONFIG_CHARGER_SC8541)	+= sc8541_charger.o
+obj-$(CONFIG_CHARGER_SC8547A)	+= sc8547a.o

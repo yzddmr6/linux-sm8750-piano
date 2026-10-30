@@ -26352,6 +26352,13 @@ F:	Documentation/driver-api/soundwire/
 F:	drivers/soundwire/
 F:	include/linux/soundwire/
 
+SOUTHCHIP SC8547A CHARGE PUMP
+M:	yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+L:	linux-pm@vger.kernel.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/power/supply/southchip,sc8547a.yaml
+F:	drivers/power/supply/sc8547a.[ch]
+
 SP2 MEDIA DRIVER
 M:	Olli Salonen <olli.salonen@iki.fi>
 L:	linux-media@vger.kernel.org
