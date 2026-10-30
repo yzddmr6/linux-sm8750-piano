@@ -518,6 +518,40 @@ static void dsi_pll_phy_dig_reset(struct dsi_pll_7nm *pll)
 	wmb(); /* Ensure that the reset is deasserted */
 }
 
+/*
+ * A bonded slave PHY runs from the master bit clock, but the vendor driver
+ * still mirrors the master post dividers and DSI clock mux into it (with the
+ * PHY post divider forced to 1) and enables its performance optimization.
+ * Do the same so the slave data path matches the master.
+ */
+static void dsi_pll_v7_2_program_slave(struct dsi_pll_7nm *pll)
+{
+	struct dsi_pll_7nm *slave = pll->slave;
+	u32 outdiv, cfg0, cfg1;
+
+	outdiv = readl(pll->phy->pll_base + REG_DSI_7nm_PHY_PLL_PLL_OUTDIV_RATE);
+	writel(outdiv, slave->phy->pll_base + REG_DSI_7nm_PHY_PLL_PLL_OUTDIV_RATE);
+
+	cfg0 = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CLK_CFG0);
+	dsi_pll_cmn_clk_cfg0_write(slave,
+				   (cfg0 & DSI_7nm_PHY_CMN_CLK_CFG0_DIV_CTRL_7_4__MASK) |
+				   DSI_7nm_PHY_CMN_CLK_CFG0_DIV_CTRL_3_0(1));
+
+	cfg1 = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CLK_CFG1);
+	dsi_pll_cmn_clk_cfg1_update(slave, DSI_7nm_PHY_CMN_CLK_CFG1_DSICLK_SEL__MASK, cfg1);
+
+	writel(0x22, slave->phy->pll_base + REG_DSI_7nm_PHY_PLL_PERF_OPTIMIZE);
+	wmb(); /* flush the slave configuration before the PLL starts */
+
+	DRM_DEV_INFO(&slave->phy->pdev->dev,
+		     "bonded slave programmed from PLL%d: CLK_CFG0=0x%02x CLK_CFG1=0x%02x OUTDIV=0x%02x SYSTEM_MUXES=0x%02x\n",
+		     pll->phy->id,
+		     readl(slave->phy->base + REG_DSI_7nm_PHY_CMN_CLK_CFG0),
+		     readl(slave->phy->base + REG_DSI_7nm_PHY_CMN_CLK_CFG1),
+		     readl(slave->phy->pll_base + REG_DSI_7nm_PHY_PLL_PLL_OUTDIV_RATE),
+		     readl(slave->phy->pll_base + REG_DSI_7nm_PHY_PLL_SYSTEM_MUXES));
+}
+
 static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 {
 	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(hw);
@@ -538,6 +572,9 @@ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 	dsi_pll_enable_pll_bias(pll_7nm);
 	if (pll_7nm->slave)
 		dsi_pll_enable_pll_bias(pll_7nm->slave);
+
+	if ((pll_7nm->phy->cfg->quirks & DSI_PHY_7NM_QUIRK_V7_2) && pll_7nm->slave)
+		dsi_pll_v7_2_program_slave(pll_7nm);
 
 	/* Start PLL */
 	writel(BIT(0), pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
