@@ -261,6 +261,10 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 		<bitfield name="TX_EOT_APPEND" pos="0" type="boolean"/>
 		<bitfield name="RX_EOT_IGNORE" pos="4" type="boolean"/>
 	</reg32>
+	<reg32 offset="0x000a0" name="MISR_VIDEO_CTRL">
+		<bitfield name="FRAME_COUNT" low="8" high="15" type="uint"/>
+		<bitfield name="ENABLE" pos="16" type="boolean"/>
+	</reg32>
 	<reg32 offset="0x000a4" name="LANE_STATUS">
 		<bitfield name="DLN0_STOPSTATE" pos="0" type="boolean"/>
 		<bitfield name="DLN1_STOPSTATE" pos="1" type="boolean"/>
@@ -282,6 +286,7 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 		<bitfield name="DLN_SWAP_SEL" low="0" high="2" type="dsi_lane_swap"/>
 	</reg32>
 	<reg32 offset="0x00108" name="ERR_INT_MASK0"/>
+	<reg32 offset="0x0013c" name="MISR_VIDEO_32BIT"/>
 	<reg32 offset="0x0010c" name="INTR_CTRL" type="DSI_IRQ"/>
 	<reg32 offset="0x00114" name="RESET"/>
 	<reg32 offset="0x00118" name="CLK_CTRL">
