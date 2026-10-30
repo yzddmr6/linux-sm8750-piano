@@ -1002,6 +1002,21 @@ gpio_keys_button_disable_wakeup(struct gpio_button_data *bdata)
 			 bdata->irq, error);
 }
 
+/*
+ * A deassertion wakeup can only come from an input that is asserted when the
+ * system suspends. Do not arm it otherwise, so that an edge reported without
+ * a change of the input cannot wake the system.
+ */
+static bool gpio_keys_button_wakeup_needed(struct gpio_button_data *bdata)
+{
+	if (bdata->button->wakeup_event_action != EV_ACT_DEASSERTED ||
+	    !bdata->gpiod)
+		return true;
+
+	/* Keep the wakeup when the state cannot be read. */
+	return gpiod_get_value_cansleep(bdata->gpiod) != 0;
+}
+
 static int __maybe_unused
 gpio_keys_enable_wakeup(struct gpio_keys_drvdata *ddata)
 {
@@ -1011,7 +1026,8 @@ gpio_keys_enable_wakeup(struct gpio_keys_drvdata *ddata)
 
 	for (i = 0; i < ddata->pdata->nbuttons; i++) {
 		bdata = &ddata->data[i];
-		if (bdata->button->wakeup) {
+		if (bdata->button->wakeup &&
+		    gpio_keys_button_wakeup_needed(bdata)) {
 			error = gpio_keys_button_enable_wakeup(bdata);
 			if (error)
 				goto err_out;
@@ -1024,7 +1040,7 @@ gpio_keys_enable_wakeup(struct gpio_keys_drvdata *ddata)
 err_out:
 	while (i--) {
 		bdata = &ddata->data[i];
-		if (bdata->button->wakeup)
+		if (irqd_is_wakeup_set(irq_get_irq_data(bdata->irq)))
 			gpio_keys_button_disable_wakeup(bdata);
 		bdata->suspended = false;
 	}
