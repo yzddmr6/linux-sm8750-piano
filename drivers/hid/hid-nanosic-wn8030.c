@@ -86,7 +86,6 @@ struct nanosic_wn8030 {
 	struct completion attach_known;
 	u8 attach;
 	bool tablet_registered;
-	bool no_touchpad;
 	const char *firmware_name;
 
 	struct gpio_desc *data_gpio;
@@ -114,6 +113,13 @@ struct nanosic_wn8030 {
 
 	bool suspended;
 	bool keyboard_attached;
+	bool touchpad_seen;
+	/*
+	 * The legacy "nanosic,no-touchpad" property marks a keyboard
+	 * descriptor without the pointer collection.  It does not disable
+	 * touchpad detection: the touchpad is created from its 0x19 reports.
+	 */
+	bool keyboard_no_pointer;
 	bool userspace_angle_enabled;
 	bool input_enabled;
 	bool lid_closed;
@@ -574,7 +580,7 @@ static int nanosic_wn8030_hid_parse(struct hid_device *hid)
 
 	if (hid->product == 0x00A3)
 		return hid_parse_report(hid, (u8 *)variant->kbd_rdesc,
-					(nanosic->no_touchpad && variant->packed_reports) ?
+					(nanosic->keyboard_no_pointer && variant->packed_reports) ?
 					PIANO_KEYBOARD_NO_POINTER_SIZE : variant->kbd_rsize);
 	else if (hid->product == 0x00A1)
 		return hid_parse_report(hid, (u8 *)variant->tp_rdesc,
@@ -745,8 +751,6 @@ static int nanosic_wn8030_set_touchpad(struct nanosic_wn8030 *nanosic, bool enab
 	u8 buf[XM_WN8030_I2C_WRITE] = { 0x32, 0x00, 0x4E, 0x31,
 					0x80, 0x38, 0x21, 0x01 };
 
-	if (nanosic->no_touchpad)
-		return 0;
 	buf[8] = enable;
 	buf[9] = nanosic_wn8030_checksum8(&buf[2], 7);
 
@@ -884,7 +888,7 @@ static void nanosic_wn8030_add_touchpad_hid(struct nanosic_wn8030 *nanosic)
 {
 	struct hid_device *hid;
 
-	if (nanosic->no_touchpad)
+	if (nanosic->hid_touchpad)
 		return;
 
 	hid = hid_allocate_device();
@@ -910,6 +914,7 @@ static void nanosic_wn8030_add_touchpad_hid(struct nanosic_wn8030 *nanosic)
 	}
 
 	nanosic->hid_touchpad = hid;
+	dev_info(nanosic->dev, "touchpad detected\n");
 }
 
 static void nanosic_wn8030_publish_hinge(struct nanosic_wn8030 *nanosic,
@@ -993,7 +998,6 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic,
 				nanosic_wn8030_set_touchpad(nanosic, input_enabled);
 			}
 			nanosic_wn8030_add_keyboard_hid(nanosic);
-			nanosic_wn8030_add_touchpad_hid(nanosic);
 			nanosic->keyboard_attached = true;
 			schedule_work(&nanosic->input_state_work);
 			notify_plugin = true;
@@ -1009,6 +1013,7 @@ static void nanosic_wn8030_handle_vendor(struct nanosic_wn8030 *nanosic,
 				nanosic->hid_touchpad = NULL;
 			}
 			nanosic->keyboard_attached = false;
+			WRITE_ONCE(nanosic->touchpad_seen, false);
 			notify_plugin = true;
 			plugin_attached = false;
 		}
@@ -1110,7 +1115,7 @@ static int nanosic_wn8030_dispatch(struct nanosic_wn8030 *nanosic,
 
 	switch (p[0]) {
 	case 0x2:
-		if (!nanosic->no_touchpad && READ_ONCE(nanosic->input_enabled) && nanosic->hid_keyboard)
+		if (!nanosic->keyboard_no_pointer && READ_ONCE(nanosic->input_enabled) && nanosic->hid_keyboard)
 			hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
 					 (u8 *)p, size, 0);
 		break;
@@ -1145,6 +1150,11 @@ static int nanosic_wn8030_dispatch(struct nanosic_wn8030 *nanosic,
 					 (u8 *)p, 3, 0);
 		break;
 	case 0x19:
+		if (READ_ONCE(nanosic->keyboard_attached) &&
+		    !READ_ONCE(nanosic->touchpad_seen)) {
+			WRITE_ONCE(nanosic->touchpad_seen, true);
+			nanosic_wn8030_add_touchpad_hid(nanosic);
+		}
 		if (READ_ONCE(nanosic->input_enabled) && nanosic->hid_touchpad)
 			hid_input_report(nanosic->hid_touchpad, HID_INPUT_REPORT,
 					 (u8 *)p, size, 0);
@@ -1427,7 +1437,8 @@ static void nanosic_wn8030_release_inputs(struct nanosic_wn8030 *nanosic)
 {
 	u8 keyboard[9] = { 0x05 };
 	u8 consumer[3] = { 0x06 };
-	u8 touchpad[21] = { 0x19 };
+	/* Sized for the piano variant; sheng sends a shorter report. */
+	u8 touchpad[27] = { 0x19 };
 
 	if (nanosic->hid_keyboard) {
 		hid_input_report(nanosic->hid_keyboard, HID_INPUT_REPORT,
@@ -1437,7 +1448,7 @@ static void nanosic_wn8030_release_inputs(struct nanosic_wn8030 *nanosic)
 	}
 	if (nanosic->hid_touchpad)
 		hid_input_report(nanosic->hid_touchpad, HID_INPUT_REPORT,
-				 touchpad, sizeof(touchpad), 0);
+				 touchpad, nanosic->variant->touchpad_len, 0);
 	WRITE_ONCE(nanosic->micmute_key_down, false);
 }
 
@@ -1925,7 +1936,8 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 	nanosic->panel_on = !drm_is_panel_follower(nanosic->dev);
 	nanosic->client = client;
 	init_completion(&nanosic->attach_known);
-	nanosic->no_touchpad = device_property_read_bool(nanosic->dev, "nanosic,no-touchpad");
+	nanosic->keyboard_no_pointer =
+		device_property_read_bool(nanosic->dev, "nanosic,no-touchpad");
 	nanosic->firmware_name = "nanosic/MCU_Upgrade.bin";
 	device_property_read_string(nanosic->dev, "firmware-name", &nanosic->firmware_name);
 	nanosic->variant = i2c_get_match_data(client);
