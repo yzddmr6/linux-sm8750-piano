@@ -7,11 +7,13 @@
  */
 #include <linux/auxiliary_bus.h>
 #include <linux/cleanup.h>
+#include <linux/component.h>
 #include <linux/devm-helpers.h>
 #include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/nvmem-consumer.h>
+#include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
@@ -23,6 +25,9 @@
 #include <linux/units.h>
 #include <linux/usb/pd.h>
 #include <linux/workqueue.h>
+
+#include "qcom_battmgr_pps.h"
+#include "sc8547a.h"
 
 #define BATTMGR_CHEMISTRY_LEN	4
 #define BATTMGR_STRING_LEN	128
@@ -128,8 +133,6 @@ enum qcom_battmgr_variant {
 #define BATT_OPLUS_CHG_EN		24
 /* Fixed PDO voltage in mV, written with BATTMGR_BAT_PROPERTY_SET */
 #define BATT_OPLUS_SET_PDO		25
-/* OPLUS firmware: allow the charge current of a raised input voltage */
-#define BATT_OPLUS_FASTCHG_ALLOW	46
 
 #define BATTMGR_USB_PROPERTY_GET	0x32
 #define BATTMGR_USB_PROPERTY_SET	0x33
@@ -154,7 +157,6 @@ enum qcom_battmgr_variant {
 #define USB_OPLUS_PPS_VOLT		34
 #define USB_OPLUS_PPS_CURR		35
 #define USB_OPLUS_PPS_MAX_CURR		36
-#define USB_OPLUS_PPS_ENABLE		49
 
 #define BATTMGR_WLS_PROPERTY_GET	0x34
 #define BATTMGR_WLS_PROPERTY_SET	0x35
@@ -181,56 +183,6 @@ enum qcom_battmgr_variant {
 
 /* VBUS boost current limit for a USB sink, from the vendor devicetree */
 #define OTG_BOOST_CURRENT_MA		1250
-
-/*
- * PPS contract: 8.4 V at up to 3 A from the charger, with an input current
- * limit of 3 A and a battery charge current limit of 4.4 A.  At most
- * 25.2 W, far below the 67 W charging limit of the device (vendor
- * devicetree oplus,vooc_power_max_w = <0x43>).
- */
-#define PPS_VOLT_MV			8400
-#define PPS_CURR_START_MA		1000
-#define PPS_CURR_MA			3000
-#define PPS_CURR_STEP_MA		250
-#define PPS_INPUT_LIMIT_UA		3000000
-#define PPS_CHARGE_LIMIT_UA		4400000
-#define PPS_POWER_MAX_MW		67000
-static_assert(PPS_VOLT_MV * PPS_CURR_MA <= PPS_POWER_MAX_MW * 1000);
-
-/* Values written to leave the contract */
-#define PPS_END_VOLT_MV			5000
-#define PPS_END_CURR_MA			2000
-
-/* Polling while a PPS contract is pending or active */
-#define PPS_POLL_MS			2000
-/* Time for the firmware to finish its own charger setup after plug-in */
-#define PPS_SETTLE_MS			10000
-/* VBUS must have left 5 V after this many polls, and never collapse */
-#define PPS_RISE_POLLS			6
-#define PPS_VBUS_RISEN_UV		5500000
-#define PPS_VBUS_COLLAPSE_UV		3800000
-/* Polls at a raised VBUS without input current before giving up */
-#define PPS_VBUS_HIGH_UV		7000000
-#define PPS_STALL_UA			100000
-#define PPS_STALL_POLLS			15
-
-/*
- * Battery limits for the contract, from the vendor PPS settings: it ends at
- * 90 % (oplus,pps_charge_strategy_soc), at 4.49 V
- * (oplus,pps_full_normal_sw_vbat), above 43.0 C (the highest step of
- * oplus,pps_strategy_batt_high_temp) and below 0 C.  Starting needs a
- * margin: at most 85 %, 4.4 V and 40.0 C (the vendor recovery
- * temperature), and at least 5.0 C.
- */
-#define PPS_SOC_MAX			90
-#define PPS_SOC_MARGIN			5
-#define PPS_VBAT_MAX_UV			4490000
-#define PPS_VBAT_START_UV		4400000
-#define PPS_VBAT_MIN_UV			3300000
-#define PPS_TEMP_MAX			430
-#define PPS_TEMP_START_MAX		400
-#define PPS_TEMP_START_MIN		50
-#define PPS_TEMP_MIN			0
 
 /* Fixed PD limits from oplus-chg-erhai-common.dtsi and oplus-chg-24924.dtsi. */
 #define PD_FIXED_MV			9000
@@ -259,26 +211,24 @@ enum qcom_battmgr_pd_event {
 };
 
 static bool pps_enable;
-module_param(pps_enable, bool, 0644);
-MODULE_PARM_DESC(pps_enable,
-		 "Request a USB PD PPS contract from PPS chargers where supported (default: off)");
+static DEFINE_MUTEX(pps_param_lock);
+static struct qcom_battmgr *pps_device;
 
 enum qcom_battmgr_pps_state {
-	PPS_IDLE,	/* no PPS charger, or PPS disabled */
-	PPS_SETTLE,	/* PPS charger present, waiting for its setup to finish */
-	PPS_ACTIVE,	/* contract requested */
-	PPS_HOLD,	/* ended for the battery, may start again with margin */
-	PPS_FAILED,	/* charger or firmware refused, not retried until unplugged */
+	PPS_IDLE,
+	PPS_RAMP,
+	PPS_CONFIRM,
+	PPS_ACTIVE,
+	PPS_HOLD,
+	PPS_FAILED,
 };
 
 struct qcom_battmgr_pps_sample {
-	unsigned int soc;
-	unsigned int vbat_uv;
-	int ibat_ua;		/* positive while charging */
-	int temp;		/* tenths of a degree Celsius */
-	unsigned int health;
-	unsigned int vbus_uv;
-	unsigned int ibus_ua;
+	int soc;
+	int vbat_mv;
+	int ibat_ma;
+	int temp;
+	u32 health;
 };
 
 struct qcom_battmgr_enable_request {
@@ -570,22 +520,25 @@ struct qcom_battmgr {
 	bool otg_request;
 	bool otg_vbus;
 
-	/*
-	 * USB PD PPS, run from @charge_work under @charge_lock; @pm_nb ends
-	 * the contract before system suspend, since it is not monitored
-	 * while suspended.
-	 */
+	/* Both charging policies are serialized by @charge_lock. */
 	struct mutex charge_lock;
 	struct notifier_block pm_nb;
+	struct sc8547a_group cp;
+	bool cp_ready;
+	bool pps_suspended;
+	bool pps_fault;
+	bool pps_cleanup;
+	bool pps_slave;
 	enum qcom_battmgr_pps_state pps_state;
-	unsigned long pps_since;
+	unsigned long pps_next;
+	unsigned long pps_started;
 	unsigned int pps_polls;
-	unsigned int pps_stalls;
-	u32 pps_curr_ma;
-	u32 pps_target_ma;
-	/* Limits found before the contract, restored when it ends */
-	u32 pps_input_limit_ua;
-	u32 pps_charge_limit_ua;
+	unsigned int pps_low_polls;
+	int pps_mv;
+	int pps_ma;
+	int pps_max_ma;
+	int pps_ceiling_ma;
+	int pps_peak_vbat;
 
 	/* Fixed PD shares @charge_work and @charge_lock with PPS. */
 	struct notifier_block psy_nb;
@@ -646,7 +599,7 @@ static int qcom_battmgr_request_property(struct qcom_battmgr *battmgr, int opcod
  * name the written property, so a late answer to an earlier request that
  * timed out is not taken for this one.
  */
-static int qcom_battmgr_set_property(struct qcom_battmgr *battmgr, int opcode,
+static int qcom_battmgr_set_property_locked(struct qcom_battmgr *battmgr, int opcode,
 				     u32 property, u32 value)
 {
 	struct qcom_battmgr_property_request request = {
@@ -659,14 +612,23 @@ static int qcom_battmgr_set_property(struct qcom_battmgr *battmgr, int opcode,
 	};
 	int ret;
 
-	mutex_lock(&battmgr->lock);
 	battmgr->resp_property = U32_MAX;
 	ret = __qcom_battmgr_request(battmgr, &request, sizeof(request),
 				     msecs_to_jiffies(BATTMGR_SET_TIMEOUT_MS));
 	if (!ret && battmgr->resp_property != property)
 		ret = -EIO;
-	mutex_unlock(&battmgr->lock);
 
+	return ret;
+}
+
+static int qcom_battmgr_set_property(struct qcom_battmgr *battmgr, int opcode,
+				     u32 property, u32 value)
+{
+	int ret;
+
+	mutex_lock(&battmgr->lock);
+	ret = qcom_battmgr_set_property_locked(battmgr, opcode, property, value);
+	mutex_unlock(&battmgr->lock);
 	return ret;
 }
 
@@ -1168,332 +1130,438 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 	}
 }
 
-static bool qcom_battmgr_pps_enabled(struct qcom_battmgr *battmgr)
+/* Caller owns @lock until it has consumed the PDO array. */
+static int qcom_battmgr_read_pdos_locked(struct qcom_battmgr *battmgr)
 {
-	return (battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS) && READ_ONCE(pps_enable);
+	struct qcom_battmgr_read_pdos_request req = {
+		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
+		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
+		.hdr.opcode = cpu_to_le32(BATTMGR_OPLUS_READ_PDOS),
+		.data_size = cpu_to_le32(OPLUS_READ_BUFFER_WORDS * sizeof(__le32)),
+	};
+	int ret;
+
+	battmgr->num_src_pdos = 0;
+	ret = __qcom_battmgr_request(battmgr, &req, sizeof(req),
+				     msecs_to_jiffies(BATTMGR_SET_TIMEOUT_MS));
+	if (ret)
+		return ret;
+	if (!battmgr->num_src_pdos || pdo_type(battmgr->src_pdos[0]) != PDO_TYPE_FIXED ||
+	    pdo_fixed_voltage(battmgr->src_pdos[0]) != PD_DEFAULT_MV ||
+	    !pdo_max_current(battmgr->src_pdos[0]))
+		return -ENODATA;
+	return 0;
 }
 
-/* A charger that offers PPS, as detected by the firmware */
-static bool qcom_battmgr_pps_charger(struct qcom_battmgr *battmgr)
+static bool qcom_battmgr_pps_enabled(struct qcom_battmgr *battmgr)
 {
-	u32 type, pps;
+	return (battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS) && READ_ONCE(pps_enable) &&
+	       READ_ONCE(battmgr->cp_ready) && !READ_ONCE(battmgr->pps_suspended);
+}
 
-	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-				      USB_ADAP_TYPE, &type) ||
-	    type != POWER_SUPPLY_USB_TYPE_PD_PPS)
-		return false;
+static bool qcom_battmgr_pps_running(struct qcom_battmgr *battmgr)
+{
+	enum qcom_battmgr_pps_state state = READ_ONCE(battmgr->pps_state);
 
-	return !qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-					  USB_OPLUS_PPS_TYPE, &pps) && pps == 1;
+	return state == PPS_RAMP || state == PPS_CONFIRM || state == PPS_ACTIVE;
+}
+
+static int qcom_battmgr_pps_source_current(struct qcom_battmgr *battmgr)
+{
+	unsigned int i;
+	u32 pdo;
+	int ret, ma = 0;
+
+	mutex_lock(&battmgr->lock);
+	ret = qcom_battmgr_read_pdos_locked(battmgr);
+	if (!ret) {
+		for (i = 0; i < battmgr->num_src_pdos; i++) {
+			pdo = battmgr->src_pdos[i];
+			if (pdo_type(pdo) != PDO_TYPE_APDO || pdo_apdo_type(pdo) != APDO_TYPE_PPS)
+				continue;
+			/* Same APDO must cover the vendor's 5.5 V start and 11 V rating. */
+			if (pdo_pps_apdo_min_voltage(pdo) <= OPD_PPS_START_MV &&
+			    pdo_pps_apdo_max_voltage(pdo) >= 11000)
+				ma = max_t(int, ma, pdo_pps_apdo_max_current(pdo));
+		}
+	}
+	mutex_unlock(&battmgr->lock);
+	if (ret)
+		return ret;
+	if (ma < OPD_PPS_START_MA)
+		return -ENODATA;
+	return min(ma, OPD_PPS_MAX_MA);
+}
+
+static int qcom_battmgr_pps_request(struct qcom_battmgr *battmgr, int mv, int ma)
+{
+	int ret, err;
+
+	if (mv < OPD_PPS_START_MV || mv > OPD_PPS_MAX_MV || mv % 20 ||
+	    ma <= 0 || ma > min(battmgr->pps_max_ma, OPD_PPS_MAX_MA) || ma % 50 ||
+	    mv * ma > OPD_PPS_MAX_MW * 1000)
+		return -EINVAL;
+
+	/* Always send 34 then 35, including after an ambiguous voltage timeout. */
+	mutex_lock(&battmgr->lock);
+	ret = qcom_battmgr_set_property_locked(battmgr, BATTMGR_USB_PROPERTY_SET,
+					       USB_OPLUS_PPS_VOLT, mv);
+	err = qcom_battmgr_set_property_locked(battmgr, BATTMGR_USB_PROPERTY_SET,
+					       USB_OPLUS_PPS_CURR, ma);
+	mutex_unlock(&battmgr->lock);
+	if (ret || err)
+		return ret ?: err;
+	if (READ_ONCE(battmgr->pps_fault))
+		return -EIO;
+	battmgr->pps_mv = mv;
+	battmgr->pps_ma = ma;
+	return 0;
 }
 
 static int qcom_battmgr_pps_sample(struct qcom_battmgr *battmgr,
 				   struct qcom_battmgr_pps_sample *s)
 {
-	u32 soc, curr, temp;
+	u32 value;
 	int ret;
 
 	ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
-					BATT_CAPACITY, &soc);
-	if (!ret)
-		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
-						BATT_VOLT_NOW, &s->vbat_uv);
-	if (!ret)
-		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
-						BATT_CURR_NOW, &curr);
-	if (!ret)
-		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
-						BATT_TEMP, &temp);
-	if (!ret)
-		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
-						BATT_HEALTH, &s->health);
-	if (!ret)
-		ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-						USB_VOLT_NOW, &s->vbus_uv);
-	if (!ret)
-		ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-						USB_CURR_NOW, &s->ibus_ua);
+					BATT_CAPACITY, &value);
 	if (ret)
 		return ret;
-
-	s->soc = soc / 100;
-	s->ibat_ua = (s32)curr;
+	s->soc = value / 100;
+	ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+					BATT_VOLT_NOW, &value);
+	if (ret)
+		return ret;
+	s->vbat_mv = value / 1000;
+	ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+					BATT_CURR_NOW, &value);
+	if (ret)
+		return ret;
+	s->ibat_ma = (s32)value / 1000;
 	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_BATT_CURRENT_INVERTED)
-		s->ibat_ua = -s->ibat_ua;
-	s->temp = DIV_ROUND_CLOSEST((s32)temp, 10);
-
-	return 0;
+		s->ibat_ma = -s->ibat_ma;
+	ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, &value);
+	if (ret)
+		return ret;
+	s->temp = DIV_ROUND_CLOSEST((s32)value, 10);
+	return qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+					BATT_HEALTH, &s->health);
 }
 
-/* The contract ends at the end threshold if that is below the PPS limit */
 static unsigned int qcom_battmgr_pps_soc_max(struct qcom_battmgr *battmgr)
 {
 	unsigned int end = READ_ONCE(battmgr->info.charge_ctrl_end);
 
-	if (qcom_battmgr_charge_limited(battmgr) && end < PPS_SOC_MAX)
-		return end;
-
-	return PPS_SOC_MAX;
-}
-
-static const char *qcom_battmgr_pps_stop_reason(struct qcom_battmgr *battmgr,
-						const struct qcom_battmgr_pps_sample *s)
-{
-	if (battmgr->charge_inhibited)
-		return "charging stopped for the end threshold";
-	if (s->health != POWER_SUPPLY_HEALTH_GOOD)
-		return "battery health";
-	if (s->temp < PPS_TEMP_MIN || s->temp >= PPS_TEMP_MAX)
-		return "battery temperature";
-	if (s->vbat_uv < PPS_VBAT_MIN_UV || s->vbat_uv >= PPS_VBAT_MAX_UV)
-		return "battery voltage";
-	if (s->soc >= qcom_battmgr_pps_soc_max(battmgr))
-		return "battery charge level";
-
-	return NULL;
+	return end ? min(end, OPD_PPS_SOC_STOP) : OPD_PPS_SOC_STOP;
 }
 
 static bool qcom_battmgr_pps_may_start(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pps_sample s;
 
-	if (qcom_battmgr_pps_sample(battmgr, &s) ||
-	    qcom_battmgr_pps_stop_reason(battmgr, &s))
+	if (!qcom_battmgr_pps_enabled(battmgr) || battmgr->pps_cleanup ||
+	    battmgr->pps_state == PPS_HOLD || battmgr->pps_state == PPS_FAILED ||
+	    READ_ONCE(battmgr->pps_fault) || battmgr->charge_inhibited ||
+	    qcom_battmgr_pps_sample(battmgr, &s) || s.health != POWER_SUPPLY_HEALTH_GOOD)
 		return false;
-
-	return s.temp >= PPS_TEMP_START_MIN && s.temp <= PPS_TEMP_START_MAX &&
-	       s.vbat_uv <= PPS_VBAT_START_UV &&
-	       s.soc + PPS_SOC_MARGIN <= qcom_battmgr_pps_soc_max(battmgr);
+	return opd_pps_check(s.soc, s.temp, s.vbat_mv, s.ibat_ma, OPD_PPS_START_MV, 0,
+			     qcom_battmgr_pps_soc_max(battmgr)) == OPD_PPS_OK &&
+	       opd_pps_curve_limit(s.soc, s.temp, s.vbat_mv) > 0;
 }
 
-/*
- * Leave the contract: back to 5 V first, then release the limits and the
- * PPS mode.  The limits found before the contract are restored, and
- * charging stays off if the end threshold holds it off.
- */
-static void qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr,
-				  enum qcom_battmgr_pps_state next,
-				  const char *reason)
+/* All callers hold @charge_lock, including component removal and PM prepare. */
+static int qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr,
+				 enum qcom_battmgr_pps_state next, const char *reason)
 {
-	int ret, err = 0;
+	u32 online = 1, vbus, icl;
+	int i, ret, err = 0, buck_ret = -EAGAIN, pd_ret = -EAGAIN;
+	bool cleanup = battmgr->pps_cleanup || qcom_battmgr_pps_running(battmgr);
 
-	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-					USB_OPLUS_PPS_CURR, PPS_END_CURR_MA);
-	err = err ?: ret;
-	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-					USB_OPLUS_PPS_VOLT, PPS_END_VOLT_MV);
-	err = err ?: ret;
-	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
-					BATT_OPLUS_FASTCHG_ALLOW, 0);
-	err = err ?: ret;
-	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
-					BATT_CHG_CTRL_LIM, battmgr->pps_charge_limit_ua);
-	err = err ?: ret;
-	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
-					BATT_OPLUS_CHG_EN, !battmgr->charge_inhibited);
-	err = err ?: ret;
-	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-					USB_INPUT_CURR_LIMIT, battmgr->pps_input_limit_ua);
-	err = err ?: ret;
-	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-					USB_OPLUS_PPS_ENABLE, 0);
-	err = err ?: ret;
-
-	/* Writes to a port without a charger may be refused */
-	if (err && next != PPS_IDLE)
-		dev_warn(battmgr->dev, "PPS: failed to restore 5 V charging: %d\n", err);
-
-	dev_info(battmgr->dev, "PPS contract ended: %s\n", reason);
 	battmgr->pps_state = next;
+	set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+	if (!cleanup)
+		return 0;
+	battmgr->pps_cleanup = true;
+	for (i = SC8547A_PUMPS - 1; i >= 0; i--) {
+		if (!battmgr->cp.pumps[i])
+			continue;
+		ret = sc8547a_stop(battmgr->cp.pumps[i]);
+		err = err ?: ret;
+	}
+	battmgr->pps_slave = false;
+	if (battmgr->service_up) {
+		/* A fixed PDO leaves PPS; no charge-pump firmware properties are used. */
+		pd_ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+						 BATT_OPLUS_SET_PDO, PD_DEFAULT_MV);
+		/* Unconditionally release the buck, even if stopping the pumps/PD failed. */
+		buck_ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+						   USB_INPUT_CURR_LIMIT, U32_MAX);
+		qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, &online);
+		if (!buck_ret && online) {
+			buck_ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+							   USB_INPUT_CURR_LIMIT, &icl);
+			if (!buck_ret && !icl)
+				buck_ret = -EAGAIN;
+		}
+		if (!pd_ret && online) {
+			msleep(PD_SHUTDOWN_WAIT_MS);
+			pd_ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+							 USB_VOLT_NOW, &vbus);
+			if (!pd_ret && vbus >= OPD_PPS_START_MV * 1000)
+				pd_ret = -EAGAIN;
+		}
+	}
+	if (!err && !buck_ret && (!pd_ret || !online))
+		battmgr->pps_cleanup = false;
+	battmgr->pd_logged = false;
+	set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+	err = err ?: buck_ret ?: (online ? pd_ret : 0);
+	if (err)
+		dev_err_ratelimited(battmgr->dev, "PPS: cleanup pending (%s): %d\n", reason, err);
+	else
+		dev_info(battmgr->dev, "PPS: stopped (%s), pumps off, fixed 5 V, buck released\n",
+			 reason);
+	return err;
 }
 
-/*
- * Request the contract, in the order the firmware needs: PPS mode, the
- * voltage before the current, the input limit, and only then the charge
- * current permission and limit.  Other orders leave VBUS at about 6.6 V
- * or the input current at about 1.3 A.
- */
 static int qcom_battmgr_pps_start(struct qcom_battmgr *battmgr)
 {
-	u32 max_ma;
-	int ret;
+	int ret, i;
 
-	/*
-	 * Both limits are put back when the contract ends.  Do not start
-	 * without them, and not while either is 0: an input current limit
-	 * of 0 suspends the input.
-	 */
-	ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-					USB_INPUT_CURR_LIMIT,
-					&battmgr->pps_input_limit_ua);
-	if (!ret)
-		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
-						BATT_CHG_CTRL_LIM,
-						&battmgr->pps_charge_limit_ua);
-	if (!ret && (!battmgr->pps_input_limit_ua || !battmgr->pps_charge_limit_ua))
-		ret = -ENODATA;
-	if (ret) {
-		dev_warn(battmgr->dev, "PPS: current limits unavailable: %d\n", ret);
-		battmgr->pps_state = PPS_FAILED;
-		return ret;
-	}
-
-	/* Stay within the current the charger offers */
-	battmgr->pps_target_ma = PPS_CURR_MA;
-	if (!qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-				       USB_OPLUS_PPS_MAX_CURR, &max_ma) &&
-	    max_ma >= PPS_CURR_START_MA && max_ma < PPS_CURR_MA)
-		battmgr->pps_target_ma = max_ma;
-	battmgr->pps_curr_ma = PPS_CURR_START_MA;
-
-	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-					USB_OPLUS_PPS_ENABLE, 1);
-	if (!ret)
-		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-						USB_OPLUS_PPS_VOLT, PPS_VOLT_MV);
-	if (!ret)
-		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-						USB_OPLUS_PPS_CURR, battmgr->pps_curr_ma);
-	if (!ret)
-		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-						USB_INPUT_CURR_LIMIT, PPS_INPUT_LIMIT_UA);
-	if (!ret)
-		ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
-						BATT_OPLUS_FASTCHG_ALLOW, 1);
-	if (!ret)
-		ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
-						BATT_OPLUS_CHG_EN, 1);
-	if (!ret)
-		ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
-						BATT_CHG_CTRL_LIM, PPS_CHARGE_LIMIT_UA);
-	if (ret) {
-		qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "request refused");
-		return ret;
-	}
-
-	battmgr->pps_state = PPS_ACTIVE;
-	battmgr->pd_logged = false;
+	ret = qcom_battmgr_pps_source_current(battmgr);
+	if (ret < 0)
+		goto failed;
+	battmgr->pps_max_ma = ret;
+	battmgr->pps_ceiling_ma = ret;
+	battmgr->pps_peak_vbat = 0;
+	battmgr->pps_low_polls = 0;
 	battmgr->pps_polls = 0;
-	battmgr->pps_stalls = 0;
-	dev_info(battmgr->dev, "PPS contract requested: %u mV, up to %u mA\n",
-		 PPS_VOLT_MV, battmgr->pps_target_ma);
-
+	battmgr->pps_cleanup = true;
+	for (i = 0; i < SC8547A_PUMPS; i++) {
+		ret = sc8547a_prepare(battmgr->cp.pumps[i]);
+		if (ret)
+			goto failed;
+	}
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					USB_INPUT_CURR_LIMIT, 0);
+	if (ret)
+		goto failed;
+	ret = qcom_battmgr_pps_request(battmgr, OPD_PPS_START_MV, OPD_PPS_START_MA);
+	if (ret)
+		goto failed;
+	battmgr->pps_state = PPS_RAMP;
+	battmgr->pps_started = jiffies;
+	battmgr->pps_next = jiffies + msecs_to_jiffies(OPD_PPS_START_DELAY_MS);
+	battmgr->pd_logged = false;
+	dev_info(battmgr->dev, "PPS: starting 2:1, source limit %d mA, buck suspended\n",
+		 battmgr->pps_max_ma);
 	return 0;
+failed:
+	dev_warn(battmgr->dev, "PPS: start refused: %d\n", ret);
+	qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "start failure");
+	return ret;
 }
 
-static void qcom_battmgr_pps_monitor(struct qcom_battmgr *battmgr)
+static unsigned int qcom_battmgr_pps_delay(struct qcom_battmgr *battmgr, unsigned int ms)
 {
-	struct qcom_battmgr_pps_sample s;
-	const char *reason;
-	u32 curr;
-
-	if (qcom_battmgr_pps_sample(battmgr, &s)) {
-		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "no battery data");
-		return;
-	}
-
-	reason = qcom_battmgr_pps_stop_reason(battmgr, &s);
-	if (reason) {
-		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, reason);
-		return;
-	}
-
-	battmgr->pps_polls++;
-	if (s.vbus_uv < PPS_VBUS_COLLAPSE_UV) {
-		qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "VBUS collapsed");
-		return;
-	}
-	if (battmgr->pps_polls >= PPS_RISE_POLLS && s.vbus_uv < PPS_VBUS_RISEN_UV) {
-		qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "VBUS did not rise");
-		return;
-	}
-
-	if (s.vbus_uv > PPS_VBUS_HIGH_UV && s.ibus_ua < PPS_STALL_UA) {
-		if (++battmgr->pps_stalls >= PPS_STALL_POLLS) {
-			qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "no input current");
-			return;
-		}
-	} else {
-		battmgr->pps_stalls = 0;
-	}
-
-	if (battmgr->pps_curr_ma >= battmgr->pps_target_ma)
-		return;
-
-	curr = min(battmgr->pps_curr_ma + PPS_CURR_STEP_MA, battmgr->pps_target_ma);
-	/* The firmware expects a voltage/current pair for each PDO update. */
-	if (qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-				      USB_OPLUS_PPS_VOLT, PPS_VOLT_MV) ||
-	    qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
-				      USB_OPLUS_PPS_CURR, curr)) {
-		qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "current request refused");
-		return;
-	}
-
-	battmgr->pps_curr_ma = curr;
-	if (curr == battmgr->pps_target_ma)
-		dev_info(battmgr->dev, "PPS: VBUS %u mV %u mA, battery %d mA\n",
-			 s.vbus_uv / 1000, s.ibus_ua / 1000, s.ibat_ua / 1000);
+	battmgr->pps_next = jiffies + msecs_to_jiffies(ms);
+	return ms;
 }
 
-/*
- * Run the PPS state machine once; returns the delay to the next run in
- * milliseconds, or 0 if nothing has to be watched.
- */
 static unsigned int qcom_battmgr_pps_update(struct qcom_battmgr *battmgr)
 {
-	u32 online;
+	struct qcom_battmgr_pps_sample s;
+	struct sc8547a_sample cp[SC8547A_PUMPS];
+	enum opd_pps_exit exit;
+	int ret, target, mv, ma, next_ma, ibus, vbat, i;
+	u32 online, icl;
+	bool slave;
 
+	/* This also runs with PPS disabled: an ICL=0 vote must never be forgotten. */
+	if (battmgr->pps_cleanup && !qcom_battmgr_pps_running(battmgr)) {
+		if (qcom_battmgr_pps_stop(battmgr, battmgr->pps_state, "restore buck"))
+			return qcom_battmgr_pps_delay(battmgr, OPD_PPS_START_DELAY_MS);
+	}
 	if (!qcom_battmgr_pps_enabled(battmgr)) {
-		if (battmgr->pps_state == PPS_ACTIVE)
+		if (qcom_battmgr_pps_running(battmgr))
 			qcom_battmgr_pps_stop(battmgr, PPS_IDLE, "disabled");
-		battmgr->pps_state = PPS_IDLE;
+		return battmgr->pps_cleanup ? OPD_PPS_START_DELAY_MS : 0;
+	}
+	ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, &online);
+	if (ret)
+		goto failed;
+	if (!online) {
+		qcom_battmgr_pps_stop(battmgr, PPS_IDLE, "charger removed");
+		WRITE_ONCE(battmgr->pps_fault, false);
+		return battmgr->pps_cleanup ? OPD_PPS_START_DELAY_MS : 0;
+	}
+	if (battmgr->pps_state == PPS_FAILED || battmgr->pps_state == PPS_HOLD)
+		return 0;
+	if (battmgr->pps_state == PPS_IDLE) {
+		if (!qcom_battmgr_pps_may_start(battmgr))
+			return 0;
+		qcom_battmgr_pps_start(battmgr);
+		return qcom_battmgr_pps_delay(battmgr, OPD_PPS_START_DELAY_MS);
+	}
+	if (!battmgr->cp_ready || READ_ONCE(battmgr->pps_fault)) {
+		ret = -ENODEV;
+		goto failed;
+	}
+	/* USB notifications must not shorten ADC/soft-start settling or the servo period. */
+	if (time_before(jiffies, battmgr->pps_next))
+		return jiffies_to_msecs(battmgr->pps_next - jiffies) + 1;
+	if (time_after(jiffies, battmgr->pps_started + OPD_PPS_TIMEOUT_S * HZ)) {
+		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "session timeout");
 		return 0;
 	}
-
-	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-				      USB_ONLINE, &online))
-		return CHARGE_CTRL_POLL_MS;
-
-	if (!online) {
-		if (battmgr->pps_state == PPS_ACTIVE)
-			qcom_battmgr_pps_stop(battmgr, PPS_IDLE, "charger removed");
-		battmgr->pps_state = PPS_IDLE;
-		return CHARGE_CTRL_POLL_MS;
+	ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+					USB_INPUT_CURR_LIMIT, &icl);
+	if (ret)
+		goto failed;
+	if (icl) {
+		ret = -EBUSY;
+		goto failed;
 	}
+	ret = qcom_battmgr_pps_sample(battmgr, &s);
+	if (ret)
+		goto failed;
+	if (s.health != POWER_SUPPLY_HEALTH_GOOD || battmgr->charge_inhibited) {
+		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "battery health or charge limit");
+		return 0;
+	}
+	for (i = 0; i < SC8547A_PUMPS; i++) {
+		ret = sc8547a_sample(battmgr->cp.pumps[i], &cp[i]);
+		if (ret)
+			goto failed;
+	}
+	ibus = cp[0].ibus_ma + (battmgr->pps_slave ? cp[1].ibus_ma : 0);
+	vbat = max(s.vbat_mv, max(cp[0].vbat_mv, cp[1].vbat_mv));
+	exit = opd_pps_check(s.soc, s.temp, vbat, s.ibat_ma,
+			     max(cp[0].vbus_mv, cp[1].vbus_mv), ibus,
+			     qcom_battmgr_pps_soc_max(battmgr));
+	if (exit != OPD_PPS_OK) {
+		dev_warn(battmgr->dev, "PPS: protection %u, SOC %d, temp %d, VBAT %d, IBAT %d\n",
+			 exit, s.soc, s.temp, vbat, s.ibat_ma);
+		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "protection limit");
+		return 0;
+	}
+	if (test_and_clear_bit(PD_EVENT_CAPS, &battmgr->pd_events)) {
+		ret = qcom_battmgr_pps_source_current(battmgr);
+		if (ret < 0)
+			goto failed;
+		battmgr->pps_max_ma = min(battmgr->pps_max_ma, ret);
+	}
+	battmgr->pps_peak_vbat = max(battmgr->pps_peak_vbat, vbat);
+	ma = opd_pps_current(s.soc, s.temp, battmgr->pps_peak_vbat,
+			     battmgr->pps_max_ma, battmgr->pps_ceiling_ma);
+	if (!ma) {
+		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "curve complete");
+		return 0;
+	}
+	battmgr->pps_ceiling_ma = ma;
 
-	switch (battmgr->pps_state) {
-	case PPS_IDLE:
-	case PPS_HOLD:
-		if (!qcom_battmgr_pps_charger(battmgr) ||
-		    !qcom_battmgr_pps_may_start(battmgr))
-			return CHARGE_CTRL_POLL_MS;
-
-		battmgr->pps_state = PPS_SETTLE;
-		battmgr->pps_since = jiffies;
-		return PPS_POLL_MS;
-	case PPS_SETTLE:
-		if (!qcom_battmgr_pps_charger(battmgr) ||
-		    !qcom_battmgr_pps_may_start(battmgr)) {
-			battmgr->pps_state = PPS_IDLE;
-			return CHARGE_CTRL_POLL_MS;
+	if (battmgr->pps_state == PPS_RAMP) {
+		/* Bound an unresponsive source by the vendor PD configuration timeout. */
+		if (time_after(jiffies, battmgr->pps_started +
+			       msecs_to_jiffies(PD_CONFIG_TIMEOUT_MS))) {
+			ret = -ETIMEDOUT;
+			goto failed;
 		}
-
-		if (time_before(jiffies, battmgr->pps_since +
-				msecs_to_jiffies(PPS_SETTLE_MS)))
-			return PPS_POLL_MS;
-
-		if (qcom_battmgr_pps_start(battmgr))
-			return CHARGE_CTRL_POLL_MS;
-
-		return PPS_POLL_MS;
-	case PPS_ACTIVE:
-		qcom_battmgr_pps_monitor(battmgr);
-		return battmgr->pps_state == PPS_ACTIVE ? PPS_POLL_MS : CHARGE_CTRL_POLL_MS;
-	case PPS_FAILED:
-	default:
-		return CHARGE_CTRL_POLL_MS;
+		target = opd_pps_entry_mv(cp[0].vbat_mv);
+		if (!target) {
+			ret = -ERANGE;
+			goto failed;
+		}
+		if (cp[0].vbus_mv >= target && cp[0].vbus_mv <= target + 200) {
+			ret = sc8547a_start(battmgr->cp.pumps[0]);
+			if (ret)
+				goto failed;
+			battmgr->pps_state = PPS_CONFIRM;
+			return qcom_battmgr_pps_delay(battmgr, OPD_PPS_START_DELAY_MS);
+		}
+		mv = opd_pps_ramp_mv(battmgr->pps_mv, cp[0].vbus_mv, target);
+		ret = qcom_battmgr_pps_request(battmgr, mv, min(ma, OPD_PPS_START_MA));
+		if (ret)
+			goto failed;
+		return qcom_battmgr_pps_delay(battmgr, OPD_PPS_START_DELAY_MS);
 	}
+	if (!cp[0].switching || (battmgr->pps_slave && !cp[1].switching)) {
+		ret = -EIO;
+		goto failed;
+	}
+	if (battmgr->pps_state == PPS_CONFIRM) {
+		battmgr->pps_state = PPS_ACTIVE;
+		battmgr->pps_polls = 0;
+		dev_info(battmgr->dev, "PPS: primary pump switching, VBUS %d mV, VBAT %d mV\n",
+			 cp[0].vbus_mv, cp[0].vbat_mv);
+		/* USB_CURR_NOW measures the suspended buck, so use the pump ADCs. */
+		dev_info(battmgr->dev, "USB contract: PPS, VBUS %d mV, IBUS %d mA, ICL 0 mA\n",
+			 cp[0].vbus_mv, ibus);
+		battmgr->pd_logged = true;
+	}
+	if (ibus < 300) {
+		if (++battmgr->pps_low_polls >= 4) {
+			ret = -ENODATA;
+			goto failed;
+		}
+	} else {
+		battmgr->pps_low_polls = 0;
+	}
+	/* Apply a lower limit before removing a parallel current path. */
+	if (ma < battmgr->pps_ma) {
+		ret = qcom_battmgr_pps_request(battmgr, battmgr->pps_mv, ma);
+		if (ret)
+			goto failed;
+	}
+	/* Stock virtual_cp uses requested current, not a transient half-current ADC. */
+	next_ma = opd_pps_step_ma(battmgr->pps_ma, ma);
+	slave = battmgr->pps_slave ? next_ma > OPD_PPS_SLAVE_OFF_MA :
+				    next_ma >= OPD_PPS_SLAVE_ON_MA;
+	if (slave != battmgr->pps_slave) {
+		if (slave) {
+			ret = sc8547a_start(battmgr->cp.pumps[1]);
+		} else {
+			ret = sc8547a_stop(battmgr->cp.pumps[1]);
+			if (!ret)
+				ret = sc8547a_prepare(battmgr->cp.pumps[1]);
+		}
+		if (ret)
+			goto failed;
+		battmgr->pps_slave = slave;
+		dev_info(battmgr->dev, "PPS: secondary pump %s\n", slave ? "on" : "off");
+		/* Observe both pumps after the vendor's 500 ms switching check. */
+		return qcom_battmgr_pps_delay(battmgr, OPD_PPS_START_DELAY_MS);
+	}
+	/* Settle each current step before changing voltage, as in current_work. */
+	if (next_ma != battmgr->pps_ma) {
+		ret = qcom_battmgr_pps_request(battmgr, battmgr->pps_mv, next_ma);
+		if (ret)
+			goto failed;
+		return qcom_battmgr_pps_delay(battmgr, OPD_PPS_POLL_MS);
+	}
+	mv = opd_pps_servo_mv(battmgr->pps_mv, s.vbat_mv, ibus, ma);
+	if (!mv) {
+		ret = -ERANGE;
+		goto failed;
+	}
+	/* Voltage/current are always paired, including current-only changes. */
+	if (mv != battmgr->pps_mv || ma != battmgr->pps_ma) {
+		ret = qcom_battmgr_pps_request(battmgr, mv, ma);
+		if (ret)
+			goto failed;
+	}
+	if (!battmgr->pps_polls || battmgr->pps_polls % 10 == 0)
+		dev_info(battmgr->dev,
+			 "PPS: VBUS %d mV, IBUS %d+%d mA, VBAT %d mV, IBAT %d mA, target %d mA\n",
+			 cp[0].vbus_mv, cp[0].ibus_ma, battmgr->pps_slave ? cp[1].ibus_ma : 0,
+			 s.vbat_mv, s.ibat_ma, ma);
+	battmgr->pps_polls++;
+	return qcom_battmgr_pps_delay(battmgr, OPD_PPS_POLL_MS);
+failed:
+	dev_warn(battmgr->dev, "PPS: stopped on error %d\n", ret);
+	qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "I/O, watchdog or pump failure");
+	return battmgr->pps_cleanup ? OPD_PPS_START_DELAY_MS : 0;
 }
 
 /* Match only the Type-C supply belonging to this PMIC GLINK instance. */
@@ -1533,31 +1601,15 @@ static int qcom_battmgr_pd_source_match(struct power_supply *psy, void *data)
 /* Read fresh capabilities; never infer a 9 V fixed PDO from an APDO range. */
 static int qcom_battmgr_pd_current(struct qcom_battmgr *battmgr, u32 *ua)
 {
-	struct qcom_battmgr_read_pdos_request req = {
-		.hdr.owner = cpu_to_le32(PMIC_GLINK_OWNER_BATTMGR),
-		.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP),
-		.hdr.opcode = cpu_to_le32(BATTMGR_OPLUS_READ_PDOS),
-		.data_size = cpu_to_le32(OPLUS_READ_BUFFER_WORDS * sizeof(__le32)),
-	};
 	unsigned int i;
 	u32 pdo;
 	int ret;
 
 	*ua = 0;
 	mutex_lock(&battmgr->lock);
-	battmgr->num_src_pdos = 0;
-	ret = __qcom_battmgr_request(battmgr, &req, sizeof(req),
-				     msecs_to_jiffies(BATTMGR_SET_TIMEOUT_MS));
+	ret = qcom_battmgr_read_pdos_locked(battmgr);
 	if (ret)
 		goto out;
-
-	/* A valid source list starts with a nonzero 5 V fixed PDO. */
-	pdo = battmgr->src_pdos[0];
-	if (!battmgr->num_src_pdos || pdo_type(pdo) != PDO_TYPE_FIXED ||
-	    pdo_fixed_voltage(pdo) != PD_DEFAULT_MV || !pdo_max_current(pdo)) {
-		ret = -ENODATA;
-		goto out;
-	}
 
 	for (i = 0; i < battmgr->num_src_pdos; i++) {
 		pdo = battmgr->src_pdos[i];
@@ -1590,7 +1642,7 @@ static void qcom_battmgr_pd_log(struct qcom_battmgr *battmgr, u32 type)
 	case POWER_SUPPLY_USB_TYPE_PD_DRP:
 	case OPLUS_USB_TYPE_PD_SDP:
 	case POWER_SUPPLY_USB_TYPE_PD_PPS:
-		name = battmgr->pps_state == PPS_ACTIVE ? "PPS" : "PD fixed";
+		name = "PD fixed";
 		break;
 	case POWER_SUPPLY_USB_TYPE_SDP:
 		name = "SDP";
@@ -1605,10 +1657,6 @@ static void qcom_battmgr_pd_log(struct qcom_battmgr *battmgr, u32 type)
 		name = "USB";
 		break;
 	}
-
-	if (battmgr->pps_state == PPS_ACTIVE &&
-	    (!battmgr->pps_polls || uv < PPS_VBUS_RISEN_UV))
-		return;
 
 	dev_info(battmgr->dev, "USB contract: %s, VBUS %u mV, IBUS %u mA, ICL %u mA\n",
 		 name, uv / 1000, ua / 1000, icl / 1000);
@@ -1662,52 +1710,66 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	int ret;
 
 	if (test_and_clear_bit(PD_EVENT_RESET, &battmgr->pd_events)) {
+		if (qcom_battmgr_pps_running(battmgr) || battmgr->pps_cleanup)
+			qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "firmware restarted");
 		battmgr->pd_state = PD_IDLE;
 		battmgr->pd_restore = false;
 		battmgr->pd_logged = false;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 
+	if (battmgr->pps_cleanup && !qcom_battmgr_pps_running(battmgr)) {
+		if (qcom_battmgr_pps_stop(battmgr, battmgr->pps_state, "restore buck"))
+			return OPD_PPS_START_DELAY_MS;
+	}
 	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-				      USB_ONLINE, &online))
-		return CHARGE_CTRL_POLL_MS;
+				      USB_ONLINE, &online)) {
+		if (qcom_battmgr_pps_running(battmgr))
+			qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "USB status unavailable");
+		return battmgr->pps_cleanup ? OPD_PPS_START_DELAY_MS : CHARGE_CTRL_POLL_MS;
+	}
 	if (!online) {
 		qcom_battmgr_pd_stop(battmgr, true, "charger removed");
 		battmgr->pd_state = PD_IDLE;
 		battmgr->pd_logged = false;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
-		return qcom_battmgr_pps_update(battmgr);
+		qcom_battmgr_pps_stop(battmgr, PPS_IDLE, "charger removed");
+		WRITE_ONCE(battmgr->pps_fault, false);
+		return battmgr->pps_cleanup ? OPD_PPS_START_DELAY_MS : 0;
 	}
 
 	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-				      USB_ADAP_TYPE, &type))
-		return CHARGE_CTRL_POLL_MS;
+				      USB_ADAP_TYPE, &type)) {
+		if (qcom_battmgr_pps_running(battmgr))
+			qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "adapter type unavailable");
+		return battmgr->pps_cleanup ? OPD_PPS_START_DELAY_MS : CHARGE_CTRL_POLL_MS;
+	}
 
 	power_supply_for_each_psy(&src, qcom_battmgr_pd_source_match);
-	if (!qcom_battmgr_pps_enabled(battmgr) && battmgr->pps_state != PPS_IDLE)
-		qcom_battmgr_pps_update(battmgr);
+	if (!qcom_battmgr_pps_enabled(battmgr) && qcom_battmgr_pps_running(battmgr))
+		qcom_battmgr_pps_stop(battmgr, PPS_IDLE, "disabled");
+	if (battmgr->pps_cleanup && !qcom_battmgr_pps_running(battmgr))
+		return OPD_PPS_START_DELAY_MS;
 
 	prefer_pps = src.sink && !READ_ONCE(battmgr->otg_request) &&
 		     !(battmgr->pd_state == PD_FAILED && battmgr->pd_restore) &&
 		     qcom_battmgr_pps_enabled(battmgr) &&
-		     battmgr->pps_state != PPS_FAILED &&
-		     qcom_battmgr_pps_charger(battmgr) &&
-		     (battmgr->pps_state == PPS_ACTIVE || qcom_battmgr_pps_may_start(battmgr));
+		     battmgr->pps_state != PPS_FAILED && battmgr->pps_state != PPS_HOLD &&
+		     type == POWER_SUPPLY_USB_TYPE_PD_PPS &&
+		     (qcom_battmgr_pps_running(battmgr) || qcom_battmgr_pps_may_start(battmgr));
 	if (prefer_pps) {
 		if (qcom_battmgr_pd_stop(battmgr, false, "PPS handover"))
 			return CHARGE_CTRL_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
-		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 		ret = qcom_battmgr_pps_update(battmgr);
-		if (battmgr->pps_state == PPS_ACTIVE)
-			qcom_battmgr_pd_log(battmgr, type);
-		return ret;
+		/* Re-evaluate fixed PD promptly after a completed PPS exit. */
+		return ret ?: OPD_PPS_START_DELAY_MS;
 	}
 	/* Complete a PPS exit before allowing a fixed PDO request. */
-	if (battmgr->pps_state == PPS_ACTIVE)
-		qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "fixed PD handover");
-	else if (battmgr->pps_state == PPS_SETTLE)
-		battmgr->pps_state = PPS_IDLE;
+	if (qcom_battmgr_pps_running(battmgr))
+		qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "fixed PD handover");
+	if (battmgr->pps_cleanup)
+		return OPD_PPS_START_DELAY_MS;
 
 	if (!src.sink || READ_ONCE(battmgr->otg_request) ||
 	    (type != POWER_SUPPLY_USB_TYPE_PD && type != POWER_SUPPLY_USB_TYPE_PD_DRP &&
@@ -1819,10 +1881,16 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 	unsigned int delay = 0;
 
 	/* Kicked again by qcom_battmgr_enable_worker() once the service is up */
-	if (!battmgr->service_up || READ_ONCE(battmgr->removing))
+	if (READ_ONCE(battmgr->removing) || READ_ONCE(battmgr->pps_suspended))
 		return;
 
 	mutex_lock(&battmgr->charge_lock);
+	if (!battmgr->service_up) {
+		if (qcom_battmgr_pps_running(battmgr) || battmgr->pps_cleanup)
+			qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "firmware unavailable");
+		mutex_unlock(&battmgr->charge_lock);
+		return;
+	}
 
 	qcom_battmgr_charge_limit_update(battmgr);
 
@@ -1838,7 +1906,7 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 
 	mutex_unlock(&battmgr->charge_lock);
 
-	if (delay && !READ_ONCE(battmgr->removing))
+	if (delay && !READ_ONCE(battmgr->removing) && !READ_ONCE(battmgr->pps_suspended))
 		queue_delayed_work(system_freezable_wq, &battmgr->charge_work,
 				   msecs_to_jiffies(delay));
 }
@@ -1850,6 +1918,25 @@ static void qcom_battmgr_charge_kick(struct qcom_battmgr *battmgr)
 	    !READ_ONCE(battmgr->removing))
 		mod_delayed_work(system_freezable_wq, &battmgr->charge_work, 0);
 }
+
+static int qcom_battmgr_pps_param_set(const char *value, const struct kernel_param *kp)
+{
+	int ret;
+
+	mutex_lock(&pps_param_lock);
+	ret = param_set_bool(value, kp);
+	if (!ret && pps_device)
+		qcom_battmgr_charge_kick(pps_device);
+	mutex_unlock(&pps_param_lock);
+	return ret;
+}
+
+static const struct kernel_param_ops qcom_battmgr_pps_param_ops = {
+	.set = qcom_battmgr_pps_param_set,
+	.get = param_get_bool,
+};
+module_param_cb(pps_enable, &qcom_battmgr_pps_param_ops, &pps_enable, 0644);
+MODULE_PARM_DESC(pps_enable, "Enable the OnePlus PPS charge pumps (default: off)");
 
 /*
  * A charger came or went: the firmware may have turned charging back on, so
@@ -1872,7 +1959,8 @@ static int qcom_battmgr_psy_notify(struct notifier_block *nb,
 	if (event == PSY_EVENT_PROP_CHANGED && qcom_battmgr_is_ucsi_supply(battmgr, psy)) {
 		guard(spinlock_irqsave)(&battmgr->notify_lock);
 		if (!battmgr->removing) {
-			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+			if (!qcom_battmgr_pps_running(battmgr))
+				set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 			qcom_battmgr_usb_event(battmgr);
 		}
 	}
@@ -1891,15 +1979,22 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 	switch (action) {
 	case PM_HIBERNATION_PREPARE:
 	case PM_SUSPEND_PREPARE:
+		WRITE_ONCE(battmgr->pps_suspended, true);
 		cancel_delayed_work_sync(&battmgr->charge_work);
 		mutex_lock(&battmgr->charge_lock);
-		if (battmgr->pps_state == PPS_ACTIVE)
-			qcom_battmgr_pps_stop(battmgr, PPS_HOLD, "system suspend");
+		if (qcom_battmgr_pps_running(battmgr) || battmgr->pps_cleanup)
+			qcom_battmgr_pps_stop(battmgr, PPS_IDLE, "system suspend");
 		mutex_unlock(&battmgr->charge_lock);
+		if (battmgr->pps_cleanup) {
+			WRITE_ONCE(battmgr->pps_suspended, false);
+			qcom_battmgr_charge_kick(battmgr);
+			return NOTIFY_BAD;
+		}
 		break;
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
 	case PM_POST_SUSPEND:
+		WRITE_ONCE(battmgr->pps_suspended, false);
 		qcom_battmgr_charge_kick(battmgr);
 		break;
 	}
@@ -2412,6 +2507,9 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 	case NOTIF_OPLUS_POWER_ROLE:
 	case NOTIF_OPLUS_PD_HARD_RESET:
 		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
+			if (notification == NOTIF_OPLUS_PD_HARD_RESET &&
+			    qcom_battmgr_pps_running(battmgr))
+				WRITE_ONCE(battmgr->pps_fault, true);
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 			qcom_battmgr_usb_event(battmgr);
 			break;
@@ -3024,8 +3122,10 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		/* ... and starts with the boost off and without a PPS contract */
 		battmgr->otg_request = false;
 		battmgr->otg_vbus = false;
-		battmgr->pps_state = PPS_IDLE;
+		if (READ_ONCE(battmgr->pps_cleanup))
+			WRITE_ONCE(battmgr->pps_fault, true);
 		set_bit(PD_EVENT_RESET, &battmgr->pd_events);
+		qcom_battmgr_charge_kick(battmgr);
 	}
 }
 
@@ -3119,11 +3219,9 @@ static void qcom_battmgr_cancel_work(void *data)
 	cancel_delayed_work_sync(&battmgr->charge_work);
 	cancel_work_sync(&battmgr->otg_work);
 	mutex_lock(&battmgr->charge_lock);
-	if (battmgr->service_up) {
-		if (battmgr->pps_state == PPS_ACTIVE)
-			qcom_battmgr_pps_stop(battmgr, PPS_IDLE, "driver stopped");
+	qcom_battmgr_pps_stop(battmgr, PPS_IDLE, "driver stopped");
+	if (battmgr->service_up)
 		qcom_battmgr_pd_stop(battmgr, false, "driver stopped");
-	}
 	mutex_unlock(&battmgr->charge_lock);
 }
 
@@ -3139,6 +3237,106 @@ static void qcom_battmgr_unregister_pm_notifier(void *data)
 	struct qcom_battmgr *battmgr = data;
 
 	unregister_pm_notifier(&battmgr->pm_nb);
+}
+
+static void qcom_battmgr_cp_fault(void *data)
+{
+	struct qcom_battmgr *battmgr = data;
+
+	WRITE_ONCE(battmgr->pps_fault, true);
+	qcom_battmgr_charge_kick(battmgr);
+}
+
+static int qcom_battmgr_cp_bind(struct device *dev)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&battmgr->charge_lock);
+	ret = component_bind_all(dev, &battmgr->cp);
+	if (!ret) {
+		WRITE_ONCE(battmgr->cp_ready, true);
+		dev_info(dev, "PPS: two charge pumps bound\n");
+	}
+	mutex_unlock(&battmgr->charge_lock);
+	qcom_battmgr_charge_kick(battmgr);
+	return ret;
+}
+
+static void qcom_battmgr_cp_unbind(struct device *dev)
+{
+	struct qcom_battmgr *battmgr = dev_get_drvdata(dev);
+
+	mutex_lock(&battmgr->charge_lock);
+	WRITE_ONCE(battmgr->cp_ready, false);
+	qcom_battmgr_pps_stop(battmgr, PPS_FAILED, "charge pump unbound");
+	component_unbind_all(dev, &battmgr->cp);
+	mutex_unlock(&battmgr->charge_lock);
+	qcom_battmgr_charge_kick(battmgr);
+}
+
+static const struct component_master_ops qcom_battmgr_cp_ops = {
+	.bind = qcom_battmgr_cp_bind,
+	.unbind = qcom_battmgr_cp_unbind,
+};
+
+static void qcom_battmgr_cp_remove(void *data)
+{
+	struct qcom_battmgr *battmgr = data;
+
+	component_master_del(battmgr->dev, &qcom_battmgr_cp_ops);
+}
+
+static void qcom_battmgr_pps_param_remove(void *data)
+{
+	mutex_lock(&pps_param_lock);
+	if (pps_device == data)
+		pps_device = NULL;
+	mutex_unlock(&pps_param_lock);
+}
+
+static int qcom_battmgr_cp_init(struct qcom_battmgr *battmgr)
+{
+	struct device *dev = battmgr->dev;
+	struct component_match *match = NULL;
+	struct device_node *node;
+	int i, count, ret;
+
+	if (!(battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS))
+		return 0;
+	if (!of_property_present(dev->of_node, "charge-pumps"))
+		return 0;
+	count = of_count_phandle_with_args(dev->of_node, "charge-pumps", NULL);
+	if (count != SC8547A_PUMPS)
+		return -EINVAL;
+	battmgr->cp.fault = qcom_battmgr_cp_fault;
+	battmgr->cp.data = battmgr;
+	for (i = 0; i < count; i++) {
+		node = of_parse_phandle(dev->of_node, "charge-pumps", i);
+		if (!node)
+			return -EINVAL;
+		if (i && node == battmgr->cp.nodes[0]) {
+			of_node_put(node);
+			return -EINVAL;
+		}
+		battmgr->cp.nodes[i] = node;
+		component_match_add_release(dev, &match, component_release_of,
+					    component_compare_of, node);
+		if (IS_ERR(match)) {
+			of_node_put(node);
+			return PTR_ERR(match);
+		}
+	}
+	ret = component_master_add_with_match(dev, &qcom_battmgr_cp_ops, match);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, qcom_battmgr_cp_remove, battmgr);
+	if (ret)
+		return ret;
+	mutex_lock(&pps_param_lock);
+	pps_device = battmgr;
+	mutex_unlock(&pps_param_lock);
+	return devm_add_action_or_reset(dev, qcom_battmgr_pps_param_remove, battmgr);
 }
 
 static int qcom_battmgr_probe(struct auxiliary_device *adev,
@@ -3294,6 +3492,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 				   qcom_battmgr_enable_worker);
 	if (ret)
 		return ret;
+
+	ret = qcom_battmgr_cp_init(battmgr);
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot bind charge pumps\n");
 
 	ret = devm_add_action_or_reset(dev, qcom_battmgr_cancel_work, battmgr);
 	if (ret)
