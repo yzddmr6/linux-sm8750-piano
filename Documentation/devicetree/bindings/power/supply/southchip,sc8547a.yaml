@@ -1,0 +1,93 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/southchip,sc8547a.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Southchip SC8547A switched-capacitor charge pump
+
+maintainers:
+  - yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+
+description: |
+  The SC8547A provides a 2:1 charging path with voltage and current ADCs,
+  overvoltage and overcurrent protection, and a hardware watchdog. Parallel
+  pumps can be managed by an external USB PD charging policy. The proprietary
+  charging protocol PHY is not described by this binding.
+
+properties:
+  compatible:
+    const: southchip,sc8547a
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  southchip,secondary:
+    type: boolean
+    description: Use the secondary pump switching configuration.
+
+  southchip,battery-overvoltage-microvolt:
+    description: Battery overvoltage protection threshold.
+    minimum: 3500000
+    maximum: 5075000
+    multipleOf: 25000
+
+  southchip,ac-overvoltage-microvolt:
+    description: Adapter input overvoltage protection threshold.
+    minimum: 11000000
+    maximum: 17000000
+    multipleOf: 1000000
+
+  southchip,input-overvoltage-microvolt:
+    description: Charge pump bus overvoltage protection threshold.
+    minimum: 6000000
+    maximum: 12350000
+    multipleOf: 50000
+
+  southchip,input-overcurrent-microamp:
+    description: Charge pump bus overcurrent protection threshold.
+    minimum: 1200000
+    maximum: 5700000
+    multipleOf: 300000
+
+required:
+  - compatible
+  - reg
+  - southchip,battery-overvoltage-microvolt
+  - southchip,ac-overvoltage-microvolt
+  - southchip,input-overvoltage-microvolt
+  - southchip,input-overcurrent-microamp
+
+allOf:
+  - if:
+      not:
+        required:
+          - southchip,secondary
+    then:
+      required:
+        - interrupts
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        charger@6f {
+            compatible = "southchip,sc8547a";
+            reg = <0x6f>;
+            interrupt-parent = <&gpio>;
+            interrupts = <163 IRQ_TYPE_EDGE_FALLING>;
+            southchip,battery-overvoltage-microvolt = <4850000>;
+            southchip,ac-overvoltage-microvolt = <12000000>;
+            southchip,input-overvoltage-microvolt = <10000000>;
+            southchip,input-overcurrent-microamp = <4500000>;
+        };
+    };

@@ -1623,6 +1623,8 @@ patternProperties:
     description: Sophos Ltd.
   "^sourceparts,.*":
     description: Source Parts Inc.
+  "^southchip,.*":
+    description: Southchip Semiconductor Technology (Shanghai) Co., Ltd.
   "^spacemit,.*":
     description: SpacemiT (Hangzhou) Technology Co. Ltd
   "^southchip,.*":

@@ -66,6 +66,16 @@ properties:
     description: Charge pump cooperating with the Xiaomi MCA firmware for OTG.
     $ref: /schemas/types.yaml#/definitions/phandle
 
+  charge-pumps:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 2
+    maxItems: 2
+    items:
+      maxItems: 1
+    description:
+      Primary and secondary charge pumps, in that order, controlled by the AP
+      for PPS charging on the OnePlus Pad 2 Pro.
+
   '#address-cells':
     const: 1
 
@@ -100,6 +110,17 @@ patternProperties:
 
 required:
   - compatible
+
+allOf:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: oneplus,pad2pro-pmic-glink
+    then:
+      properties:
+        charge-pumps: false
 
 additionalProperties: false
 
