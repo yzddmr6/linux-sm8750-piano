@@ -510,11 +510,12 @@ static const struct piano_module piano_boe_module = {
 	.rate_b2_first = true,
 };
 
-static int piano_init_sequence(struct nt36532 *ctx,
-			       const struct drm_display_mode *mode,
-			       const struct piano_module *module)
+static int piano_init_sequence_link(struct nt36532 *ctx,
+				    const struct drm_display_mode *mode,
+				    const struct piano_module *module,
+				    struct mipi_dsi_device *dsi)
 {
-	struct mipi_dsi_multi_context multi_ctx = { .dsi = to_primary_dsi(ctx) };
+	struct mipi_dsi_multi_context multi_ctx = { .dsi = dsi };
 	struct mipi_dsi_multi_context *dsi_ctx = &multi_ctx;
 	struct drm_dsc_picture_parameter_set pps;
 	u8 b2, b3;
@@ -671,6 +672,26 @@ static int piano_init_sequence(struct nt36532 *ctx,
 	mipi_dsi_picture_parameter_set_multi(dsi_ctx, &pps);
 
 	return dsi_ctx->accum_err;
+}
+
+
+static int piano_init_sequence(struct nt36532 *ctx,
+			       const struct drm_display_mode *mode,
+			       const struct piano_module *module)
+{
+	struct mipi_dsi_device *primary = to_primary_dsi(ctx);
+	int ret;
+
+	ret = piano_init_sequence_link(ctx, mode, module, primary);
+	if (ctx->panel_info->is_dual_dsi) {
+		int ret2 = piano_init_sequence_link(ctx, mode, module, ctx->dsi[0]);
+
+		if (ret2)
+			dev_warn(&ctx->dsi[0]->dev,
+				 "secondary link init failed: %d\n", ret2);
+	}
+
+	return ret;
 }
 
 static int piano_csot_init_sequence(struct nt36532 *ctx,
