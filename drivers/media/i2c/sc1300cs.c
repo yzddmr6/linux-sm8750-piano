@@ -243,7 +243,7 @@ static const struct cci_reg_sequence sc1300cs_mode[] = {
 	{ CCI_REG8(0x3213), 0x08 },
 	{ CCI_REG8(0x3215), 0x11 },
 	{ CCI_REG8(0x3220), 0x00 },
-	/* Both flips: the captured mode starts with an RGGB pixel. */
+	/* Both flips: mirrored and flipped, the RGGB array reads out as BGGR. */
 	{ CCI_REG8(0x3221), 0x66 },
 	{ CCI_REG8(0x5000), 0x1e },
 	{ CCI_REG8(0x5900), 0x01 },
@@ -463,7 +463,7 @@ static int sc1300cs_set_format(struct v4l2_subdev *sd,
 	fmt->format = (struct v4l2_mbus_framefmt) {
 		.width = SC1300CS_WIDTH,
 		.height = SC1300CS_HEIGHT,
-		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+		.code = MEDIA_BUS_FMT_SBGGR10_1X10,
 		.field = V4L2_FIELD_NONE,
 		.colorspace = V4L2_COLORSPACE_RAW,
 		.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT,
@@ -492,7 +492,7 @@ static int sc1300cs_enum_mbus_code(struct v4l2_subdev *sd,
 {
 	if (code->index)
 		return -EINVAL;
-	code->code = MEDIA_BUS_FMT_SRGGB10_1X10;
+	code->code = MEDIA_BUS_FMT_SBGGR10_1X10;
 	return 0;
 }
 
@@ -500,7 +500,7 @@ static int sc1300cs_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *state,
 				  struct v4l2_subdev_frame_size_enum *fse)
 {
-	if (fse->index || fse->code != MEDIA_BUS_FMT_SRGGB10_1X10)
+	if (fse->index || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
 		return -EINVAL;
 	fse->min_width = fse->max_width = SC1300CS_WIDTH;
 	fse->min_height = fse->max_height = SC1300CS_HEIGHT;

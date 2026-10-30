@@ -194,7 +194,7 @@ static const struct cci_reg_sequence sc820cs_mode[] = {
 	{ CCI_REG8(0x5780), 0x66 },
 	{ CCI_REG8(0x578d), 0x40 },
 	{ CCI_REG8(0x57aa), 0xeb },
-	/* No flips: keep the BGGR phase advertised on the source pad. */
+	/* No flips: the readout starts with the R pixel of the RGGB array. */
 	{ CCI_REG8(0x3221), 0x00 },
 	{ CCI_REG8(0x301f), 0x0e },
 	{ CCI_REG8(0x3200), 0x00 },
@@ -431,7 +431,7 @@ static int sc820cs_set_format(struct v4l2_subdev *sd,
 	fmt->format = (struct v4l2_mbus_framefmt) {
 		.width = SC820CS_WIDTH,
 		.height = SC820CS_HEIGHT,
-		.code = MEDIA_BUS_FMT_SBGGR10_1X10,
+		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
 		.field = V4L2_FIELD_NONE,
 		.colorspace = V4L2_COLORSPACE_RAW,
 		.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT,
@@ -460,7 +460,7 @@ static int sc820cs_enum_mbus_code(struct v4l2_subdev *sd,
 {
 	if (code->index)
 		return -EINVAL;
-	code->code = MEDIA_BUS_FMT_SBGGR10_1X10;
+	code->code = MEDIA_BUS_FMT_SRGGB10_1X10;
 	return 0;
 }
 
@@ -468,7 +468,7 @@ static int sc820cs_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *state,
 				  struct v4l2_subdev_frame_size_enum *fse)
 {
-	if (fse->index || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
+	if (fse->index || fse->code != MEDIA_BUS_FMT_SRGGB10_1X10)
 		return -EINVAL;
 	fse->min_width = fse->max_width = SC820CS_WIDTH;
 	fse->min_height = fse->max_height = SC820CS_HEIGHT;
