@@ -1158,15 +1158,15 @@
 &mdss_dsi1 {
 	vdda-supply = <&vreg_l3g_1p2>;
 
-	/* The host reparents both bonded links to PHY0 after PHY setup. */
+	/* DSI1 is clocked from its own PHY; PHY setup is handled per link. */
 	clocks = <&dispcc DISP_CC_MDSS_BYTE1_CLK>,
 		 <&dispcc DISP_CC_MDSS_BYTE1_INTF_CLK>,
 		 <&dispcc DISP_CC_MDSS_PCLK1_CLK>,
 		 <&dispcc DISP_CC_MDSS_ESC1_CLK>,
 		 <&dispcc DISP_CC_MDSS_AHB_CLK>,
 		 <&gcc GCC_DISP_HF_AXI_CLK>,
-		 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>,
-		 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
+		 <&mdss_dsi1_phy DSI_PIXEL_PLL_CLK>,
+		 <&mdss_dsi1_phy DSI_BYTE_PLL_CLK>,
 		 <&dispcc DISP_CC_ESYNC1_CLK>,
 		 <&dispcc DISP_CC_OSC_CLK>,
 		 <&dispcc DISP_CC_MDSS_BYTE1_CLK_SRC>,
