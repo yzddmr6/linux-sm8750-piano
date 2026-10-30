@@ -898,7 +898,7 @@ static void nanosic_wn8030_add_touchpad_hid(struct nanosic_wn8030 *nanosic)
 
 	hid = hid_allocate_device();
 	if (IS_ERR(hid)) {
-		dev_err(nanosic->dev, "failed allocate touchpad hid device");
+		dev_err_ratelimited(nanosic->dev, "failed allocate touchpad hid device");
 		nanosic->hid_touchpad = NULL;
 		return;
 	}
@@ -912,7 +912,7 @@ static void nanosic_wn8030_add_touchpad_hid(struct nanosic_wn8030 *nanosic)
 	sprintf(hid->name, "%s", "Xiaomi Touchpad");
 
 	if (hid_add_device(hid)) {
-		dev_err(nanosic->dev, "failed add touchpad hid device");
+		dev_err_ratelimited(nanosic->dev, "failed add touchpad hid device");
 		hid_destroy_device(hid);
 		nanosic->hid_touchpad = NULL;
 		return;
@@ -1157,8 +1157,9 @@ static int nanosic_wn8030_dispatch(struct nanosic_wn8030 *nanosic,
 	case 0x19:
 		if (READ_ONCE(nanosic->keyboard_attached) &&
 		    !READ_ONCE(nanosic->touchpad_seen)) {
-			WRITE_ONCE(nanosic->touchpad_seen, true);
 			nanosic_wn8030_add_touchpad_hid(nanosic);
+			/* Retry on the next report if the device was not created. */
+			WRITE_ONCE(nanosic->touchpad_seen, !!nanosic->hid_touchpad);
 		}
 		if (READ_ONCE(nanosic->input_enabled) && nanosic->hid_touchpad)
 			hid_input_report(nanosic->hid_touchpad, HID_INPUT_REPORT,
