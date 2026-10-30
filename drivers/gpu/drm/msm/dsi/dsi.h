@@ -43,6 +43,7 @@ struct msm_dsi {
 
 	struct device *phy_dev;
 	bool phy_enabled;
+	int vco_refs;
 
 	int id;
 };

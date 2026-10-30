@@ -149,9 +149,22 @@ static int enable_phy(struct msm_dsi *msm_dsi,
 	    msm_dsi->phy->vco_hw) {
 		struct clk *vco = msm_dsi->phy->vco_hw->clk;
 
+		/*
+		 * The CCF enable count survives a CX power collapse even though
+		 * the PLL registers do not. Drop the stale reference first so
+		 * the prepare below really reprograms the slave PLL.
+		 */
+		while (msm_dsi->vco_refs > 0) {
+			clk_disable_unprepare(vco);
+			msm_dsi->vco_refs--;
+		}
+
 		ret = clk_set_rate(vco, clk_req.bitclk_rate);
-		if (!ret)
+		if (!ret) {
 			ret = clk_prepare_enable(vco);
+			if (!ret)
+				msm_dsi->vco_refs = 1;
+		}
 	}
 
 	return ret;
@@ -212,6 +225,11 @@ static void dsi_mgr_phy_disable(int id)
 	msm_dsi->phy_enabled = false;
 	if (IS_BONDED_DSI() && mdsi && sdsi) {
 		if (!mdsi->phy_enabled && !sdsi->phy_enabled) {
+			while (sdsi->phy->usecase == MSM_DSI_PHY_STANDALONE &&
+			       sdsi->phy->vco_hw && sdsi->vco_refs > 0) {
+				clk_disable_unprepare(sdsi->phy->vco_hw->clk);
+				sdsi->vco_refs--;
+			}
 			msm_dsi_phy_disable(sdsi->phy);
 			msm_dsi_phy_disable(mdsi->phy);
 		}
