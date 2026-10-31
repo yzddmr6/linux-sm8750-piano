@@ -445,6 +445,27 @@ u32 vfe_hw_version(struct vfe_device *vfe)
 }
 
 /*
+ * vfe_next_sequence - Sequence number of the next buffer on a write master
+ * @vfe: VFE Device
+ * @wm: Write master id
+ *
+ * Buffers are numbered as they complete, so this is the number the frame
+ * that is starting will carry.
+ */
+u32 vfe_next_sequence(struct vfe_device *vfe, int wm)
+{
+	unsigned long flags;
+	u32 sequence = 0;
+
+	spin_lock_irqsave(&vfe->output_lock, flags);
+	if (vfe->wm_output_map[wm] != VFE_LINE_NONE)
+		sequence = vfe->line[vfe->wm_output_map[wm]].output.sequence;
+	spin_unlock_irqrestore(&vfe->output_lock, flags);
+
+	return sequence;
+}
+
+/*
  * vfe_buf_done - Process write master done interrupt
  * @vfe: VFE Device
  * @wm: Write master id

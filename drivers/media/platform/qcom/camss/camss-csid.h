@@ -141,6 +141,8 @@ struct csid_hw_ops {
 
 struct csid_subdev_resources {
 	bool is_lite;
+	/* The interrupt handler reports the start of each frame. */
+	bool frame_sync;
 	const struct csid_hw_ops *hw_ops;
 	const struct parent_dev_ops *parent_dev_ops;
 	const struct csid_formats *formats;
@@ -201,6 +203,8 @@ u32 csid_find_code(u32 *codes, unsigned int ncode,
 const struct csid_format_info *csid_get_fmt_entry(const struct csid_format_info *formats,
 						  unsigned int nformats,
 						  u32 code);
+
+void csid_frame_start(struct csid_device *csid, int port_id);
 
 int msm_csid_subdev_init(struct camss *camss, struct csid_device *csid,
 			 const struct camss_subdev_resources *res, u8 id);

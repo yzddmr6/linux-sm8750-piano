@@ -4402,6 +4402,7 @@ static const struct camss_subdev_resources csid_res_sm8750[] = {
 		.interrupt = { "csid0" },
 		.csid = {
 			.is_lite = false,
+			.frame_sync = true,
 			.parent_dev_ops = &vfe_parent_dev_ops,
 			.hw_ops = &csid_ops_980,
 			.formats = &csid_formats_gen2
@@ -4416,6 +4417,7 @@ static const struct camss_subdev_resources csid_res_sm8750[] = {
 		.interrupt = { "csid1" },
 		.csid = {
 			.is_lite = false,
+			.frame_sync = true,
 			.parent_dev_ops = &vfe_parent_dev_ops,
 			.hw_ops = &csid_ops_980,
 			.formats = &csid_formats_gen2
@@ -4430,6 +4432,7 @@ static const struct camss_subdev_resources csid_res_sm8750[] = {
 		.interrupt = { "csid2" },
 		.csid = {
 			.is_lite = false,
+			.frame_sync = true,
 			.parent_dev_ops = &vfe_parent_dev_ops,
 			.hw_ops = &csid_ops_980,
 			.formats = &csid_formats_gen2
@@ -5438,6 +5441,14 @@ void camss_buf_done(struct camss *camss, int hw_id, int port_id)
 
 		vfe->res->hw_ops->vfe_buf_done(vfe, port_id);
 	}
+}
+
+u32 camss_next_sequence(struct camss *camss, int hw_id, int port_id)
+{
+	if (hw_id >= camss->res->vfe_num)
+		return 0;
+
+	return vfe_next_sequence(&camss->vfe[hw_id], port_id);
 }
 
 /*

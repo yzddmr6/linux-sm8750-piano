@@ -1312,9 +1312,42 @@ static int csid_link_setup(struct media_entity *entity,
 	return 0;
 }
 
+/*
+ * csid_frame_start - Report the start of a frame on a source stream
+ * @csid: CSID device
+ * @port_id: Source stream (RDI) index
+ *
+ * Called from the interrupt handler. The event carries the sequence number
+ * that the frame's buffer will be given, so that userspace can tell which
+ * frame a sensor control written at this point applies to.
+ */
+void csid_frame_start(struct csid_device *csid, int port_id)
+{
+	struct v4l2_event event = {
+		.type = V4L2_EVENT_FRAME_SYNC,
+		.u.frame_sync.frame_sequence =
+			camss_next_sequence(csid->camss, csid->id, port_id),
+	};
+
+	v4l2_event_queue(csid->subdev.devnode, &event);
+}
+
+static int csid_subscribe_event(struct v4l2_subdev *sd, struct v4l2_fh *fh,
+				struct v4l2_event_subscription *sub)
+{
+	struct csid_device *csid = v4l2_get_subdevdata(sd);
+
+	if (sub->type != V4L2_EVENT_FRAME_SYNC)
+		return v4l2_ctrl_subdev_subscribe_event(sd, fh, sub);
+	if (!csid->res->frame_sync)
+		return -EINVAL;
+
+	return v4l2_event_subscribe(fh, sub, 4, NULL);
+}
+
 static const struct v4l2_subdev_core_ops csid_core_ops = {
 	.s_power = csid_set_power,
-	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
+	.subscribe_event = csid_subscribe_event,
 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
 };
 

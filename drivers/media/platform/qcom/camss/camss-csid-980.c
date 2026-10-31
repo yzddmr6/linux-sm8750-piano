@@ -122,7 +122,11 @@
 	(csid_is_lite(csid) ? 0xEC : 0x114 + 0x10 * (rdi))
 #define CSID_CSI2_RDIN_IRQ_CLEAR(rdi) \
 	(csid_is_lite(csid) ? 0xF4 : 0x11C + 0x10 * (rdi))
+#define		INFO_INPUT_SOF				BIT(12)
 #define		INFO_RUP_DONE				BIT(23)
+/* Full CSID only: per-RDI interrupt mask and its summary bit in the top mask. */
+#define CSID_CSI2_RDIN_IRQ_MASK(rdi)		(0x118 + 0x10 * (rdi))
+#define		TOP_IRQ_RDI(rdi)			BIT(16 + (rdi))
 
 static void __csid_full_aup_rup_trigger(struct csid_device *csid)
 {
@@ -304,6 +308,23 @@ static void __csid_configure_rdi_stream(struct csid_device *csid, u8 enable, u8 
 	writel(val, csid->base + rdi_cfg0_offset);
 }
 
+/* Interrupt at the start of every frame on an RDI to report frame starts. */
+static void __csid_frame_sync_irq(struct csid_device *csid, u8 enable, u8 rdi)
+{
+	u32 top;
+
+	if (!csid->res->frame_sync)
+		return;
+
+	top = readl(csid->base + CSID_TOP_IRQ_MASK);
+	if (enable)
+		top |= TOP_IRQ_RDI(rdi);
+	else
+		top &= ~TOP_IRQ_RDI(rdi);
+	writel(enable ? INFO_INPUT_SOF : 0, csid->base + CSID_CSI2_RDIN_IRQ_MASK(rdi));
+	writel(top, csid->base + CSID_TOP_IRQ_MASK);
+}
+
 static void csid_configure_stream(struct csid_device *csid, u8 enable)
 {
 	u8 i, k;
@@ -312,6 +333,7 @@ static void csid_configure_stream(struct csid_device *csid, u8 enable)
 
 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS_980; i++) {
 		if (csid->phy.en_vc & BIT(i)) {
+			__csid_frame_sync_irq(csid, enable, i);
 			__csid_configure_rdi_stream(csid, enable, i, 0);
 			__csid_configure_rx_vc(csid, 0);
 
@@ -371,6 +393,10 @@ static irqreturn_t csid_isr(int irq, void *dev)
 
 			if (buf_done_val & BIT(BUF_DONE_IRQ_STATUS_RDI_OFFSET + i))
 				camss_buf_done(csid->camss, csid->id, i);
+
+			/* After buf done, so the event carries this frame's number. */
+			if (val & INFO_INPUT_SOF && csid->res->frame_sync)
+				csid_frame_start(csid, i);
 		}
 	}
 

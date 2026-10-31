@@ -286,6 +286,7 @@ int vfe_enable_v2(struct vfe_line *line);
  * @wm: Write master id
  */
 void vfe_buf_done(struct vfe_device *vfe, int wm);
+u32 vfe_next_sequence(struct vfe_device *vfe, int wm);
 
 /*
  * vfe_get_output_v2 - Get vfe output line
