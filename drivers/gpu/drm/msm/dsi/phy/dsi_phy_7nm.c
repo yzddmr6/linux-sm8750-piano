@@ -1188,6 +1188,10 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
 	data = DSI_7nm_PHY_CMN_CTRL_0_DIGTOP_PWRDN_B |
 	       DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
 	writel(data, base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+	/* The pre-seeded bias reference skips this write in the PLL helper. */
+	if ((phy->cfg->quirks & DSI_PHY_7NM_QUIRK_V7_2) &&
+	    phy->usecase == MSM_DSI_PHY_SLAVE)
+		writel(0xc0, phy->pll_base + REG_DSI_7nm_PHY_PLL_SYSTEM_MUXES);
 	spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
 
 	/* Assert PLL core reset */
