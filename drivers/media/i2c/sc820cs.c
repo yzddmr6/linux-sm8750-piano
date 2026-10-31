@@ -40,7 +40,7 @@
 #define SC820CS_VTS_MAX		0x7fff
 #define SC820CS_EXPOSURE_MARGIN	4
 #define SC820CS_PIXEL_RATE	264000000
-#define SC820CS_XCLK_RATE	19200000
+#define SC820CS_XCLK_RATE	24000000
 
 static const s64 sc820cs_link_freqs[] = { 368000000 };
 /* Power-on order: I/O, digital core, analogue. */
@@ -578,7 +578,7 @@ static int sc820cs_probe(struct i2c_client *client)
 	if (IS_ERR(sensor->xclk))
 		return dev_err_probe(dev, PTR_ERR(sensor->xclk), "failed to get clock\n");
 	if (clk_get_rate(sensor->xclk) != SC820CS_XCLK_RATE)
-		return dev_err_probe(dev, -EINVAL, "19.2 MHz clock required\n");
+		return dev_err_probe(dev, -EINVAL, "24 MHz clock required\n");
 	sensor->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_HIGH);
 	if (IS_ERR(sensor->reset))
 		return dev_err_probe(dev, PTR_ERR(sensor->reset), "failed to get reset\n");
