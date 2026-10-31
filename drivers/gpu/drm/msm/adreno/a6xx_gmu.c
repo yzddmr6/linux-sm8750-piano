@@ -443,9 +443,13 @@ int a6xx_gmu_set_oob(struct a6xx_gmu *gmu, enum a6xx_gmu_oob_state state)
 
 		/* We may timeout because the GMU is temporarily wedged from
 		 * pending faults from the GPU and we are taking a devcoredump.
-		 * Wait until the MMU is resumed and try again.
+		 * Wait until the MMU is resumed and try again, but not for
+		 * ever: the devcoredump takes gpu->lock, which our caller may
+		 * hold (recover_worker), and both would wait on each other.
 		 */
-		wait_for_completion(&a6xx_gpu->base.fault_coredump_done);
+		if (!wait_for_completion_timeout(&a6xx_gpu->base.fault_coredump_done,
+						 msecs_to_jiffies(2000)))
+			break;
 	} while (true);
 
 	if (ret)
