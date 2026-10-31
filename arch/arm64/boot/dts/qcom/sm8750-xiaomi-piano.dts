@@ -1083,12 +1083,12 @@
 };
 
 /*
- * Native display path for the bonded dual-DSI DSC video-mode LCD, from the
- * stock dsi-display-primary, mdss_dsi_ctrl0/1 and mdss_dsi_phy0/1 nodes:
- * DSI0 is the clock master and both links run from its PHY PLL, four lanes
- * per link, commands broadcast to both links. The desktop enables this
- * path; chosen/framebuffer retains the early firmware console until KMS
- * removes its aperture. Native takeover has not yet been tested here.
+ * Native display path for the dual-DSI DSC video-mode LCD, from the stock
+ * dsi-display-primary, mdss_dsi_ctrl0/1 and mdss_dsi_phy0/1 nodes:
+ * each P81 link runs four lanes from its own PHY PLL and the panel driver
+ * initializes both command streams. The desktop enables this path;
+ * chosen/framebuffer retains the early firmware console until KMS removes
+ * its aperture.
  */
 &mdss_dsi0 {
 	/* Stock vdda-1p2 on both controllers: L3G, 16.6 mA. */
@@ -1096,7 +1096,6 @@
 
 	qcom,dual-dsi-mode;
 	qcom,master-dsi;
-	qcom,sync-dual-dsi;
 
 	/*
 	 * Two panel modules share this board. The stock bootloader picks the
@@ -1169,22 +1168,21 @@
 &mdss_dsi1 {
 	vdda-supply = <&vreg_l3g_1p2>;
 
-	/* The host reparents both bonded links to PHY0 after PHY setup. */
+	/* DSI1 is clocked from its own PHY; PHY setup is handled per link. */
 	clocks = <&dispcc DISP_CC_MDSS_BYTE1_CLK>,
 		 <&dispcc DISP_CC_MDSS_BYTE1_INTF_CLK>,
 		 <&dispcc DISP_CC_MDSS_PCLK1_CLK>,
 		 <&dispcc DISP_CC_MDSS_ESC1_CLK>,
 		 <&dispcc DISP_CC_MDSS_AHB_CLK>,
 		 <&gcc GCC_DISP_HF_AXI_CLK>,
-		 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>,
-		 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
+		 <&mdss_dsi1_phy DSI_PIXEL_PLL_CLK>,
+		 <&mdss_dsi1_phy DSI_BYTE_PLL_CLK>,
 		 <&dispcc DISP_CC_ESYNC1_CLK>,
 		 <&dispcc DISP_CC_OSC_CLK>,
 		 <&dispcc DISP_CC_MDSS_BYTE1_CLK_SRC>,
 		 <&dispcc DISP_CC_MDSS_PCLK1_CLK_SRC>;
 
 	qcom,dual-dsi-mode;
-	qcom,sync-dual-dsi;
 };
 
 &mdss_dsi1_out {
