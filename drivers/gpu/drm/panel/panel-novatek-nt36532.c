@@ -822,8 +822,7 @@ static const struct panel_info csot_panel_info = {
 	.name = _name,								\
 	.lanes = 4,								\
 	.format = MIPI_DSI_FMT_RGB101010,					\
-	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_CLOCK_NON_CONTINUOUS |	\
-		      MIPI_DSI_MODE_LPM,					\
+	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_LPM,			\
 	.modes = piano_display_modes,						\
 	.num_modes = ARRAY_SIZE(piano_display_modes),				\
 	.supplies = piano_supplies,						\
