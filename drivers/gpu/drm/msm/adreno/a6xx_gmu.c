@@ -239,9 +239,12 @@ void a6xx_gmu_set_freq(struct msm_gpu *gpu, struct dev_pm_opp *opp,
 
 	if (!gmu->legacy) {
 		a6xx_hfi_set_freq(gmu, perf_index, bw_index);
-		/* With Bandwidth voting, we now vote for all resources, so skip OPP set */
-		if (!bw_index)
-			dev_pm_opp_set_opp(&gpu->pdev->dev, opp);
+		/*
+		 * With Bandwidth voting the GMU votes for all resources: remove the bus
+		 * quota a6xx_gmu_set_initial_bw() set for boot, or it holds DDR at the
+		 * boot frequency's bandwidth for as long as the GPU stays powered
+		 */
+		dev_pm_opp_set_opp(&gpu->pdev->dev, bw_index ? NULL : opp);
 		return;
 	}
 
