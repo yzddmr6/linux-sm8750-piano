@@ -3365,6 +3365,15 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.supplied_to = qcom_battmgr_battery;
 	psy_cfg_supply.num_supplicants = 1;
 
+	/*
+	 * The charger firmware sends a notification on every change, and
+	 * power_supply_changed() reports each one as a wakeup event, which
+	 * aborts suspend-to-idle within minutes. Those updates aren't a reason
+	 * to wake the system.
+	 */
+	psy_cfg.no_wakeup_source = true;
+	psy_cfg_supply.no_wakeup_source = true;
+
 	INIT_DELAYED_WORK(&battmgr->charge_work, qcom_battmgr_charge_worker);
 	INIT_WORK(&battmgr->otg_work, qcom_battmgr_otg_worker);
 	mutex_init(&battmgr->lock);
