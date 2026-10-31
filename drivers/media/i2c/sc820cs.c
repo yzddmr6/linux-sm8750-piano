@@ -60,9 +60,11 @@ struct sc820cs {
 	struct media_pad pad;
 	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *exposure;
+	struct v4l2_ctrl *hblank;
 	struct v4l2_ctrl *vblank;
 	struct v4l2_ctrl *hflip;
 	struct v4l2_ctrl *vflip;
+	const struct sc820cs_mode *mode;
 };
 
 static inline struct sc820cs *to_sc820cs(struct v4l2_subdev *sd)
@@ -251,6 +253,37 @@ static const struct cci_reg_sequence sc820cs_mode[] = {
 	{ CCI_REG8(0x391f), 0xc9 },
 };
 
+/*
+ * 2x2 binning, from the stock camera module data: the registers that differ
+ * from the full-resolution sequence above. Line length and frame length are
+ * unchanged, so the line time and the frame rate stay the same.
+ */
+static const struct cci_reg_sequence sc820cs_binning[] = {
+	{ CCI_REG8(0x3208), 0x06 },
+	{ CCI_REG8(0x3209), 0x60 },
+	{ CCI_REG8(0x320a), 0x04 },
+	{ CCI_REG8(0x320b), 0xc8 },
+	{ CCI_REG8(0x3213), 0x04 },
+	{ CCI_REG8(0x3215), 0x31 },
+	{ CCI_REG8(0x3220), 0x01 },
+	{ CCI_REG8(0x5000), 0x4e },
+	{ CCI_REG8(0x5900), 0xf1 },
+	{ CCI_REG8(0x5901), 0x04 },
+};
+
+struct sc820cs_mode {
+	u32 width;
+	u32 height;
+	const struct cci_reg_sequence *regs;
+	unsigned int num_regs;
+};
+
+static const struct sc820cs_mode sc820cs_modes[] = {
+	{ .width = SC820CS_WIDTH, .height = SC820CS_HEIGHT },
+	{ .width = 1632, .height = 1224, .regs = sc820cs_binning,
+	  .num_regs = ARRAY_SIZE(sc820cs_binning) },
+};
+
 static int sc820cs_power_on(struct device *dev)
 {
 	struct sc820cs *sensor = to_sc820cs(dev_get_drvdata(dev));
@@ -311,7 +344,7 @@ static int sc820cs_set_ctrl(struct v4l2_ctrl *ctrl)
 	int ret, exposure_max;
 
 	if (ctrl->id == V4L2_CID_VBLANK) {
-		exposure_max = SC820CS_HEIGHT + ctrl->val - SC820CS_EXPOSURE_MARGIN;
+		exposure_max = sensor->mode->height + ctrl->val - SC820CS_EXPOSURE_MARGIN;
 		ret = __v4l2_ctrl_modify_range(sensor->exposure, 2, exposure_max,
 					       1, min(exposure_max, 1000));
 		if (ret)
@@ -338,7 +371,7 @@ static int sc820cs_set_ctrl(struct v4l2_ctrl *ctrl)
 		/* Clamp the shutter before shortening the frame. */
 		ret = sc820cs_set_exposure(sensor, sensor->exposure->val);
 		cci_write(sensor->regmap, CCI_REG16(0x320e),
-			  SC820CS_HEIGHT + ctrl->val, &ret);
+			  sensor->mode->height + ctrl->val, &ret);
 		break;
 	case V4L2_CID_ANALOGUE_GAIN:
 		/* Vendor gain encoding: 1024 represents unity. */
@@ -379,12 +412,12 @@ static int sc820cs_init_controls(struct sc820cs *sensor)
 		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_PIXEL_RATE, SC820CS_PIXEL_RATE,
 			  SC820CS_PIXEL_RATE, 1, SC820CS_PIXEL_RATE);
-	ctrl = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_HBLANK,
+	sensor->hblank = v4l2_ctrl_new_std(hdl, NULL, V4L2_CID_HBLANK,
 				 SC820CS_LINE_LENGTH - SC820CS_WIDTH,
 				 SC820CS_LINE_LENGTH - SC820CS_WIDTH, 1,
 				 SC820CS_LINE_LENGTH - SC820CS_WIDTH);
-	if (ctrl)
-		ctrl->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+	if (sensor->hblank)
+		sensor->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
 	sensor->vblank = v4l2_ctrl_new_std(hdl, &sc820cs_ctrl_ops, V4L2_CID_VBLANK,
 					 SC820CS_VTS - SC820CS_HEIGHT,
 					 SC820CS_VTS_MAX - SC820CS_HEIGHT, 1,
@@ -436,6 +469,9 @@ static int sc820cs_enable_streams(struct v4l2_subdev *sd,
 	usleep_range(10000, 11000);
 	ret = cci_multi_reg_write(sensor->regmap, sc820cs_mode,
 				  ARRAY_SIZE(sc820cs_mode), NULL);
+	if (sensor->mode->num_regs)
+		cci_multi_reg_write(sensor->regmap, sensor->mode->regs,
+				    sensor->mode->num_regs, &ret);
 	cci_write(sensor->regmap, CCI_REG16(0x320c), SC820CS_HTS, &ret);
 	if (ret)
 		goto power_off;
@@ -472,13 +508,20 @@ static int sc820cs_set_format(struct v4l2_subdev *sd,
 			     struct v4l2_subdev_state *state,
 			     struct v4l2_subdev_format *fmt)
 {
+	struct sc820cs *sensor = to_sc820cs(sd);
+	const struct sc820cs_mode *mode;
+	int ret;
+
 	if (fmt->which == V4L2_SUBDEV_FORMAT_ACTIVE && sd->enabled_pads)
 		return -EBUSY;
 
+	mode = v4l2_find_nearest_size(sc820cs_modes, ARRAY_SIZE(sc820cs_modes),
+				      width, height, fmt->format.width,
+				      fmt->format.height);
 	fmt->format = (struct v4l2_mbus_framefmt) {
-		.width = SC820CS_WIDTH,
-		.height = SC820CS_HEIGHT,
-		.code = sc820cs_mbus_code(to_sc820cs(sd)),
+		.width = mode->width,
+		.height = mode->height,
+		.code = sc820cs_mbus_code(sensor),
 		.field = V4L2_FIELD_NONE,
 		.colorspace = V4L2_COLORSPACE_RAW,
 		.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT,
@@ -486,11 +529,29 @@ static int sc820cs_set_format(struct v4l2_subdev *sd,
 		.xfer_func = V4L2_XFER_FUNC_NONE,
 	};
 	*v4l2_subdev_state_get_format(state, 0) = fmt->format;
+	/* Both modes read out the whole array; binning halves each axis. */
 	*v4l2_subdev_state_get_crop(state, 0) = (struct v4l2_rect) {
 		.width = SC820CS_WIDTH,
 		.height = SC820CS_HEIGHT,
 	};
-	return 0;
+	if (fmt->which != V4L2_SUBDEV_FORMAT_ACTIVE)
+		return 0;
+
+	sensor->mode = mode;
+	ret = __v4l2_ctrl_modify_range(sensor->hblank,
+				       SC820CS_LINE_LENGTH - mode->width,
+				       SC820CS_LINE_LENGTH - mode->width, 1,
+				       SC820CS_LINE_LENGTH - mode->width);
+	if (ret)
+		return ret;
+	ret = __v4l2_ctrl_modify_range(sensor->vblank,
+				       SC820CS_VTS - mode->height,
+				       SC820CS_VTS_MAX - mode->height,
+				       sensor->vblank->step,
+				       SC820CS_VTS - mode->height);
+	if (ret)
+		return ret;
+	return __v4l2_ctrl_s_ctrl(sensor->vblank, SC820CS_VTS - mode->height);
 }
 
 static int sc820cs_init_state(struct v4l2_subdev *sd,
@@ -515,10 +576,11 @@ static int sc820cs_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *state,
 				  struct v4l2_subdev_frame_size_enum *fse)
 {
-	if (fse->index || fse->code != sc820cs_mbus_code(to_sc820cs(sd)))
+	if (fse->index >= ARRAY_SIZE(sc820cs_modes) ||
+	    fse->code != sc820cs_mbus_code(to_sc820cs(sd)))
 		return -EINVAL;
-	fse->min_width = fse->max_width = SC820CS_WIDTH;
-	fse->min_height = fse->max_height = SC820CS_HEIGHT;
+	fse->min_width = fse->max_width = sc820cs_modes[fse->index].width;
+	fse->min_height = fse->max_height = sc820cs_modes[fse->index].height;
 	return 0;
 }
 
@@ -656,6 +718,7 @@ static int sc820cs_probe(struct i2c_client *client)
 	ret = sc820cs_init_controls(sensor);
 	if (ret)
 		goto power_off;
+	sensor->mode = &sc820cs_modes[0];
 	ret = media_entity_pads_init(&sensor->sd.entity, 1, &sensor->pad);
 	if (ret)
 		goto free_controls;
