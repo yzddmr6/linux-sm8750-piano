@@ -42,6 +42,10 @@
 #define SC820CS_PIXEL_RATE	264000000
 #define SC820CS_XCLK_RATE	24000000
 
+#define SC820CS_REG_MIRROR_FLIP	CCI_REG8(0x3221)
+#define SC820CS_MIRROR		0x06
+#define SC820CS_FLIP		0x60
+
 static const s64 sc820cs_link_freqs[] = { 368000000 };
 /* Power-on order: I/O, digital core, analogue. */
 static const char * const sc820cs_supply_names[] = { "dovdd", "dvdd", "avdd" };
@@ -57,11 +61,27 @@ struct sc820cs {
 	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *exposure;
 	struct v4l2_ctrl *vblank;
+	struct v4l2_ctrl *hflip;
+	struct v4l2_ctrl *vflip;
 };
 
 static inline struct sc820cs *to_sc820cs(struct v4l2_subdev *sd)
 {
 	return container_of(sd, struct sc820cs, sd);
+}
+
+/*
+ * The colour filter array is RGGB. Mirroring and flipping move the first
+ * pixel read out, so each flip changes the Bayer order.
+ */
+static u32 sc820cs_mbus_code(struct sc820cs *sensor)
+{
+	static const u32 codes[2][2] = {
+		{ MEDIA_BUS_FMT_SRGGB10_1X10, MEDIA_BUS_FMT_SGRBG10_1X10 },
+		{ MEDIA_BUS_FMT_SGBRG10_1X10, MEDIA_BUS_FMT_SBGGR10_1X10 },
+	};
+
+	return codes[sensor->vflip->val][sensor->hflip->val];
 }
 
 /*
@@ -194,7 +214,7 @@ static const struct cci_reg_sequence sc820cs_mode[] = {
 	{ CCI_REG8(0x5780), 0x66 },
 	{ CCI_REG8(0x578d), 0x40 },
 	{ CCI_REG8(0x57aa), 0xeb },
-	/* No flips: the readout starts with the R pixel of the RGGB array. */
+	/* Native readout; the flip controls program this register. */
 	{ CCI_REG8(0x3221), 0x00 },
 	{ CCI_REG8(0x301f), 0x0e },
 	{ CCI_REG8(0x3200), 0x00 },
@@ -298,6 +318,13 @@ static int sc820cs_set_ctrl(struct v4l2_ctrl *ctrl)
 			return ret;
 	}
 
+	if (ctrl->id == V4L2_CID_HFLIP || ctrl->id == V4L2_CID_VFLIP) {
+		struct v4l2_subdev_state *state =
+			v4l2_subdev_get_locked_active_state(&sensor->sd);
+
+		v4l2_subdev_state_get_format(state, 0)->code = sc820cs_mbus_code(sensor);
+	}
+
 	ret = pm_runtime_get_if_in_use(sensor->dev);
 	if (ret <= 0)
 		return ret;
@@ -320,6 +347,12 @@ static int sc820cs_set_ctrl(struct v4l2_ctrl *ctrl)
 		cci_write(sensor->regmap, CCI_REG8(0x3e07),
 			  (ctrl->val >> stage) >> 3, &ret);
 		break;
+	case V4L2_CID_HFLIP:
+	case V4L2_CID_VFLIP:
+		ret = cci_write(sensor->regmap, SC820CS_REG_MIRROR_FLIP,
+				(sensor->hflip->val ? SC820CS_MIRROR : 0) |
+				(sensor->vflip->val ? SC820CS_FLIP : 0), NULL);
+		break;
 	default:
 		ret = -EINVAL;
 		break;
@@ -339,7 +372,7 @@ static int sc820cs_init_controls(struct sc820cs *sensor)
 	struct v4l2_ctrl *ctrl;
 	int ret;
 
-	v4l2_ctrl_handler_init(hdl, 9);
+	v4l2_ctrl_handler_init(hdl, 11);
 	ctrl = v4l2_ctrl_new_int_menu(hdl, NULL, V4L2_CID_LINK_FREQ, 0, 0,
 				      sc820cs_link_freqs);
 	if (ctrl)
@@ -361,6 +394,14 @@ static int sc820cs_init_controls(struct sc820cs *sensor)
 					   1, 1000);
 	v4l2_ctrl_new_std(hdl, &sc820cs_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
 			  1024, 16384, 8, 1024);
+	sensor->hflip = v4l2_ctrl_new_std(hdl, &sc820cs_ctrl_ops, V4L2_CID_HFLIP,
+					0, 1, 1, 0);
+	if (sensor->hflip)
+		sensor->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+	sensor->vflip = v4l2_ctrl_new_std(hdl, &sc820cs_ctrl_ops, V4L2_CID_VFLIP,
+					0, 1, 1, 0);
+	if (sensor->vflip)
+		sensor->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
 	if (hdl->error) {
 		ret = hdl->error;
 		goto free_controls;
@@ -402,8 +443,12 @@ static int sc820cs_enable_streams(struct v4l2_subdev *sd,
 	if (ret)
 		goto power_off;
 	ret = cci_write(sensor->regmap, CCI_REG8(0x0100), 1, NULL);
-	if (!ret)
-		return 0;
+	if (ret)
+		goto power_off;
+	/* The flips change the Bayer order; keep them fixed while streaming. */
+	__v4l2_ctrl_grab(sensor->hflip, true);
+	__v4l2_ctrl_grab(sensor->vflip, true);
+	return 0;
 power_off:
 	pm_runtime_put_sync(sensor->dev);
 	return ret;
@@ -417,6 +462,8 @@ static int sc820cs_disable_streams(struct v4l2_subdev *sd,
 	int ret;
 
 	ret = cci_write(sensor->regmap, CCI_REG8(0x0100), 0, NULL);
+	__v4l2_ctrl_grab(sensor->hflip, false);
+	__v4l2_ctrl_grab(sensor->vflip, false);
 	pm_runtime_put_sync(sensor->dev);
 	return ret;
 }
@@ -431,7 +478,7 @@ static int sc820cs_set_format(struct v4l2_subdev *sd,
 	fmt->format = (struct v4l2_mbus_framefmt) {
 		.width = SC820CS_WIDTH,
 		.height = SC820CS_HEIGHT,
-		.code = MEDIA_BUS_FMT_SRGGB10_1X10,
+		.code = sc820cs_mbus_code(to_sc820cs(sd)),
 		.field = V4L2_FIELD_NONE,
 		.colorspace = V4L2_COLORSPACE_RAW,
 		.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT,
@@ -460,7 +507,7 @@ static int sc820cs_enum_mbus_code(struct v4l2_subdev *sd,
 {
 	if (code->index)
 		return -EINVAL;
-	code->code = MEDIA_BUS_FMT_SRGGB10_1X10;
+	code->code = sc820cs_mbus_code(to_sc820cs(sd));
 	return 0;
 }
 
@@ -468,7 +515,7 @@ static int sc820cs_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *state,
 				  struct v4l2_subdev_frame_size_enum *fse)
 {
-	if (fse->index || fse->code != MEDIA_BUS_FMT_SRGGB10_1X10)
+	if (fse->index || fse->code != sc820cs_mbus_code(to_sc820cs(sd)))
 		return -EINVAL;
 	fse->min_width = fse->max_width = SC820CS_WIDTH;
 	fse->min_height = fse->max_height = SC820CS_HEIGHT;

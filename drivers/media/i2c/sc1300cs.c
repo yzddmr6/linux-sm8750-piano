@@ -42,6 +42,10 @@
 #define SC1300CS_PIXEL_RATE	480000000
 #define SC1300CS_XCLK_RATE	24000000
 
+#define SC1300CS_REG_MIRROR_FLIP	CCI_REG8(0x3221)
+#define SC1300CS_MIRROR		0x06
+#define SC1300CS_FLIP		0x60
+
 static const s64 sc1300cs_link_freqs[] = { 600000000 };
 /* Power-on order: I/O, digital core, analogue. */
 static const char * const sc1300cs_supply_names[] = { "dovdd", "dvdd", "avdd" };
@@ -57,11 +61,27 @@ struct sc1300cs {
 	struct v4l2_ctrl_handler ctrls;
 	struct v4l2_ctrl *exposure;
 	struct v4l2_ctrl *vblank;
+	struct v4l2_ctrl *hflip;
+	struct v4l2_ctrl *vflip;
 };
 
 static inline struct sc1300cs *to_sc1300cs(struct v4l2_subdev *sd)
 {
 	return container_of(sd, struct sc1300cs, sd);
+}
+
+/*
+ * The colour filter array is RGGB. Mirroring and flipping move the first
+ * pixel read out, so each flip changes the Bayer order.
+ */
+static u32 sc1300cs_mbus_code(struct sc1300cs *sensor)
+{
+	static const u32 codes[2][2] = {
+		{ MEDIA_BUS_FMT_SRGGB10_1X10, MEDIA_BUS_FMT_SGRBG10_1X10 },
+		{ MEDIA_BUS_FMT_SGBRG10_1X10, MEDIA_BUS_FMT_SBGGR10_1X10 },
+	};
+
+	return codes[sensor->vflip->val][sensor->hflip->val];
 }
 
 /*
@@ -243,8 +263,8 @@ static const struct cci_reg_sequence sc1300cs_mode[] = {
 	{ CCI_REG8(0x3213), 0x08 },
 	{ CCI_REG8(0x3215), 0x11 },
 	{ CCI_REG8(0x3220), 0x00 },
-	/* Both flips: mirrored and flipped, the RGGB array reads out as BGGR. */
-	{ CCI_REG8(0x3221), 0x66 },
+	/* Native readout; the flip controls program this register. */
+	{ CCI_REG8(0x3221), 0x00 },
 	{ CCI_REG8(0x5000), 0x1e },
 	{ CCI_REG8(0x5900), 0x01 },
 	{ CCI_REG8(0x5901), 0x00 },
@@ -330,6 +350,13 @@ static int sc1300cs_set_ctrl(struct v4l2_ctrl *ctrl)
 			return ret;
 	}
 
+	if (ctrl->id == V4L2_CID_HFLIP || ctrl->id == V4L2_CID_VFLIP) {
+		struct v4l2_subdev_state *state =
+			v4l2_subdev_get_locked_active_state(&sensor->sd);
+
+		v4l2_subdev_state_get_format(state, 0)->code = sc1300cs_mbus_code(sensor);
+	}
+
 	ret = pm_runtime_get_if_in_use(sensor->dev);
 	if (ret <= 0)
 		return ret;
@@ -352,6 +379,12 @@ static int sc1300cs_set_ctrl(struct v4l2_ctrl *ctrl)
 		cci_write(sensor->regmap, CCI_REG8(0x3e07),
 			  (ctrl->val >> stage) >> 3, &ret);
 		break;
+	case V4L2_CID_HFLIP:
+	case V4L2_CID_VFLIP:
+		ret = cci_write(sensor->regmap, SC1300CS_REG_MIRROR_FLIP,
+				(sensor->hflip->val ? SC1300CS_MIRROR : 0) |
+				(sensor->vflip->val ? SC1300CS_FLIP : 0), NULL);
+		break;
 	default:
 		ret = -EINVAL;
 		break;
@@ -371,7 +404,7 @@ static int sc1300cs_init_controls(struct sc1300cs *sensor)
 	struct v4l2_ctrl *ctrl;
 	int ret;
 
-	v4l2_ctrl_handler_init(hdl, 9);
+	v4l2_ctrl_handler_init(hdl, 11);
 	ctrl = v4l2_ctrl_new_int_menu(hdl, NULL, V4L2_CID_LINK_FREQ, 0, 0,
 				      sc1300cs_link_freqs);
 	if (ctrl)
@@ -393,6 +426,14 @@ static int sc1300cs_init_controls(struct sc1300cs *sensor)
 					   2, 1000);
 	v4l2_ctrl_new_std(hdl, &sc1300cs_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
 			  1024, 16384, 8, 1024);
+	sensor->hflip = v4l2_ctrl_new_std(hdl, &sc1300cs_ctrl_ops, V4L2_CID_HFLIP,
+					0, 1, 1, 0);
+	if (sensor->hflip)
+		sensor->hflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
+	sensor->vflip = v4l2_ctrl_new_std(hdl, &sc1300cs_ctrl_ops, V4L2_CID_VFLIP,
+					0, 1, 1, 0);
+	if (sensor->vflip)
+		sensor->vflip->flags |= V4L2_CTRL_FLAG_MODIFY_LAYOUT;
 	if (hdl->error) {
 		ret = hdl->error;
 		goto free_controls;
@@ -434,8 +475,12 @@ static int sc1300cs_enable_streams(struct v4l2_subdev *sd,
 	if (ret)
 		goto power_off;
 	ret = cci_write(sensor->regmap, CCI_REG8(0x0100), 1, NULL);
-	if (!ret)
-		return 0;
+	if (ret)
+		goto power_off;
+	/* The flips change the Bayer order; keep them fixed while streaming. */
+	__v4l2_ctrl_grab(sensor->hflip, true);
+	__v4l2_ctrl_grab(sensor->vflip, true);
+	return 0;
 power_off:
 	pm_runtime_put_sync(sensor->dev);
 	return ret;
@@ -449,6 +494,8 @@ static int sc1300cs_disable_streams(struct v4l2_subdev *sd,
 	int ret;
 
 	ret = cci_write(sensor->regmap, CCI_REG8(0x0100), 0, NULL);
+	__v4l2_ctrl_grab(sensor->hflip, false);
+	__v4l2_ctrl_grab(sensor->vflip, false);
 	pm_runtime_put_sync(sensor->dev);
 	return ret;
 }
@@ -463,7 +510,7 @@ static int sc1300cs_set_format(struct v4l2_subdev *sd,
 	fmt->format = (struct v4l2_mbus_framefmt) {
 		.width = SC1300CS_WIDTH,
 		.height = SC1300CS_HEIGHT,
-		.code = MEDIA_BUS_FMT_SBGGR10_1X10,
+		.code = sc1300cs_mbus_code(to_sc1300cs(sd)),
 		.field = V4L2_FIELD_NONE,
 		.colorspace = V4L2_COLORSPACE_RAW,
 		.ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT,
@@ -492,7 +539,7 @@ static int sc1300cs_enum_mbus_code(struct v4l2_subdev *sd,
 {
 	if (code->index)
 		return -EINVAL;
-	code->code = MEDIA_BUS_FMT_SBGGR10_1X10;
+	code->code = sc1300cs_mbus_code(to_sc1300cs(sd));
 	return 0;
 }
 
@@ -500,7 +547,7 @@ static int sc1300cs_enum_frame_size(struct v4l2_subdev *sd,
 				  struct v4l2_subdev_state *state,
 				  struct v4l2_subdev_frame_size_enum *fse)
 {
-	if (fse->index || fse->code != MEDIA_BUS_FMT_SBGGR10_1X10)
+	if (fse->index || fse->code != sc1300cs_mbus_code(to_sc1300cs(sd)))
 		return -EINVAL;
 	fse->min_width = fse->max_width = SC1300CS_WIDTH;
 	fse->min_height = fse->max_height = SC1300CS_HEIGHT;
