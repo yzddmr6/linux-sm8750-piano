@@ -527,12 +527,13 @@ msm_context_is_vmbind(struct msm_context *ctx)
  * Each ring is associated with it's own scheduler instance.  However, our
  * UABI is that lower numerical values are higher priority.  So mapping the
  * single userspace priority level into ring_nr and sched_prio takes some
- * care.  The userspace provided priority (when a submitqueue is created)
- * is mapped to ring nr and scheduler priority as such:
+ * care.  enum drm_sched_priority also has lower numerical values as higher
+ * priority, so the userspace provided priority (when a submitqueue is
+ * created) is mapped to ring nr and scheduler priority as such:
  *
  *   ring_nr    = userspace_prio / NR_SCHED_PRIORITIES
- *   sched_prio = NR_SCHED_PRIORITIES -
- *                (userspace_prio % NR_SCHED_PRIORITIES) - 1
+ *   sched_prio = DRM_SCHED_PRIORITY_HIGH +
+ *                (userspace_prio % NR_SCHED_PRIORITIES)
  *
  * This allows generations without preemption (nr_rings==1) to have some
  * amount of prioritization, and provides more priority levels for gens
@@ -547,10 +548,8 @@ static inline int msm_gpu_convert_priority(struct msm_gpu *gpu, int prio,
 
 	rn = div_u64_rem(prio, NR_SCHED_PRIORITIES, &sp);
 
-	/* invert sched priority to map to higher-numeric-is-higher-
-	 * priority convention
-	 */
-	sp = NR_SCHED_PRIORITIES - sp - 1;
+	/* submitqueues map onto HIGH..LOW; KERNEL stays with VM_BIND queues */
+	sp += DRM_SCHED_PRIORITY_HIGH;
 
 	if (rn >= gpu->nr_rings)
 		return -EINVAL;
