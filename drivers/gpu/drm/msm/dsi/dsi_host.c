@@ -439,12 +439,16 @@ int dsi_link_clk_set_rate_6g_v2_9(struct msm_dsi_host *msm_host)
 	 * cannot use assigned-clock-parents.
 	 */
 	ret = clk_set_parent(msm_host->byte_src_clk, msm_host->dsi_pll_byte_clk);
-	if (ret)
+	if (ret) {
 		dev_err(dev, "Failed to parent byte_src -> dsi_pll_byte: %d\n", ret);
+		return ret;
+	}
 
 	ret = clk_set_parent(msm_host->pixel_src_clk, msm_host->dsi_pll_pixel_clk);
-	if (ret)
+	if (ret) {
 		dev_err(dev, "Failed to parent pixel_src -> dsi_pll_pixel: %d\n", ret);
+		return ret;
+	}
 
 	return dsi_link_clk_set_rate_6g(msm_host);
 }
@@ -1588,7 +1592,7 @@ static void dsi_err_worker(struct work_struct *work)
 		container_of(work, struct msm_dsi_host, err_work);
 	u32 status = msm_host->err_work_state;
 
-	pr_err_ratelimited("%s: status=%x\n", __func__, status);
+	dev_err_ratelimited(&msm_host->pdev->dev, "%s: status=%x\n", __func__, status);
 	if (status & DSI_ERR_STATE_MDP_FIFO_UNDERFLOW)
 		dsi_sw_reset(msm_host);
 
@@ -2184,6 +2188,7 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
 {
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
+	int ret;
 
 	/* TODO: make sure dsi_cmd_mdp is idle.
 	 * Since DSI6G v1.2.0, we can set DSI_TRIG_CTRL.BLOCK_DMA_WITHIN_FRAME
@@ -2195,9 +2200,17 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
 	 * mdss interrupt is generated in mdp core clock domain
 	 * mdp clock need to be enabled to receive dsi interrupt
 	 */
-	pm_runtime_get_sync(&msm_host->pdev->dev);
-	cfg_hnd->ops->link_clk_set_rate(msm_host);
-	cfg_hnd->ops->link_clk_enable(msm_host);
+	ret = pm_runtime_resume_and_get(&msm_host->pdev->dev);
+	if (ret < 0)
+		return ret;
+
+	ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
+	if (ret)
+		goto err_put_pm;
+
+	ret = cfg_hnd->ops->link_clk_enable(msm_host);
+	if (ret)
+		goto err_put_pm;
 
 	/* TODO: vote for bus bandwidth */
 
@@ -2212,6 +2225,10 @@ int msm_dsi_host_xfer_prepare(struct mipi_dsi_host *host,
 	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_CMD_DMA_DONE, 1);
 
 	return 0;
+
+err_put_pm:
+	pm_runtime_put(&msm_host->pdev->dev);
+	return ret;
 }
 
 void msm_dsi_host_xfer_restore(struct mipi_dsi_host *host,
@@ -2528,14 +2545,17 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 		goto unlock_ret;
 	}
 
-	pm_runtime_get_sync(&msm_host->pdev->dev);
+	ret = pm_runtime_resume_and_get(&msm_host->pdev->dev);
+	if (ret < 0)
+		goto fail_disable_reg;
+
 	ret = cfg_hnd->ops->link_clk_set_rate(msm_host);
 	if (!ret)
 		ret = cfg_hnd->ops->link_clk_enable(msm_host);
 	if (ret) {
 		pr_err("%s: failed to enable link clocks. ret=%d\n",
 		       __func__, ret);
-		goto fail_disable_reg;
+		goto fail_put_pm;
 	}
 
 	ret = pinctrl_pm_select_default_state(&msm_host->pdev->dev);
@@ -2556,6 +2576,7 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 
 fail_disable_clk:
 	cfg_hnd->ops->link_clk_disable(msm_host);
+fail_put_pm:
 	pm_runtime_put(&msm_host->pdev->dev);
 fail_disable_reg:
 	regulator_bulk_disable(msm_host->cfg_hnd->cfg->num_regulators,
