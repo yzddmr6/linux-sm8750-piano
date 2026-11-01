@@ -37,20 +37,15 @@ static int dsi_get_phy(struct msm_dsi *msm_dsi)
 	phy_pdev = of_find_device_by_node(phy_node);
 	if (phy_pdev) {
 		msm_dsi->phy = platform_get_drvdata(phy_pdev);
+		/* dsi_destroy() owns the reference, including on probe failure. */
 		msm_dsi->phy_dev = &phy_pdev->dev;
 	}
 
 	of_node_put(phy_node);
 
-	if (!phy_pdev) {
-		DRM_DEV_ERROR(&pdev->dev, "%s: phy driver is not ready\n", __func__);
-		return -EPROBE_DEFER;
-	}
-	if (!msm_dsi->phy) {
-		put_device(&phy_pdev->dev);
-		DRM_DEV_ERROR(&pdev->dev, "%s: phy driver is not ready\n", __func__);
-		return -EPROBE_DEFER;
-	}
+	if (!phy_pdev || !msm_dsi->phy)
+		return dev_err_probe(&pdev->dev, -EPROBE_DEFER,
+				     "PHY driver is not ready\n");
 
 	return 0;
 }
