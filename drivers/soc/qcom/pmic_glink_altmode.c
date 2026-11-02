@@ -152,7 +152,6 @@ struct pmic_glink_altmode {
 
 	struct work_struct enable_work;
 	spinlock_t work_lock;
-	bool stopping;
 
 	struct pmic_glink_altmode_port ports[PMIC_GLINK_MAX_PORTS];
 };
@@ -160,9 +159,7 @@ struct pmic_glink_altmode {
 static void pmic_glink_altmode_queue(struct pmic_glink_altmode *altmode,
 				     struct work_struct *work)
 {
-	guard(spinlock_irqsave)(&altmode->work_lock);
-	if (!altmode->stopping)
-		queue_work(system_freezable_wq, work);
+	queue_work(system_freezable_wq, work);
 }
 
 static struct auxiliary_driver pmic_glink_altmode_driver;
@@ -200,19 +197,6 @@ static const struct kernel_param_ops pmic_glink_altmode_pan_ack_ops = {
 	.get = param_get_bool,
 };
 module_param_cb(pan_ack, &pmic_glink_altmode_pan_ack_ops, &pan_ack, 0644);
-
-static void pmic_glink_altmode_stop(void *data)
-{
-	struct pmic_glink_altmode *altmode = data;
-	unsigned int port;
-
-	scoped_guard(spinlock_irqsave, &altmode->work_lock)
-		altmode->stopping = true;
-	cancel_work_sync(&altmode->enable_work);
-	for (port = 0; port < ARRAY_SIZE(altmode->ports); port++)
-		if (altmode->ports[port].altmode)
-			cancel_work_sync(&altmode->ports[port].work);
-}
 
 static int pmic_glink_altmode_request(struct pmic_glink_altmode *altmode, u32 cmd, u32 arg)
 {
@@ -651,6 +635,23 @@ static void pmic_glink_altmode_put_switch(void *data)
 	typec_switch_put(data);
 }
 
+static void pmic_glink_altmode_disable_work(void *data)
+{
+	struct pmic_glink_altmode *altmode = data;
+	struct pmic_glink_altmode_port *alt_port;
+	unsigned int port;
+
+	disable_work_sync(&altmode->enable_work);
+
+	for (port = 0; port < ARRAY_SIZE(altmode->ports); port++) {
+		alt_port = &altmode->ports[port];
+		if (!alt_port->altmode)
+			continue;
+
+		disable_work_sync(&alt_port->work);
+	}
+}
+
 static void pmic_glink_altmode_enable_worker(struct work_struct *work)
 {
 	struct pmic_glink_altmode *altmode = work_to_altmode(work);
@@ -812,7 +813,15 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 	if (IS_ERR(altmode->client))
 		return PTR_ERR(altmode->client);
 
-	ret = devm_add_action_or_reset(dev, pmic_glink_altmode_stop, altmode);
+	/*
+	 * Registered after the client, so that on unbind the workers are
+	 * disabled, and any in-flight instance is waited for, before the
+	 * client, the typec handles and the altmode context go away. The
+	 * client callbacks may still fire until the client is released, so
+	 * disable rather than cancel the works to keep them from being
+	 * requeued.
+	 */
+	ret = devm_add_action_or_reset(dev, pmic_glink_altmode_disable_work, altmode);
 	if (ret)
 		return ret;
 
