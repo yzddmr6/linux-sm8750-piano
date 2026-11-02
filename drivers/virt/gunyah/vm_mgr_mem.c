@@ -66,7 +66,7 @@ int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
 
 	for (i = 0; i < parcel->n_mem_entries; i++) {
 		entry = &parcel->mem_entries[i];
-		size = entry->size;
+		size = le64_to_cpu(entry->size);
 		folio = pfn_folio(PHYS_PFN(le64_to_cpu(entry->phys_addr)));
 		while (size > 0) {
 			ret = mtree_insert_range(&ghvm->mm, gfn + off,
@@ -75,7 +75,7 @@ int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
 						 GFP_KERNEL);
 			if (ret) {
 				WARN_ON(ret != -ENOMEM);
-				gunyah_vm_mm_erase_range(ghvm, gfn, off - 1);
+				gunyah_vm_mm_erase_range(ghvm, gfn, off);
 				goto unlock;
 			}
 			off += folio_nr_pages(folio);
@@ -84,7 +84,7 @@ int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
 		}
 	}
 	BUG_ON(off != nr);
-	vm_parcel->start = 0;
+	vm_parcel->paged = true;
 	b->vm_parcel = NULL;
 
 unlock:
@@ -115,6 +115,28 @@ void gunyah_vm_mm_erase_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr)
 			return;
 		off += folio_nr_pages(folio);
 	}
+}
+
+void gunyah_vm_parcel_to_paged_abort(struct gunyah_vm *ghvm,
+				   struct gunyah_vm_parcel *vm_parcel)
+{
+	struct gunyah_vm_binding *b;
+
+	down_write(&ghvm->bindings_lock);
+	/* start_fail also runs before conversion, including partial failures. */
+	if (!vm_parcel->paged)
+		goto unlock;
+
+	b = mtree_load(&ghvm->bindings, vm_parcel->start);
+	if (WARN_ON(!b))
+		goto unlock;
+
+	/* RM still owns the parcel until VM_START succeeds: do not unpin. */
+	gunyah_vm_mm_erase_range(ghvm, vm_parcel->start, vm_parcel->pages);
+	b->vm_parcel = vm_parcel;
+	vm_parcel->paged = false;
+unlock:
+	up_write(&ghvm->bindings_lock);
 }
 
 static inline u32 donate_flags(bool share)
@@ -843,8 +865,9 @@ int gunyah_reclaim_parcels(struct gunyah_vm *ghvm, u64 start_gfn,
 	int ret, ret2 = 0;
 
 	mt_for_each(&ghvm->bindings, b, gfn, end_gfn) {
-		if (b->vm_parcel)
-			ret = gunyah_reclaim_parcel(ghvm, b->vm_parcel);
+		if (!b->vm_parcel)
+			continue;
+		ret = gunyah_reclaim_parcel(ghvm, b->vm_parcel);
 		if (ret)
 			ret2 = ret;
 	}

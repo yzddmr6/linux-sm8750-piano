@@ -24,6 +24,8 @@
 struct gunyah_vm_parcel {
 	u64 start, pages;
 	struct gunyah_rm_mem_parcel parcel;
+	/* The original range is retained until VM_START can no longer fail. */
+	bool paged;
 };
 
 struct gunyah_vm_binding {
@@ -247,6 +249,9 @@ static inline void gunyah_folio_host_reclaim(struct folio *folio)
 int gunyah_vm_parcel_to_paged(struct gunyah_vm *ghvm,
 			      struct gunyah_rm_mem_parcel *parcel, u64 gfn,
 			      u64 nr);
+
+void gunyah_vm_parcel_to_paged_abort(struct gunyah_vm *ghvm,
+				   struct gunyah_vm_parcel *vm_parcel);
 void gunyah_vm_mm_erase_range(struct gunyah_vm *ghvm, u64 gfn, u64 nr);
 int gunyah_vm_provide_folio(struct gunyah_vm *ghvm, struct folio *folio,
 			    u64 gfn, bool share, bool write);
