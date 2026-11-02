@@ -8,6 +8,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/bpf_defs.h>
 #include <linux/extable.h>
@@ -30,6 +31,7 @@
 #include <linux/hugetlb.h>
 
 #include <asm/acpi.h>
+#include <asm/asm-extable.h>
 #include <asm/bug.h>
 #include <asm/cmpxchg.h>
 #include <asm/cpufeature.h>
@@ -874,10 +876,46 @@ static int do_bad(unsigned long far, unsigned long esr, struct pt_regs *regs)
 	return 1; /* "fault" */
 }
 
+static bool gunyah_sea_fixup __ro_after_init;
+
+static int __init gunyah_sea_init(void)
+{
+	const uuid_t gunyah_uuid = UUID_INIT(0xc1d58fcd, 0xa453, 0x5fdb,
+					   0x92, 0x65, 0xce, 0x36,
+					   0x67, 0x3d, 0x5f, 0x14);
+
+	if (IS_ENABLED(CONFIG_GUNYAH))
+		gunyah_sea_fixup = arm_smccc_hypervisor_has_uuid(&gunyah_uuid);
+
+	return 0;
+}
+arch_initcall(gunyah_sea_init);
+
+static bool gunyah_fixup_sea(unsigned long esr, struct pt_regs *regs)
+{
+	const struct exception_table_entry *ex;
+
+	/* Gunyah injects a data SEA when a load crosses into a lent page. */
+	if (!gunyah_sea_fixup || user_mode(regs) ||
+	    ESR_ELx_EC(esr) != ESR_ELx_EC_DABT_CUR ||
+	    (esr & ESR_ELx_FSC) != ESR_ELx_FSC_EXTABT || (esr & ESR_ELx_WNR))
+		return false;
+
+	ex = search_exception_tables(instruction_pointer(regs));
+	if (!ex || ex->type != EX_TYPE_LOAD_UNALIGNED_ZEROPAD)
+		return false;
+
+	/* Re-read the accessible aligned word and zero-pad the excess bytes. */
+	return fixup_exception(regs, esr);
+}
+
 static int do_sea(unsigned long far, unsigned long esr, struct pt_regs *regs)
 {
 	const struct fault_info *inf;
 	unsigned long siaddr;
+
+	if (gunyah_fixup_sea(esr, regs))
+		return 0;
 
 	inf = esr_to_fault_info(esr);
 
