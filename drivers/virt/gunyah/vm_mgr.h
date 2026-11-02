@@ -26,6 +26,8 @@ struct gunyah_vm_parcel {
 	struct gunyah_rm_mem_parcel parcel;
 	/* The original range is retained until VM_START can no longer fail. */
 	bool paged;
+	/* Failed share rollback: pins are held indefinitely, not retried. */
+	bool quarantined;
 };
 
 struct gunyah_vm_binding {
