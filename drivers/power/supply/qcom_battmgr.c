@@ -8,7 +8,6 @@
 #include <linux/auxiliary_bus.h>
 #include <linux/cleanup.h>
 #include <linux/platform_device.h>
-#include <linux/devm-helpers.h>
 #include <linux/delay.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -468,6 +467,9 @@ struct qcom_battmgr {
 	 */
 	struct mutex lock;
 
+	/* Set under @lock once @client is about to be released */
+	bool client_gone;
+
 	/*
 	 * @notify_lock orders @removing against the PMIC GLINK callbacks, which
 	 * may still run while the power supplies and @enable_work are torn down.
@@ -527,6 +529,10 @@ static int __qcom_battmgr_request(struct qcom_battmgr *battmgr, void *data,
 	const struct pmic_glink_hdr *hdr = data;
 	unsigned long left;
 	int ret;
+
+	/* All request paths, including the timed OPLUS ones, hold @lock. */
+	if (battmgr->client_gone)
+		return -ENODEV;
 
 	reinit_completion(&battmgr->ack);
 	WRITE_ONCE(battmgr->request_opcode, le32_to_cpu(hdr->opcode));
@@ -2825,13 +2831,27 @@ static void qcom_battmgr_cancel_work(void *data)
 {
 	struct qcom_battmgr *battmgr = data;
 
-	cancel_delayed_work_sync(&battmgr->charge_work);
-	cancel_work_sync(&battmgr->otg_work);
+	disable_delayed_work_sync(&battmgr->charge_work);
+	disable_work_sync(&battmgr->otg_work);
 	mutex_lock(&battmgr->charge_lock);
 	qcom_battmgr_pps_stop(battmgr);
 	if (battmgr->service_up)
 		qcom_battmgr_pd_stop(battmgr, false, "driver stopped");
 	mutex_unlock(&battmgr->charge_lock);
+}
+
+static void qcom_battmgr_release_client(void *data)
+{
+	struct qcom_battmgr *battmgr = data;
+
+	/* OPLUS callbacks and workers also use the serialized request path. */
+	qcom_battmgr_stop_notifications(battmgr);
+	disable_work_sync(&battmgr->enable_work);
+	qcom_battmgr_cancel_work(battmgr);
+
+	mutex_lock(&battmgr->lock);
+	battmgr->client_gone = true;
+	mutex_unlock(&battmgr->lock);
 }
 
 static void qcom_battmgr_unregister_psy_notifier(void *data)
@@ -3033,6 +3053,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	psy_cfg_supply.no_wakeup_source = true;
 
 	INIT_DELAYED_WORK(&battmgr->charge_work, qcom_battmgr_charge_worker);
+	INIT_WORK(&battmgr->enable_work, qcom_battmgr_enable_worker);
 	INIT_WORK(&battmgr->otg_work, qcom_battmgr_otg_worker);
 	mutex_init(&battmgr->lock);
 	spin_lock_init(&battmgr->notify_lock);
@@ -3055,45 +3076,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 		return dev_err_probe(dev, ret,
 				     "failed to init battery charge control thresholds\n");
 
-	/*
-	 * The client must outlive the power supplies and enable_work, which
-	 * both send requests through it: devres releases it after them.
-	 */
-	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
-						       qcom_battmgr_callback,
-						       qcom_battmgr_pdr_notify,
-						       battmgr);
-	if (IS_ERR(battmgr->client))
-		return PTR_ERR(battmgr->client);
-
 	/* Without a configured end threshold, charge to full */
 	if ((battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE) &&
 	    !battmgr->info.charge_ctrl_end)
 		battmgr->info.charge_ctrl_end = CHARGE_CTRL_END_THR_MAX;
-
-	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
-		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
-		battmgr->psy_nb.notifier_call = qcom_battmgr_psy_notify;
-		ret = power_supply_reg_notifier(&battmgr->psy_nb);
-		if (ret)
-			return ret;
-		ret = devm_add_action_or_reset(dev, qcom_battmgr_unregister_psy_notifier,
-					       battmgr);
-		if (ret)
-			return ret;
-	}
-
-	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS) {
-		battmgr->pm_nb.notifier_call = qcom_battmgr_pm_notify;
-		ret = register_pm_notifier(&battmgr->pm_nb);
-		if (ret)
-			return ret;
-
-		ret = devm_add_action_or_reset(dev, qcom_battmgr_unregister_pm_notifier,
-					       battmgr);
-		if (ret)
-			return ret;
-	}
 
 	if (battmgr->variant == QCOM_BATTMGR_SC8280XP ||
 	    battmgr->variant == QCOM_BATTMGR_X1E80100) {
@@ -3155,23 +3141,45 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 					     "failed to register wireless charing power supply\n");
 	}
 
-	ret = devm_work_autocancel(dev, &battmgr->enable_work,
-				   qcom_battmgr_enable_worker);
+	battmgr->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
+						       qcom_battmgr_callback,
+						       qcom_battmgr_pdr_notify,
+						       battmgr);
+	if (IS_ERR(battmgr->client))
+		return PTR_ERR(battmgr->client);
+
+	/* Quiesce every requester before the client devres is released. */
+	ret = devm_add_action_or_reset(dev, qcom_battmgr_release_client, battmgr);
 	if (ret)
 		return ret;
+
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
+		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+		battmgr->psy_nb.notifier_call = qcom_battmgr_psy_notify;
+		ret = power_supply_reg_notifier(&battmgr->psy_nb);
+		if (ret)
+			return ret;
+		ret = devm_add_action_or_reset(dev, qcom_battmgr_unregister_psy_notifier,
+					       battmgr);
+		if (ret)
+			return ret;
+	}
+
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS) {
+		battmgr->pm_nb.notifier_call = qcom_battmgr_pm_notify;
+		ret = register_pm_notifier(&battmgr->pm_nb);
+		if (ret)
+			return ret;
+
+		ret = devm_add_action_or_reset(dev, qcom_battmgr_unregister_pm_notifier,
+					       battmgr);
+		if (ret)
+			return ret;
+	}
 
 	ret = qcom_battmgr_charging_init(battmgr);
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot create charging interface\n");
-
-	ret = devm_add_action_or_reset(dev, qcom_battmgr_cancel_work, battmgr);
-	if (ret)
-		return ret;
-
-	/* Released first: no notification may touch the supplies or the work. */
-	ret = devm_add_action_or_reset(dev, qcom_battmgr_stop_notifications, battmgr);
-	if (ret)
-		return ret;
 
 	pmic_glink_client_register(battmgr->client);
 
