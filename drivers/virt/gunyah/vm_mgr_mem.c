@@ -632,9 +632,10 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 	parcel->n_mem_entries = entries + 1;
 	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
 	if (ret == -ENOTRECOVERABLE) {
-		/* some memory is still assigned away: keep every pin */
-		dev_err(ghvm->parent, "share failed and not rolled back: keeping %d pinned pages\n",
-			pinned);
+		/* Keep the remaining folio pins even after VM teardown. */
+		vm_parcel->quarantined = true;
+		dev_err(ghvm->parent, "share failed and not rolled back: quarantining parcel %#x\n",
+			parcel->mem_handle);
 		kfree(parcel->mem_entries);
 		parcel->mem_entries = NULL;
 		parcel->n_mem_entries = 0;
@@ -649,9 +650,17 @@ static int gunyah_gup_share_parcel(struct gunyah_vm *ghvm,
 	goto free_pages;
 
 free_mem_entries:
+	/* Tail-page pins were already dropped while merging the entries. */
+	for (i = 0; i < pinned; i++) {
+		if (i && pages[i] != folio_page(page_folio(pages[i]), 0))
+			continue;
+		unpin_user_page(pages[i]);
+		account_locked_vm(current->mm, 1, false);
+	}
 	kfree(parcel->mem_entries);
 	parcel->mem_entries = NULL;
 	parcel->n_mem_entries = 0;
+	goto free_pages;
 unaccount_pages:
 	account_locked_vm(current->mm, pinned, false);
 unpin_pages:
@@ -839,6 +848,10 @@ static int gunyah_reclaim_parcel(struct gunyah_vm *ghvm,
 {
 	struct gunyah_vm_binding *b;
 	int ret;
+
+	/* A failed APPEND rollback may retain a handle but no pin metadata. */
+	if (vm_parcel->quarantined)
+		return -ENOTRECOVERABLE;
 
 	down_write(&ghvm->bindings_lock);
 	b = mtree_load(&ghvm->bindings, vm_parcel->start);

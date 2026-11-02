@@ -315,7 +315,13 @@ int gunyah_rm_mem_share(struct gunyah_rm *rm, struct gunyah_rm_mem_parcel *p)
 			rm, p->mem_handle, &p->mem_entries[initial_mem_entries],
 			p->n_mem_entries - initial_mem_entries);
 		if (ret) {
-			gunyah_rm_mem_reclaim(rm, p);
+			int reclaim_ret = gunyah_rm_mem_reclaim(rm, p);
+
+			if (reclaim_ret) {
+				pr_err("gunyah: parcel %#x APPEND failed: %d, reclaim failed: %d\n",
+				       p->mem_handle, ret, reclaim_ret);
+				return -ENOTRECOVERABLE;
+			}
 			p->mem_handle = GUNYAH_MEM_HANDLE_INVAL;
 		}
 	}
