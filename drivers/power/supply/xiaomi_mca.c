@@ -12,8 +12,9 @@
  * Standard power_supply telemetry and ICL/FCC writes retain their units,
  * checked replies/readback and unknown-source refusal. The complete community
  * charging policy is opt-in: source-bounded 9 V/PPS, battery-temperature FCC,
- * MiPPS relay and SC8541 direct charging. Float voltage, termination, charging
- * enable and firmware JEITA are not written. All policy switches default off.
+ * MiPPS relay, SC8541 direct charging and temperature-bounded float voltage.
+ * Charging enable and firmware JEITA are not written. All policy switches
+ * default off.
  * USB-C port acknowledgments belong to the existing AltMode client.
  */
 
@@ -52,6 +53,7 @@
 #define MCA_PROP_CHGR_STATUS		0x2001
 #define MCA_PROP_CHARGING_ENABLED	0x2003
 #define MCA_PROP_CHARGE_CURRENT		0x2005
+#define MCA_PROP_TERM_VOLT		0x2007
 #define MCA_PROP_INPUT_CURRENT_LIMIT	0x2008
 #define MCA_PROP_AICL_ENABLED		0x2012
 #define MCA_PROP_INPUT_SUSPEND		0x2019
@@ -259,6 +261,22 @@ MODULE_PARM_DESC(charge_current,
 		 "Raise the battery charge current by charger type; needs charge_policy (default: off, about 500 mA)");
 
 /*
+ * full_charge: use the stock normal float voltage, lowered at 48 degC with
+ * 2 degC hysteresis. Missing battery telemetry selects the hot limit. The
+ * firmware still stops charging outside its own 0-55 degC JEITA window.
+ */
+#define MCA_TERM_DEFAULT_MV	4400
+#define MCA_TERM_FULL_MV	4480
+#define MCA_TERM_HOT_MV		4060
+#define MCA_TERM_HOT_DEGC	48
+#define MCA_TERM_COOL_DEGC	46
+
+static bool full_charge;
+module_param(full_charge, bool, 0644);
+MODULE_PARM_DESC(full_charge,
+		 "Use the stock full-charge voltage with thermal derating; needs charge_policy (default: off)");
+
+/*
  * hv_charge: a PD source with a fixed 9 V PDO is asked for 9 V, as the
  * stock buck strategy does, whatever the battery temperature (that is left
  * to the charge current).  A source without one whose PPS APDO covers 9 V
@@ -310,9 +328,10 @@ MODULE_PARM_DESC(mipps_auth,
  * time until current flows, then regulate the voltage every MCA_CP_POLL_MS
  * so the bus current stays at its target and the battery current (both
  * gauges) below the limit of xiaomi_mca_cp_ibat_limit().  The limits follow
- * stock's battery tables without FFC (the charger firmware floats at
- * 4350 mV), within a narrower window: direct charging only runs from
- * MCA_CP_VBAT_MIN_MV to MCA_CP_VBAT_MAX_MV and from MCA_CP_TBAT_MIN to
+ * stock's battery tables without FFC (the charger firmware defaults to
+ * 4400 mV: readback 5200 = 2 * mV - 3600), within a narrower window:
+ * direct charging only runs from MCA_CP_VBAT_MIN_MV to MCA_CP_VBAT_MAX_MV
+ * and from MCA_CP_TBAT_MIN to
  * MCA_CP_TBAT_EXIT degC, and the buck charger does the rest.  The bus
  * target is cp_ibus_max, at most MCA_CP_IBUS_MAX_MA (stock div_max_curr)
  * from a verified Xiaomi adapter and MCA_CP_THIRD_IBUS_MA (stock
@@ -598,6 +617,8 @@ struct xiaomi_mca {
 	bool otg_active;
 
 	struct delayed_work poll_work;
+	bool term_written;	/* restore even after a lost write acknowledgment */
+	bool term_hot;		/* float-voltage thermal hysteresis */
 	bool sleeping;		/* no transactions between prepare and complete */
 	bool online;
 	int vbus_uv;
@@ -972,6 +993,10 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	case MCA_PROP_INPUT_CURRENT_LIMIT:
 		return len == sizeof(u32) &&
 		       val >= MCA_ICL_MIN_MA && val <= MCA_ICL_HV_MAX_MA;
+	case MCA_PROP_TERM_VOLT:
+		return len == sizeof(u32) &&
+		       (val == MCA_TERM_HOT_MV || val == MCA_TERM_DEFAULT_MV ||
+			val == MCA_TERM_FULL_MV);
 	case MCA_PROP_CHARGE_CURRENT:
 		return len == sizeof(u32) &&
 		       val >= MCA_FCC_MIN_MA && val <= MCA_FCC_MAX_MA;
@@ -1015,6 +1040,24 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	if (len > sizeof(buf) || !xiaomi_mca_write_allowed(prop, data, len))
 		return -EPERM;
 	lockdep_assert_held(&mca->lock);
+	if (prop == MCA_PROP_TERM_VOLT) {
+		/* Unlike source current limits, this also restores while unplugged. */
+		scoped_guard(spinlock_irqsave, &mca->rx_lock)
+			generation = mca->service_generation;
+		mca->term_written = true;
+		memcpy(buf, data, len);
+		ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
+		if (ret)
+			return ret;
+		ret = xiaomi_mca_read(mca, prop, &readback);
+		if (ret)
+			return ret;
+		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+			if (generation != mca->service_generation || !mca->service_up)
+				return -ECONNRESET;
+		}
+		return readback == 2 * get_unaligned_le32(data) - 3600 ? 0 : -EIO;
+	}
 	if (prop == MCA_PROP_CC_TOGGLE) {
 		if (!mca->piano_otg)
 			return -EOPNOTSUPP;
@@ -1478,6 +1521,56 @@ static int xiaomi_mca_gauges(int *vbat_mv, int *ibat_ma, int *tcool, int *tbat)
 	}
 
 	return 0;
+}
+
+static int xiaomi_mca_restore_term_volt(struct xiaomi_mca *mca)
+{
+	int ret;
+
+	if (!mca->term_written)
+		return 0;
+
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, MCA_TERM_DEFAULT_MV);
+	if (!ret) {
+		mca->term_written = false;
+		mca->term_hot = false;
+	}
+	return ret;
+}
+
+static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
+{
+	int vbat, ibat, tcool, tbat;
+	u32 tpack, target, readback;
+	int ret;
+
+	lockdep_assert_held(&mca->lock);
+	if (mca->sleeping)
+		return -EHOSTDOWN;
+	if (!full_charge || !charge_policy)
+		return xiaomi_mca_restore_term_volt(mca);
+
+	ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
+	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat);
+	if (ret) {
+		mca->term_hot = true;
+	} else {
+		tbat = max_t(s32, tbat, tpack);
+		if (tbat >= MCA_TERM_HOT_DEGC)
+			mca->term_hot = true;
+		else if (tbat < MCA_TERM_COOL_DEGC)
+			mca->term_hot = false;
+	}
+	target = mca->term_hot ? MCA_TERM_HOT_MV : MCA_TERM_FULL_MV;
+
+	/* Read every poll: detach or an ADSP restart can discard the vote. */
+	ret = xiaomi_mca_read(mca, MCA_PROP_TERM_VOLT, &readback);
+	if (!ret && readback == 2 * target - 3600) {
+		mca->term_written = true;
+		return 0;
+	}
+
+	return xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, target);
 }
 
 static bool xiaomi_mca_cp_active(struct xiaomi_mca *mca)
@@ -2398,8 +2491,12 @@ static void xiaomi_mca_poll(struct work_struct *work)
 	struct xiaomi_mca_state now;
 	u32 generation, svid;
 	bool changed = false;
+	int ret;
 
 	scoped_guard(mutex, &mca->lock) {
+		ret = xiaomi_mca_full_charge_poll(mca);
+		if (ret)
+			dev_warn_ratelimited(mca->dev, "failed to set float voltage: %d\n", ret);
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
 			generation = mca->service_generation;
 		xiaomi_mca_sync_config(mca);
@@ -2893,6 +2990,7 @@ static const struct {
 	{ "chgr_status", MCA_PROP_CHGR_STATUS },
 	{ "charging_enabled", MCA_PROP_CHARGING_ENABLED },
 	{ "charge_current_ma", MCA_PROP_CHARGE_CURRENT },
+	{ "term_voltage_raw", MCA_PROP_TERM_VOLT },
 	{ "input_current_limit_ma", MCA_PROP_INPUT_CURRENT_LIMIT },
 	{ "aicl_enabled", MCA_PROP_AICL_ENABLED },
 	{ "aicl_status", MCA_PROP_AICL_STATUS },
@@ -3021,8 +3119,12 @@ static void xiaomi_mca_debugfs_remove(void *data)
 static void xiaomi_mca_unbind_restore(void *data)
 {
 	struct xiaomi_mca *mca = data;
+	int ret;
 
 	guard(mutex)(&mca->lock);
+	ret = xiaomi_mca_restore_term_volt(mca);
+	if (ret)
+		dev_warn(mca->dev, "failed to restore float voltage: %d\n", ret);
 	if (xiaomi_mca_cp_stop(mca, "unbind")) {
 		/* Unbind cannot fail; the stage driver retains its stop watcher. */
 		power_supply_put(mca->cp_psy);
@@ -3214,6 +3316,14 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 	return 0;
 }
 
+static void xiaomi_mca_shutdown(struct auxiliary_device *adev)
+{
+	struct xiaomi_mca *mca = auxiliary_get_drvdata(adev);
+
+	xiaomi_mca_stop_poll(mca);
+	xiaomi_mca_unbind_restore(mca);
+}
+
 static const struct auxiliary_device_id xiaomi_mca_id_table[] = {
 	{ .name = "pmic_glink.xiaomi-mca", },
 	{}
@@ -3223,6 +3333,7 @@ MODULE_DEVICE_TABLE(auxiliary, xiaomi_mca_id_table);
 static struct auxiliary_driver xiaomi_mca_driver = {
 	.name = "xiaomi_mca",
 	.probe = xiaomi_mca_probe,
+	.shutdown = xiaomi_mca_shutdown,
 	.id_table = xiaomi_mca_id_table,
 	.driver.pm = pm_sleep_ptr(&xiaomi_mca_pm_ops),
 };
