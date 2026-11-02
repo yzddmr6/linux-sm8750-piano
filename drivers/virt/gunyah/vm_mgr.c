@@ -178,9 +178,7 @@ static void gunyah_generic_vm_start_fail(struct gunyah_vm *ghvm)
 	 * need to rollback parcel_to_paged because RM is still
 	 * tracking the parcel
 	 */
-	gunyah_vm_mm_erase_range(ghvm,
-		ghvm->config_image.parcel.start,
-		ghvm->config_image.parcel.pages);
+	gunyah_vm_parcel_to_paged_abort(ghvm, &ghvm->config_image.parcel);
 }
 
 static struct gunyah_auth_vm_mgr_ops generic_vm_ops = {
