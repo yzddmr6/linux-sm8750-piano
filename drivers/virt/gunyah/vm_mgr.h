@@ -189,9 +189,12 @@ static bool folio_mmapped(struct folio *folio)
  *
  * Mainline arm64 does not export set_direct_map_{invalid,default}_noflush()
  * to modules, so this is a no-op when gunyah_rsc_mgr is built as a module.
- * Lent memory is still protected by the hypervisor's stage-2 unmap; only the
- * defence against accidental host-side accesses through the linear map is
- * lost.
+ * The imported gunyah_folio_lend_safe() currently has no callers, even in a
+ * built-in configuration. Exporting these helpers alone would enable the
+ * reclaim-side updates but would not invalidate mappings before lending.
+ * The lend paths need to establish the mapping and ownership rules before
+ * enabling direct-map protection; stage-2 protection alone does not make
+ * accidental host accesses safe.
  */
 static inline void gunyah_folio_set_direct_map(struct folio *folio, bool valid)
 {
