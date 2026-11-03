@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/supply/oplus,wls-charger-cps8601.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Oplus CPS8601 wireless pen charger
+
+maintainers:
+  - yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+
+description:
+  Inductive transmitter for the stylus, powered by the ADSP-controlled hboost
+  rail. The interrupt GPIO also serves as the firmware wake handshake line.
+
+properties:
+  compatible:
+    const: oplus,wls-charger-cps8601
+
+  reg:
+    maxItems: 1
+
+  int-gpios:
+    maxItems: 1
+    description: Interrupt and firmware wake handshake.
+
+  sleep-gpios:
+    maxItems: 1
+    description: MCU sleep control.
+
+  scan-gpios:
+    maxItems: 1
+    description: Receiver scan control.
+
+  off-state-gpios:
+    maxItems: 1
+    description: Charge inhibit control.
+
+  sw-en-gpios:
+    maxItems: 1
+    description: MCU supply switch enable.
+
+  oplus,ocp-threshold:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Transmitter overcurrent threshold in the firmware register units.
+    minimum: 1
+    maximum: 3000
+
+  oplus,ovp-threshold:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Transmitter overvoltage threshold in the firmware register units.
+    minimum: 3000
+    maximum: 20000
+
+  oplus,lvp-threshold:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Transmitter undervoltage threshold in the firmware register units.
+    minimum: 1
+    maximum: 5000
+
+  oplus,fod-threshold:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Foreign object detection threshold in the firmware register units.
+    minimum: 1
+    maximum: 65535
+
+required:
+  - compatible
+  - reg
+  - int-gpios
+  - sleep-gpios
+  - scan-gpios
+  - off-state-gpios
+  - sw-en-gpios
+  - oplus,ocp-threshold
+  - oplus,ovp-threshold
+  - oplus,lvp-threshold
+  - oplus,fod-threshold
+
+additionalProperties: false

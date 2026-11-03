@@ -36,6 +36,7 @@
 #include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/pm.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/random.h>
@@ -60,6 +61,12 @@
  * (sc->vooc_saw_any) — so a non-VOOC charger still declines on the FIRST
  * window exactly as before (D+/D- restored promptly).
  */
+static bool serial_enable;
+module_param(serial_enable, bool, 0444);
+MODULE_PARM_DESC(serial_enable, "Enable experimental serial VOOC/SVOOC (default off)");
+
+static DEFINE_MUTEX(sc8547_pps_lock);
+
 static unsigned int identify_ms = 4000;
 module_param(identify_ms, uint, 0644);
 MODULE_PARM_DESC(identify_ms,
@@ -100,7 +107,7 @@ MODULE_PARM_DESC(adsp_vooc_real_type,
  * Two erhai populations exist and BOTH must fast-charge:
  *   - pack-gauge SKUs carry a TI bq27z561 on AP I2C -> psy "bq27z561-0";
  *   - the QBG population runs the gauge inside the ADSP -> psy
- *     "erhai-adsp-bat" (registered by erhai_otg_glink.c; on a board whose
+ *     "qcom-battmgr-bat" (registered by erhai_otg_glink.c; on a board whose
  *     bq27z561 ACKs but never reports status the OTG driver detaches the dead
  *     pack gauge, so only the ADSP psy remains).
  * The list is tried in order and the first gauge that ANSWERS is used, so a
@@ -115,7 +122,7 @@ MODULE_PARM_DESC(gauge_name,
 
 static const char * const sc8547_gauge_names[] = {
 	"bq27z561-0",		/* pack-gauge SKUs: TI bq27z561 (AP I2C) */
-	"erhai-adsp-bat",	/* QBG SKUs: gauge lives in the ADSP */
+	"qcom-battmgr-bat",	/* QBG SKUs: gauge lives in the ADSP */
 };
 
 #include "erhai_otg_glink.h"
@@ -306,7 +313,7 @@ static const char * const sc8547_gauge_names[] = {
  * 4.49 V on the CP vs 4.20 V on the gauge, while at rest both read 3920 mV).
  * Judging the CC/CV curve (and the CV end) on that loaded reading aborted every
  * SVOOC session 15-30 s in, at ~50% SoC.  The battery gauge reports the CELL
- * voltage — "bq27z561-0" on the pack-gauge SKUs, "erhai-adsp-bat" on the QBG
+ * voltage — "bq27z561-0" on the pack-gauge SKUs, "qcom-battmgr-bat" on the QBG
  * population (see sc8547_gauge_names[]) — so it is the reference for the curve
  * steps, the start gate and the CV ceiling; the CP reading is kept only as an
  * over-voltage guard, set well above any legitimate loaded reading (the highest
@@ -529,6 +536,7 @@ static struct sc8547a_device *sc8547_master_dev;
  */
 bool sc8547a_fastchg_delivering(void)
 {
+	guard(mutex)(&sc8547_pps_lock);
 	struct sc8547a_device *sc = sc8547_master_dev;
 
 	return sc && sc->fastchg_deliver;
@@ -545,6 +553,7 @@ EXPORT_SYMBOL_GPL(sc8547a_fastchg_delivering);
  */
 bool sc8547a_fastchg_identifying(void)
 {
+	guard(mutex)(&sc8547_pps_lock);
 	struct sc8547a_device *sc = sc8547_master_dev;
 
 	return sc && (sc->auto_state == SC_AUTO_IDENTIFY ||
@@ -722,25 +731,49 @@ static void sc8547_send_handshake(struct sc8547a_device *sc)
 /* Base hardware config, applied at probe and on reset. */
 static int sc8547_init_device(struct sc8547a_device *sc)
 {
-	sc8547_write_byte(sc, SC8547_REG_11, 0x00);	/* ADC disable */
-	sc8547_write_byte(sc, SC8547_REG_02, 0x01);	/* VAC_OVP 12V */
-	sc8547_write_byte(sc, SC8547_REG_04, 0x50);	/* VBUS_OVP 10V */
-	sc8547_write_byte(sc, SC8547_REG_00, 0x20 | (sc->ovp_reg & 0x1f)); /* VBAT_OVP */
-	sc8547_write_byte(sc, SC8547_REG_05, 0x10 | (sc->ocp_reg & 0x0f)); /* IBUS_OCP/UCP */
-	sc8547_write_byte(sc, SC8547_REG_01, 0xbf);	/* BAT_OCP */
-	sc8547_write_byte(sc, SC8547_REG_2B, 0x00);	/* VOOC disable */
-	sc8547_write_byte(sc, SC8547_REG_3A, 0x60);
-	sc8547_update_bits(sc, SC8547_REG_09, BIT(4), BIT(4)); /* IBUS_UCP_RISE mask */
-	sc8547_write_byte(sc, SC8547_REG_10, 0x02);	/* mask insert irq */
-	sc8547_write_byte(sc, SC8547A_REG_OTG_EN, 0x04);
-	return 0;
+	int ret, err = 0;
+	ret = sc8547_write_byte(sc, SC8547_REG_11, 0x00);
+	if (ret && !err)
+		err = ret;	/* ADC disable */
+	ret = sc8547_write_byte(sc, SC8547_REG_02, 0x01);
+	if (ret && !err)
+		err = ret;	/* VAC_OVP 12V */
+	ret = sc8547_write_byte(sc, SC8547_REG_04, 0x50);
+	if (ret && !err)
+		err = ret;	/* VBUS_OVP 10V */
+	ret = sc8547_write_byte(sc, SC8547_REG_00, 0x20 | (sc->ovp_reg & 0x1f));
+	if (ret && !err)
+		err = ret; /* VBAT_OVP */
+	ret = sc8547_write_byte(sc, SC8547_REG_05, 0x10 | (sc->ocp_reg & 0x0f));
+	if (ret && !err)
+		err = ret; /* IBUS_OCP/UCP */
+	ret = sc8547_write_byte(sc, SC8547_REG_01, 0xbf);
+	if (ret && !err)
+		err = ret;	/* BAT_OCP */
+	ret = sc8547_write_byte(sc, SC8547_REG_2B, 0x00);
+	if (ret && !err)
+		err = ret;	/* VOOC disable */
+	ret = sc8547_write_byte(sc, SC8547_REG_3A, 0x60);
+	if (ret && !err)
+		err = ret;
+	ret = sc8547_update_bits(sc, SC8547_REG_09, BIT(4), BIT(4));
+	if (ret && !err)
+		err = ret; /* IBUS_UCP_RISE mask */
+	ret = sc8547_write_byte(sc, SC8547_REG_10, 0x02);
+	if (ret && !err)
+		err = ret;	/* mask insert irq */
+	ret = sc8547_write_byte(sc, SC8547A_REG_OTG_EN, 0x04);
+	if (ret && !err)
+		err = ret;
+	return err;
 }
 
 /* Full reset used at probe (reg_reset + base config). */
 static int sc8547_hardware_init(struct sc8547a_device *sc)
 {
-	sc8547_reg_reset(sc);
-	return sc8547_init_device(sc);
+	int ret = sc8547_reg_reset(sc);
+
+	return ret ?: sc8547_init_device(sc);
 }
 
 /*
@@ -771,17 +804,32 @@ static int sc8547_init_vooc(struct sc8547a_device *sc)
 /* SVOOC constant-current hardware profile (vendor sc8547_svooc_hw_setting). */
 static int sc8547_svooc_hw_setting(struct sc8547a_device *sc)
 {
-	sc8547_write_byte(sc, SC8547_REG_02, 0x01);	/* VAC_OVP 12V */
-	sc8547_write_byte(sc, SC8547_REG_04, 0x50);	/* VBUS_OVP 10V */
-	sc8547_write_byte(sc, SC8547_REG_05, 0x10 | (sc->ocp_reg & 0x0f));
+	int ret, err = 0;
+	ret = sc8547_write_byte(sc, SC8547_REG_02, 0x01);
+	if (ret && !err)
+		err = ret;	/* VAC_OVP 12V */
+	ret = sc8547_write_byte(sc, SC8547_REG_04, 0x50);
+	if (ret && !err)
+		err = ret;	/* VBUS_OVP 10V */
+	ret = sc8547_write_byte(sc, SC8547_REG_05, 0x10 | (sc->ocp_reg & 0x0f));
+	if (ret && !err)
+		err = ret;
 	/* watchdog (REG_09) deliberately NOT enabled here: this profile is applied
 	 * at arm-time, before the VOOC servo, so enabling the 1000ms watchdog now
 	 * (with the CP not yet feeding it) would expire mid-servo. The watchdog is
 	 * enabled together with the CP at is_vbus-ok NORMAL, then fed by the poller. */
-	sc8547_write_byte(sc, SC8547_REG_11, 0x80);	/* ADC enable */
-	sc8547_write_byte(sc, SC8547_REG_0D, 0x70);
-	sc8547_write_byte(sc, SC8547_REG_33, 0xd1);	/* loose_det */
-	sc8547_write_byte(sc, SC8547_REG_3A, 0x60);
+	ret = sc8547_write_byte(sc, SC8547_REG_11, 0x80);
+	if (ret && !err)
+		err = ret;	/* ADC enable */
+	ret = sc8547_write_byte(sc, SC8547_REG_0D, 0x70);
+	if (ret && !err)
+		err = ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_33, 0xd1);
+	if (ret && !err)
+		err = ret;	/* loose_det */
+	ret = sc8547_write_byte(sc, SC8547_REG_3A, 0x60);
+	if (ret && !err)
+		err = ret;
 	/*
 	 * Disable IBUS under-current protection + soft-start timeout for the SVOOC
 	 * phase (vendor set_sstimeout_ucp_enable(false)). At CP-enable the current
@@ -790,33 +838,68 @@ static int sc8547_svooc_hw_setting(struct sc8547a_device *sc)
 	 * REG_07 self-clears, the adapter sees no load and aborts comm. OCP/OVP and
 	 * the software vbat/ibus backstop still bound the delivery.
 	 */
-	sc8547_update_bits(sc, SC8547_REG_05, SC8547_IBUS_UCP_DIS_MASK,
-			   SC8547_IBUS_UCP_DIS_MASK);		/* UCP disable */
-	sc8547_update_bits(sc, SC8547_REG_08, SC8547_SS_TIMEOUT_SET_MASK,
-			   SC8547_SS_TIMEOUT_DISABLE);		/* SS timeout disable */
-	return 0;
+	ret = sc8547_update_bits(sc, SC8547_REG_05, SC8547_IBUS_UCP_DIS_MASK,
+			   SC8547_IBUS_UCP_DIS_MASK);
+	if (ret && !err)
+		err = ret;		/* UCP disable */
+	ret = sc8547_update_bits(sc, SC8547_REG_08, SC8547_SS_TIMEOUT_SET_MASK,
+			   SC8547_SS_TIMEOUT_DISABLE);
+	if (ret && !err)
+		err = ret;		/* SS timeout disable */
+	return err;
 }
 
 /* Tear down the VOOC PHY on unplug / fastchg exit. */
 static int sc8547_reset_voocphy(struct sc8547a_device *sc)
 {
-	sc8547_write_byte(sc, SC8547_REG_07, 0x00);	/* CP off */
-	sc8547_update_bits(sc, SC8547_REG_09, SC8547_WATCHDOG_MASK,
+	int ret, err = 0;
+	ret = sc8547_write_byte(sc, SC8547_REG_07, 0x00);
+	if (ret && !err)
+		err = ret;	/* CP off */
+	ret = sc8547_update_bits(sc, SC8547_REG_09, SC8547_WATCHDOG_MASK,
 			   SC8547_WATCHDOG_DIS);
-	sc8547_write_byte(sc, SC8547_REG_00, 0x20 | (sc->ovp_reg & 0x1f));
-	sc8547_write_byte(sc, SC8547_REG_02, 0x01);
-	sc8547_write_byte(sc, SC8547_REG_04, 0x50);
-	sc8547_write_byte(sc, SC8547_REG_05, 0x10 | (sc->ocp_reg & 0x0f));
-	sc8547_write_byte(sc, SC8547_REG_11, 0x00);	/* ADC off */
-	sc8547_write_byte(sc, SC8547_REG_2C, 0x00);	/* clear tx */
-	sc8547_write_byte(sc, SC8547_REG_2D, 0x00);
-	sc8547_write_byte(sc, SC8547_REG_30, 0x7f);	/* mask vooc irq */
-	sc8547_write_byte(sc, SC8547_REG_21, 0xc0);	/* D+ HiZ */
-	sc8547_write_byte(sc, SC8547_REG_2B, 0x00);	/* VOOC disable */
-	sc8547_write_word(sc, SC8547_REG_31, 0x0);	/* predata */
-	sc8547_write_byte(sc, SC8547_REG_10, 0x02);	/* mask insert irq */
-	sc8547_write_byte(sc, SC8547A_REG_OTG_EN, 0x04);
-	return 0;
+	if (ret && !err)
+		err = ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_00, 0x20 | (sc->ovp_reg & 0x1f));
+	if (ret && !err)
+		err = ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_02, 0x01);
+	if (ret && !err)
+		err = ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_04, 0x50);
+	if (ret && !err)
+		err = ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_05, 0x10 | (sc->ocp_reg & 0x0f));
+	if (ret && !err)
+		err = ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_11, 0x00);
+	if (ret && !err)
+		err = ret;	/* ADC off */
+	ret = sc8547_write_byte(sc, SC8547_REG_2C, 0x00);
+	if (ret && !err)
+		err = ret;	/* clear tx */
+	ret = sc8547_write_byte(sc, SC8547_REG_2D, 0x00);
+	if (ret && !err)
+		err = ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_30, 0x7f);
+	if (ret && !err)
+		err = ret;	/* mask vooc irq */
+	ret = sc8547_write_byte(sc, SC8547_REG_21, 0xc0);
+	if (ret && !err)
+		err = ret;	/* D+ HiZ */
+	ret = sc8547_write_byte(sc, SC8547_REG_2B, 0x00);
+	if (ret && !err)
+		err = ret;	/* VOOC disable */
+	ret = sc8547_write_word(sc, SC8547_REG_31, 0x0);
+	if (ret && !err)
+		err = ret;	/* predata */
+	ret = sc8547_write_byte(sc, SC8547_REG_10, 0x02);
+	if (ret && !err)
+		err = ret;	/* mask insert irq */
+	ret = sc8547_write_byte(sc, SC8547A_REG_OTG_EN, 0x04);
+	if (ret && !err)
+		err = ret;
+	return err;
 }
 
 /* ------------------ PPS host-engine CP API (erhai_pps) ------------------ *
@@ -837,11 +920,12 @@ static bool pps_cp_engaged;
 static bool pps_adc_hold;	/* keep the ADC on across drops (PPS session) */
 static bool sc8547_slave_is_on(void);	/* defined in the slave section below */
 
-void sc8547a_pps_cp_disengage(void);	/* defined below, called by feed()'s drop path */
+static int sc8547_pps_disengage(void);
 
 /* Snapshot the chip's own VBUS/VBAT/IBUS ADCs (V is upstream of the CP). */
 int sc8547a_pps_snapshot(int *vbus_mv, int *vbat_mv, int *ibus_ma)
 {
+	guard(mutex)(&sc8547_pps_lock);
 	struct sc8547a_device *sc = sc8547_master_dev;
 	int vbus, vbat, ibus;
 
@@ -872,6 +956,7 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_snapshot);
  */
 int sc8547a_pps_regs(u8 *r06, u8 *r07)
 {
+	guard(mutex)(&sc8547_pps_lock);
 	struct sc8547a_device *sc = sc8547_master_dev;
 	int ret;
 
@@ -886,7 +971,7 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_regs);
 
 bool sc8547a_pps_cp_engaged(void)
 {
-	return pps_cp_engaged;
+	return READ_ONCE(pps_cp_engaged);
 }
 EXPORT_SYMBOL_GPL(sc8547a_pps_cp_engaged);
 
@@ -900,12 +985,13 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_cp_engaged);
  */
 int sc8547a_pps_cp_engage(int *need_mv)
 {
+	guard(mutex)(&sc8547_pps_lock);
 	struct sc8547a_device *sc = sc8547_master_dev;
-	int vbus, vbat, diff, target;
+	int vbus, vbat, diff, target, ret;
 
 	if (!sc)
 		return -ENODEV;
-	if (sc8547a_fastchg_delivering() || sc8547_slave_is_on())
+	if (sc->fastchg_deliver || sc8547_slave_is_on())
 		return -EBUSY;	/* serial VOOC / slave owns the CP */
 	if (pps_cp_engaged)
 		return 0;
@@ -922,9 +1008,15 @@ int sc8547a_pps_cp_engage(int *need_mv)
 	    diff > SC8547_CP_RESTART_MARGIN_CEIL_MV)
 		return -EAGAIN;
 
-	sc8547_svooc_hw_setting(sc);
-	sc8547_write_byte(sc, SC8547_REG_09, 0x13);	/* watchdog 1000 ms */
-	sc8547_set_chg_enable(sc, true);
+	ret = sc8547_svooc_hw_setting(sc);
+	if (!ret)
+		ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+	if (!ret)
+		ret = sc8547_set_chg_enable(sc, true);
+	if (ret) {
+		sc8547_pps_disengage();
+		return ret;
+	}
 	pps_cp_engaged = true;
 	dev_info(sc->dev,
 		 "PPS CP: master engaged 2:1 (vbus %d mV vbat %d mV diff %d mV)\n",
@@ -941,6 +1033,7 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_cp_engage);
  */
 int sc8547a_pps_cp_feed(int *vbus_mv, int *vbat_mv)
 {
+	guard(mutex)(&sc8547_pps_lock);
 	struct sc8547a_device *sc = sc8547_master_dev;
 	int vbus, vbat, diff;
 
@@ -958,31 +1051,38 @@ int sc8547a_pps_cp_feed(int *vbus_mv, int *vbat_mv)
 	if (diff < SC8547_CP_RESTART_MARGIN_MV ||
 	    diff > SC8547_CP_RESTART_MARGIN_CEIL_MV)
 		goto drop;
-	sc8547_write_byte(sc, SC8547_REG_09, 0x13);
-	sc8547_set_chg_enable(sc, true);
+	if (sc8547_write_byte(sc, SC8547_REG_09, 0x13) ||
+	    sc8547_set_chg_enable(sc, true))
+		goto drop;
 	return 0;
 drop:
-	sc8547a_pps_cp_disengage();
+	sc8547_pps_disengage();
 	return -EAGAIN;
 }
 EXPORT_SYMBOL_GPL(sc8547a_pps_cp_feed);
 
-void sc8547a_pps_cp_disengage(void)
+static int sc8547_pps_disengage(void)
 {
 	struct sc8547a_device *sc = sc8547_master_dev;
+	int ret;
 
+	if (!sc) {
+		pps_cp_engaged = false;
+		return 0;
+	}
+	ret = sc8547_reset_voocphy(sc);
+	if (ret)
+		return ret;
 	pps_cp_engaged = false;
-	if (!sc)
-		return;
-	/* full teardown mirrors the VOOC exit path (reset_voocphy): CP off,
-	 * watchdog off, OCP/OVP and ADC back to base defaults. */
-	sc8547_reset_voocphy(sc);
-	/* ...except the ADC while the PPS session is still up: engage() and the
-	 * engine steer on these ADCs, and with the ADC off they read the last
-	 * conversion forever (lab Experiment 4: 855 identical samples). */
 	if (pps_adc_hold)
-		sc8547_set_adc_enable(sc, true);
-	dev_info(sc->dev, "PPS CP: master disengaged - buck path restored\n");
+		return sc8547_set_adc_enable(sc, true);
+	return 0;
+}
+
+int sc8547a_pps_cp_disengage(void)
+{
+	guard(mutex)(&sc8547_pps_lock);
+	return sc8547_pps_disengage();
 }
 EXPORT_SYMBOL_GPL(sc8547a_pps_cp_disengage);
 
@@ -990,13 +1090,15 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_cp_disengage);
  * Hold the master ADC on for a whole PPS session (vendor oplus_chg_pps keeps
  * the CP ADC on from switch-check to exit).  Off again when released.
  */
-void sc8547a_pps_adc_hold(bool on)
+int sc8547a_pps_adc_hold(bool on)
 {
+	guard(mutex)(&sc8547_pps_lock);
 	struct sc8547a_device *sc = sc8547_master_dev;
 
 	pps_adc_hold = on;
 	if (sc && !pps_cp_engaged)
-		sc8547_set_adc_enable(sc, on);
+		return sc8547_set_adc_enable(sc, on);
+	return sc || !on ? 0 : -ENODEV;
 }
 EXPORT_SYMBOL_GPL(sc8547a_pps_adc_hold);
 
@@ -1724,7 +1826,7 @@ out:
  * WHICH gauge: every candidate in sc8547_gauge_names is tried in order and the
  * first one that answers is used (gauge_name, when set, is tried first) —
  * pack-gauge SKUs answer on "bq27z561-0", the QBG population on
- * "erhai-adsp-bat".  Returns the last error (e.g. -ENODEV when no gauge is up
+ * "qcom-battmgr-bat".  Returns the last error (e.g. -ENODEV when no gauge is up
  * yet), which the caller reports as "gauge not ready".
  */
 static int sc8547_read_gauge(struct sc8547a_device *sc, int *soc, int *temp_ddc,
@@ -2859,6 +2961,8 @@ static void sc8547_create_debugfs(struct sc8547a_device *sc)
 	debugfs_create_file("registers", 0444, sc->debug_root, sc,
 			    &sc8547_dump_fops);
 	debugfs_create_file("adc", 0444, sc->debug_root, sc, &sc8547_adc_fops);
+	if (!serial_enable)
+		return;
 	debugfs_create_file("cp_enable", 0644, sc->debug_root, sc,
 			    &sc8547_enable_fops);
 	debugfs_create_file("init_vooc", 0200, sc->debug_root, sc,
@@ -2893,6 +2997,7 @@ static int sc8547a_probe(struct i2c_client *client)
 {
 	struct sc8547a_device *sc;
 	int ret;
+	u32 threshold;
 
 	if (!i2c_check_functionality(client->adapter,
 				     I2C_FUNC_SMBUS_READ_WORD_DATA |
@@ -2908,13 +3013,32 @@ static int sc8547a_probe(struct i2c_client *client)
 	sc->client = client;
 	sc->dev = &client->dev;
 	sc->irq = client->irq;
-	sc->is_slave = device_property_read_bool(sc->dev, "oplus,slave");
+	sc->is_slave = device_property_read_bool(sc->dev, "southchip,secondary") ||
+		       device_property_read_bool(sc->dev, "oplus,slave");
 	sc->fastchg_curr_code = SC8547_CURR_CODE_MIN;
 	sc->max_soc = SC8547_MAX_SOC_DEFAULT;
 	sc->ovp_reg = SC8547_DEFAULT_OVP_REG;
 	sc->ocp_reg = SC8547_DEFAULT_OCP_REG;
 	device_property_read_u8(sc->dev, "sc,vbat-ovp-reg", &sc->ovp_reg);
 	device_property_read_u8(sc->dev, "sc,ibus-ocp-reg", &sc->ocp_reg);
+	if (!device_property_read_u32(sc->dev, "southchip,battery-overvoltage-microvolt",
+				      &threshold)) {
+		if (threshold < 3500000 || threshold > 5075000 || threshold % 25000)
+			return -EINVAL;
+		sc->ovp_reg = (threshold - 3500000) / 25000;
+	}
+	if (!device_property_read_u32(sc->dev, "southchip,input-overcurrent-microamp",
+				      &threshold)) {
+		if (threshold < 1200000 || threshold > 5700000 || threshold % 300000)
+			return -EINVAL;
+		sc->ocp_reg = (threshold - 1200000) / 300000;
+	}
+	if (!device_property_read_u32(sc->dev, "southchip,ac-overvoltage-microvolt",
+				      &threshold) && threshold != 12000000)
+		return -EINVAL;
+	if (!device_property_read_u32(sc->dev, "southchip,input-overvoltage-microvolt",
+				      &threshold) && threshold != 10000000)
+		return -EINVAL;
 	mutex_init(&sc->i2c_lock);
 	INIT_DELAYED_WORK(&sc->attach_work, sc8547_attach_work);
 	i2c_set_clientdata(client, sc);
@@ -2939,10 +3063,12 @@ static int sc8547a_probe(struct i2c_client *client)
 
 	sc8547_create_debugfs(sc);
 
+	mutex_lock(&sc8547_pps_lock);
 	if (sc->is_slave)
 		sc8547_slave_dev = sc;	/* master delivery path drives it */
 	else
 		sc8547_master_dev = sc;
+	mutex_unlock(&sc8547_pps_lock);
 
 	/*
 	 * Hands-free: start the master's attach poller now so a SuperVOOC adapter
@@ -2952,7 +3078,7 @@ static int sc8547a_probe(struct i2c_client *client)
 	 * and is bounded by the max_soc / vbat-CV / ibus / thermal backstops. A
 	 * not-yet-ready DPDM crossbar (-ENODEV) is non-fatal and simply retried.
 	 */
-	if (!sc->is_slave)
+	if (!sc->is_slave && serial_enable)
 		sc8547_vooc_start(sc);
 
 	dev_info(sc->dev, "SC8547A %s charge pump probed (addr 0x%02x)\n",
@@ -2967,19 +3093,45 @@ static void sc8547a_remove(struct i2c_client *client)
 	sc->vooc_started = false;
 	cancel_delayed_work_sync(&sc->attach_work);
 	debugfs_remove_recursive(sc->debug_root);
+	guard(mutex)(&sc8547_pps_lock);
 	sc8547_reset_voocphy(sc);
-	if (sc->is_slave && sc8547_slave_dev == sc)
+	if (sc->is_slave)
 		sc8547_slave_dev = NULL;
-	if (!sc->is_slave && sc8547_master_dev == sc)
+	else {
 		sc8547_master_dev = NULL;
+		pps_cp_engaged = false;
+		pps_adc_hold = false;
+	}
 }
+
+static int sc8547a_suspend(struct device *dev)
+{
+	struct sc8547a_device *sc = dev_get_drvdata(dev);
+
+	sc->vooc_started = false;
+	cancel_delayed_work_sync(&sc->attach_work);
+	guard(mutex)(&sc8547_pps_lock);
+	if (!sc->is_slave) {
+		pps_adc_hold = false;
+		pps_cp_engaged = false;
+	}
+	return sc8547_reset_voocphy(sc);
+}
+
+static int sc8547a_resume(struct device *dev)
+{
+	struct sc8547a_device *sc = dev_get_drvdata(dev);
+
+	if (!sc->is_slave && serial_enable)
+		sc8547_vooc_start(sc);
+	return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(sc8547a_pm_ops, sc8547a_suspend, sc8547a_resume);
 
 static void sc8547a_shutdown(struct i2c_client *client)
 {
-	struct sc8547a_device *sc = i2c_get_clientdata(client);
-
-	sc8547_write_byte(sc, SC8547_REG_11, 0x00);	/* ADC off */
-	sc8547_write_byte(sc, SC8547_REG_21, 0x00);	/* DPDM off */
+	sc8547a_suspend(&client->dev);
 }
 
 static const struct of_device_id sc8547a_of_match[] = {
@@ -2999,6 +3151,7 @@ static struct i2c_driver sc8547a_driver = {
 	.driver = {
 		.name = "sc8547a",
 		.of_match_table = sc8547a_of_match,
+		.pm = pm_sleep_ptr(&sc8547a_pm_ops),
 	},
 	.probe = sc8547a_probe,
 	.remove = sc8547a_remove,

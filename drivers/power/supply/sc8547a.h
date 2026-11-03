@@ -43,10 +43,10 @@ int sc8547a_pps_snapshot(int *vbus_mv, int *vbat_mv, int *ibus_ma);
 bool sc8547a_pps_cp_engaged(void);
 int sc8547a_pps_cp_engage(int *need_mv);
 int sc8547a_pps_cp_feed(int *vbus_mv, int *vbat_mv);
-void sc8547a_pps_cp_disengage(void);
+int sc8547a_pps_cp_disengage(void);
 
 /* Keep the master ADC on for a whole PPS session (on) / release it (off). */
-void sc8547a_pps_adc_hold(bool on);
+int sc8547a_pps_adc_hold(bool on);
 
 /* Raw master REG_06 / REG_07 for the erhai_pps trace (read-only). */
 int sc8547a_pps_regs(u8 *r06, u8 *r07);

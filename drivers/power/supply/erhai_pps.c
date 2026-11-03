@@ -51,14 +51,12 @@
  * touch the OTG/SC8547 drivers.
  */
 
-#include <linux/debugfs.h>
+#include <linux/platform_device.h>
 #include <linux/delay.h>
-#include <linux/fs.h>			/* simple_write_to_buffer() */
 
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/power_supply.h>
-#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
@@ -78,45 +76,20 @@ struct erhai_pps_sc_api {
 	bool	(*cp_engaged)(void);
 	int	(*cp_engage)(int *need_mv);
 	int	(*cp_feed)(int *vbus_mv, int *vbat_mv);
-	void	(*cp_disengage)(void);
+	int	(*cp_disengage)(void);
 };
 
 static const struct erhai_pps_sc_api *pps_sc_cp_get(void)
 {
-	static struct erhai_pps_sc_api api;
-	static bool resolved;
+	static const struct erhai_pps_sc_api api = {
+		.snapshot = sc8547a_pps_snapshot,
+		.cp_engaged = sc8547a_pps_cp_engaged,
+		.cp_engage = sc8547a_pps_cp_engage,
+		.cp_feed = sc8547a_pps_cp_feed,
+		.cp_disengage = sc8547a_pps_cp_disengage,
+	};
 
-	/* Latch only on success: the charge-pump module may still be loading
-	 * when this engine first looks for it, and a permanent NULL here
-	 * would silently degrade every later session to buck charging.
-	 * Only symbols that actually resolved may be put back — symbol_put()
-	 * on a name that is absent from the kernel BUG_ON()s in
-	 * __symbol_put() (kernel/module/main.c), and "module not loaded yet"
-	 * is exactly the case this retry exists for. */
-	if (!resolved) {
-		api.snapshot = (void *)symbol_get(sc8547a_pps_snapshot);
-		api.cp_engaged = (void *)symbol_get(sc8547a_pps_cp_engaged);
-		api.cp_engage = (void *)symbol_get(sc8547a_pps_cp_engage);
-		api.cp_feed = (void *)symbol_get(sc8547a_pps_cp_feed);
-		api.cp_disengage = (void *)symbol_get(sc8547a_pps_cp_disengage);
-		if (!api.snapshot || !api.cp_engaged || !api.cp_engage ||
-		    !api.cp_feed || !api.cp_disengage) {
-			if (api.snapshot)
-				symbol_put(sc8547a_pps_snapshot);
-			if (api.cp_engaged)
-				symbol_put(sc8547a_pps_cp_engaged);
-			if (api.cp_engage)
-				symbol_put(sc8547a_pps_cp_engage);
-			if (api.cp_feed)
-				symbol_put(sc8547a_pps_cp_feed);
-			if (api.cp_disengage)
-				symbol_put(sc8547a_pps_cp_disengage);
-			memset(&api, 0, sizeof(api));
-			return NULL;
-		}
-		resolved = true;
-	}
-	return resolved ? &api : NULL;
+	return &api;
 }
 
 /* returns true while the CP is engaged AND the API is reachable */
@@ -127,12 +100,9 @@ static bool pps_cp_is_engaged(void)
 	return a && a->cp_engaged();
 }
 
-static void pps_cp_drop(void)
+static int pps_cp_drop(void)
 {
-	const struct erhai_pps_sc_api *a = pps_sc_cp_get();
-
-	if (a && a->cp_engaged())
-		a->cp_disengage();
+	return sc8547a_pps_cp_disengage();
 }
 
 /* ---- ADSP v2 property ids (oplus_hal_adsp.h), our subset ---- */
@@ -178,196 +148,196 @@ module_param(pps_enable, bool, 0644);
 MODULE_PARM_DESC(pps_enable, "master kill switch for the PPS fast-charge engine");
 
 static unsigned int pps_poll_ms = 2000;
-module_param(pps_poll_ms, uint, 0644);
+module_param(pps_poll_ms, uint, 0444);
 MODULE_PARM_DESC(pps_poll_ms, "engine poll period (ms)");
 
 static unsigned int pps_identify_ms = 10000;
 static unsigned int pps_reprobe_ms = 15000;
-module_param(pps_reprobe_ms, uint, 0644);
+module_param(pps_reprobe_ms, uint, 0444);
 MODULE_PARM_DESC(pps_reprobe_ms, "re-probe interval while the adapter reads as undeployable (ADSP slow start)");
-module_param(pps_identify_ms, uint, 0644);
+module_param(pps_identify_ms, uint, 0444);
 MODULE_PARM_DESC(pps_identify_ms,
 		 "wait for the serial-VOOC ladder to decline before PPS engages (ms)");
 
 static unsigned int pps_start_volt_mv = 5500;
-module_param(pps_start_volt_mv, uint, 0644);
+module_param(pps_start_volt_mv, uint, 0444);
 MODULE_PARM_DESC(pps_start_volt_mv,
 		 "legacy PPS entry VBUS (mV) - entry now writes the TARGET directly (validated "
 		 "2026-09-24: the ADSP latches the PPS APDO range to the first 34 write, so a "
 		 "5.5 V seed + step-ramp caps VBUS at ~6.6 V); kept as the ramp liveness floor");
 
 static unsigned int pps_target_volt_mv = 8400;
-module_param(pps_target_volt_mv, uint, 0644);
+module_param(pps_target_volt_mv, uint, 0444);
 MODULE_PARM_DESC(pps_target_volt_mv,
 		 "PPS target VBUS (mV) - Android measures 8.4-8.6 V with the 100 W Anker");
 
 static unsigned int pps_max_volt_mv = 8900;
-module_param(pps_max_volt_mv, uint, 0644);
+module_param(pps_max_volt_mv, uint, 0444);
 MODULE_PARM_DESC(pps_max_volt_mv, "hard PPS VBUS ceiling (mV)");
 
 static unsigned int pps_volt_step_mv = 400;
-module_param(pps_volt_step_mv, uint, 0644);
+module_param(pps_volt_step_mv, uint, 0444);
 MODULE_PARM_DESC(pps_volt_step_mv, "VBUS ramp step (mV) per poll");
 
 static unsigned int pps_start_curr_ma = 1000;
-module_param(pps_start_curr_ma, uint, 0644);
+module_param(pps_start_curr_ma, uint, 0444);
 MODULE_PARM_DESC(pps_start_curr_ma, "PPS entry current (mA)");
 
 static unsigned int pps_target_curr_ma = 4000;
-module_param(pps_target_curr_ma, uint, 0644);
+module_param(pps_target_curr_ma, uint, 0444);
 MODULE_PARM_DESC(pps_target_curr_ma,
 		 "PPS input current target (mA), capped per plug by the adapter's own PPS max "
 		 "current - lab-validated 4000 through the pump (~39 W, 32-34 C)");
 
 static unsigned int pps_max_curr_ma = 4000;
-module_param(pps_max_curr_ma, uint, 0644);
+module_param(pps_max_curr_ma, uint, 0444);
 MODULE_PARM_DESC(pps_max_curr_ma, "hard PPS input current ceiling (mA)");
 
 static unsigned int pps_cable_safe_ma = 3000;
-module_param(pps_cable_safe_ma, uint, 0644);
+module_param(pps_cable_safe_ma, uint, 0444);
 MODULE_PARM_DESC(pps_cable_safe_ma,
 		 "PPS current cap when the adapter does not report its PPS max current (mA); "
 		 "a source offers more than 3 A only over a 5 A e-marked cable");
 
 static unsigned int pps_iclim_ma = 3000;
-module_param(pps_iclim_ma, uint, 0644);
+module_param(pps_iclim_ma, uint, 0444);
 MODULE_PARM_DESC(pps_iclim_ma,
 		 "USB_INPUT_CURR_LIMIT written on PPS entry (mA); the ADSP honours 3000 when "
 		 "the battery demand is granted (validated 2026-09-24)");
 
 static unsigned int pps_fcc_ma = 4400;
-module_param(pps_fcc_ma, uint, 0644);
+module_param(pps_fcc_ma, uint, 0444);
 MODULE_PARM_DESC(pps_fcc_ma,
 		 "pack charge demand granted via BATT_CHG_CTRL_LIM (mA); Android draws ~4.4 A at 2 A/8.4 V in");
 
 static unsigned int pps_soc_stop = 80;
-module_param(pps_soc_stop, uint, 0644);
+module_param(pps_soc_stop, uint, 0444);
 MODULE_PARM_DESC(pps_soc_stop, "exit PPS at this pSoC (%)");
 
 static unsigned int pps_soc_restart = 75;
-module_param(pps_soc_restart, uint, 0644);
+module_param(pps_soc_restart, uint, 0444);
 MODULE_PARM_DESC(pps_soc_restart,
 		 "below this pSoC a stopped PPS session may resume (%)");
 
 static unsigned int pps_vbat_max_mv = 4490;
-module_param(pps_vbat_max_mv, uint, 0644);
+module_param(pps_vbat_max_mv, uint, 0444);
 MODULE_PARM_DESC(pps_vbat_max_mv, "taper/exit at this pack voltage (mV)");
 
 static unsigned int pps_vbat_min_mv = 3300;
-module_param(pps_vbat_min_mv, uint, 0644);
+module_param(pps_vbat_min_mv, uint, 0444);
 MODULE_PARM_DESC(pps_vbat_min_mv, "abort below this pack voltage (mV)");
 
 static unsigned int pps_vbus_collapse_mv = 3800;
-module_param(pps_vbus_collapse_mv, uint, 0644);
+module_param(pps_vbus_collapse_mv, uint, 0444);
 MODULE_PARM_DESC(pps_vbus_collapse_mv,
 		 "VBUS below this while targeting >5 V means a bad cable/adapter -> exit (mV)");
 
 static int pps_temp_min_c = -5;
-module_param(pps_temp_min_c, int, 0644);
+module_param(pps_temp_min_c, int, 0444);
 MODULE_PARM_DESC(pps_temp_min_c, "PPS pack temp floor (C)");
 
 static int pps_temp_max_c = 45;
-module_param(pps_temp_max_c, int, 0644);
+module_param(pps_temp_max_c, int, 0444);
 MODULE_PARM_DESC(pps_temp_max_c, "PPS pack temp ceiling (C)");
 
 static unsigned int pps_vooc_min = 2;
-module_param(pps_vooc_min, uint, 0644);
+module_param(pps_vooc_min, uint, 0444);
 MODULE_PARM_DESC(pps_vooc_min,
 		 "ADSP USB_VOOC_FAST_CHG_TYPE at or above this means serial VOOC owns the plug; never engage PPS");
 
 static unsigned int pps_stall_polls = 15;
-module_param(pps_stall_polls, uint, 0644);
+module_param(pps_stall_polls, uint, 0444);
 MODULE_PARM_DESC(pps_stall_polls,
 		 "consecutive polls with ~no pack current at >7 V VBUS before exiting (0 = never)");
 
 static bool pps_cp_init = true;
-module_param(pps_cp_init, bool, 0644);
+module_param(pps_cp_init, bool, 0444);
 MODULE_PARM_DESC(pps_cp_init,
 		 "also write USB_PPS_CP_MODE_INIT(40)=1 + USB_PPS_MOS_CTRL(39)=1 on entry (vendor PHY init)");
 
 /* ---- SC8547A charge-pump 2:1 (CP direct-charge from the PPS bus) ---- */
 static bool pps_cp_enable = true;
-module_param(pps_cp_enable, bool, 0644);
+module_param(pps_cp_enable, bool, 0444);
 MODULE_PARM_DESC(pps_cp_enable,
 		 "drive the SC8547A charge pump 2:1 from the PPS bus when the chip window is reachable "
 		 "(b5; owner-testing).  Disable = pure buck path (b4 behaviour).");
 
 static bool pps_cp_buck_suspend = true;
-module_param(pps_cp_buck_suspend, bool, 0644);
+module_param(pps_cp_buck_suspend, bool, 0444);
 MODULE_PARM_DESC(pps_cp_buck_suspend,
 		 "suspend the buck (USB_INPUT_CURR_LIMIT 0) while the pump runs, as the vendor does "
 		 "(WIRED_CHARGE_SUSPEND); any pump stop resumes it in the same poll");
 
 static unsigned int pps_cp_entry_margin_mv = 450;
-module_param(pps_cp_entry_margin_mv, uint, 0644);
+module_param(pps_cp_entry_margin_mv, uint, 0444);
 MODULE_PARM_DESC(pps_cp_entry_margin_mv,
 		 "pump entry: request 2*vbat + this before engaging (mV; vendor +450)");
 
 static unsigned int pps_cp_lift_ms = 5000;
-module_param(pps_cp_lift_ms, uint, 0644);
+module_param(pps_cp_lift_ms, uint, 0444);
 MODULE_PARM_DESC(pps_cp_lift_ms,
 		 "time allowed for the pump to engage after the entry request, buck suspended (ms)");
 
 static unsigned int pps_cp_rearm_ms = 10000;
-module_param(pps_cp_rearm_ms, uint, 0644);
+module_param(pps_cp_rearm_ms, uint, 0444);
 MODULE_PARM_DESC(pps_cp_rearm_ms, "hold-off after a pump drop or a failed entry (ms)");
 
 static unsigned int pps_cp_rearm_max = 5;
-module_param(pps_cp_rearm_max, uint, 0644);
+module_param(pps_cp_rearm_max, uint, 0444);
 MODULE_PARM_DESC(pps_cp_rearm_max, "pump attempts per plug-in; then buck path for the rest of it");
 
 static unsigned int pps_cp_vstep_mv = 40;
-module_param(pps_cp_vstep_mv, uint, 0644);
+module_param(pps_cp_vstep_mv, uint, 0444);
 MODULE_PARM_DESC(pps_cp_vstep_mv, "pump ibus servo: PPS voltage step (mV) per poll (vendor 40)");
 
 static unsigned int pps_cp_vstep_over_mv = 100;
-module_param(pps_cp_vstep_over_mv, uint, 0644);
+module_param(pps_cp_vstep_over_mv, uint, 0444);
 MODULE_PARM_DESC(pps_cp_vstep_over_mv,
 		 "pump ibus servo: step down (mV) when ibus is over target + 500 mA (vendor 100)");
 
 static unsigned int pps_cp_ibus_band_ma = 100;
-module_param(pps_cp_ibus_band_ma, uint, 0644);
+module_param(pps_cp_ibus_band_ma, uint, 0444);
 MODULE_PARM_DESC(pps_cp_ibus_band_ma, "pump ibus servo: deadband around the target (mA; vendor 100)");
 
 static unsigned int pps_cp_diff_max_mv = 650;
-module_param(pps_cp_diff_max_mv, uint, 0644);
+module_param(pps_cp_diff_max_mv, uint, 0444);
 MODULE_PARM_DESC(pps_cp_diff_max_mv,
 		 "never step VBUS up while vbus - 2*vbat at the chip is at or above this (mV; "
 		 "the pump drops at 700)");
 
 static unsigned int pps_cp_ibat_max_ma = 9000;
-module_param(pps_cp_ibat_max_ma, uint, 0644);
+module_param(pps_cp_ibat_max_ma, uint, 0444);
 MODULE_PARM_DESC(pps_cp_ibat_max_ma, "pump ibus servo: step VBUS down while the pack takes more than this (mA)");
 
 static unsigned int pps_cp_min_ibus_ma = 300;
-module_param(pps_cp_min_ibus_ma, uint, 0644);
+module_param(pps_cp_min_ibus_ma, uint, 0444);
 MODULE_PARM_DESC(pps_cp_min_ibus_ma,
 		 "engaged pump carrying less than this for 4 polls (after pps_cp_settle_ms) is "
 		 "released to the buck (mA; vendor 300)");
 
 static unsigned int pps_cp_settle_ms = 2000;
-module_param(pps_cp_settle_ms, uint, 0644);
+module_param(pps_cp_settle_ms, uint, 0444);
 MODULE_PARM_DESC(pps_cp_settle_ms, "grace after an engage before the low-ibus check (ms)");
 
 static unsigned int pps_cp_max_volt_mv = 9900;
-module_param(pps_cp_max_volt_mv, uint, 0644);
+module_param(pps_cp_max_volt_mv, uint, 0444);
 MODULE_PARM_DESC(pps_cp_max_volt_mv,
 		 "pump PPS VBUS ceiling (mV); 9900 keeps the engaged chip under its 10 V VBUS_OVP "
 		 "(lab: 9.17 V max at 4 A), vendor 10500");
 
 static unsigned int pps_cp_feed_ms = 300;
-module_param(pps_cp_feed_ms, uint, 0644);
+module_param(pps_cp_feed_ms, uint, 0444);
 MODULE_PARM_DESC(pps_cp_feed_ms,
 		 "engine poll period (ms) while the CP is engaged - must stay under the "
 		 "SC8547A 1000 ms REG_09 watchdog window");
 
 static unsigned int pps_log_ticks = 60;
-module_param(pps_log_ticks, uint, 0644);
+module_param(pps_log_ticks, uint, 0444);
 MODULE_PARM_DESC(pps_log_ticks,
 		 "log this many charging ticks per session to dmesg (default 60 = ~2 minutes at 2000 ms)");
 
 static bool pps_voocphy_enable = true;
-module_param(pps_voocphy_enable, bool, 0644);
+module_param(pps_voocphy_enable, bool, 0444);
 MODULE_PARM_DESC(pps_voocphy_enable,
 		 "value written to USB_PPS_VOOCPHY_ENABLE(49) on PPS entry (default 1 = vendor order; lab experiment 2b sets 0)");
 
@@ -408,8 +378,9 @@ static const char *const pps_state_names[PPS_LAST_STATE] = {
 #define PPS_EXIT_REASON_FORCED		"forced"
 
 struct erhai_pps {
-	struct delayed_work	work;
-	struct dentry		*debugfs;
+	bool cleanup;
+	bool failed;
+	unsigned long next_poll;
 
 	enum pps_state		state;
 	const char		*last_reason;
@@ -451,67 +422,26 @@ struct erhai_pps {
 	unsigned int		cp_rearms;	/* pump attempts this plug */
 };
 
-static struct erhai_pps *g_pps;
-static DEFINE_MUTEX(pps_lock);
-
 static void pps_enter(struct erhai_pps *p, enum pps_state st, const char *why);
 
-/* optional serial-VOOC gate (sc8547a module) */
 static bool pps_sc_delivering(void)
 {
-	static bool (*fn)(void);
-	bool delivering = false;
-
-	if (!fn) {
-		fn = (bool (*)(void))symbol_get(sc8547a_fastchg_delivering);
-		if (fn)
-			pr_debug("erhai_pps: sc8547a delivering() gate linked\n");
-	}
-	if (fn)
-		delivering = fn();
-
-	return delivering;
+	return sc8547a_fastchg_delivering();
 }
 
-/* optional "serial ladder still identifying/delivering" gate (sc8547a module) —
- * the engine must not capture the connector while the ladder is mid-identify
- * (2026-09-25): a genuine SuperVOOC brick identifies in its 5 V window and is
- * only lost when the engine's debounce laps it and lifts VBUS to PPS first. */
 static bool pps_sc_identifying(void)
 {
-	static bool (*fn)(void);
-	bool identifying = false;
-
-	if (!fn) {
-		fn = (bool (*)(void))symbol_get(sc8547a_fastchg_identifying);
-		if (fn)
-			pr_debug("erhai_pps: sc8547a identifying() gate linked\n");
-	}
-	if (fn)
-		identifying = fn();
-
-	return identifying;
+	return sc8547a_fastchg_identifying();
 }
 
-/* optional raw REG_06/REG_07 read for the trace (sc8547a module) */
 static int pps_sc_regs(u8 *r06, u8 *r07)
 {
-	static int (*fn)(u8 *r06, u8 *r07);
-
-	if (!fn)
-		fn = (int (*)(u8 *, u8 *))symbol_get(sc8547a_pps_regs);
-	return fn ? fn(r06, r07) : -ENODEV;
+	return sc8547a_pps_regs(r06, r07);
 }
 
-/* optional "keep the pump ADC on for the session" (sc8547a module) */
-static void pps_sc_adc_hold(bool on)
+static int pps_sc_adc_hold(bool on)
 {
-	static void (*fn)(bool on);
-
-	if (!fn)
-		fn = (void (*)(bool))symbol_get(sc8547a_pps_adc_hold);
-	if (fn)
-		fn(on);
+	return sc8547a_pps_adc_hold(on);
 }
 
 /* ---- ADSP prop helpers ---- */
@@ -536,54 +466,39 @@ static void pps_prop_err(struct erhai_pps *p, const char *what, int rc)
 		what, rc, pps_state_names[p->state]);
 }
 
-/* ---- pack reads: prefer the real pack gauge, fall back to the ADSP battery ---- */
-static struct power_supply *pps_bat_psy(void)
-{
-	struct power_supply *psy = power_supply_get_by_name("bq27z561-0");
-
-	if (!psy)
-		psy = power_supply_get_by_name("erhai-adsp-bat");
-	return psy;
-}
-
-/* the value goes through *out: a discharging pack reads a negative
- * current_now, which is a reading, not an errno (lab c3 run 1) */
-static int pps_psy_int(struct power_supply *psy, enum power_supply_property prop,
-		       int *out)
-{
-	union power_supply_propval val = { };
-	int rc;
-
-	rc = power_supply_get_property(psy, prop, &val);
-	if (!rc)
-		*out = val.intval;
-	return rc;
-}
-
-/* fills p->vbat_mv / p->ibat_ma / p->soc / p->temp_c; returns 0 on success */
+/* Use battmgr's battery: it already normalizes this firmware's current sign. */
 static int pps_read_battery(struct erhai_pps *p)
 {
-	struct power_supply *psy = pps_bat_psy();
-	int v, i, s, t;
+	struct power_supply *psy = power_supply_get_by_name("qcom-battmgr-bat");
+	union power_supply_propval val;
+	int ret, temp;
 
 	if (!psy)
 		return -ENODEV;
-
-	if (pps_psy_int(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &v) ||
-	    pps_psy_int(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &i) ||
-	    pps_psy_int(psy, POWER_SUPPLY_PROP_CAPACITY, &s) ||
-	    pps_psy_int(psy, POWER_SUPPLY_PROP_TEMP, &t)) {
-		power_supply_put(psy);
-		return -EIO;
-	}
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
+	if (ret)
+		goto out;
+	p->vbat_mv = val.intval / 1000;
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &val);
+	if (ret)
+		goto out;
+	p->ibat_ma = val.intval / 1000;
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val);
+	if (ret)
+		goto out;
+	p->soc = val.intval;
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val);
+	if (ret)
+		goto out;
+	temp = val.intval;
+	p->temp_c = temp / 10;
+	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_HEALTH, &val);
+	if (!ret && (val.intval != POWER_SUPPLY_HEALTH_GOOD ||
+		     temp < pps_temp_min_c * 10 || temp > pps_temp_max_c * 10))
+		ret = -ERANGE;
+out:
 	power_supply_put(psy);
-
-	/* sysfs battery: voltage_now uV -> mV; current_now uA -> mA; temp 0.1C -> C */
-	p->vbat_mv = v / 1000;
-	p->ibat_ma = i / 1000;
-	p->soc = s;
-	p->temp_c = t / 10;
-	return 0;
+	return ret;
 }
 
 /* reads VBUS through the ADSP (USB_VOLT_NOW in uV) */
@@ -607,7 +522,7 @@ static bool pps_deployable(struct erhai_pps *p, bool *vooc_engaged)
 	pps_type = pps_usb_get(PPS_PROP_USB_GET_PPS_TYPE);
 	fct = pps_usb_get(PPS_PROP_USB_VOOC_FAST_CHG_TYPE);
 
-	if (real != PPS_USB_TYPE_PD_PPS || pps_type != 1)
+	if (real != PPS_USB_TYPE_PD_PPS || pps_type != 1 || fct < 0)
 		return false;
 	if (fct >= (int)pps_vooc_min || pps_sc_delivering() ||
 	    pps_sc_identifying()) {
@@ -628,7 +543,7 @@ static bool pps_deployable(struct erhai_pps *p, bool *vooc_engaged)
 	if (p->soc >= (int)pps_soc_stop)
 		return false;
 	if (p->vbat_mv < (int)pps_vbat_min_mv ||
-	    p->vbat_mv > (int)pps_vbat_max_mv)
+	    p->vbat_mv >= (int)pps_vbat_max_mv)
 		return false;
 	if (p->temp_c < pps_temp_min_c || p->temp_c > pps_temp_max_c)
 		return false;
@@ -637,51 +552,47 @@ static bool pps_deployable(struct erhai_pps *p, bool *vooc_engaged)
 
 
 /* ---- the 5 V revert ---- */
-static void pps_revert(struct erhai_pps *p)
+static int pps_revert(struct erhai_pps *p)
 {
-	int rc;
+	int rc, err = 0, vbus, online;
 
-	/* Order matters: current+voltage back to 5 V first, then limits. */
-	rc = pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, 2000);
-	if (rc)
-		pps_prop_err(p, "revert PPS_CURR", rc);
-	rc = pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, 5000);
-	if (rc)
-		pps_prop_err(p, "revert PPS_VOLT", rc);
-	if (pps_cp_init) {
-		rc = pps_usb_set(PPS_PROP_USB_PPS_MOS_CTRL, 0);
-		if (rc)
-			pps_prop_err(p, "revert MOS_CTRL", rc);
+#define PPS_RESTORE(call) do { rc = (call); if (rc && !err) err = rc; } while (0)
+	PPS_RESTORE(pps_cp_drop());
+	PPS_RESTORE(pps_sc_adc_hold(false));
+	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, 2000));
+	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, 5000));
+	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_PPS_MOS_CTRL, 0));
+	PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_AP_FASTCHG_ALLOW, 0));
+	PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_CHG_CTRL_LIM, 0));
+	PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_CHG_EN,
+			       erhai_otg_charge_inhibited() ? 0 : 1));
+	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_PPS_VOOCPHY_ENABLE, 0));
+	/* Explicitly leave the APDO as well as lowering its requested voltage. */
+	PPS_RESTORE(pps_batt_set(25, 5000));
+	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_INPUT_CURR_LIMIT, PPS_ICL_UNSUSPEND));
+#undef PPS_RESTORE
+	online = pps_usb_get(0);
+	if (online > 0) {
+		msleep(100);
+		vbus = pps_usb_get(1);
+		if (vbus < 0 || vbus > 5500000)
+			err = err ?: -EAGAIN;
+	} else if (online < 0) {
+		err = err ?: online;
 	}
-	/* Release the profile gate; keep charging enabled for normal 5 V. */
-	rc = pps_batt_set(PPS_PROP_BATT_AP_FASTCHG_ALLOW, 0);
-	if (rc)
-		pps_prop_err(p, "revert FASTCHG_ALLOW", rc);
-	rc = pps_batt_set(PPS_PROP_BATT_CHG_CTRL_LIM, 0);
-	if (rc)
-		pps_prop_err(p, "revert CHG_CTRL_LIM", rc);
-	/* re-enable charging only when no policy holds the pack (bypass
-	 * switch, max_soc): this write must not undo the user's inhibit */
-	rc = pps_batt_set(PPS_PROP_BATT_CHG_EN, erhai_otg_charge_inhibited() ? 0 : 1);
-	if (rc)
-		pps_prop_err(p, "revert CHG_EN", rc);
-	/* unsuspend, not a number: the ADSP takes 0 as "suspend input" and only
-	 * the vendor's 0xFFFFFFFF releases it; a plain limit written after a
-	 * suspend leaves the input suspended (lab, c4 build 7 bypass test) */
-	rc = pps_usb_set(PPS_PROP_USB_INPUT_CURR_LIMIT, PPS_ICL_UNSUSPEND);
-	if (rc)
-		pps_prop_err(p, "revert ICL", rc);
-	rc = pps_usb_set(PPS_PROP_USB_PPS_VOOCPHY_ENABLE, 0);
-	if (rc)
-		pps_prop_err(p, "revert VOOCPHY", rc);
-
+	p->cleanup = !!err;
+	if (err) {
+		pr_warn_ratelimited("erhai_pps: 5 V cleanup pending: %d\n", err);
+		return err;
+	}
+	p->adc_held = false;
 	p->set_volt_mv = 0;
 	p->set_curr_ma = 0;
 	p->stall_count = 0;
 	p->buck_off = false;
 	p->cp_lift_since = 0;
-	/* the next attached poll re-runs the plug-in unsuspend */
 	p->plug_logged = false;
+	return 0;
 }
 
 /* ---- state transitions ---- */
@@ -703,23 +614,22 @@ static void pps_enter(struct erhai_pps *p, enum pps_state st, const char *why)
 
 static void pps_exit(struct erhai_pps *p, const char *reason)
 {
-	if (p->state == PPS_IDLE || p->state == PPS_EXIT)
+	if (p->state == PPS_IDLE && !p->cleanup)
 		return;
+	if (!strcmp(reason, PPS_EXIT_REASON_SET_FAIL) ||
+	    !strcmp(reason, PPS_EXIT_REASON_COLLAPSE) ||
+	    !strcmp(reason, PPS_EXIT_REASON_STALL) ||
+	    !strcmp(reason, PPS_EXIT_REASON_RAMP_TIMEOUT))
+		p->failed = true;
 	p->last_reason = reason;
 	p->exits++;
 	p->charg_ticks = 0;
 	pr_info("erhai_pps: exit: %s\n", reason);
 	trace_erhai_pps_cp_event(reason, 0, -1, -1, -1, p->set_volt_mv);
-	/* drop the charge pump BEFORE the 5 V revert: at 5 V the 2:1 window is
-	 * gone and a latched CHG_EN has nothing to drive but also no watchdog. */
-	if (pps_cp_is_engaged())
-		pps_cp_drop();
-	if (p->adc_held) {
-		pps_sc_adc_hold(false);
-		p->adc_held = false;
-	}
-	pps_revert(p);
-	pps_enter(p, PPS_IDLE, NULL);
+	if (!p->cleanup || !pps_revert(p))
+		pps_enter(p, PPS_IDLE, NULL);
+	else
+		pps_enter(p, PPS_EXIT, reason);
 }
 
 /* ---- pump controller (c3): the vendor recipe, docs/vendor-pps.md ---- */
@@ -770,8 +680,8 @@ static int pps_buck_set(struct erhai_pps *p, bool off)
  */
 static int pps_cp_release(struct erhai_pps *p, const char *why, bool count)
 {
-	if (pps_cp_is_engaged())
-		pps_cp_drop();
+	if (pps_cp_is_engaged() && pps_cp_drop())
+		return -EIO;
 	p->cp_lift_since = 0;
 	if (count) {
 		p->cp_rearms++;
@@ -801,15 +711,13 @@ static int pps_cp_step(struct erhai_pps *p)
 	if (!a)
 		return 0;
 	if (!p->adc_held) {
-		pps_sc_adc_hold(true);
+		if (pps_sc_adc_hold(true))
+			return -EIO;
 		p->adc_held = true;
 	}
-	if (a->snapshot(&cvbus, &cvbat, &cibus)) {
-		/* blind: never leave a pump unfed or the buck suspended */
-		if (a->cp_engaged() || p->cp_lift_since)
-			return pps_cp_release(p, "adc read failed", true);
-		return 0;
-	}
+	if (a->snapshot(&cvbus, &cvbat, &cibus))
+		return -EIO;
+
 	diff = cvbus - cvbat * 2;
 
 	if (a->cp_engaged()) {
@@ -822,7 +730,7 @@ static int pps_cp_step(struct erhai_pps *p)
 			trace_erhai_pps_cp_event("drop", rc, cvbus, cvbat, cibus,
 						 p->set_volt_mv);
 			p->cp_drops++;
-			return pps_cp_release(p, "drop", true);
+			return -EIO;
 		}
 		p->cp_fed_at = jiffies;
 		/* switching but carrying nothing: with the buck suspended the
@@ -831,7 +739,7 @@ static int pps_cp_step(struct erhai_pps *p)
 		    time_after_eq(jiffies, p->cp_engaged_since +
 				  msecs_to_jiffies(pps_cp_settle_ms))) {
 			if (++p->cp_low_cnt >= 4)
-				return pps_cp_release(p, "low ibus", true);
+				return -EIO;
 		} else {
 			p->cp_low_cnt = 0;
 		}
@@ -856,12 +764,8 @@ static int pps_cp_step(struct erhai_pps *p)
 		return 0;
 
 	if (!p->cp_lift_since) {
-		if (pps_cp_buck_suspend && pps_buck_set(p, true)) {
-			p->cp_rearms++;
-			p->cp_holdoff_until = jiffies +
-					      msecs_to_jiffies(pps_cp_rearm_ms);
-			return 0;
-		}
+		if (pps_cp_buck_suspend && pps_buck_set(p, true))
+			return -EIO;
 		nv = min_t(unsigned int,
 			   roundup(cvbat * 2 + pps_cp_entry_margin_mv, 20),
 			   pps_cp_max_volt_mv);
@@ -890,6 +794,8 @@ static int pps_cp_step(struct erhai_pps *p)
 	 * unloaded bus overshoots the request by up to ~250 mV (c4 build 7:
 	 * diff 708-783 mV for a 2*vbat + 450 request, 5 timeouts in a row).
 	 */
+	if (rc != -EAGAIN)
+		return rc;
 	if (rc == -EAGAIN) {
 		nv = p->set_volt_mv;
 		if (diff > (int)pps_cp_diff_max_mv)
@@ -904,7 +810,7 @@ static int pps_cp_step(struct erhai_pps *p)
 			  msecs_to_jiffies(pps_cp_lift_ms))) {
 		pr_info("erhai_pps: CP entry timed out (diff %d mV, engage rc=%d)\n",
 			diff, rc);
-		return pps_cp_release(p, "entry timeout", true);
+		return -ETIMEDOUT;
 	}
 	return 0;
 }
@@ -915,12 +821,38 @@ static void pps_poll(struct erhai_pps *p)
 {
 	int online, rc;
 
-	if (!pps_enable)
+	if (!READ_ONCE(pps_enable)) {
+		pps_exit(p, "disabled");
 		return;
+	}
+	if (p->cleanup && p->state == PPS_EXIT) {
+		pps_exit(p, "cleanup retry");
+		return;
+	}
 
 	online = pps_usb_get(0);	/* USB_ONLINE */
 	if (pps_read_vbus(p) < 0)
 		online = -EINVAL;	/* ADSP not up yet -> treat as offline */
+
+	if (p->state >= PPS_NEGOTIATE && p->state < PPS_EXIT) {
+		if (online <= 0 || erhai_otg_charge_inhibited() || pps_read_battery(p)) {
+			p->failed = online > 0;
+			pps_exit(p, "source, policy or battery unavailable");
+			return;
+		}
+		if (p->soc >= (int)pps_soc_stop || p->vbat_mv < (int)pps_vbat_min_mv ||
+		    p->vbat_mv >= (int)pps_vbat_max_mv) {
+			p->soc_hold = p->soc >= (int)pps_soc_stop;
+			pps_exit(p, "battery limit");
+			return;
+		}
+		if (p->vbus_mv > (int)pps_cp_max_volt_mv ||
+		    (p->state != PPS_NEGOTIATE && p->vbus_mv < (int)pps_vbus_collapse_mv)) {
+			p->failed = true;
+			pps_exit(p, "VBUS outside limits");
+			return;
+		}
+	}
 
 	switch (p->state) {
 	case PPS_IDLE: {
@@ -928,29 +860,13 @@ static void pps_poll(struct erhai_pps *p)
 
 		if (online <= 0) {
 			p->plug_logged = false;
+			p->failed = false;
 			return;
 		}
-		if (!p->plug_logged) {
-			int icl = pps_usb_get(PPS_PROP_USB_INPUT_CURR_LIMIT);
+		if (p->failed)
+			return;
+		p->plug_logged = true;
 
-			p->plug_logged = true;
-			/*
-			 * Every plug-in starts unsuspended: the revert at a
-			 * detach runs after the cable is gone, and the ADSP appears
-			 * to keep the last input limit it took while attached (0
-			 * when a session ends with the pump running; "icl was" below
-			 * shows what it held).  Left alone, the
-			 * next fixed-PD/5 V charger never charges (lab c4 dock
-			 * check: pack at -0.7..-1.1 A on the dock).
-			 */
-			rc = pps_usb_set(PPS_PROP_USB_INPUT_CURR_LIMIT,
-					 PPS_ICL_UNSUSPEND);
-			pr_info("erhai_pps: adapter online: real_type %d pps_type %d pps_max_curr %d vbus %d mV (icl was %d, unsuspend rc=%d)\n",
-				pps_usb_get(PPS_PROP_USB_REAL_TYPE),
-				pps_usb_get(PPS_PROP_USB_GET_PPS_TYPE),
-				pps_usb_get(PPS_PROP_USB_GET_PPS_MAX_CURR),
-				p->vbus_mv, icl, rc);
-		}
 		/*
 		 * Early after boot the ADSP property service may still be
 		 * coming up: the first read returns garbage (real_type 6,
@@ -1000,6 +916,7 @@ static void pps_poll(struct erhai_pps *p)
 	case PPS_NEGOTIATE: {
 		int adapter_ma;
 
+		p->cleanup = true;
 		/*
 		 * Entry sequence — ORDER IS LOAD-BEARING (live-validated 2026-09-24,
 		 * 100 W Anker, b3 kernel): the ADSP charger_pd latches its PPS APDO
@@ -1073,6 +990,7 @@ static void pps_poll(struct erhai_pps *p)
 
 fail:
 		pps_prop_err(p, "PPS ENTER", rc);
+		p->failed = true;
 		pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 		return;
 	}
@@ -1101,14 +1019,19 @@ fail:
 		next = min(p->set_volt_mv + pps_volt_step_mv, pps_target_volt_mv);
 		next = min(next, pps_max_volt_mv);
 		if (pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, next)) {
+			p->failed = true;
 			pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}
 		/* keep the input current moving toward the target */
 		if (p->set_curr_ma < p->target_curr_ma) {
 			ci = min(p->set_curr_ma + 250U, p->target_curr_ma);
-			if (!pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, ci))
-				p->set_curr_ma = ci;
+			if (pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, ci)) {
+				p->failed = true;
+				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
+				return;
+			}
+			p->set_curr_ma = ci;
 		}
 		p->set_volt_mv = next;
 		pr_info("erhai_pps: ramp VBUS %u mV curr %u mA (read %d mV)\n",
@@ -1121,14 +1044,6 @@ fail:
 
 		if (online <= 0) {
 			pps_exit(p, PPS_EXIT_REASON_DETACH);
-			return;
-		}
-		rc = pps_read_battery(p);
-		if (rc) {
-			/* blind: never sit with the buck suspended */
-			if ((p->buck_off || pps_cp_is_engaged()) &&
-			    pps_cp_release(p, "pack read failed", true))
-				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}
 
@@ -1161,25 +1076,6 @@ fail:
 			p->stall_count = 0;
 		}
 
-		if (p->vbat_mv >= (int)pps_vbat_max_mv) {
-			if (pps_cp_release(p, "taper", false)) {
-				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
-				return;
-			}
-			if (charging)
-				pps_enter(p, PPS_TAPER, "vbat at CV");
-			/* taper: shed current in steps, then hand to 5 V */
-			if (p->set_curr_ma > 500) {
-				unsigned int n = max(500U,
-						     p->set_curr_ma - 250U);
-
-				if (!pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, n))
-					p->set_curr_ma = n;
-			} else {
-				pps_exit(p, PPS_EXIT_REASON_VBAT_MAX);
-			}
-			return;
-		}
 
 		/*
 		 * current servo: the ADSP fills the pack up to the ICL/FCC
@@ -1189,8 +1085,12 @@ fail:
 			unsigned int n = min(p->set_curr_ma + 250U,
 					     p->target_curr_ma);
 
-			if (!pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, n))
-				p->set_curr_ma = n;
+			if (pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, n)) {
+				p->failed = true;
+				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
+				return;
+			}
+			p->set_curr_ma = n;
 		}
 
 		/*
@@ -1215,6 +1115,7 @@ fail:
 			rc = pps_cp_release(p, "disabled", false);
 		}
 		if (rc) {
+			p->failed = true;
 			pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}
@@ -1255,8 +1156,8 @@ static void pps_cp_backstop(struct erhai_pps *p)
 	if (!stuck)
 		return;
 	pr_warn("erhai_pps: CP backstop: buck suspended without a working pump - resuming the buck\n");
-	if (pps_cp_release(p, "backstop", true))
-		pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
+	p->failed = true;
+	pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 }
 
 /* one tracepoint sample per poll while a session is up; chip reads only
@@ -1298,139 +1199,78 @@ static void pps_trace_sample(struct erhai_pps *p)
 	trace_erhai_pps_sample(&s);
 }
 
-static void pps_ws(struct work_struct *work)
+/* The battery manager supplies the freezable worker and policy lock. */
+static unsigned int erhai_pps_update(void *data)
 {
-	struct erhai_pps *p = container_of(to_delayed_work(work),
-					   struct erhai_pps, work);
-	bool fast;
+	struct erhai_pps *p = data;
+	unsigned int delay;
 
-	mutex_lock(&pps_lock);
+	if (time_before(jiffies, p->next_poll))
+		return jiffies_to_msecs(p->next_poll - jiffies) + 1;
 	pps_poll(p);
 	pps_cp_backstop(p);
 	pps_trace_sample(p);
-	fast = pps_cp_is_engaged() || p->cp_lift_since;
-	mutex_unlock(&pps_lock);
-	/* while the charge pump is engaged (or being entered), poll at the
-	 * REG_09 watchdog feed interval (must stay under the SC8547A 1000 ms
-	 * window); otherwise the normal telemetry cadence is fine.  A dropped
-	 * poll = a watchdog expiry self-clears REG_07, so this can only slow the
-	 * CP down, never strand it. */
-	schedule_delayed_work(&p->work,
-			      msecs_to_jiffies(fast ? pps_cp_feed_ms : pps_poll_ms));
+	delay = pps_cp_is_engaged() || p->cp_lift_since ? pps_cp_feed_ms : pps_poll_ms;
+	p->next_poll = jiffies + msecs_to_jiffies(delay);
+	return delay;
 }
 
-
-/* ---- debugfs ---- */
-static int pps_state_show(struct seq_file *s, void *v)
+static bool erhai_pps_enabled(void)
 {
-	struct erhai_pps *p = s->private;
-	const char *cp_state;
-	bool buck_off;
+	return READ_ONCE(pps_enable);
+}
 
-	/* pps_cp_is_engaged() lazily resolves the charge-pump symbols; take
-	 * the same lock the worker uses so the one-time init cannot race. */
-	mutex_lock(&pps_lock);
-	cp_state = pps_cp_is_engaged() ? "on" : "off";
-	buck_off = p->buck_off;
-	mutex_unlock(&pps_lock);
+static bool erhai_pps_active(void *data)
+{
+	struct erhai_pps *p = data;
 
-	seq_printf(s, "pps_enable %d\nstate %s\nlast_exit %s\n",
-		   pps_enable, pps_state_names[p->state],
-		   p->last_reason ?: "-");
-	seq_printf(s, "set volt %u mV curr %u mA target %u mA\n",
-		   p->set_volt_mv, p->set_curr_ma, p->target_curr_ma);
-	if (p->state > PPS_IDLE)
-		seq_printf(s, "read vbus %d mV vbat %d mV ibat %d mA soc %d%% t %d C\n",
-			   p->vbus_mv, p->vbat_mv, p->ibat_ma, p->soc,
-			   p->temp_c);
-	seq_printf(s, "sessions %llu entries %u exits %u cp %s (eng %u drop %u attempts %u) buck %s\n",
-		   p->sessions, p->entries, p->exits,
-		   cp_state,
-		   p->cp_engages, p->cp_drops, p->cp_rearms,
-		   buck_off ? "suspended" : "on");
+	return p->state != PPS_IDLE || p->cleanup;
+}
+
+static int erhai_pps_stop(void *data)
+{
+	struct erhai_pps *p = data;
+
+	pps_exit(p, "policy stop");
+	if (p->cleanup)
+		return -EIO;
+	p->next_poll = 0;
+	p->failed = false;
 	return 0;
 }
-DEFINE_SHOW_ATTRIBUTE(pps_state);
 
-static ssize_t pps_cmd_write(struct file *f, const char __user *ubuf,
-			     size_t count, loff_t *off)
-{
-	struct erhai_pps *p = f->private_data;
-	char buf[32];
-	ssize_t n;
-
-	n = simple_write_to_buffer(buf, sizeof(buf) - 1, off, ubuf, count);
-	if (n < 0)
-		return n;
-	buf[n] = '\0';
-
-	mutex_lock(&pps_lock);
-	if (strncmp(buf, "start", 5) == 0) {
-		if (p->state == PPS_IDLE)
-			pps_enter(p, PPS_ARMED, "manual");
-	} else if (strncmp(buf, "stop", 4) == 0) {
-		pps_exit(p, PPS_EXIT_REASON_FORCED);
-	}
-	mutex_unlock(&pps_lock);
-	return n;
-}
-
-static const struct file_operations pps_cmd_fops = {
-	.open	= simple_open,
-	.write	= pps_cmd_write,
-	.llseek	= noop_llseek,
+static const struct erhai_pps_ops erhai_pps_ops = {
+	.enabled = erhai_pps_enabled,
+	.active = erhai_pps_active,
+	.update = erhai_pps_update,
+	.stop = erhai_pps_stop,
 };
 
-static int __init erhai_pps_init(void)
+static int erhai_pps_probe(struct platform_device *pdev)
 {
 	struct erhai_pps *p;
 
-	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	p = devm_kzalloc(&pdev->dev, sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
-
-	p->state = PPS_IDLE;
-	INIT_DELAYED_WORK(&p->work, pps_ws);
-	g_pps = p;
-
-	p->debugfs = debugfs_create_dir("erhai_pps", NULL);
-	debugfs_create_file("state", 0444, p->debugfs, p, &pps_state_fops);
-	debugfs_create_file("cmd", 0200, p->debugfs, p, &pps_cmd_fops);
-	/* the engine polls even before the ADSP is up (returns cleanly) */
-	schedule_delayed_work(&p->work, msecs_to_jiffies(5000));
-
-	pr_info("erhai_pps: PPS host engine loaded (poll %u ms, target %u mV/%u mA, FCC %u mA, soc<=%u%%)\n",
-		pps_poll_ms, pps_target_volt_mv, pps_target_curr_ma, pps_fcc_ma,
-		pps_soc_stop);
-	return 0;
+	return erhai_pps_register(pdev->dev.parent, &erhai_pps_ops, p);
 }
 
-static void __exit erhai_pps_exit(void)
+static void erhai_pps_remove(struct platform_device *pdev)
 {
-	struct erhai_pps *p = g_pps;
-
-	if (!p)
-		return;
-	/* Cancel before taking the lock: pps_ws() takes pps_lock on entry, so
-	 * holding it across cancel_delayed_work_sync() deadlocks whenever the
-	 * work is already running. */
-	cancel_delayed_work_sync(&p->work);
-	mutex_lock(&pps_lock);
-	if (p->state != PPS_IDLE) {
-		pps_cp_drop();
-		pps_revert(p);
-	}
-	if (p->adc_held)
-		pps_sc_adc_hold(false);
-	mutex_unlock(&pps_lock);
-	debugfs_remove_recursive(p->debugfs);
-	kfree(p);
-	g_pps = NULL;
+	erhai_pps_unregister(pdev->dev.parent);
 }
 
-module_init(erhai_pps_init);
-module_exit(erhai_pps_exit);
+static struct platform_driver erhai_pps_driver = {
+	.probe = erhai_pps_probe,
+	.remove = erhai_pps_remove,
+	.driver = {
+		.name = "erhai-pps",
+		.suppress_bind_attrs = true,
+	},
+};
+module_platform_driver(erhai_pps_driver);
 
-MODULE_DESCRIPTION("erhai (OnePlus Pad 3) ADSP PPS fast-charge host engine");
+MODULE_ALIAS("platform:erhai-pps");
+MODULE_DESCRIPTION("Erhai ADSP PPS fast-charge host engine");
 MODULE_LICENSE("GPL");
-

@@ -209,19 +209,29 @@ config BATTERY_PMU
 	  through the generic battery class.
 
 config CHARGER_SC8547A
-	tristate "Southchip SC8547A charge pump"
-	depends on I2C && OF
+	tristate "Southchip SC8547A charge pump / VOOC PHY"
+	depends on I2C && OF && BATTERY_QCOM_BATTMGR
+	help
+	  Southchip SC8547A charge pump and PPS hardware interface.
+	  The experimental proprietary serial charging path is disabled by default.
+
+config CHARGER_ERHAI_PPS
+	tristate "Erhai ADSP PPS fast-charge engine"
+	depends on BATTERY_QCOM_BATTMGR && CHARGER_SC8547A
+	help
+	  Negotiate PPS through the battery manager and control the SC8547A.
+	  The battery manager serializes PPS, fixed PD and charge limits.
+
+config CHARGER_CPS8601
+	tristate "CPS8601 wireless pen charger"
+	depends on I2C && OF && BATTERY_QCOM_BATTMGR
 	select REGMAP_I2C
 	help
-	  Read-only telemetry and a component interface for the SC8547A 2:1
-	  charge pump. A charging policy driver must explicitly start it.
-	  Includes ADC monitoring, protection thresholds and a hardware
-	  watchdog. The proprietary charging protocol PHY is not supported.
+	  Support the CPS8601 inductive pen charger and its ADSP hboost rail.
 
 config BATTERY_QCOM_BATTMGR
 	tristate "Qualcomm PMIC GLINK battery manager support"
 	depends on QCOM_PMIC_GLINK
-	depends on CHARGER_SC8547A || !CHARGER_SC8547A
 	select AUXILIARY_BUS
 	help
 	  Say Y here to enable the Qualcomm PMIC GLINK power supply driver,

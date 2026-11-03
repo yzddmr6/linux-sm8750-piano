@@ -31,7 +31,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
-#include <linux/pm_wakeup.h>
+#include <linux/suspend.h>
 #include <linux/delay.h>
 #include <linux/completion.h>
 #include <linux/firmware.h>
@@ -166,7 +166,8 @@ struct cps8601 {
 	struct work_struct	init_work;
 	struct delayed_work	ready_work;
 	struct work_struct	attach_work;
-	struct wakeup_source	*ws;
+	struct notifier_block pm_nb;
+	bool suspended;
 	struct completion	hboost_ack;
 	struct pmic_glink_client *pgclient;
 	bool			service_up;
@@ -186,7 +187,6 @@ struct cps8601 {
 	u32			ovp_uv;
 	u32			lvp_uv;
 	u32			fod_uv;
-	u16			debug_reg;
 };
 
 /*
@@ -202,7 +202,12 @@ static void cps8601_glink_rx(const void *data, size_t len, void *priv)
 {
 	struct cps8601 *chip = priv;
 
-	complete(&chip->hboost_ack);
+	const struct pmic_glink_hdr *hdr = data;
+
+	if (len >= sizeof(*hdr) &&
+	    le32_to_cpu(hdr->owner) == CPS8601_HBOOST_OWNER &&
+	    le32_to_cpu(hdr->opcode) == CPS8601_HBOOST_OPCODE)
+		complete(&chip->hboost_ack);
 }
 
 static void cps8601_pdr_notify(void *priv, int state)
@@ -248,7 +253,9 @@ static int cps8601_hboost_req(struct cps8601 *chip, u8 code)
 	 * first success; a blind send plus a fixed sleep just NACKs the
 	 * chip.  Gate on the routed ACK instead of sleeping.
 	 */
-	for (i = 0; i < 60; i++) {
+	for (i = 0; i < (code ? 60 : 1); i++) {
+		if (code && (READ_ONCE(chip->suspended) || READ_ONCE(chip->removing)))
+			return -ESHUTDOWN;
 		reinit_completion(&chip->hboost_ack);
 		ret = pmic_glink_send(chip->pgclient, (void *)&msg, sizeof(msg));
 		if (ret && ret != -ECONNRESET)
@@ -802,7 +809,8 @@ static void cps8601_attach_work(struct work_struct *work)
 {
 	struct cps8601 *chip = container_of(work, struct cps8601, attach_work);
 
-	cps8601_hboost_req(chip, CPS8601_HBOOST_ATTACH_CODE);
+	if (!READ_ONCE(chip->suspended) && !READ_ONCE(chip->removing))
+		cps8601_hboost_req(chip, CPS8601_HBOOST_ATTACH_CODE);
 }
 
 static irqreturn_t cps8601_irq(int irq, void *data)
@@ -811,13 +819,12 @@ static irqreturn_t cps8601_irq(int irq, void *data)
 	u16 status = 0;
 	u16 active;
 
-	__pm_stay_awake(chip->ws);
 
 	/* vendor order: clear pending first, then read status, then ack by
 	 * writing the status back (cps_comm_reg e3/e4/e5) */
 	cps8601_write16(chip, CPS8601_REG_IRQ_CLEAR, 0xffff);
 	if (cps8601_read16(chip, CPS8601_REG_IRQ_STATUS, &status)) {
-		__pm_relax(chip->ws);
+
 		return IRQ_HANDLED;
 	}
 	active = status;
@@ -852,7 +859,6 @@ static irqreturn_t cps8601_irq(int irq, void *data)
 	if (active & CPS8601_IRQ_MISLOCATED)
 		dev_warn(chip->dev, "pen mislocated\n");
 
-	__pm_relax(chip->ws);
 	return IRQ_HANDLED;
 }
 
@@ -862,16 +868,19 @@ static void cps8601_init_work(struct work_struct *work)
 	u16 id = 0;
 	int ret, tries;
 
-	__pm_stay_awake(chip->ws);
 
 	/* power the coil rail through the ADSP before touching the MCU.
 	 * Vendor bring-up only raises the DEFAULT (7 V) code here — the
 	 * 10 V attach code is sent from the RX_ATTACH IRQ, once a pen is
 	 * actually detected.  The ACK-gated request mirrors the vendor's
 	 * 512 ms × ~60 retry loop. */
+	if (READ_ONCE(chip->suspended) || READ_ONCE(chip->removing))
+		return;
 	ret = cps8601_hboost_req(chip, CPS8601_HBOOST_DEFAULT_CODE);
-	if (ret)
+	if (ret) {
 		dev_warn(chip->dev, "hboost default failed: %d\n", ret);
+		return;
+	}
 	/* vendor: first I2C lands ~3.2 s after the rail ACK; the MCU needs
 	 * that much after rail-up before it decodes the bus */
 	msleep(1500);
@@ -888,7 +897,7 @@ static void cps8601_init_work(struct work_struct *work)
 		dev_warn(chip->dev,
 			 "chip id mismatch: %#x (ret %d), retry %u/3 in 15 s\n",
 			 id, ret, chip->init_retries + 1);
-		if (chip->init_retries++ < 3 && !chip->removing) {
+		if (chip->init_retries++ < 3 && !(READ_ONCE(chip->removing) || READ_ONCE(chip->suspended))) {
 			gpiod_set_value(chip->sw_en_gpiod, 0);
 			gpiod_set_value(chip->scan_gpiod, 0);
 			gpiod_set_value(chip->off_state_gpiod, 0);
@@ -922,7 +931,7 @@ static void cps8601_init_work(struct work_struct *work)
 	/* IRQ is armed only once the chip is up: the 2.5 s MCU boot window
 	 * would otherwise feed INT glitches into the handler before the
 	 * chip can answer, and the vendor driver registers it here too. */
-	if (chip->removing)
+	if (READ_ONCE(chip->removing) || READ_ONCE(chip->suspended))
 		goto out_nopm;
 	ret = request_threaded_irq(chip->irq, NULL, cps8601_irq,
 				   IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
@@ -932,7 +941,7 @@ static void cps8601_init_work(struct work_struct *work)
 	else
 		chip->irq_armed = true;
 
-	if (chip->removing)
+	if (READ_ONCE(chip->removing) || READ_ONCE(chip->suspended))
 		goto out_nopm;
 
 	/*
@@ -944,11 +953,11 @@ static void cps8601_init_work(struct work_struct *work)
 	 */
 	gpiod_set_value(chip->off_state_gpiod, 0);
 	schedule_delayed_work(&chip->ready_work, msecs_to_jiffies(1250));
-	__pm_relax(chip->ws);
+
 	return;
 
 out_nopm:
-	__pm_relax(chip->ws);
+
 }
 
 static void cps8601_ready_work(struct work_struct *work)
@@ -956,17 +965,16 @@ static void cps8601_ready_work(struct work_struct *work)
 	struct cps8601 *chip = container_of(work, struct cps8601,
 					    ready_work.work);
 
-	if (!chip->removing && !chip->ready) {
+	if (!(READ_ONCE(chip->removing) || READ_ONCE(chip->suspended)) && !chip->ready) {
 		/* retry entry: the first power-on raced a slow-starting
 		 * ADSP (hboost service swallows early rail requests), so
 		 * re-run the whole rail + power-on + probe sequence */
 		schedule_work(&chip->init_work);
 		return;
 	}
-	if (chip->removing)
+	if (READ_ONCE(chip->removing) || READ_ONCE(chip->suspended))
 		return;
 
-	__pm_stay_awake(chip->ws);
 	/* vendor terminal state keeps sw_en HIGH (it gates the MCU supply);
 	 * dropping it here killed the bus right after "ready" and made every
 	 * later register write NAK (2026-11-01 endgame). */
@@ -974,7 +982,7 @@ static void cps8601_ready_work(struct work_struct *work)
 	msleep(50);
 	gpiod_set_value(chip->scan_gpiod, 1);
 	dev_info(chip->dev, "scan armed (vendor post-ready state)\n");
-	__pm_relax(chip->ws);
+
 }
 
 static ssize_t present_show(struct device *dev,
@@ -1034,26 +1042,24 @@ static ssize_t scan_store(struct device *dev,
 	bool v;
 	int ret;
 
+	guard(mutex)(&chip->prog_lock);
+	if (chip->suspended || chip->removing || !chip->ready)
+		return -EHOSTDOWN;
 	ret = kstrtobool(buf, &v);
 	if (ret)
 		return ret;
 	if (v)
 		cps8601_scan(chip);
-	else
-		cps8601_q_cali(chip);
-	return count;
+	else {
+		if (chip->irq_armed)
+			disable_irq(chip->irq);
+		ret = cps8601_q_cali(chip);
+		if (chip->irq_armed)
+			enable_irq(chip->irq);
+	}
+	return ret ?: count;
 }
 static DEVICE_ATTR_WO(scan);
-
-static ssize_t wireless_reg_show(struct device *dev,
-				 struct device_attribute *attr, char *buf)
-{
-	struct cps8601 *chip = i2c_get_clientdata(to_i2c_client(dev));
-	u16 val = 0;
-
-	cps8601_read16(chip, chip->debug_reg, &val);
-	return sysfs_emit(buf, "0x%04x = 0x%04x\n", chip->debug_reg, val);
-}
 
 /*
  * Vendor FSK broadcast (cps_wls_send_fsk_packet with {0x1f, 0xac}, the
@@ -1085,31 +1091,17 @@ static ssize_t fsk_store(struct device *dev,
 	bool v;
 	int ret;
 
+	guard(mutex)(&chip->prog_lock);
+	if (chip->suspended || chip->removing || !chip->ready)
+		return -EHOSTDOWN;
 	ret = kstrtobool(buf, &v);
 	if (ret)
 		return ret;
 	if (v)
-		cps8601_send_wake_fsk(chip);
-	return count;
+		ret = cps8601_send_wake_fsk(chip);
+	return ret ?: count;
 }
 static DEVICE_ATTR_WO(fsk);
-
-static ssize_t wireless_reg_store(struct device *dev,
-				  struct device_attribute *attr,
-				  const char *buf, size_t count)
-{
-	struct cps8601 *chip = i2c_get_clientdata(to_i2c_client(dev));
-	unsigned int reg, val;
-
-	if (sscanf(buf, "%x %x", &reg, &val) == 2)
-		cps8601_write16(chip, reg, val);
-	else if (sscanf(buf, "%x", &reg) == 1)
-		chip->debug_reg = reg;
-	else
-		return -EINVAL;
-	return count;
-}
-static DEVICE_ATTR_RW(wireless_reg);
 
 static struct attribute *cps8601_attrs[] = {
 	&dev_attr_present.attr,
@@ -1118,7 +1110,6 @@ static struct attribute *cps8601_attrs[] = {
 	&dev_attr_tx_voltage.attr,
 	&dev_attr_tx_current.attr,
 	&dev_attr_scan.attr,
-	&dev_attr_wireless_reg.attr,
 	&dev_attr_fsk.attr,
 	NULL
 };
@@ -1137,10 +1128,60 @@ static const struct regmap_config cps8601_progmap_cfg = {
 	.max_register	= 0xffffffff,
 };
 
+/* No wake source or IRQ wake: the coil rail is released before suspend. */
+static int cps8601_quiesce(struct cps8601 *chip)
+{
+	int ret;
+
+	WRITE_ONCE(chip->suspended, true);
+	cancel_delayed_work_sync(&chip->ready_work);
+	cancel_work_sync(&chip->init_work);
+	cancel_delayed_work_sync(&chip->ready_work);
+	cancel_work_sync(&chip->init_work);
+	if (chip->irq_armed) {
+		free_irq(chip->irq, chip);
+		chip->irq_armed = false;
+	}
+	cancel_work_sync(&chip->attach_work);
+	guard(mutex)(&chip->prog_lock);
+	cps8601_power_off(chip);
+	chip->ready = false;
+	chip->present = false;
+	chip->pen_soc = -1;
+	ret = cps8601_hboost_req(chip, 0);
+	return ret;
+}
+
+static int cps8601_pm_notify(struct notifier_block *nb,
+			   unsigned long action, void *data)
+{
+	struct cps8601 *chip = container_of(nb, struct cps8601, pm_nb);
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+		if (cps8601_quiesce(chip)) {
+			WRITE_ONCE(chip->suspended, false);
+			schedule_work(&chip->init_work);
+			return NOTIFY_BAD;
+		}
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		WRITE_ONCE(chip->suspended, false);
+		chip->init_retries = 0;
+		schedule_work(&chip->init_work);
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
 static int cps8601_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct cps8601 *chip;
+	int ret;
 
 	chip = devm_kzalloc(dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
@@ -1185,7 +1226,6 @@ static int cps8601_probe(struct i2c_client *client)
 
 	/* the IRQ itself is requested from init_work once the chip is ready */
 
-	chip->ws = wakeup_source_register(dev, "cps8601");
 	INIT_WORK(&chip->init_work, cps8601_init_work);
 	INIT_DELAYED_WORK(&chip->ready_work, cps8601_ready_work);
 	INIT_WORK(&chip->attach_work, cps8601_attach_work);
@@ -1198,14 +1238,19 @@ static int cps8601_probe(struct i2c_client *client)
 	/* devm_pmic_glink_client_alloc() is only valid for pmic_glink child
 	 * devices — from this i2c device it would mutex-lock garbage (see
 	 * erhai_otg_glink.c).  Register through the real child instead. */
-	chip->pgclient = erhai_otg_glink_client_register_sibling(
+	chip->pgclient = erhai_otg_glink_client_register_sibling(dev,
 					CPS8601_HBOOST_OWNER,
 					cps8601_glink_rx,
 					cps8601_pdr_notify, chip);
-	if (IS_ERR(chip->pgclient)) {
-		dev_warn(dev, "0x8011 sibling client: %ld, falling back to piggyback\n",
-			 PTR_ERR(chip->pgclient));
-		chip->pgclient = NULL;
+	if (IS_ERR(chip->pgclient))
+		return dev_err_probe(dev, PTR_ERR(chip->pgclient),
+				     "cannot register pen GLINK client\n");
+
+	chip->pm_nb.notifier_call = cps8601_pm_notify;
+	ret = register_pm_notifier(&chip->pm_nb);
+	if (ret) {
+		pmic_glink_client_neuter(chip->pgclient);
+		return ret;
 	}
 
 	schedule_work(&chip->init_work);
@@ -1217,42 +1262,18 @@ static void cps8601_remove(struct i2c_client *client)
 {
 	struct cps8601 *chip = i2c_get_clientdata(client);
 
-	/* Order matters for more than ACKs:
-	 *  - flip `removing` first so neither work item can arm the other or
-	 *    request the IRQ after we start tearing down;
-	 *  - the init/ready pair is a two-cycle loop (init_work registers the
-	 *    IRQ and arms ready_work; ready_work re-queues init_work on a
-	 *    retry), so it has to be drained twice — once to stop the pending
-	 *    timer, once more for whatever the in-flight worker re-armed
-	 *    before it saw `removing`;
-	 *  - free_irq() only after that drain, so `irq_armed` can no longer
-	 *    change under us; and before wakeup_source_unregister(), because
-	 *    the handler takes chip->ws;
-	 *  - cancel attach_work after free_irq(), since the handler is what
-	 *    queues it;
-	 *  - drop the rail while the glink client still routes ACKs:
-	 *    neuter() clears the callback and priv, so a request issued after
-	 *    it waits out every retry (~30 s) even though the send succeeds. */
-	chip->removing = true;
+	unregister_pm_notifier(&chip->pm_nb);
+	WRITE_ONCE(chip->removing, true);
+	cps8601_quiesce(chip);
+	pmic_glink_client_neuter(chip->pgclient);
+}
 
-	cancel_delayed_work_sync(&chip->ready_work);
-	cancel_work_sync(&chip->init_work);
-	cancel_delayed_work_sync(&chip->ready_work);
-	cancel_work_sync(&chip->init_work);
+static void cps8601_shutdown(struct i2c_client *client)
+{
+	struct cps8601 *chip = i2c_get_clientdata(client);
 
-	if (chip->irq_armed)
-		free_irq(chip->irq, chip);
-	cancel_work_sync(&chip->attach_work);
-
-	if (chip->pgclient)
-		cps8601_hboost_req(chip, 0);
-	wakeup_source_unregister(chip->ws);
-	if (chip->ready)
-		cps8601_power_off(chip);
-	else
-		gpiod_set_value(chip->sw_en_gpiod, 0);
-	if (chip->pgclient)
-		pmic_glink_client_neuter(chip->pgclient);
+	WRITE_ONCE(chip->removing, true);
+	cps8601_quiesce(chip);
 }
 
 static const struct of_device_id cps8601_of_match[] = {
@@ -1269,6 +1290,7 @@ static struct i2c_driver cps8601_driver = {
 	},
 	.probe		= cps8601_probe,
 	.remove		= cps8601_remove,
+	.shutdown	= cps8601_shutdown,
 };
 module_i2c_driver(cps8601_driver);
 
