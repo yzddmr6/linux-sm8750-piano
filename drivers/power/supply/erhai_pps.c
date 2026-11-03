@@ -232,11 +232,11 @@ module_param(pps_vbus_collapse_mv, uint, 0444);
 MODULE_PARM_DESC(pps_vbus_collapse_mv,
 		 "VBUS below this while targeting >5 V means a bad cable/adapter -> exit (mV)");
 
-static int pps_temp_min_c = -5;
+static int pps_temp_min_c = 12;
 module_param(pps_temp_min_c, int, 0444);
 MODULE_PARM_DESC(pps_temp_min_c, "PPS pack temp floor (C)");
 
-static int pps_temp_max_c = 45;
+static int pps_temp_max_c = 44;
 module_param(pps_temp_max_c, int, 0444);
 MODULE_PARM_DESC(pps_temp_max_c, "PPS pack temp ceiling (C)");
 
