@@ -506,6 +506,7 @@ struct qcom_battmgr {
 	struct mutex charge_lock;
 	struct notifier_block pm_nb;
 	bool pps_suspended;
+	bool pps_input_used;
 	const struct erhai_pps_ops *pps_ops;
 	void *pps_data;
 
@@ -1340,6 +1341,15 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		if (qcom_battmgr_pps_stop(battmgr))
 			return PD_POLL_MS;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+	}
+
+	/* A suspend vote can persist across a cable removal in this firmware. */
+	if (battmgr->pps_input_used) {
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+						USB_INPUT_CURR_LIMIT, U32_MAX);
+		if (ret)
+			return PD_POLL_MS;
+		battmgr->pps_input_used = false;
 	}
 
 	if (!src.sink || READ_ONCE(battmgr->otg_request) ||
@@ -2810,11 +2820,22 @@ EXPORT_SYMBOL_GPL(erhai_otg_adsp_usb_prop);
 
 int erhai_otg_adsp_prop_set(u32 opcode, u32 property, u32 value)
 {
+	int ret;
+
 	guard(mutex)(&erhai_bridge_lock);
 	if (!erhai_battmgr || !erhai_battmgr->service_up)
 		return -ENODEV;
 	/* Only the PPS handshake is exported; OTG and thresholds stay local. */
 	if (opcode == BATTMGR_USB_PROPERTY_SET) {
+		if (property == USB_INPUT_CURR_LIMIT && !value)
+			erhai_battmgr->pps_input_used = true;
+		if (property == 49 && value && erhai_battmgr->pps_input_used) {
+			ret = qcom_battmgr_set_property(erhai_battmgr,
+					BATTMGR_USB_PROPERTY_SET, USB_INPUT_CURR_LIMIT, U32_MAX);
+			if (ret)
+				return ret;
+			erhai_battmgr->pps_input_used = false;
+		}
 		if (property != 5 && property != 34 && property != 35 &&
 		    property != 39 && property != 40 && property != 49)
 			return -EINVAL;

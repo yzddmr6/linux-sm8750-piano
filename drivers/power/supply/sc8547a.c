@@ -732,6 +732,7 @@ static void sc8547_send_handshake(struct sc8547a_device *sc)
 static int sc8547_init_device(struct sc8547a_device *sc)
 {
 	int ret, err = 0;
+
 	ret = sc8547_write_byte(sc, SC8547_REG_11, 0x00);
 	if (ret && !err)
 		err = ret;	/* ADC disable */
@@ -805,6 +806,7 @@ static int sc8547_init_vooc(struct sc8547a_device *sc)
 static int sc8547_svooc_hw_setting(struct sc8547a_device *sc)
 {
 	int ret, err = 0;
+
 	ret = sc8547_write_byte(sc, SC8547_REG_02, 0x01);
 	if (ret && !err)
 		err = ret;	/* VAC_OVP 12V */
@@ -853,9 +855,11 @@ static int sc8547_svooc_hw_setting(struct sc8547a_device *sc)
 static int sc8547_reset_voocphy(struct sc8547a_device *sc)
 {
 	int ret, err = 0;
+
 	ret = sc8547_write_byte(sc, SC8547_REG_07, 0x00);
-	if (ret && !err)
-		err = ret;	/* CP off */
+	/* Keep the watchdog armed if the pump-off write did not complete. */
+	if (ret)
+		return ret;
 	ret = sc8547_update_bits(sc, SC8547_REG_09, SC8547_WATCHDOG_MASK,
 			   SC8547_WATCHDOG_DIS);
 	if (ret && !err)
@@ -1036,9 +1040,13 @@ int sc8547a_pps_cp_feed(int *vbus_mv, int *vbat_mv)
 	guard(mutex)(&sc8547_pps_lock);
 	struct sc8547a_device *sc = sc8547_master_dev;
 	int vbus, vbat, diff;
+	u8 control;
 
 	if (!sc || !pps_cp_engaged)
 		return -ENODEV;
+	if (sc8547_read_byte(sc, SC8547_REG_07, &control) ||
+	    !(control & SC8547_CHG_EN_MASK))
+		goto drop;
 	vbus = sc8547_get_vbus(sc);
 	vbat = sc8547_get_vbat(sc);
 	if (vbus < 0 || vbat < 0)
@@ -1774,8 +1782,6 @@ static const struct sc8547_curve_row sc_curve_soc85_90_nl[] = {
 static const struct sc8547_curve_row sc_curve_soc85_90_nh[] = {
 	{ 4535, 25, 0 }, { 4535, 20, 0 }, { 4535, 15, 0 }, { 4545, 10, 1 },
 };
-
-#define SC_CURVE(arr)	(arr), ARRAY_SIZE(arr)
 
 /*
  * Read pack SOC (%), temperature (0.1 C) and cell voltage (mV) from ONE named

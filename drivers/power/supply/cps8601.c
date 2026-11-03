@@ -6,7 +6,7 @@
  * The chip is an 8051-core MCU driving the inductive TX coil that charges
  * the capacitive stylus. It sits behind a geni i2c-master-hub SE (0x98c000)
  * at I2C address 0x41 with five TLMM control lines. Register access is
- * plain 8-bit regmap, big-endian word assembly.
+ * 16-bit register addresses with little-endian multi-byte values.
  *
  * Register map, IRQ bits, power-on/off sequences and the RX data-frame
  * protocol were reverse engineered from the vendor module
@@ -155,6 +155,7 @@ struct cps8601 {
 	/* program-mode map, 32-bit register addresses (fw update only) */
 	struct regmap		*progmap;
 	struct mutex		prog_lock;
+	struct mutex		io_lock;
 	struct device		*dev;
 
 	struct gpio_desc	*int_gpiod;
@@ -168,6 +169,7 @@ struct cps8601 {
 	struct work_struct	attach_work;
 	struct notifier_block pm_nb;
 	bool suspended;
+	bool hboost_active;
 	struct completion	hboost_ack;
 	struct pmic_glink_client *pgclient;
 	bool			service_up;
@@ -189,15 +191,7 @@ struct cps8601 {
 	u32			fod_uv;
 };
 
-/*
- * Dedicated pmic_glink client for the wireless-pen hboost owner.
- * pmic_glink routes RX strictly by hdr->owner to the registered client,
- * and the ADSP drops 0x8011 requests that arrive on the battery_charger
- * client's channel — the piggyback send (erhai_otg_glink_send_raw with a
- * forged owner) provably never got an answer (60 x 512 ms of silence in
- * the ge3816d8d8 boot, 2026-10-25).  Any inbound message on our own
- * client after a rail request is the ACK we gate on.
- */
+/* GLINK dispatches by owner, so the pen needs its own response callback. */
 static void cps8601_glink_rx(const void *data, size_t len, void *priv)
 {
 	struct cps8601 *chip = priv;
@@ -238,8 +232,6 @@ static int cps8601_hboost_req(struct cps8601 *chip, u8 code)
 		return -ENODEV;
 	}
 
-	/* ride on the erhai_otg client: a dedicated 0x8011 client never gets
-	 * a PDR attachment and blocks in pmic_glink_client_register */
 	msg.hdr.owner = cpu_to_le32(CPS8601_HBOOST_OWNER);
 	msg.hdr.type = cpu_to_le32(PMIC_GLINK_REQ_RESP);
 	msg.hdr.opcode = cpu_to_le32(CPS8601_HBOOST_OPCODE);
@@ -262,6 +254,7 @@ static int cps8601_hboost_req(struct cps8601 *chip, u8 code)
 			return ret;
 		if (wait_for_completion_timeout(&chip->hboost_ack,
 						msecs_to_jiffies(512))) {
+			chip->hboost_active = !!code;
 			dev_info(chip->dev, "hboost %u ACKed (round %d, own client %d)\n",
 				 code, i + 1, !!chip->pgclient);
 			return 0;
@@ -351,7 +344,9 @@ static int cps8601_q_cali(struct cps8601 *chip)
 	 * INT pin high for the session -- that handshake is proven to work
 	 * here (hundreds of bootloader writes landed through it), so use
 	 * the same one. */
-	gpiod_direction_output(chip->int_gpiod, 1);
+	ret = gpiod_direction_output(chip->int_gpiod, 1);
+	if (ret)
+		return ret;
 	msleep(50);
 	/* vendor writes INT_EN = 0xffff in every irq pass */
 	cps8601_write16(chip, CPS8601_REG_IRQ_CLEAR, 0xffff);
@@ -392,8 +387,8 @@ static int cps8601_q_cali(struct cps8601 *chip)
 			 "q-cali failed (res %u, flag %#x, times %u)\n",
 			 res, flag, cnt);
 
-	gpiod_direction_input(chip->int_gpiod);
-	return res == 1 ? 0 : -EIO;
+	ret = gpiod_direction_input(chip->int_gpiod);
+	return ret ?: (res == 1 ? 0 : -EIO);
 }
 
 static int cps8601_read16(struct cps8601 *chip, u16 reg, u16 *val)
@@ -869,6 +864,7 @@ static void cps8601_init_work(struct work_struct *work)
 	int ret, tries;
 
 
+	guard(mutex)(&chip->io_lock);
 	/* power the coil rail through the ADSP before touching the MCU.
 	 * Vendor bring-up only raises the DEFAULT (7 V) code here — the
 	 * 10 V attach code is sent from the RX_ATTACH IRQ, once a pen is
@@ -911,16 +907,15 @@ static void cps8601_init_work(struct work_struct *work)
 	 * (or fw_force is set); on failure keep going with what runs */
 	cps8601_fw_update_check(chip);
 
-	cps8601_read16(chip, CPS8601_REG_FW_VER, &chip->fw_version);
-
-	if (chip->ocp_uv && chip->ocp_uv <= 3000)
-		cps8601_write16(chip, CPS8601_REG_OCP_TH, chip->ocp_uv);
-	if (chip->lvp_uv && chip->lvp_uv <= 5000)
-		cps8601_write16(chip, CPS8601_REG_LVP_TH, chip->lvp_uv);
-	if (chip->ovp_uv >= 3000 && chip->ovp_uv <= 20000)
-		cps8601_write16(chip, CPS8601_REG_OVP_TH, chip->ovp_uv);
-	if (chip->fod_uv)
-		cps8601_write16(chip, CPS8601_REG_FOD_TH, chip->fod_uv);
+	ret = cps8601_read16(chip, CPS8601_REG_FW_VER, &chip->fw_version);
+	if (ret)
+		goto out_nopm;
+	ret = cps8601_write16(chip, CPS8601_REG_OCP_TH, chip->ocp_uv);
+	ret = ret ?: cps8601_write16(chip, CPS8601_REG_LVP_TH, chip->lvp_uv);
+	ret = ret ?: cps8601_write16(chip, CPS8601_REG_OVP_TH, chip->ovp_uv);
+	ret = ret ?: cps8601_write16(chip, CPS8601_REG_FOD_TH, chip->fod_uv);
+	if (ret)
+		goto out_nopm;
 
 	/* vendor raises the sleep line only after the thresholds are set */
 	gpiod_set_value(chip->sleep_gpiod, 1);
@@ -936,10 +931,11 @@ static void cps8601_init_work(struct work_struct *work)
 	ret = request_threaded_irq(chip->irq, NULL, cps8601_irq,
 				   IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 				   "cps8601", chip);
-	if (ret)
+	if (ret) {
 		dev_err(chip->dev, "irq request failed: %d\n", ret);
-	else
-		chip->irq_armed = true;
+		goto out_nopm;
+	}
+	chip->irq_armed = true;
 
 	if (READ_ONCE(chip->removing) || READ_ONCE(chip->suspended))
 		goto out_nopm;
@@ -957,7 +953,9 @@ static void cps8601_init_work(struct work_struct *work)
 	return;
 
 out_nopm:
-
+	chip->ready = false;
+	cps8601_power_off(chip);
+	cps8601_hboost_req(chip, 0);
 }
 
 static void cps8601_ready_work(struct work_struct *work)
@@ -965,6 +963,7 @@ static void cps8601_ready_work(struct work_struct *work)
 	struct cps8601 *chip = container_of(work, struct cps8601,
 					    ready_work.work);
 
+	guard(mutex)(&chip->io_lock);
 	if (!(READ_ONCE(chip->removing) || READ_ONCE(chip->suspended)) && !chip->ready) {
 		/* retry entry: the first power-on raced a slow-starting
 		 * ADSP (hboost service swallows early rail requests), so
@@ -1017,9 +1016,13 @@ static ssize_t tx_voltage_show(struct device *dev,
 {
 	struct cps8601 *chip = i2c_get_clientdata(to_i2c_client(dev));
 	u16 v = 0;
+	int ret;
 
-	cps8601_read16(chip, CPS8601_REG_TX_VOLTAGE, &v);
-	return sysfs_emit(buf, "%u\n", v);
+	guard(mutex)(&chip->io_lock);
+	if (chip->suspended || chip->removing || !chip->ready)
+		return -EHOSTDOWN;
+	ret = cps8601_read16(chip, CPS8601_REG_TX_VOLTAGE, &v);
+	return ret ?: sysfs_emit(buf, "%u\n", v);
 }
 static DEVICE_ATTR_RO(tx_voltage);
 
@@ -1028,9 +1031,13 @@ static ssize_t tx_current_show(struct device *dev,
 {
 	struct cps8601 *chip = i2c_get_clientdata(to_i2c_client(dev));
 	u16 v = 0;
+	int ret;
 
-	cps8601_read16(chip, CPS8601_REG_TX_CURRENT, &v);
-	return sysfs_emit(buf, "%u\n", v);
+	guard(mutex)(&chip->io_lock);
+	if (chip->suspended || chip->removing || !chip->ready)
+		return -EHOSTDOWN;
+	ret = cps8601_read16(chip, CPS8601_REG_TX_CURRENT, &v);
+	return ret ?: sysfs_emit(buf, "%u\n", v);
 }
 static DEVICE_ATTR_RO(tx_current);
 
@@ -1042,7 +1049,7 @@ static ssize_t scan_store(struct device *dev,
 	bool v;
 	int ret;
 
-	guard(mutex)(&chip->prog_lock);
+	guard(mutex)(&chip->io_lock);
 	if (chip->suspended || chip->removing || !chip->ready)
 		return -EHOSTDOWN;
 	ret = kstrtobool(buf, &v);
@@ -1051,11 +1058,20 @@ static ssize_t scan_store(struct device *dev,
 	if (v)
 		cps8601_scan(chip);
 	else {
-		if (chip->irq_armed)
-			disable_irq(chip->irq);
+		if (chip->irq_armed) {
+			free_irq(chip->irq, chip);
+			chip->irq_armed = false;
+		}
 		ret = cps8601_q_cali(chip);
-		if (chip->irq_armed)
-			enable_irq(chip->irq);
+		if (!READ_ONCE(chip->suspended) && !READ_ONCE(chip->removing)) {
+			int irq_ret;
+
+			irq_ret = request_threaded_irq(chip->irq, NULL, cps8601_irq,
+					IRQF_TRIGGER_FALLING | IRQF_ONESHOT, "cps8601", chip);
+			if (!irq_ret)
+				chip->irq_armed = true;
+			ret = ret ?: irq_ret;
+		}
 	}
 	return ret ?: count;
 }
@@ -1091,7 +1107,7 @@ static ssize_t fsk_store(struct device *dev,
 	bool v;
 	int ret;
 
-	guard(mutex)(&chip->prog_lock);
+	guard(mutex)(&chip->io_lock);
 	if (chip->suspended || chip->removing || !chip->ready)
 		return -EHOSTDOWN;
 	ret = kstrtobool(buf, &v);
@@ -1132,24 +1148,27 @@ static const struct regmap_config cps8601_progmap_cfg = {
 static int cps8601_quiesce(struct cps8601 *chip)
 {
 	int ret;
+	bool active;
 
 	WRITE_ONCE(chip->suspended, true);
 	cancel_delayed_work_sync(&chip->ready_work);
 	cancel_work_sync(&chip->init_work);
 	cancel_delayed_work_sync(&chip->ready_work);
 	cancel_work_sync(&chip->init_work);
+	guard(mutex)(&chip->io_lock);
 	if (chip->irq_armed) {
 		free_irq(chip->irq, chip);
 		chip->irq_armed = false;
 	}
 	cancel_work_sync(&chip->attach_work);
-	guard(mutex)(&chip->prog_lock);
 	cps8601_power_off(chip);
 	chip->ready = false;
 	chip->present = false;
 	chip->pen_soc = -1;
+	active = chip->hboost_active;
 	ret = cps8601_hboost_req(chip, 0);
-	return ret;
+	/* An unavailable optional charger must not prevent system sleep. */
+	return active ? ret : 0;
 }
 
 static int cps8601_pm_notify(struct notifier_block *nb,
@@ -1204,6 +1223,7 @@ static int cps8601_probe(struct i2c_client *client)
 		return dev_err_probe(dev, PTR_ERR(chip->progmap),
 				     "program regmap init failed\n");
 	mutex_init(&chip->prog_lock);
+	mutex_init(&chip->io_lock);
 
 	chip->int_gpiod = devm_gpiod_get(dev, "int", GPIOD_IN);
 	chip->sleep_gpiod = devm_gpiod_get(dev, "sleep", GPIOD_OUT_LOW);
@@ -1219,6 +1239,11 @@ static int cps8601_probe(struct i2c_client *client)
 	device_property_read_u32(dev, "oplus,ovp-threshold", &chip->ovp_uv);
 	device_property_read_u32(dev, "oplus,lvp-threshold", &chip->lvp_uv);
 	device_property_read_u32(dev, "oplus,fod-threshold", &chip->fod_uv);
+	if (!chip->ocp_uv || chip->ocp_uv > 3000 ||
+	    !chip->lvp_uv || chip->lvp_uv > 5000 ||
+	    chip->ovp_uv < 3000 || chip->ovp_uv > 20000 ||
+	    !chip->fod_uv || chip->fod_uv > U16_MAX)
+		return dev_err_probe(dev, -EINVAL, "invalid protection thresholds\n");
 
 	chip->irq = gpiod_to_irq(chip->int_gpiod);
 	if (chip->irq < 0)

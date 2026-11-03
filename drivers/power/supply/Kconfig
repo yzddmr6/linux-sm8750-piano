@@ -214,6 +214,8 @@ config CHARGER_SC8547A
 	help
 	  Southchip SC8547A charge pump and PPS hardware interface.
 	  The experimental proprietary serial charging path is disabled by default.
+	  Each I2C instance binds one pump; the PPS engine controls the primary.
+	  Telemetry and hardware protections remain available without serial mode.
 
 config CHARGER_ERHAI_PPS
 	tristate "Erhai ADSP PPS fast-charge engine"
@@ -221,6 +223,8 @@ config CHARGER_ERHAI_PPS
 	help
 	  Negotiate PPS through the battery manager and control the SC8547A.
 	  The battery manager serializes PPS, fixed PD and charge limits.
+	  PPS is enabled by default and exits to 5 V before system suspend.
+	  Hardware failures release the pump and restore the ordinary charger.
 
 config CHARGER_CPS8601
 	tristate "CPS8601 wireless pen charger"
@@ -228,6 +232,9 @@ config CHARGER_CPS8601
 	select REGMAP_I2C
 	help
 	  Support the CPS8601 inductive pen charger and its ADSP hboost rail.
+	  A dedicated GLINK owner receives acknowledgements for rail requests.
+	  The driver exposes stylus presence, charge level and scan controls.
+	  Charging pauses during system suspend without adding a wake source.
 
 config BATTERY_QCOM_BATTMGR
 	tristate "Qualcomm PMIC GLINK battery manager support"

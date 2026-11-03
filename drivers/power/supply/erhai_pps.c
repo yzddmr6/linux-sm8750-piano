@@ -47,8 +47,8 @@
  *  - module params mirror the sc8547a driver style; every state crossing and
  *    exit reason is logged; counters/substates behind debugfs.
  *
- * No DT change.  Built as a separate module so shipping/removing it does not
- * touch the OTG/SC8547 drivers.
+ * The battery manager supplies the freezable worker, policy lock and GLINK
+ * transport. There is no independent battery supply or battery_charger client.
  */
 
 #include <linux/platform_device.h>
@@ -67,10 +67,9 @@
 #define CREATE_TRACE_POINTS
 #include "erhai_pps_trace.h"
 
-/* sc8547a PPS-CP API (see drivers/power/supply/sc8547a.c) — the 2:1 charge-pump
- * entry points this engine drives when the chip window is reachable.  Resolved
- * lazily via symbol_get() exactly like pps_sc_delivering(): this module must
- * load (and degrade to the buck path) even when the sc8547a module is absent. */
+/* A direct module dependency keeps the charge-pump interface available.
+ * Individual I2C devices may still be waiting for their suppliers to probe.
+ */
 struct erhai_pps_sc_api {
 	int	(*snapshot)(int *vbus_mv, int *vbat_mv, int *ibus_ma);
 	bool	(*cp_engaged)(void);
@@ -124,6 +123,7 @@ static int pps_cp_drop(void)
 #define PPS_PROP_BATT_TEMP		12
 #define PPS_PROP_BATT_CHG_EN		24
 #define PPS_PROP_BATT_AP_FASTCHG_ALLOW	46
+#define PPS_PROP_BATT_SET_PDO		25
 /* ADSP battery GET subset (battmgr ids, mirror erhai_otg_glink.c) */
 #define PPS_PROP_BATT_STATUS		0
 #define PPS_PROP_BATT_CAPACITY		4
@@ -557,8 +557,8 @@ static int pps_revert(struct erhai_pps *p)
 	int rc, err = 0, vbus, online;
 
 #define PPS_RESTORE(call) do { rc = (call); if (rc && !err) err = rc; } while (0)
-	PPS_RESTORE(pps_cp_drop());
 	PPS_RESTORE(pps_sc_adc_hold(false));
+	PPS_RESTORE(pps_cp_drop());
 	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, 2000));
 	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, 5000));
 	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_PPS_MOS_CTRL, 0));
@@ -568,7 +568,7 @@ static int pps_revert(struct erhai_pps *p)
 			       erhai_otg_charge_inhibited() ? 0 : 1));
 	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_PPS_VOOCPHY_ENABLE, 0));
 	/* Explicitly leave the APDO as well as lowering its requested voltage. */
-	PPS_RESTORE(pps_batt_set(25, 5000));
+	PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_SET_PDO, 5000));
 	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_INPUT_CURR_LIMIT, PPS_ICL_UNSUSPEND));
 #undef PPS_RESTORE
 	online = pps_usb_get(0);
@@ -614,7 +614,7 @@ static void pps_enter(struct erhai_pps *p, enum pps_state st, const char *why)
 
 static void pps_exit(struct erhai_pps *p, const char *reason)
 {
-	if (p->state == PPS_IDLE && !p->cleanup)
+	if (p->state == PPS_IDLE && !p->cleanup && !p->adc_held)
 		return;
 	if (!strcmp(reason, PPS_EXIT_REASON_SET_FAIL) ||
 	    !strcmp(reason, PPS_EXIT_REASON_COLLAPSE) ||
@@ -626,6 +626,12 @@ static void pps_exit(struct erhai_pps *p, const char *reason)
 	p->charg_ticks = 0;
 	pr_info("erhai_pps: exit: %s\n", reason);
 	trace_erhai_pps_cp_event(reason, 0, -1, -1, -1, p->set_volt_mv);
+	if (!p->cleanup && p->adc_held) {
+		if (pps_sc_adc_hold(false))
+			p->cleanup = true;
+		else
+			p->adc_held = false;
+	}
 	if (!p->cleanup || !pps_revert(p))
 		pps_enter(p, PPS_IDLE, NULL);
 	else
@@ -638,8 +644,11 @@ static void pps_exit(struct erhai_pps *p, const char *reason)
  * (oplus_chg_set_pps_config, adsp.c:10302-10303) */
 static int pps_pdo_set(struct erhai_pps *p, unsigned int mv, unsigned int ma)
 {
-	int rc = pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, mv);
+	int rc;
 
+	if (mv < 5000 || mv > pps_cp_max_volt_mv || !ma || ma > pps_max_curr_ma)
+		return -ERANGE;
+	rc = pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, mv);
 	if (rc)
 		return rc;
 	p->set_volt_mv = mv;
@@ -717,6 +726,9 @@ static int pps_cp_step(struct erhai_pps *p)
 	}
 	if (a->snapshot(&cvbus, &cvbat, &cibus))
 		return -EIO;
+	if (cvbat < pps_vbat_min_mv || cvbat >= pps_vbat_max_mv ||
+	    cvbus < pps_vbus_collapse_mv || cvbus > pps_cp_max_volt_mv)
+		return -ERANGE;
 
 	diff = cvbus - cvbat * 2;
 
@@ -884,6 +896,12 @@ static void pps_poll(struct erhai_pps *p)
 			p->plug_logged = false;	/* force a fresh probe log */
 			return;
 		}
+		/* The disabled serial poller no longer prewarms the ADC for us. */
+		if (pps_cp_enable && !p->adc_held) {
+			if (pps_sc_adc_hold(true))
+				return;
+			p->adc_held = true;
+		}
 		pps_enter(p, PPS_ARMED, "PD_PPS adapter");
 		return;
 	}
@@ -910,12 +928,18 @@ static void pps_poll(struct erhai_pps *p)
 		 * assignment skipped the transition log, left last_reason
 		 * stale and never refreshed state_since, so the debugfs view
 		 * disagreed with the engine's actual state. */
-		pps_enter(p, PPS_IDLE, NULL);
+		pps_exit(p, PPS_EXIT_REASON_NOT_PPS);
 		return;
 	}
 	case PPS_NEGOTIATE: {
 		int adapter_ma;
 
+		adapter_ma = pps_usb_get(PPS_PROP_USB_GET_PPS_MAX_CURR);
+		if (adapter_ma <= 0)
+			adapter_ma = pps_cable_safe_ma;
+		p->target_curr_ma = min3(pps_target_curr_ma, pps_max_curr_ma,
+					 (unsigned int)adapter_ma);
+		p->set_curr_ma = min(pps_start_curr_ma, p->target_curr_ma);
 		p->cleanup = true;
 		/*
 		 * Entry sequence — ORDER IS LOAD-BEARING (live-validated 2026-09-24,
@@ -940,7 +964,7 @@ static void pps_poll(struct erhai_pps *p)
 		rc = pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, pps_target_volt_mv);
 		if (rc)
 			goto fail;
-		rc = pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, pps_start_curr_ma);
+		rc = pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, p->set_curr_ma);
 		if (rc)
 			goto fail;
 		rc = pps_usb_set(PPS_PROP_USB_INPUT_CURR_LIMIT,
@@ -969,14 +993,6 @@ static void pps_poll(struct erhai_pps *p)
 		}
 
 		p->set_volt_mv = pps_target_volt_mv;
-		p->set_curr_ma = pps_start_curr_ma;
-		/* never ask for more than the adapter offers on this cable
-		 * (vendor pps.c:1735-1774 caps by the adapter's max too) */
-		adapter_ma = pps_usb_get(PPS_PROP_USB_GET_PPS_MAX_CURR);
-		if (adapter_ma <= 0)
-			adapter_ma = pps_cable_safe_ma;
-		p->target_curr_ma = min3(pps_target_curr_ma, pps_max_curr_ma,
-					 (unsigned int)adapter_ma);
 		pr_info("erhai_pps: PPS current target %u mA (adapter offers %d mA)\n",
 			p->target_curr_ma, adapter_ma);
 		p->buck_off = false;
@@ -1013,6 +1029,8 @@ fail:
 			return;
 		}
 		if (p->set_volt_mv >= pps_target_volt_mv) {
+			if (p->vbus_mv < pps_start_volt_mv)
+				return;
 			pps_enter(p, PPS_CHARGING, "VBUS at target");
 			return;
 		}
@@ -1145,7 +1163,7 @@ static void pps_cp_backstop(struct erhai_pps *p)
 {
 	bool stuck;
 
-	if (!p->buck_off)
+	if (!p->buck_off || p->state == PPS_EXIT)
 		return;
 	if (pps_cp_is_engaged())
 		stuck = time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(1000));
@@ -1207,7 +1225,13 @@ static unsigned int erhai_pps_update(void *data)
 
 	if (time_before(jiffies, p->next_poll))
 		return jiffies_to_msecs(p->next_poll - jiffies) + 1;
-	pps_poll(p);
+	if (pps_cp_is_engaged() &&
+	    time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(1000))) {
+		p->failed = true;
+		pps_exit(p, "pump watchdog deadline missed");
+	} else {
+		pps_poll(p);
+	}
 	pps_cp_backstop(p);
 	pps_trace_sample(p);
 	delay = pps_cp_is_engaged() || p->cp_lift_since ? pps_cp_feed_ms : pps_poll_ms;
@@ -1224,7 +1248,7 @@ static bool erhai_pps_active(void *data)
 {
 	struct erhai_pps *p = data;
 
-	return p->state != PPS_IDLE || p->cleanup;
+	return p->state != PPS_IDLE || p->cleanup || p->adc_held;
 }
 
 static int erhai_pps_stop(void *data)
