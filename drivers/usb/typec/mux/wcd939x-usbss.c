@@ -14,6 +14,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
+#include <linux/usb/wcd939x-usbss.h>
 
 #define WCD_USBSS_PMP_OUT1			0x2
 
@@ -197,7 +198,22 @@ struct wcd939x_usbss {
 	enum typec_orientation orientation;
 	unsigned long mode;
 	unsigned int svid;
+
+	/* DP alt-mode is routed through the SBU/MG switches right now */
+	bool dp_active;
+	/* D+/D- currently parked on the charge-pump crossbar (erhai VOOC) */
+	bool fc_routed;
 };
+
+/*
+ * Single USBSS instance reference for the charge-pump fast-charge crossbar
+ * helper. The board has exactly one WCD939x USBSS; the SC8547A VOOC PHY driver
+ * needs to flip its DPDM route but does not own it, so it reaches the switch
+ * through wcd939x_usbss_dpdm_switch_fast_charge() below. Guarded by its own
+ * lock so probe/remove can't race the exported call.
+ */
+static DEFINE_MUTEX(wcd939x_usbss_fc_lock);
+static struct wcd939x_usbss *wcd939x_usbss_fc_dev;
 
 static const struct regmap_range_cfg wcd939x_usbss_ranges[] = {
 	{
@@ -273,6 +289,19 @@ static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
 	} else {
 		return -EOPNOTSUPP;
 	}
+
+	/*
+	 * This reprograms the whole switch block, so whatever the charge-pump
+	 * crossbar did to D+/D- is gone; track DP so the crossbar cannot break
+	 * the AUX routing behind our back (erhai).
+	 */
+	usbss->dp_active = enable_dp;
+	usbss->fc_routed = false;
+
+	dev_info(&usbss->client->dev,
+		 "erhai usbss: set mode=%lu svid=%04x orient=%d -> usb=%d dp=%d audio=%d dp_active=%d\n",
+		 usbss->mode, usbss->svid, usbss->orientation,
+		 enable_usb, enable_dp, enable_audio, usbss->dp_active);
 
 	/* Disable all switches */
 	ret = regmap_clear_bits(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
@@ -542,6 +571,9 @@ static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
 	if (usbss->orientation != orientation) {
 		usbss->orientation = orientation;
 
+		dev_info(&usbss->client->dev,
+			 "erhai usbss: switch_set orient=%d\n", orientation);
+
 		ret = wcd939x_usbss_set(usbss);
 	}
 
@@ -562,7 +594,26 @@ static int wcd939x_usbss_mux_set(struct typec_mux_dev *mux,
 
 	mutex_lock(&usbss->lock);
 
-	if (usbss->mode != state->mode) {
+	/*
+	 * fc_routed means the charge-pump crossbar overwrote the switch block,
+	 * so the cached mode no longer describes the hardware — reprogram even
+	 * when the requested state is unchanged (erhai).
+	 */
+	/*
+	 * Idempotence (erhai): the UCSI poll (erhai_ucsi_poll_ms) calls us
+	 * every 4 s with an UNCHANGED state. Reprogramming the crossbar then
+	 * steals D+/D- from the charge-pump path and kills SVOOC delivery
+	 * (2026-08-28: CHG_EN self-clear at CP enable, margin < 150 mV).
+	 * Only reprogram when the requested mode actually changed, or when
+	 * the charge path owns the crossbar AND DisplayPort is really coming
+	 * up: we then have to take the crossbar back for AUX routing.
+	 * TYPEC_STATE_MODAL is only 2 and is shared by USB2/USB3/audio, so a
+	 * mode>=MODAL test would steal the crossbar from the charge path on
+	 * every plain USB re-poll; the DP SVID is the actual signal.
+	 */
+	if (usbss->mode != state->mode ||
+	    (usbss->fc_routed && state->alt &&
+	     state->alt->svid == USB_TYPEC_DP_SID)) {
 		usbss->mode = state->mode;
 
 		if (state->alt)
@@ -573,6 +624,21 @@ static int wcd939x_usbss_mux_set(struct typec_mux_dev *mux,
 		ret = wcd939x_usbss_set(usbss);
 	}
 
+	/*
+	 * The block above is the only other place dp_active is written, and it
+	 * runs only on a mode change. A DP sink that withdraws alt-mode while
+	 * the cable stays put leaves the mode identical and the alt list empty,
+	 * so dp_active would latch at 1 forever and every later fast-charge
+	 * request gets -EBUSY. No alt mode means the mux state no longer claims
+	 * DP, so drop the flag — clearing only, never setting, keeps this from
+	 * ever granting the crossbar while DisplayPort is really up.
+	 */
+	if (!state->alt && usbss->dp_active) {
+		usbss->dp_active = false;
+		dev_info(&usbss->client->dev,
+			 "erhai usbss: alt-mode gone, dp_active released\n");
+	}
+
 	mutex_unlock(&usbss->lock);
 
 	if (ret)
@@ -581,6 +647,107 @@ static int wcd939x_usbss_mux_set(struct typec_mux_dev *mux,
 	/* Report event to codec after switch has been done */
 	return typec_mux_set(usbss->codec, state);
 }
+
+/*
+ * Route connector D+/D- to the SC8547A charge-pump crossbar (enable=true) or
+ * back to the normal USB path (enable=false). Register sequence captured from
+ * the vendor stack on erhai; the crossbar select and USB_SS_CNTL values match
+ * the live Android i2c trace byte-for-byte.
+ */
+int wcd939x_usbss_dpdm_switch_fast_charge(bool enable)
+{
+	struct wcd939x_usbss *usbss;
+	int ret;
+
+	mutex_lock(&wcd939x_usbss_fc_lock);
+	usbss = wcd939x_usbss_fc_dev;
+	if (!usbss) {
+		mutex_unlock(&wcd939x_usbss_fc_lock);
+		return -ENODEV;
+	}
+
+	mutex_lock(&usbss->lock);
+
+	/*
+	 * DP alt-mode owns the SBU/MG switches while a DisplayPort sink is
+	 * attached. The register writes below rewrite SWITCH_SETTINGS_ENABLE /
+	 * SELECT0 wholesale, which clears the DP_AUXP/AUXM_TO_MGX switches and
+	 * kills AUX (every DPCD read then times out -110 and the connector goes
+	 * disconnected). A DP sink is never a VOOC adapter, so refuse the
+	 * crossbar while DP is up, and restore the mux-programmed routing when
+	 * the charge path asks for the normal USB route back.
+	 */
+	if (usbss->dp_active) {
+		if (enable) {
+			ret = -EBUSY;
+				dev_info(&usbss->client->dev,
+					 "erhai usbss: fc DENIED while DP active\n");
+		} else if (usbss->fc_routed) {
+			ret = wcd939x_usbss_set(usbss);
+			if (!ret)
+				usbss->fc_routed = false;
+		} else {
+			ret = 0;
+		}
+		mutex_unlock(&usbss->lock);
+		mutex_unlock(&wcd939x_usbss_fc_lock);
+		return ret;
+	}
+
+	/* Pre-state: device enabled, DNL/DPR switches off. */
+	ret = regmap_write(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+			   WCD_USBSS_SWITCH_SETTINGS_ENABLE_DEVICE_ENABLE);
+	if (ret)
+		goto out;
+
+	/*
+	 * Crossbar select: fast charge routes DNL->DN2, DPR->DR2 (0x28);
+	 * normal USB routes DNL->DN, DPR->DP (0x14).
+	 */
+	ret = regmap_write(usbss->regmap, WCD_USBSS_SWITCH_SELECT0,
+			   enable ?
+			   (FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
+				       WCD_USBSS_SWITCH_SELECT0_DNL_SWITCH_DN2) |
+			    FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES,
+				       WCD_USBSS_SWITCH_SELECT0_DPR_SWITCH_DR2)) :
+			   (FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
+				       WCD_USBSS_SWITCH_SELECT0_DNL_SWITCH_DN) |
+			    FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES,
+				       WCD_USBSS_SWITCH_SELECT0_DPR_SWITCH_DP)));
+	if (ret)
+		goto out;
+
+	/* Enable DNL + DPR switches (0x98). */
+	ret = regmap_write(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+			   WCD_USBSS_SWITCH_SETTINGS_ENABLE_DEVICE_ENABLE |
+			   WCD_USBSS_SWITCH_SETTINGS_ENABLE_DNL_SWITCHES |
+			   WCD_USBSS_SWITCH_SETTINGS_ENABLE_DPR_SWITCHES);
+	if (ret)
+		goto out;
+
+	/*
+	 * USB_SS_CNTL: RCO_EN + USB mode, never STANDBY_STATE. The old
+	 * behaviour set STANDBY for the "normal USB route" (matching a
+	 * misread vendor trace) which standby-ed the whole SS block at
+	 * every detach (fc-restore) and deafened the HS path for all
+	 * subsequent attaches (register diff A/B: 0x419 0d -> 1d).
+	 */
+	ret = regmap_write(usbss->regmap, WCD_USBSS_USB_SS_CNTL,
+			   WCD_USBSS_USB_SS_CNTL_RCO_EN |
+			   FIELD_PREP(WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
+				      WCD_USBSS_USB_SS_CNTL_USB_SS_MODE_USB));
+	if (!ret)
+		usbss->fc_routed = enable;
+out:
+	mutex_unlock(&usbss->lock);
+	if (ret)
+		dev_err(&usbss->client->dev,
+			"fast-charge DPDM switch %s failed: %d\n",
+			enable ? "on" : "off", ret);
+	mutex_unlock(&wcd939x_usbss_fc_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(wcd939x_usbss_dpdm_switch_fast_charge);
 
 static int wcd939x_usbss_probe(struct i2c_client *client)
 {
@@ -722,6 +889,10 @@ static int wcd939x_usbss_probe(struct i2c_client *client)
 
 	i2c_set_clientdata(client, usbss);
 
+	mutex_lock(&wcd939x_usbss_fc_lock);
+	wcd939x_usbss_fc_dev = usbss;
+	mutex_unlock(&wcd939x_usbss_fc_lock);
+
 	return 0;
 
 err_switch_unregister:
@@ -742,6 +913,11 @@ err_mux_put:
 static void wcd939x_usbss_remove(struct i2c_client *client)
 {
 	struct wcd939x_usbss *usbss = i2c_get_clientdata(client);
+
+	mutex_lock(&wcd939x_usbss_fc_lock);
+	if (wcd939x_usbss_fc_dev == usbss)
+		wcd939x_usbss_fc_dev = NULL;
+	mutex_unlock(&wcd939x_usbss_fc_lock);
 
 	typec_mux_unregister(usbss->mux);
 	typec_switch_unregister(usbss->sw);
