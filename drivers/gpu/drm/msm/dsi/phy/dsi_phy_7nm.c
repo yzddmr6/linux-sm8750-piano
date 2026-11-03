@@ -428,16 +428,14 @@ static void dsi_pll_enable_pll_bias(struct dsi_pll_7nm *pll)
 	u32 data;
 
 	spin_lock_irqsave(&pll->pll_enable_lock, flags);
-	if (pll->pll_enable_cnt++) {
-		spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
-		WARN_ON(pll->pll_enable_cnt == INT_MAX);
-		return;
+	if (!pll->pll_enable_cnt++) {
+		data = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
+		data |= DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
+		writel(data, pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
 	}
+	WARN_ON(pll->pll_enable_cnt == INT_MAX);
 
-	data = readl(pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
-	data |= DSI_7nm_PHY_CMN_CTRL_0_PLL_SHUTDOWNB;
-	writel(data, pll->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0);
-
+	/* dsi_7nm_phy_enable() takes the first reference without programming the muxes. */
 	writel(0xc0, pll->phy->pll_base + REG_DSI_7nm_PHY_PLL_SYSTEM_MUXES);
 	spin_unlock_irqrestore(&pll->pll_enable_lock, flags);
 	ndelay(250);
