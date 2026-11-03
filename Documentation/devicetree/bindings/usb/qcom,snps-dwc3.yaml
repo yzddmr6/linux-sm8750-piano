@@ -158,6 +158,8 @@ properties:
       HS/FS/LS modes are supported.
     type: boolean
 
+  mode-switch: true
+
   wakeup-source: true
 
 required:
@@ -170,6 +172,7 @@ required:
 
 allOf:
   - $ref: snps,dwc3-common.yaml#
+  - $ref: /schemas/usb/usb-switch.yaml#
   - if:
       properties:
         compatible:
