@@ -1936,6 +1936,7 @@
 };
 
 &usb {
+	mode-switch;
 	dr_mode = "otg";
 	maximum-speed = "super-speed";
 	phys = <&usb_hsphy>, <&usb_dp_qmpphy QMP_USB43DP_USB3_PHY>;
