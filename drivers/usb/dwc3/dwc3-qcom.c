@@ -89,15 +89,13 @@ struct dwc3_qcom {
 	bool			dp_active;
 	bool			dp_only;
 	bool			utmi_pipe_clk;
-	/* protects dp_active, dp_only, utmi_pipe_clk and pm_suspended */
-	struct mutex		pipe_clk_lock;
 	struct typec_mux_dev	*mux;
 	struct icc_path		*icc_path_ddr;
 	struct icc_path		*icc_path_apps;
 
 	enum usb_role		current_role;
 
-	/* Serializes the role notifier against system suspend and resume */
+	/* Serializes role/mux updates and system PM, including QSCRATCH. */
 	struct mutex		role_lock;
 	bool			vbus_override_pending;
 	bool			vbus_override;
@@ -462,7 +460,7 @@ static int dwc3_qcom_mux_set(struct typec_mux_dev *mux,
 {
 	struct dwc3_qcom *qcom = typec_mux_get_drvdata(mux);
 
-	guard(mutex)(&qcom->pipe_clk_lock);
+	guard(mutex)(&qcom->role_lock);
 
 	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
 		if (!qcom->dp_active)
@@ -781,7 +779,6 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 			qcom->current_role = USB_ROLE_DEVICE;
 	}
 
-	mutex_init(&qcom->pipe_clk_lock);
 	qcom->dwc.glue_ops = &dwc3_qcom_glue_ops;
 
 	qcom->dwc.dev = dev;
@@ -854,8 +851,6 @@ static int dwc3_qcom_pm_suspend(struct device *dev)
 	if (ret)
 		return ret;
 
-	guard(mutex)(&qcom->pipe_clk_lock);
-
 	ret = dwc3_qcom_suspend(qcom, wakeup);
 	if (ret)
 		return ret;
@@ -874,18 +869,15 @@ static int dwc3_qcom_pm_resume(struct device *dev)
 
 	guard(mutex)(&qcom->role_lock);
 
-	scoped_guard(mutex, &qcom->pipe_clk_lock) {
-		ret = dwc3_qcom_resume(qcom, wakeup);
-		if (ret)
-			return ret;
+	ret = dwc3_qcom_resume(qcom, wakeup);
+	if (ret)
+		return ret;
 
-		if (!qcom->ignore_pipe_clk &&
-		    qcom->dp_only != qcom->utmi_pipe_clk)
-			dwc3_qcom_select_utmi_clk(qcom, qcom->dp_only);
+	if (!qcom->ignore_pipe_clk &&
+	    qcom->dp_only != qcom->utmi_pipe_clk)
+		dwc3_qcom_select_utmi_clk(qcom, qcom->dp_only);
 
-		qcom->pm_suspended = false;
-	}
-
+	qcom->pm_suspended = false;
 	ret = dwc3_pm_resume(&qcom->dwc);
 
 	/*
