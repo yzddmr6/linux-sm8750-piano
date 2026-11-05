@@ -3385,6 +3385,45 @@ static void xiaomi_mca_unbind_restore(void *data)
 		xiaomi_mca_request_volt(mca, 5000);
 }
 
+/* Leave the autonomous buck charger at the source's 5 V policy limits. */
+static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca)
+{
+	u32 type, icl, fcc, tbat;
+	int ret;
+
+	if (!mca->icl_written && !mca->fcc_written)
+		return 0;
+
+	ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &type);
+	if (ret)
+		return ret;
+	icl = xiaomi_mca_policy_icl(type);
+	fcc = xiaomi_mca_policy_fcc(type, false);
+	if (!icl || !fcc)
+		return -EOPNOTSUPP;
+	if (xiaomi_mca_is_pd(type))
+		icl = clamp(xiaomi_mca_pd_5v_ma(mca), MCA_ICL_MIN_MA, icl);
+
+	if (mca->fcc_written) {
+		ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tbat);
+		if (ret)
+			return ret;
+		fcc = xiaomi_mca_fcc_thermal(fcc, (s32)tbat);
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, fcc);
+		if (ret)
+			return ret;
+		mca->fcc_set_ma = fcc;
+	}
+	if (mca->icl_written) {
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, icl);
+		if (ret)
+			return ret;
+		mca->icl_set_ma = icl;
+	}
+	/* Keep the written flags: detach/resume must reset these setpoints. */
+	return 0;
+}
+
 /* Stop host-controlled charging before its suppliers can suspend. */
 static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 {
@@ -3411,9 +3450,7 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 			goto out;
 	}
 
-	ret = xiaomi_mca_restore_icl(mca);
-	if (!ret && mca->fcc_written)
-		ret = xiaomi_mca_reset_fcc(mca);
+	ret = xiaomi_mca_sleep_currents(mca);
 	if (ret)
 		return ret;
 
