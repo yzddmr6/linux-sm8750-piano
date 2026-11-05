@@ -1925,6 +1925,10 @@ static void xiaomi_mca_test_threshold_stop_failure_sleep(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
 	KUNIT_EXPECT_EQ(test, f->voltage_requests, 0);
 	f->stage_error = 0;
+	f->vbus_error = -ETIMEDOUT;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, f->voltage_requests, 0);
+	f->vbus_error = 0;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, f->voltage_requests, 1);
 	KUNIT_EXPECT_FALSE(test, f->voltage_before_stop);
@@ -1947,6 +1951,15 @@ static void xiaomi_mca_test_threshold_stop_failure_sleep(struct kunit *test)
 	f->cells[1].capacity = -1;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), -ENODATA);
 	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
+	/* Unplug after HV charging must still allow protected battery sleep. */
+	f->vbus = 0;
+	f->type = MCA_TYPE_UNKNOWN;
+	f->mca.voltage_written = true;
+	f->mca.icl_written = true;
+	f->mca.fcc_written = true;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_quiesce(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, f->voltage_requests, 1);
+	KUNIT_EXPECT_FALSE(test, f->mca.voltage_written);
 }
 
 static struct kunit_case xiaomi_mca_test_cases[] = {
