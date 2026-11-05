@@ -3445,11 +3445,19 @@ static int xiaomi_mca_prepare(struct device *dev)
 
 	disable_delayed_work_sync(&mca->poll_work);
 	scoped_guard(mutex, &mca->lock) {
+		bool busy;
+
 		/* Direct suspend requests need not use the wakeup_count protocol. */
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
-			ret = mca->charge_awake ? -EBUSY : 0;
-		if (!ret)
+			busy = mca->charge_awake;
+		if (busy) {
+			dev_info(dev, "protected charging in progress; system sleep refused\n");
+			ret = -EBUSY;
+		} else {
 			ret = xiaomi_mca_quiesce(mca);
+			if (ret)
+				dev_err(dev, "cannot quiesce charging for system sleep: %d\n", ret);
+		}
 		if (!ret) {
 			mca->sleeping = true;
 			mca->last_valid = false;
@@ -3457,7 +3465,6 @@ static int xiaomi_mca_prepare(struct device *dev)
 		}
 	}
 	if (ret) {
-		dev_err(dev, "cannot quiesce charging for system sleep: %d\n", ret);
 		enable_delayed_work(&mca->poll_work);
 		schedule_delayed_work(&mca->poll_work, 0);
 	}
