@@ -32,6 +32,7 @@
 #include <linux/power/sc8541_charger.h>
 #include <linux/mutex.h>
 #include <linux/pm.h>
+#include <linux/pm_wakeup.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/seq_file.h>
@@ -621,6 +622,8 @@ struct xiaomi_mca {
 	bool term_hot;		/* float-voltage thermal hysteresis */
 	/* Thresholds are shared by the two cells and protected by rx_lock. */
 	unsigned int charge_start, charge_end;
+	struct wakeup_source *charge_ws;
+	bool charge_awake;	/* protected by rx_lock, like the thresholds */
 	bool charge_hold;	/* SOC hysteresis, protected by lock */
 	bool charge_blocked;	/* no CP/HV policy until limits can be satisfied */
 	bool charge_disabled;	/* a disable may have reached firmware */
@@ -1720,10 +1723,51 @@ static int xiaomi_mca_restore_voltage(struct xiaomi_mca *mca)
  * the charge-enable vote and makes the quick-charge strategy exit. It does
  * not map a percentage to a float voltage (delta_fv is a separate policy).
  */
-static bool xiaomi_mca_charge_limited(struct xiaomi_mca *mca)
+static void xiaomi_mca_charge_wake_locked(struct xiaomi_mca *mca, bool awake)
 {
-	guard(spinlock_irqsave)(&mca->rx_lock);
-	return mca->charge_end < 100;
+	lockdep_assert_held(&mca->rx_lock);
+	awake = awake && mca->charge_end < 100 && mca->service_up;
+	if (mca->charge_awake == awake)
+		return;
+	mca->charge_awake = awake;
+	if (awake)
+		__pm_stay_awake(mca->charge_ws);
+	else
+		__pm_relax(mca->charge_ws);
+}
+
+/* Stock online_wake_lock, limited to protected charging instead of all USB. */
+static void xiaomi_mca_charge_wake_poll(struct xiaomi_mca *mca, bool allowed)
+{
+	bool limited;
+	u32 online;
+
+	scoped_guard(spinlock_irqsave, &mca->rx_lock)
+		limited = mca->charge_end < 100;
+	allowed = allowed && limited && !mca->otg_active;
+	/* Do not use policy's cached online state after a failed VBUS read. */
+	if (allowed)
+		allowed = !xiaomi_mca_read(mca, MCA_PROP_USB_ONLINE, &online) && online == 1;
+	scoped_guard(spinlock_irqsave, &mca->rx_lock)
+		xiaomi_mca_charge_wake_locked(mca, allowed);
+}
+
+static void xiaomi_mca_charge_wake_remove(void *data)
+{
+	struct xiaomi_mca *mca = data;
+
+	__pm_relax(mca->charge_ws);
+	wakeup_source_unregister(mca->charge_ws);
+}
+
+static int xiaomi_mca_charge_wake_init(struct xiaomi_mca *mca)
+{
+	if (!IS_ENABLED(CONFIG_PM_SLEEP))
+		return 0;
+	mca->charge_ws = wakeup_source_register(mca->dev, "xiaomi-mca-charge");
+	if (!mca->charge_ws)
+		return -ENOMEM;
+	return devm_add_action_or_reset(mca->dev, xiaomi_mca_charge_wake_remove, mca);
 }
 
 static int xiaomi_mca_charge_enable(struct xiaomi_mca *mca, bool enable)
@@ -1791,6 +1835,7 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		mca->charge_hold = false;
 	if (end == 100 && !mca->charge_disabled) {
 		mca->charge_blocked = false;
+		xiaomi_mca_charge_wake_poll(mca, false);
 		return 0;
 	}
 	if (end < 100) {
@@ -1836,10 +1881,13 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 	mca->charge_blocked = ret || mca->charge_hold || mca->charge_hot || mca->charge_cold;
 	if (mca->charge_blocked) {
 		stop_ret = xiaomi_mca_charge_stop(mca);
+		xiaomi_mca_charge_wake_poll(mca, false);
 		return ret ?: stop_ret;
 	}
 	/* full_charge only selects FV; it never overrides SOC/thermal stops. */
-	return xiaomi_mca_charge_enable(mca, true);
+	ret = xiaomi_mca_charge_enable(mca, true);
+	xiaomi_mca_charge_wake_poll(mca, !ret);
+	return ret;
 }
 
 /*
@@ -2573,6 +2621,8 @@ static void xiaomi_mca_pdr_notify(void *priv, int state)
 	if (mca->service_up != (state == SERVREG_SERVICE_STATE_UP))
 		mca->service_generation++;
 	mca->service_up = state == SERVREG_SERVICE_STATE_UP;
+	if (!mca->service_up)
+		xiaomi_mca_charge_wake_locked(mca, false);
 	if (mca->poll_ready && mca->service_up)
 		mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
 }
@@ -3298,6 +3348,8 @@ static void xiaomi_mca_stop_poll(void *data)
 	scoped_guard(spinlock_irqsave, &mca->rx_lock)
 		mca->poll_ready = false;
 	disable_delayed_work_sync(&mca->poll_work);
+	scoped_guard(spinlock_irqsave, &mca->rx_lock)
+		xiaomi_mca_charge_wake_locked(mca, false);
 }
 
 static void xiaomi_mca_debugfs_remove(void *data)
@@ -3339,12 +3391,6 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 	u32 vbus;
 	int ret;
 
-	/* No SOC polling in sleep: preserve the upper bound by stopping first. */
-	if (xiaomi_mca_charge_limited(mca)) {
-		ret = xiaomi_mca_charge_stop(mca);
-		if (ret)
-			return ret;
-	}
 	ret = xiaomi_mca_cp_stop(mca, "system sleep");
 	if (ret)
 		return ret;
@@ -3399,7 +3445,11 @@ static int xiaomi_mca_prepare(struct device *dev)
 
 	disable_delayed_work_sync(&mca->poll_work);
 	scoped_guard(mutex, &mca->lock) {
-		ret = xiaomi_mca_quiesce(mca);
+		/* Direct suspend requests need not use the wakeup_count protocol. */
+		scoped_guard(spinlock_irqsave, &mca->rx_lock)
+			ret = mca->charge_awake ? -EBUSY : 0;
+		if (!ret)
+			ret = xiaomi_mca_quiesce(mca);
 		if (!ret) {
 			mca->sleeping = true;
 			mca->last_valid = false;
@@ -3472,6 +3522,8 @@ static int xiaomi_mca_threshold_set(struct power_supply *psy,
 			if (value < 1 || value > 100 || value <= mca->charge_start)
 				return -EINVAL;
 			mca->charge_end = value;
+			if (value == 100)
+				xiaomi_mca_charge_wake_locked(mca, false);
 			break;
 		default:
 			return -EINVAL;
@@ -3561,6 +3613,10 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 	init_completion(&mca->ack);
 	spin_lock_init(&mca->rx_lock);
 	ret = devm_mutex_init(dev, &mca->lock);
+	if (ret)
+		return ret;
+	/* Released after polling, restore and the GLINK client are gone. */
+	ret = xiaomi_mca_charge_wake_init(mca);
 	if (ret)
 		return ret;
 
