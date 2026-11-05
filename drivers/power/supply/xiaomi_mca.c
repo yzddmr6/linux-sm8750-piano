@@ -13,8 +13,8 @@
  * checked replies/readback and unknown-source refusal. The complete community
  * charging policy is opt-in: source-bounded 9 V/PPS, battery-temperature FCC,
  * MiPPS relay, SC8541 direct charging and temperature-bounded float voltage.
- * Charging enable and firmware JEITA are not written. All policy switches
- * default off.
+ * Optional battery thresholds use the stock charge-enable command. Firmware
+ * JEITA is never disabled. All policy switches and thresholds default off.
  * USB-C port acknowledgments belong to the existing AltMode client.
  */
 
@@ -619,6 +619,13 @@ struct xiaomi_mca {
 	struct delayed_work poll_work;
 	bool term_written;	/* restore even after a lost write acknowledgment */
 	bool term_hot;		/* float-voltage thermal hysteresis */
+	/* Thresholds are shared by the two cells and protected by rx_lock. */
+	unsigned int charge_start, charge_end;
+	bool charge_hold;	/* SOC hysteresis, protected by lock */
+	bool charge_blocked;	/* no CP/HV policy until limits can be satisfied */
+	bool charge_disabled;	/* a disable may have reached firmware */
+	bool charge_hot, charge_cold;
+	struct power_supply *batteries[2];
 	bool sleeping;		/* no transactions between prepare and complete */
 	bool online;
 	int vbus_uv;
@@ -984,6 +991,7 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	switch (prop) {
 	case MCA_PROP_CID_CFG:
 		return len == sizeof(u32) && val == MCA_PIANO_CID_CFG;
+	case MCA_PROP_CHARGING_ENABLED:
 	case MCA_PROP_CP_STATE:
 	case MCA_PROP_CC_TOGGLE:
 		return len == 1 && *(const u8 *)data <= 1;
@@ -1040,6 +1048,25 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	if (len > sizeof(buf) || !xiaomi_mca_write_allowed(prop, data, len))
 		return -EPERM;
 	lockdep_assert_held(&mca->lock);
+	if (prop == MCA_PROP_CHARGING_ENABLED) {
+		u8 enabled;
+
+		/* Stock qcom_subpmic_enable_charging sends one byte, not u32. */
+		scoped_guard(spinlock_irqsave, &mca->rx_lock)
+			generation = mca->service_generation;
+		memcpy(buf, data, len);
+		ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
+		if (ret)
+			return ret;
+		ret = xiaomi_mca_read_blob(mca, prop, &enabled, sizeof(enabled));
+		if (ret)
+			return ret;
+		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+			if (generation != mca->service_generation || !mca->service_up)
+				return -ECONNRESET;
+		}
+		return enabled == *(const u8 *)data ? 0 : -EIO;
+	}
 	if (prop == MCA_PROP_TERM_VOLT) {
 		/* Unlike source current limits, this also restores while unplugged. */
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
@@ -1662,6 +1689,148 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	mca->hv = MCA_HV_OFF;
 	mca->hv_retry = jiffies;
 	return 0;
+}
+
+static int xiaomi_mca_restore_voltage(struct xiaomi_mca *mca)
+{
+	u32 vbus;
+	int ret, wait_ret;
+
+	if (mca->voltage_written) {
+		/* Cancel a pending raise even if the bus still reads 5 V. */
+		ret = xiaomi_mca_request_volt(mca, 5000);
+		if (ret)
+			return ret;
+		/* Observe the existing voltage-settling budget; do not resend. */
+		wait_ret = read_poll_timeout(xiaomi_mca_read, ret,
+					     ret || vbus < MCA_HV_VBUS_5V_MAX_UV,
+					     jiffies_to_usecs(MCA_POLL_INTERVAL),
+					     jiffies_to_usecs(MCA_POLL_INTERVAL *
+							      MCA_HV_SETTLE_POLLS),
+					     false, mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus);
+		if (ret || wait_ret)
+			return ret ?: wait_ret;
+	}
+	mca->voltage_written = false;
+	return 0;
+}
+
+/*
+ * Android smart_charge -> set_soc_limit_sts stops buck charging through
+ * the charge-enable vote and makes the quick-charge strategy exit. It does
+ * not map a percentage to a float voltage (delta_fv is a separate policy).
+ */
+static bool xiaomi_mca_charge_limited(struct xiaomi_mca *mca)
+{
+	guard(spinlock_irqsave)(&mca->rx_lock);
+	return mca->charge_end < 100;
+}
+
+static int xiaomi_mca_charge_enable(struct xiaomi_mca *mca, bool enable)
+{
+	u8 value = enable, readback;
+	int ret;
+
+	if (enable && !mca->charge_disabled)
+		return 0;
+	/* Retain ownership after a lost disable acknowledgment. */
+	if (!enable)
+		mca->charge_disabled = true;
+	ret = xiaomi_mca_read_blob(mca, MCA_PROP_CHARGING_ENABLED,
+				   &readback, sizeof(readback));
+	if (ret || readback != value)
+		ret = xiaomi_mca_write_blob(mca, MCA_PROP_CHARGING_ENABLED,
+					    &value, sizeof(value));
+	if (!ret && enable)
+		mca->charge_disabled = false;
+	return ret;
+}
+
+static int xiaomi_mca_charge_stop(struct xiaomi_mca *mca)
+{
+	int ret, buck_ret;
+
+	ret = xiaomi_mca_cp_stop(mca, "battery protection");
+	buck_ret = xiaomi_mca_charge_enable(mca, false);
+	if (ret || buck_ret)
+		return ret ?: buck_ret;
+	/* Never reduce source voltage while CP shutdown is unconfirmed. */
+	ret = xiaomi_mca_restore_voltage(mca);
+	if (ret)
+		return ret;
+	mca->hv = MCA_HV_OFF;
+	return 0;
+}
+
+static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
+{
+	union power_supply_propval val;
+	struct power_supply *psy;
+	unsigned int start, end;
+	int soc = 0, n, ret = 0, stop_ret;
+	int vbat, ibat, tcool, tbat;
+	u32 tpack;
+
+	lockdep_assert_held(&mca->lock);
+	if (mca->sleeping)
+		return -EHOSTDOWN;
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		start = mca->charge_start;
+		end = mca->charge_end;
+	}
+	if (end == 100)
+		mca->charge_hold = false;
+	if (end == 100 && !mca->charge_disabled) {
+		mca->charge_blocked = false;
+		return 0;
+	}
+	if (end < 100) {
+		/* One charger feeds both cells: the higher SOC controls the limit. */
+		for (n = 0; n < ARRAY_SIZE(xiaomi_mca_supplied_to); n++) {
+			psy = power_supply_get_by_name(xiaomi_mca_supplied_to[n]);
+			if (!psy) {
+				ret = -ENODEV;
+				break;
+			}
+			ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val);
+			power_supply_put(psy);
+			if (ret)
+				break;
+			if (val.intval < 0 || val.intval > 100) {
+				ret = -ENODATA;
+				break;
+			}
+			soc = max(soc, val.intval);
+		}
+		if (!ret) {
+			if (soc >= end)
+				mca->charge_hold = true;
+			else if (soc <= start)
+				mca->charge_hold = false;
+		}
+	}
+	ret = ret ?: xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
+	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat);
+	if (!ret) {
+		tbat = max_t(s32, tbat, tpack);
+		tcool = min_t(s32, tcool, tpack);
+		/* Conservative release window; firmware JEITA remains enabled. */
+		if (tbat >= 55)
+			mca->charge_hot = true;
+		else if (tbat < 53)
+			mca->charge_hot = false;
+		if (tcool < 0)
+			mca->charge_cold = true;
+		else if (tcool >= 2)
+			mca->charge_cold = false;
+	}
+	mca->charge_blocked = ret || mca->charge_hold || mca->charge_hot || mca->charge_cold;
+	if (mca->charge_blocked) {
+		stop_ret = xiaomi_mca_charge_stop(mca);
+		return ret ?: stop_ret;
+	}
+	/* full_charge only selects FV; it never overrides SOC/thermal stops. */
+	return xiaomi_mca_charge_enable(mca, true);
 }
 
 /*
@@ -2521,6 +2690,13 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->policy_generation = generation;
 		}
 		xiaomi_mca_process_notifications(mca);
+		ret = xiaomi_mca_charge_limit_poll(mca);
+		if (ret) {
+			dev_warn_ratelimited(mca->dev, "failed to apply battery limit: %d\n", ret);
+			goto out;
+		}
+		if (mca->charge_blocked)
+			goto out;
 		if (charge_policy && !mca->otg_active) {
 			mca->policy_active = true;
 			xiaomi_mca_policy_poll(mca);
@@ -3136,6 +3312,11 @@ static void xiaomi_mca_unbind_restore(void *data)
 		mca->cp_psy = NULL;
 		return;
 	}
+	scoped_guard(spinlock_irqsave, &mca->rx_lock)
+		mca->charge_end = 100;
+	ret = xiaomi_mca_charge_limit_poll(mca);
+	if (ret)
+		dev_warn(mca->dev, "failed to release battery limit: %d\n", ret);
 	xiaomi_mca_restore_icl(mca);
 	if (mca->fcc_written)
 		xiaomi_mca_reset_fcc(mca);
@@ -3147,8 +3328,14 @@ static void xiaomi_mca_unbind_restore(void *data)
 static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 {
 	u32 vbus;
-	int ret, wait_ret;
+	int ret;
 
+	/* No SOC polling in sleep: preserve the upper bound by stopping first. */
+	if (xiaomi_mca_charge_limited(mca)) {
+		ret = xiaomi_mca_charge_stop(mca);
+		if (ret)
+			return ret;
+	}
 	ret = xiaomi_mca_cp_stop(mca, "system sleep");
 	if (ret)
 		return ret;
@@ -3175,21 +3362,9 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 	if (ret)
 		return ret;
 
-	if (mca->voltage_written) {
-		/* Cancel a pending raise even if the bus still reads 5 V. */
-		ret = xiaomi_mca_request_volt(mca, 5000);
-		if (ret)
-			return ret;
-		/* Observe the existing voltage-settling budget; do not resend. */
-		wait_ret = read_poll_timeout(xiaomi_mca_read, ret,
-					     ret || vbus < MCA_HV_VBUS_5V_MAX_UV,
-					     jiffies_to_usecs(MCA_POLL_INTERVAL),
-					     jiffies_to_usecs(MCA_POLL_INTERVAL *
-							      MCA_HV_SETTLE_POLLS),
-					     false, mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus);
-		if (ret || wait_ret)
-			return ret ?: wait_ret;
-	}
+	ret = xiaomi_mca_restore_voltage(mca);
+	if (ret)
+		return ret;
 
 out:
 	mca->cp = MCA_CP_OFF;
@@ -3248,6 +3423,116 @@ static const struct dev_pm_ops xiaomi_mca_pm_ops = {
 	.complete = xiaomi_mca_complete,
 };
 
+static int xiaomi_mca_threshold_get(struct power_supply *psy,
+				    const struct power_supply_ext *ext, void *data,
+				    enum power_supply_property psp,
+				    union power_supply_propval *val)
+{
+	struct xiaomi_mca *mca = data;
+
+	guard(spinlock_irqsave)(&mca->rx_lock);
+	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+		val->intval = mca->charge_start;
+		return 0;
+	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+		val->intval = mca->charge_end;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int xiaomi_mca_threshold_set(struct power_supply *psy,
+				    const struct power_supply_ext *ext, void *data,
+				    enum power_supply_property psp,
+				    const union power_supply_propval *val)
+{
+	struct xiaomi_mca *mca = data;
+	int value = val->intval;
+
+	/* No mca->lock here: power_supply callers hold extensions_sem. */
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		switch (psp) {
+		case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
+			if (value < 0 || value >= mca->charge_end)
+				return -EINVAL;
+			mca->charge_start = value;
+			break;
+		case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
+			if (value < 1 || value > 100 || value <= mca->charge_start)
+				return -EINVAL;
+			mca->charge_end = value;
+			break;
+		default:
+			return -EINVAL;
+		}
+		if (mca->poll_ready)
+			mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
+	}
+	power_supply_changed(mca->batteries[0]);
+	power_supply_changed(mca->batteries[1]);
+	return 0;
+}
+
+static int xiaomi_mca_threshold_writeable(struct power_supply *psy,
+					  const struct power_supply_ext *ext, void *data,
+					  enum power_supply_property psp)
+{
+	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
+	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
+}
+
+static const enum power_supply_property xiaomi_mca_threshold_props[] = {
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
+	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+};
+
+static const struct power_supply_ext xiaomi_mca_battery_ext = {
+	.name = "xiaomi-mca",
+	.properties = xiaomi_mca_threshold_props,
+	.num_properties = ARRAY_SIZE(xiaomi_mca_threshold_props),
+	.get_property = xiaomi_mca_threshold_get,
+	.set_property = xiaomi_mca_threshold_set,
+	.property_is_writeable = xiaomi_mca_threshold_writeable,
+};
+
+static void xiaomi_mca_battery_put(void *data)
+{
+	power_supply_put(data);
+}
+
+static void xiaomi_mca_battery_ext_remove(void *data)
+{
+	power_supply_unregister_extension(data, &xiaomi_mca_battery_ext);
+}
+
+static int xiaomi_mca_battery_ext_register(struct xiaomi_mca *mca)
+{
+	int n, ret;
+
+	for (n = 0; n < ARRAY_SIZE(mca->batteries); n++) {
+		mca->batteries[n] = power_supply_get_by_name(xiaomi_mca_supplied_to[n]);
+		if (!mca->batteries[n])
+			return -EPROBE_DEFER;
+		ret = devm_add_action_or_reset(mca->dev, xiaomi_mca_battery_put,
+					       mca->batteries[n]);
+		if (ret)
+			return ret;
+	}
+	for (n = 0; n < ARRAY_SIZE(mca->batteries); n++) {
+		ret = power_supply_register_extension(mca->batteries[n],
+						      &xiaomi_mca_battery_ext, mca->dev, mca);
+		if (ret)
+			return ret;
+		ret = devm_add_action_or_reset(mca->dev, xiaomi_mca_battery_ext_remove,
+					       mca->batteries[n]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int xiaomi_mca_probe(struct auxiliary_device *adev,
 			    const struct auxiliary_device_id *id)
 {
@@ -3261,6 +3546,7 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 		return -ENOMEM;
 
 	mca->dev = dev;
+	mca->charge_end = 100;
 	mca->piano_otg = of_device_is_compatible(dev->of_node, "xiaomi,piano-pmic-glink");
 	dev_set_drvdata(dev, mca);
 	init_completion(&mca->ack);
@@ -3312,6 +3598,10 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 	ret = devm_add_action_or_reset(dev, xiaomi_mca_debugfs_remove, mca->debugfs);
 	if (ret)
 		return ret;
+
+	ret = xiaomi_mca_battery_ext_register(mca);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to extend batteries\n");
 
 	scoped_guard(spinlock_irqsave, &mca->rx_lock)
 		mca->poll_ready = true;
