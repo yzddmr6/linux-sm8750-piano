@@ -1748,6 +1748,7 @@ static int xiaomi_mca_charge_enable(struct xiaomi_mca *mca, bool enable)
 
 static int xiaomi_mca_charge_stop(struct xiaomi_mca *mca)
 {
+	u32 vbus;
 	int ret, buck_ret;
 
 	ret = xiaomi_mca_cp_stop(mca, "battery protection");
@@ -1755,6 +1756,14 @@ static int xiaomi_mca_charge_stop(struct xiaomi_mca *mca)
 	if (ret || buck_ret)
 		return ret ?: buck_ret;
 	/* Never reduce source voltage while CP shutdown is unconfirmed. */
+	if (mca->voltage_written) {
+		ret = xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus);
+		if (ret)
+			return ret;
+		/* As in quiesce, a confirmed detach needs no source request. */
+		if (vbus < MCA_VBUS_ONLINE_UV)
+			mca->voltage_written = false;
+	}
 	ret = xiaomi_mca_restore_voltage(mca);
 	if (ret)
 		return ret;
