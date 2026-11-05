@@ -315,13 +315,18 @@ static void pmic_glink_ucsi_register(struct work_struct *work)
 	struct pmic_glink_ucsi *ucsi = container_of(work, struct pmic_glink_ucsi, register_work);
 	unsigned long flags;
 	bool pd_running;
+	int ret;
 
 	spin_lock_irqsave(&ucsi->state_lock, flags);
 	pd_running = ucsi->pd_running;
 	spin_unlock_irqrestore(&ucsi->state_lock, flags);
 
 	if (!ucsi->ucsi_registered && pd_running) {
-		ucsi_register(ucsi->ucsi);
+		ret = ucsi_register(ucsi->ucsi);
+		if (ret) {
+			dev_err(ucsi->dev, "UCSI registration failed: %d\n", ret);
+			return;
+		}
 		ucsi->ucsi_registered = true;
 	} else if (ucsi->ucsi_registered && !pd_running) {
 		ucsi_unregister(ucsi->ucsi);
@@ -499,3 +504,7 @@ module_auxiliary_driver(pmic_glink_ucsi_driver);
 
 MODULE_DESCRIPTION("Qualcomm PMIC GLINK UCSI driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_UCSI_PMIC_GLINK_KUNIT_TEST)
+#include "ucsi_glink_test.c"
+#endif

@@ -69,6 +69,13 @@ config UCSI_PMIC_GLINK
 	  To compile the driver as a module, choose M here: the module will be
 	  called ucsi_glink.
 
+config UCSI_PMIC_GLINK_KUNIT_TEST
+	bool "KUnit tests for PMIC GLINK UCSI registration" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && UCSI_PMIC_GLINK=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test synchronous registration failure and service-down bookkeeping.
+
 config CROS_EC_UCSI
 	tristate "UCSI Driver for ChromeOS EC"
 	depends on MFD_CROS_EC_DEV
