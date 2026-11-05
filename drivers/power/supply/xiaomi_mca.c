@@ -1883,9 +1883,9 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		return;
 	}
 	if (xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS)) {
-		xiaomi_mca_cp_stop(mca, "adapter authentication");
-		/* again once it is over */
-		mca->cp = MCA_CP_OFF;
+		/* Retry authentication only after the stage is confirmed off. */
+		if (!xiaomi_mca_cp_stop(mca, "adapter authentication"))
+			mca->cp = MCA_CP_OFF;
 		return;
 	}
 
@@ -2402,7 +2402,7 @@ static void xiaomi_mca_pdr_notify(void *priv, int state)
 static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 {
 	bool online;
-	u32 real_type = MCA_TYPE_UNKNOWN;
+	u32 real_type = MCA_TYPE_UNKNOWN, vbus;
 
 	/* Do not change source voltage or restart a stage whose stop failed. */
 	if (mca->cp == MCA_CP_STOPPING) {
@@ -2410,7 +2410,12 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		return;
 	}
 
-	mca->vbus_uv = xiaomi_mca_read_u32(mca, MCA_PROP_USB_VOLTAGE_NOW);
+	if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus)) {
+		/* Missing telemetry is neither a detach nor a source overload. */
+		xiaomi_mca_cp_stop(mca, "VBUS read failed");
+		return;
+	}
+	mca->vbus_uv = vbus;
 	online = mca->vbus_uv >= MCA_VBUS_ONLINE_UV;
 
 	/* The rest only means something with a source attached */
