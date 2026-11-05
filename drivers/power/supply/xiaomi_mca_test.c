@@ -509,6 +509,7 @@ struct mca_policy_fixture {
 	bool term_stuck;
 	bool term_restart;
 	int pack_error;
+	int vbus_error;
 	struct {
 		int temp;
 		int error;
@@ -577,6 +578,8 @@ static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 		value = f->type;
 		break;
 	case MCA_PROP_USB_VOLTAGE_NOW:
+		if (f->vbus_error)
+			return f->vbus_error;
 		value = f->vbus;
 		break;
 	case MCA_PROP_INPUT_CURRENT_LIMIT:
@@ -1724,6 +1727,67 @@ static void xiaomi_mca_test_full_charge_allowlist(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->writes, 0);
 }
 
+static void xiaomi_mca_test_auth_stop_failure(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct power_supply *psy;
+
+	mca_test_stage(test, f);
+	psy = f->mca.cp_psy;
+	f->verify = 1;
+	f->stage_error = -EIO;
+	guard(mutex)(&f->mca.lock);
+	xiaomi_mca_cp_step(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_STOPPING);
+	KUNIT_EXPECT_PTR_EQ(test, f->mca.cp_psy, psy);
+	xiaomi_mca_policy_poll(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_STOPPING);
+	KUNIT_EXPECT_EQ(test, f->stage_stops, 2);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	f->stage_error = 0;
+	xiaomi_mca_policy_poll(&f->mca);
+	KUNIT_EXPECT_FALSE(test, f->stage_on);
+	KUNIT_EXPECT_PTR_EQ(test, f->mca.cp_psy, NULL);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+}
+
+static void xiaomi_mca_test_vbus_error_not_detach(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+
+	mca_test_stage(test, f);
+	f->mca.online = true;
+	f->mca.cp_off_at = 123;
+	f->mca.cp_on_at = 456;
+	f->mca.cp_ibus_cap = 3000;
+	f->mca.cp_ibus_last = 2000;
+	f->mca.hv = MCA_HV_ON;
+	f->vbus_error = -ETIMEDOUT;
+	f->stage_error = -EIO;
+	guard(mutex)(&f->mca.lock);
+	xiaomi_mca_policy_poll(&f->mca);
+	KUNIT_EXPECT_TRUE(test, f->mca.online);
+	KUNIT_EXPECT_EQ(test, f->mca.real_type, MCA_TYPE_PD);
+	KUNIT_EXPECT_EQ(test, f->mca.cp_off_at, 123);
+	KUNIT_EXPECT_EQ(test, f->mca.cp_on_at, 456);
+	KUNIT_EXPECT_EQ(test, f->mca.cp_ibus_cap, 3000);
+	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_STOPPING);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	f->stage_error = 0;
+	xiaomi_mca_policy_poll(&f->mca);
+	xiaomi_mca_policy_poll(&f->mca);
+	KUNIT_EXPECT_TRUE(test, f->mca.online);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	/* A successful read of 0 V must still run the real detach path. */
+	f->vbus_error = 0;
+	f->vbus = 0;
+	xiaomi_mca_policy_poll(&f->mca);
+	KUNIT_EXPECT_FALSE(test, f->mca.online);
+	KUNIT_EXPECT_EQ(test, f->mca.real_type, MCA_TYPE_UNKNOWN);
+	KUNIT_EXPECT_NE(test, f->mca.cp_off_at, 123);
+	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_OFF);
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_values),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_errors),
@@ -1755,6 +1819,8 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_pm_gate),
 	KUNIT_CASE(xiaomi_mca_test_pm_quiesce),
 	KUNIT_CASE(xiaomi_mca_test_cp_stop_failure),
+	KUNIT_CASE(xiaomi_mca_test_auth_stop_failure),
+	KUNIT_CASE(xiaomi_mca_test_vbus_error_not_detach),
 	KUNIT_CASE(xiaomi_mca_test_pm_refused),
 	KUNIT_CASE(xiaomi_mca_test_pm_no_source),
 	KUNIT_CASE_SLOW(xiaomi_mca_test_pm_voltage_timeout),
