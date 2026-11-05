@@ -1170,8 +1170,8 @@ static int qcom_battmgr_pd_source_match(struct power_supply *psy, void *data)
 	return src->sink;
 }
 
-/* Read fresh capabilities; never infer a 9 V fixed PDO from an APDO range. */
-static int qcom_battmgr_pd_current(struct qcom_battmgr *battmgr, u32 *ua)
+/* Read fresh capabilities; never infer a fixed PDO from an APDO range. */
+static int qcom_battmgr_pd_current(struct qcom_battmgr *battmgr, u32 mv, u32 *ua)
 {
 	unsigned int i;
 	u32 pdo;
@@ -1186,7 +1186,7 @@ static int qcom_battmgr_pd_current(struct qcom_battmgr *battmgr, u32 *ua)
 	for (i = 0; i < battmgr->num_src_pdos; i++) {
 		pdo = battmgr->src_pdos[i];
 		if (pdo_type(pdo) == PDO_TYPE_FIXED &&
-		    pdo_fixed_voltage(pdo) == PD_FIXED_MV) {
+		    pdo_fixed_voltage(pdo) == mv) {
 			*ua = min_t(u32, pdo_max_current(pdo) * 1000, PD_INPUT_MAX_UA);
 			break;
 		}
@@ -1323,7 +1323,8 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		/* Optional classification must not disable ordinary fixed PD. */
 		real_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	}
-	prefer_pps = battmgr->pps_ops && battmgr->pps_ops->enabled() &&
+	prefer_pps = !READ_ONCE(battmgr->pps_suspended) &&
+		     battmgr->pps_ops && battmgr->pps_ops->enabled() &&
 		     src.sink && !READ_ONCE(battmgr->otg_request) &&
 		     real_type == POWER_SUPPLY_USB_TYPE_PD_PPS;
 	if (prefer_pps) {
@@ -1378,7 +1379,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 
 	caps_changed = test_and_clear_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	if (caps_changed) {
-		ret = qcom_battmgr_pd_current(battmgr, &ua);
+		ret = qcom_battmgr_pd_current(battmgr, PD_FIXED_MV, &ua);
 		if (ret || !ua) {
 			dev_info(battmgr->dev, "PD: no verified 9 V fixed PDO (error %d)\n", ret);
 			qcom_battmgr_pd_stop(battmgr, false, "source capabilities");
@@ -1455,6 +1456,52 @@ failed:
 	return 0;
 }
 
+/* Finish the existing fixed-PD transition before the charge worker freezes. */
+static void qcom_battmgr_pd_suspend(struct qcom_battmgr *battmgr)
+{
+	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
+	unsigned long deadline = jiffies + msecs_to_jiffies(PD_CONFIG_TIMEOUT_MS);
+	u32 ua, vbus;
+	int ret;
+
+	if (!battmgr->service_up || !(battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD))
+		return;
+
+	qcom_battmgr_charge_limit_update(battmgr);
+	set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+	qcom_battmgr_pd_update(battmgr);
+	while (battmgr->pd_state == PD_WAIT && time_before(jiffies, deadline)) {
+		msleep(PD_POLL_MS);
+		qcom_battmgr_pd_update(battmgr);
+	}
+	if (battmgr->pd_state == PD_ACTIVE)
+		return;
+	if (battmgr->pd_state == PD_WAIT)
+		qcom_battmgr_pd_stop(battmgr, false, "suspend timeout");
+
+	/*
+	 * PPS stop and a failed 9 V transition both request fixed 5 V. Only
+	 * raise its input limit after cleanup succeeded and VBUS is at 5 V.
+	 * Missing capabilities or a failed read leave the firmware fallback.
+	 */
+	if (battmgr->pd_restore || READ_ONCE(battmgr->otg_request))
+		return;
+	power_supply_for_each_psy(&src, qcom_battmgr_pd_source_match);
+	if (!src.sink || qcom_battmgr_pd_current(battmgr, PD_DEFAULT_MV, &ua) || !ua)
+		return;
+	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+				      USB_VOLT_NOW, &vbus) ||
+	    vbus < 4000000 || vbus > 5500000)
+		return;
+
+	ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					USB_INPUT_CURR_LIMIT, ua);
+	if (ret)
+		dev_warn(battmgr->dev, "PD: suspend 5 V input limit failed: %d\n", ret);
+	else
+		dev_info(battmgr->dev, "PD: suspend at 5 V, input limit %u mA\n", ua / 1000);
+}
+
 static void qcom_battmgr_charge_worker(struct work_struct *work)
 {
 	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
@@ -1525,7 +1572,8 @@ static int qcom_battmgr_psy_notify(struct notifier_block *nb,
 
 /*
  * A PPS contract is not monitored while the system is suspended, so end it
- * before and let the work start it again after resume.
+ * before freezing the worker and hand over to autonomous fixed PD. The work
+ * may start PPS again after resume.
  */
 static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 				  unsigned long action, void *data)
@@ -1544,6 +1592,7 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 			qcom_battmgr_charge_kick(battmgr);
 			return NOTIFY_BAD;
 		}
+		qcom_battmgr_pd_suspend(battmgr);
 		mutex_unlock(&battmgr->charge_lock);
 		break;
 	case PM_POST_HIBERNATION:
