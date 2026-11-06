@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/leds/backlight/kinetic,ktz8866.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Kinetic Technologies KTZ8866 backlight
+title: Kinetic Technologies KTZ8866/KTZ8868 backlight
 
 maintainers:
   - Jianhua Lu <lujianhua000@gmail.com>
@@ -14,12 +14,52 @@ description: |
   led backlight with dual lcd bias power.
   https://www.kinet-ic.com/ktz8866/
 
+  The KTZ8868 is register compatible with the KTZ8866. Its LCD bias outputs
+  OUTP and OUTN are switched by the ENP and ENN pins. A board that wires those
+  pins describes the outputs as the outp and outn regulators, so that the
+  panel they supply can sequence them with its other supplies.
+
+  Without a led child node the chip registers a backlight device. A KTZ8868
+  may instead describe its LED string in a led child node, which the chip
+  registers as an LED class device. This allows boards that light one panel
+  from several chips to combine them in a single led-backlight device.
+
 allOf:
   - $ref: common.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: kinetic,ktz8866
+    then:
+      properties:
+        led: false
+        outn: false
+        outp: false
+  - if:
+      properties:
+        compatible:
+          const: kinetic,ktz8868
+    then:
+      properties:
+        kinetic,secondary: false
+        kinetic,secondary-backlight: false
+  - if:
+      required:
+        - led
+    then:
+      properties:
+        current-num-sinks: false
+        default-brightness: false
+        max-brightness: false
+        brightness-levels: false
+        default-brightness-level: false
 
 properties:
   compatible:
-    const: kinetic,ktz8866
+    enum:
+      - kinetic,ktz8866
+      - kinetic,ktz8868
 
   reg:
     maxItems: 1
@@ -35,7 +75,9 @@ properties:
     maxItems: 1
 
   current-num-sinks:
-    description: number of the LED current sinks' channels.
+    description:
+      Number of the LED current sinks' channels, starting from LED1. Not used
+      together with a led child node, whose led-sources selects the sinks.
     $ref: /schemas/types.yaml#/definitions/uint32
     enum: [1, 2, 3, 4, 5, 6]
 
@@ -52,7 +94,10 @@ properties:
     enum: [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
 
   kinetic,enable-lcd-bias:
-    description: Set if we want to output bias power supply for LCD.
+    description:
+      Set if we want to output bias power supply for LCD. On the KTZ8868 this
+      configures the bias section to follow the ENP and ENN pins; the outputs
+      are then turned on and off through the outp and outn regulators.
     type: boolean
 
   kinetic,secondary-backlight:
@@ -68,6 +113,47 @@ properties:
       kinetic,secondary-backlight and does not provide a backlight of its
       own. Its HWEN pin and supplies are those of that chip.
     type: boolean
+  led:
+    type: object
+    $ref: /schemas/leds/common.yaml#
+    unevaluatedProperties: false
+    description:
+      LED string driven by the current sinks, registered as an LED class
+      device instead of a backlight device.
+
+    properties:
+      led-sources:
+        description:
+          Current sinks the LED string is connected to. Sinks LED1 to LED6
+          are numbered 0 to 5.
+        minItems: 1
+        maxItems: 6
+        items:
+          maximum: 5
+
+    required:
+      - led-sources
+
+patternProperties:
+  "^out[np]$":
+    type: object
+    $ref: /schemas/regulator/regulator.yaml#
+    unevaluatedProperties: false
+    description:
+      LCD bias output, OUTP (positive) or OUTN (negative), switched on and
+      off by its enable pin.
+
+    properties:
+      enable-gpios:
+        description: GPIO connected to the ENP (outp) or ENN (outn) pin.
+        maxItems: 1
+
+    required:
+      - enable-gpios
+
+dependencies:
+  outn: [ 'kinetic,enable-lcd-bias' ]
+  outp: [ 'kinetic,enable-lcd-bias' ]
 
 required:
   - compatible
@@ -91,10 +177,15 @@ then:
 else:
   required:
     - enable-gpios
-  dependentRequired:
-    kinetic,enable-lcd-bias:
-      - vddpos-supply
-      - vddneg-supply
+  if:
+    properties:
+      compatible:
+        const: kinetic,ktz8866
+  then:
+    dependentRequired:
+      kinetic,enable-lcd-bias:
+        - vddpos-supply
+        - vddneg-supply
 
 unevaluatedProperties: false
 
@@ -142,5 +233,36 @@ examples:
             compatible = "kinetic,ktz8866";
             reg = <0x11>;
             kinetic,secondary;
+        };
+    };
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/leds/common.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        backlight@11 {
+            compatible = "kinetic,ktz8868";
+            reg = <0x11>;
+            enable-gpios = <&tlmm 15 GPIO_ACTIVE_HIGH>;
+            kinetic,enable-lcd-bias;
+
+            led {
+                function = LED_FUNCTION_BACKLIGHT;
+                color = <LED_COLOR_ID_WHITE>;
+                led-sources = <0 1 2 4 5>;
+            };
+
+            outn {
+                regulator-name = "lcd_vsn";
+                enable-gpios = <&tlmm 14 GPIO_ACTIVE_HIGH>;
+            };
+
+            outp {
+                regulator-name = "lcd_vsp";
+                enable-gpios = <&tlmm 111 GPIO_ACTIVE_HIGH>;
+            };
         };
     };

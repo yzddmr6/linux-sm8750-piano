@@ -202,6 +202,8 @@ config BACKLIGHT_KTD2801
 config BACKLIGHT_KTZ8866
 	tristate "Backlight Driver for Kinetic KTZ8866"
 	depends on I2C
+	depends on LEDS_CLASS
+	depends on REGULATOR
 	select REGMAP_I2C
 	help
 		Say Y to enable the backlight driver for the Kinetic KTZ8866
