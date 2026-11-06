@@ -23,6 +23,7 @@ properties:
     items:
       - enum:
           - csot,pp8807hb1-1
+          - csot,xn242
       - const: novatek,nt36536
 
   reg:
