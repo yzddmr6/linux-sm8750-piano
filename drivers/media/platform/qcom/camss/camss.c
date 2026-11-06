@@ -4472,12 +4472,15 @@ static const struct camss_subdev_resources csid_res_sm8750[] = {
 static const struct camss_subdev_resources vfe_res_8750[] = {
 	/* VFE0 - TFE Full */
 	{
-		.clock = { "gcc_axi_hf", "vfe0_fast_ahb", "vfe0",
+		.clock = { "gcc_axi_hf", "cpas_ahb", "cpas_fast_ahb",
+			   "vfe0_fast_ahb", "vfe0",
 			   "cpas_vfe0", "cpas_vfe1", "cpas_vfe2",
 			   "camnoc_rt_axi", "camnoc_nrt_axi", "qdss_debug_xo",
 			   "vfe0_bayer_fast_ahb", "vfe0_bayer",
 			   "cpas_vfe0_bayer" },
 		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
 				{ 0 },
 				{ 360280000, 480000000, 630000000, 716000000,
 				  833000000 },
@@ -4505,12 +4508,15 @@ static const struct camss_subdev_resources vfe_res_8750[] = {
 	},
 	/* VFE1 - TFE Full */
 	{
-		.clock = { "gcc_axi_hf", "vfe1_fast_ahb", "vfe1",
+		.clock = { "gcc_axi_hf", "cpas_ahb", "cpas_fast_ahb",
+			   "vfe1_fast_ahb", "vfe1",
 			   "cpas_vfe0", "cpas_vfe1", "cpas_vfe2",
 			   "camnoc_rt_axi", "camnoc_nrt_axi", "qdss_debug_xo",
 			   "vfe1_bayer_fast_ahb", "vfe1_bayer",
 			   "cpas_vfe1_bayer" },
 		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
 				{ 0 },
 				{ 360280000, 480000000, 630000000, 716000000,
 				  833000000 },
@@ -4538,12 +4544,15 @@ static const struct camss_subdev_resources vfe_res_8750[] = {
 	},
 	/* VFE2 - TFE Full */
 	{
-		.clock = { "gcc_axi_hf", "vfe2_fast_ahb", "vfe2",
+		.clock = { "gcc_axi_hf", "cpas_ahb", "cpas_fast_ahb",
+			   "vfe2_fast_ahb", "vfe2",
 			   "cpas_vfe0", "cpas_vfe1", "cpas_vfe2",
 			   "camnoc_rt_axi", "camnoc_nrt_axi", "qdss_debug_xo",
 			   "vfe2_bayer_fast_ahb", "vfe2_bayer",
 			   "cpas_vfe2_bayer" },
 		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
 				{ 0 },
 				{ 360280000, 480000000, 630000000, 716000000,
 				  833000000 },
@@ -4571,10 +4580,13 @@ static const struct camss_subdev_resources vfe_res_8750[] = {
 	},
 	/* VFE_LITE0 */
 	{
-		.clock = { "gcc_axi_hf", "vfe_lite_ahb", "vfe_lite",
+		.clock = { "gcc_axi_hf", "cpas_ahb", "cpas_fast_ahb",
+			   "vfe_lite_ahb", "vfe_lite",
 			   "cpas_vfe_lite", "camnoc_rt_axi",
 			   "camnoc_nrt_axi", "qdss_debug_xo" },
 		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
 				{ 0 },
 				{ 266666667, 400000000, 480000000 },
 				{ 0 },
@@ -4594,10 +4606,13 @@ static const struct camss_subdev_resources vfe_res_8750[] = {
 	},
 	/* VFE_LITE1 */
 	{
-		.clock = { "gcc_axi_hf", "vfe_lite_ahb", "vfe_lite",
+		.clock = { "gcc_axi_hf", "cpas_ahb", "cpas_fast_ahb",
+			   "vfe_lite_ahb", "vfe_lite",
 			   "cpas_vfe_lite", "camnoc_rt_axi",
 			   "camnoc_nrt_axi", "qdss_debug_xo" },
 		.clock_rate = { { 0 },
+				{ 0 },
+				{ 0 },
 				{ 0 },
 				{ 266666667, 400000000, 480000000 },
 				{ 0 },
