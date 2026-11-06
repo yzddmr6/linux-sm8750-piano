@@ -1105,13 +1105,15 @@ static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
 	u16 slots = cfg->nslots_per_frame ?: module->nslots_per_frame;
 	u16 width = cfg->slot_width ?: module->slot_width;
 	struct apm_tdm_config *data;
+	size_t size = module->active_lane_mask ? sizeof(*data) :
+		      offsetof(struct apm_tdm_config, lane_param);
 
 	if (!slots || slots > 32 || !mask || mask & ~GENMASK(slots - 1, 0) ||
 	    (width != 16 && width != 24 && width != 32) ||
 	    !cfg->num_channels || cfg->num_channels > 32 || !cfg->sample_rate ||
 	    module->data_format != DATA_FORMAT_FIXED_POINT ||
 	    (cfg->bit_width != 16 && cfg->bit_width != 24 && cfg->bit_width != 32) ||
-	    cfg->bit_width > width || !module->active_lane_mask ||
+	    cfg->bit_width > width ||
 	    module->active_lane_mask > U16_MAX || module->hw_interface_type > 4 ||
 	    module->hw_interface_idx > 4 || module->sync_src > 1 ||
 	    module->ctrl_data_out_enable > 1 || module->sync_mode > 2 ||
@@ -1124,7 +1126,7 @@ static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
 		return -EOPNOTSUPP;
 
 	struct gpr_pkt *pkt __free(kfree) =
-		audioreach_alloc_apm_cmd_pkt(sizeof(*data), APM_CMD_SET_CFG, 0);
+		audioreach_alloc_apm_cmd_pkt(size, APM_CMD_SET_CFG, 0);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
@@ -1134,6 +1136,16 @@ static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
 	data->intf.lpaif_type = module->hw_interface_type;
 	data->intf.intf_idx = module->hw_interface_idx;
 	data->intf.sync_src = module->sync_src;
+	switch (cfg->fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
+	case SND_SOC_DAIFMT_BP_FP:
+		data->intf.sync_src = AR_AUDIO_IF_SYNC_SRC_INTERNAL;
+		break;
+	case SND_SOC_DAIFMT_BC_FC:
+		data->intf.sync_src = AR_AUDIO_IF_SYNC_SRC_EXTERNAL;
+		break;
+	default:
+		break;
+	}
 	data->intf.ctrl_data_out_enable = module->ctrl_data_out_enable;
 	data->intf.slot_mask = mask;
 	data->intf.nslots_per_frame = slots;
@@ -1153,13 +1165,16 @@ static int audioreach_tdm_set_media_format(struct q6apm_graph *graph,
 				 PARAM_ID_HW_EP_FRAME_SIZE_FACTOR, sizeof(data->frame));
 	data->frame.frame_size_factor = module->frame_size_factor ?: 1;
 
-	audioreach_tdm_init_param(&data->lane_param, module->instance_id,
-				 PARAM_ID_TDM_LANE_CFG, sizeof(data->lane));
-	data->lane.lane_mask = module->active_lane_mask;
+	/* Older topologies leave lane and interface-clock selection to firmware. */
+	if (module->active_lane_mask) {
+		audioreach_tdm_init_param(&data->lane_param, module->instance_id,
+					 PARAM_ID_TDM_LANE_CFG, sizeof(data->lane));
+		data->lane.lane_mask = module->active_lane_mask;
 
-	/* Zero ID, frequency, attributes and root select the firmware defaults. */
-	audioreach_tdm_init_param(&data->clock_param, module->instance_id,
-				 PARAM_ID_HW_INTF_CLK_CFG, sizeof(data->clock));
+		/* Zero ID, frequency, attributes and root select the firmware defaults. */
+		audioreach_tdm_init_param(&data->clock_param, module->instance_id,
+					 PARAM_ID_HW_INTF_CLK_CFG, sizeof(data->clock));
+	}
 
 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
 }
