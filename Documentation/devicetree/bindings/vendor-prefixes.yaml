@@ -1287,6 +1287,8 @@ patternProperties:
     description: OpenRISC.io
   "^openwrt,.*":
     description: OpenWrt
+  "^oplus,.*":
+    description: OPlus
   "^option,.*":
     description: Option NV
   "^optologic,.*":
