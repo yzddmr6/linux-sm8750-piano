@@ -274,7 +274,7 @@ struct dpu_lutdma *dpu_lutdma_init(struct dpu_kms *kms)
 			goto unmap;
 		}
 	}
-	dma->bo = msm_gem_new(kms->dev, REGDMA_BUFFER_SIZE, MSM_BO_WC);
+	dma->bo = msm_gem_new(kms->dev, REGDMA_BUFFER_SIZE, MSM_BO_WC, NULL);
 	if (IS_ERR(dma->bo)) {
 		ret = PTR_ERR(dma->bo);
 		goto unmap;
