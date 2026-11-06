@@ -3343,10 +3343,11 @@ static int wcd939x_bind(struct device *dev)
 
 	/*
 	 * As TX is main CSR reg interface, which should not be suspended first.
-	 * explicitly add the dependency link
+	 * RX is already active after component_bind_all(), so hold TX until
+	 * RX has gone through its first runtime suspend as well.
 	 */
 	if (!device_link_add(wcd939x->rxdev, wcd939x->txdev, DL_FLAG_STATELESS |
-			    DL_FLAG_PM_RUNTIME)) {
+			    DL_FLAG_PM_RUNTIME | DL_FLAG_RPM_ACTIVE)) {
 		dev_err(dev, "could not devlink tx and rx\n");
 		ret = -EINVAL;
 		goto err_put_txdev;
@@ -3374,10 +3375,26 @@ static int wcd939x_bind(struct device *dev)
 		goto err_remove_rx_link;
 	}
 
+	/*
+	 * Activate the aggregate only after its supplier links exist. Marking
+	 * it active in probe lets a later component bind miss the initial
+	 * supplier references: a runtime get on an already active codec does
+	 * not resume its SoundWire devices. Keep this reference through ASoC
+	 * registration, which can probe the codec and start jack detection.
+	 */
+	ret = pm_runtime_set_active(dev);
+	if (ret)
+		goto err_remove_rx_link;
+
+	pm_runtime_get_noresume(dev);
+	pm_runtime_set_autosuspend_delay(dev, 1000);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_enable(dev);
+
 	ret = wcd939x_irq_init(wcd939x, dev);
 	if (ret) {
 		dev_err(dev, "%s: IRQ init failed: %d\n", __func__, ret);
-		goto err_remove_rx_link;
+		goto err_disable_pm;
 	}
 
 	wcd939x->sdw_priv[AIF1_PB]->slave_irq = wcd939x->virq;
@@ -3401,11 +3418,18 @@ static int wcd939x_bind(struct device *dev)
 	if (ret) {
 		dev_err(dev, "%s: Codec registration failed\n",
 			__func__);
-		goto err_remove_rx_link;
+		goto err_disable_pm;
 	}
+
+	pm_runtime_put_autosuspend(dev);
 
 	return 0;
 
+err_disable_pm:
+	pm_runtime_disable(dev);
+	pm_runtime_put_noidle(dev);
+	pm_runtime_set_suspended(dev);
+	pm_runtime_dont_use_autosuspend(dev);
 err_remove_rx_link:
 	device_link_remove(dev, wcd939x->rxdev);
 err_remove_tx_link:
@@ -3432,6 +3456,9 @@ static void wcd939x_unbind(struct device *dev)
 	struct wcd939x_priv *wcd939x = dev_get_drvdata(dev);
 
 	snd_soc_unregister_component(dev);
+	pm_runtime_disable(dev);
+	pm_runtime_set_suspended(dev);
+	pm_runtime_dont_use_autosuspend(dev);
 	device_link_remove(dev, wcd939x->txdev);
 	device_link_remove(dev, wcd939x->rxdev);
 	device_link_remove(wcd939x->rxdev, wcd939x->txdev);
@@ -3566,18 +3593,7 @@ static int wcd939x_probe(struct platform_device *pdev)
 
 	wcd939x_reset(wcd939x);
 
-	ret = component_master_add_with_match(dev, &wcd939x_comp_ops, match);
-	if (ret)
-		return ret;
-
-	pm_runtime_set_autosuspend_delay(dev, 1000);
-	pm_runtime_use_autosuspend(dev);
-	pm_runtime_mark_last_busy(dev);
-	pm_runtime_set_active(dev);
-	pm_runtime_enable(dev);
-	pm_runtime_idle(dev);
-
-	return 0;
+	return component_master_add_with_match(dev, &wcd939x_comp_ops, match);
 }
 
 static void wcd939x_remove(struct platform_device *pdev)
@@ -3585,10 +3601,6 @@ static void wcd939x_remove(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 
 	component_master_del(dev, &wcd939x_comp_ops);
-
-	pm_runtime_disable(dev);
-	pm_runtime_set_suspended(dev);
-	pm_runtime_dont_use_autosuspend(dev);
 }
 
 #if defined(CONFIG_OF)
