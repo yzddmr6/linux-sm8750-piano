@@ -139,7 +139,7 @@ static int wn8030_test_init(struct kunit *test)
 	i2c_set_clientdata(nano->client, nano);
 	spin_lock_init(&bus->trace_lock);
 	nano->variant = &nanosic_wn8030_piano;
-	nano->no_touchpad = true;
+	nano->keyboard_no_pointer = true;
 	nano->input_enabled = true;
 	nano->userspace_angle_enabled = true;
 	nano->follower.panel = &bus->panel;
@@ -200,7 +200,7 @@ static void wn8030_led_commands(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, bus->last[10], nanosic_wn8030_checksum8(bus->last + 3, 7));
 }
 
-static void wn8030_attach_switch_and_no_touchpad(struct kunit *test)
+static void wn8030_attach_switch_before_touchpad_report(struct kunit *test)
 {
 	struct wn8030_test_bus *bus = test->priv;
 	struct nanosic_wn8030 *nano = &bus->nano;
@@ -297,7 +297,9 @@ static void wn8030_reports(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_dispatch(&bus->nano, consumer, sizeof(consumer)), 5);
 	KUNIT_EXPECT_FALSE(test, wn8030_key_down(bus->nano.hid_keyboard, KEY_VOLUMEUP));
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_dispatch(&bus->nano, touch, sizeof(touch)), 27);
-	KUNIT_EXPECT_PTR_EQ(test, bus->nano.hid_touchpad, NULL);
+	/* The keyboard descriptor hint does not suppress a detected touchpad. */
+	KUNIT_EXPECT_NOT_NULL(test, bus->nano.hid_touchpad);
+	KUNIT_EXPECT_TRUE(test, bus->nano.touchpad_seen);
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_dispatch(&bus->nano, key, 8), 0);
 }
 
@@ -680,9 +682,7 @@ static void wn8030_pending_outputs_and_auth(struct kunit *test)
 	nano->waking = true;
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_set_indicator_led(nano, 0xfd), 0);
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_set_kbd_backlight(nano, 50), 0);
-	nano->no_touchpad = false;
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_set_touchpad(nano, true), 0);
-	nano->no_touchpad = true;
 	KUNIT_EXPECT_EQ(test, bus->transfers, transfers);
 	/* Dispatch must still reply to authentication in the pending frames. */
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_xm_auth_init(nano), 0);
@@ -706,7 +706,7 @@ static void wn8030_no_periodic_power(struct kunit *test)
 static struct kunit_case wn8030_cases[] = {
 	KUNIT_CASE(wn8030_transfer_errors),
 	KUNIT_CASE(wn8030_led_commands),
-	KUNIT_CASE(wn8030_attach_switch_and_no_touchpad),
+	KUNIT_CASE(wn8030_attach_switch_before_touchpad_report),
 	KUNIT_CASE(wn8030_initial_attached),
 	KUNIT_CASE(wn8030_firmware_transport),
 	KUNIT_CASE(wn8030_reports),
