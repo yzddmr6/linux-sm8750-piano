@@ -2548,6 +2548,9 @@ static int qca_serdev_probe(struct serdev_device *serdev)
 			 * through the power sequence. In such cases, fall through
 			 * to follow the legacy flow.
 			 */
+			if (PTR_ERR_OR_ZERO(qcadev->bt_power->pwrseq) == -EPROBE_DEFER)
+				return -EPROBE_DEFER;
+
 			if (IS_ERR(qcadev->bt_power->pwrseq))
 				qcadev->bt_power->pwrseq = NULL;
 			else
