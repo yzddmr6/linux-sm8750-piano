@@ -177,8 +177,8 @@ static bool folio_mmapped(struct folio *folio)
 	bool ret = false;
 
 	i_mmap_lock_read(mapping);
-	vma_interval_tree_foreach(vma, &mapping->i_mmap, folio->index,
-				  folio->index + folio_nr_pages(folio)) {
+	mapping_rmap_tree_foreach(vma, mapping, folio->index,
+				  folio->index + folio_nr_pages(folio) - 1) {
 		ret = true;
 		break;
 	}

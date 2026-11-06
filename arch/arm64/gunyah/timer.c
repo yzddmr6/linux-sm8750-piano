@@ -10,10 +10,10 @@
 #include <linux/module.h>
 #include <linux/types.h>
 
-/**
- * struct gunyah_timer_scale - Scaling factors for timer conversion
- * @mult: Multiplier for converting cycles to nanoseconds
- * @shift: Shift value for the multiplier
+/*
+ * Scaling factors for timer conversion:
+ * mult is the multiplier for converting cycles to nanoseconds;
+ * shift is the shift value for the multiplier.
  *
  * These values are pre-calculated during initialization to efficiently
  * convert hypervisor tick deadlines to kernel time without performing
