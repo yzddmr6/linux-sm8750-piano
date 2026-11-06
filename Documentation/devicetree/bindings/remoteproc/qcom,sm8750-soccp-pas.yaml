@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/remoteproc/qcom,sm8750-soccp-pas.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Qualcomm SM8750 SoC Control Processor Peripheral Authentication Service
+
+maintainers:
+  - Erwin <yzddmr7@gmail.com>
+
+description:
+  The SoCCP is authenticated through PAS. Its TCSR D-state register indicates
+  when the loaded firmware can release the interconnect vote held during boot.
+
+allOf:
+  - $ref: /schemas/remoteproc/qcom,pas-common.yaml#
+
+properties:
+  compatible:
+    const: qcom,sm8750-soccp-pas
+
+  clocks:
+    maxItems: 1
+
+  clock-names:
+    const: xo
+
+  power-domains:
+    maxItems: 2
+
+  power-domain-names:
+    items:
+      - const: cx
+      - const: mx
+
+  interrupts:
+    maxItems: 5
+
+  interrupt-names:
+    items:
+      - const: wdog
+      - const: fatal
+      - const: ready
+      - const: handover
+      - const: stop-ack
+
+  firmware-name:
+    maxItems: 1
+
+  memory-region:
+    maxItems: 1
+
+  interconnects:
+    maxItems: 1
+
+  qcom,smem-states:
+    maxItems: 1
+
+  qcom,smem-state-names:
+    maxItems: 1
+
+  qcom,soccp-dstate:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description: TCSR syscon and byte offset of the SoCCP D-state register.
+    items:
+      - items:
+          - description: TCSR syscon
+          - description: Register offset
+
+required:
+  - compatible
+  - power-domains
+  - power-domain-names
+  - memory-region
+  - interconnects
+  - qcom,soccp-dstate
+
+unevaluatedProperties: false

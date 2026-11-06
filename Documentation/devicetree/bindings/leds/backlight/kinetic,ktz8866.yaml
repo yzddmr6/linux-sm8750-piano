@@ -175,13 +175,13 @@ then:
     default-brightness: false
     max-brightness: false
 else:
-  required:
-    - enable-gpios
   if:
     properties:
       compatible:
         const: kinetic,ktz8866
   then:
+    required:
+      - enable-gpios
     dependentRequired:
       kinetic,enable-lcd-bias:
         - vddpos-supply

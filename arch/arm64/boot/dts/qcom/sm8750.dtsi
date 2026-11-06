@@ -2310,7 +2310,7 @@
 		};
 
 		tcsr: syscon@1fc0000 {
-			compatible = "syscon";
+			compatible = "qcom,sm8750-tcsr", "syscon";
 			reg = <0x0 0x01fc0000 0x0 0x30000>;
 		};
 

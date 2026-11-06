@@ -59,18 +59,22 @@ properties:
       - description: Interconnect path to enable the MultiMedia NoC
 
   power-domains:
+    minItems: 2
     description:
       Power domains required for the clock controller to operate
     items:
       - description: MMCX power domain
       - description: MXC power domain
+      - description: Titan top power domain for SM8750 CAMBIST
 
   required-opps:
+    minItems: 2
     description:
       OPP nodes that describe required performance points on power domains
     items:
       - description: MMCX performance point
       - description: MXC performance point
+      - description: Titan top power domain has no performance point
 
   reg:
     maxItems: 1
@@ -81,6 +85,18 @@ required:
   - power-domains
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: qcom,sm8750-cambistmclkcc
+    then:
+      properties:
+        power-domains:
+          maxItems: 2
+        required-opps:
+          maxItems: 2
   - $ref: qcom,gcc.yaml#
   - if:
       properties:

@@ -341,3 +341,11 @@
 		output-low;
 	};
 };
+
+&camss_csiphy1_in {
+	data-lanes = <1 2 3 4>;
+};
+
+&camss_csiphy4_in {
+	data-lanes = <1 2 3 4>;
+};

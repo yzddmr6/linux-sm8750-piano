@@ -61,6 +61,16 @@ properties:
     enum: [ 10, 11 ]
     default: 10
 
+  qcom,phy-timings:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 14
+    maxItems: 14
+    description: Board D-PHY TIMING_CTRL_0 through TIMING_CTRL_13 values.
+
+  qcom,phy-hstx-strength:
+    $ref: /schemas/types.yaml#/definitions/uint8
+    description: Board D-PHY GLBL_HSTX_STR_CTRL_0 value.
+
 required:
   - compatible
   - reg

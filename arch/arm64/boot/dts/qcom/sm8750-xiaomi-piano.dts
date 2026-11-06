@@ -373,77 +373,77 @@
 	xo_therm: thermal-sensor-xo {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x44>;
+		io-channels = <&pmk8550_vadc 0x44>;
 		io-channel-names = "sensor-channel";
 	};
 
 	msm_therm: thermal-sensor-msm {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x144>;
+		io-channels = <&pmk8550_vadc 0x144>;
 		io-channel-names = "sensor-channel";
 	};
 
 	flash_therm: thermal-sensor-flash {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x145>;
+		io-channels = <&pmk8550_vadc 0x145>;
 		io-channel-names = "sensor-channel";
 	};
 
 	wifi_therm: thermal-sensor-wifi {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x146>;
+		io-channels = <&pmk8550_vadc 0x146>;
 		io-channel-names = "sensor-channel";
 	};
 
 	display_therm: thermal-sensor-display {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x149>;
+		io-channels = <&pmk8550_vadc 0x149>;
 		io-channel-names = "sensor-channel";
 	};
 
 	backlight_therm: thermal-sensor-backlight {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x14a>;
+		io-channels = <&pmk8550_vadc 0x14a>;
 		io-channel-names = "sensor-channel";
 	};
 
 	conn2_therm: thermal-sensor-conn2 {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x14b>;
+		io-channels = <&pmk8550_vadc 0x14b>;
 		io-channel-names = "sensor-channel";
 	};
 
 	battery_therm: thermal-sensor-battery {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x744>;
+		io-channels = <&pmk8550_vadc 0x744>;
 		io-channel-names = "sensor-channel";
 	};
 
 	conn_therm: thermal-sensor-conn {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x747>;
+		io-channels = <&pmk8550_vadc 0x747>;
 		io-channel-names = "sensor-channel";
 	};
 
 	quiet_therm: thermal-sensor-quiet {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x74a>;
+		io-channels = <&pmk8550_vadc 0x74a>;
 		io-channel-names = "sensor-channel";
 	};
 
 	charger1_therm: thermal-sensor-charger1 {
 		compatible = "generic-adc-thermal";
 		#thermal-sensor-cells = <0>;
-		io-channels = <&pmk8550_adc 0x74d>;
+		io-channels = <&pmk8550_vadc 0x74d>;
 		io-channel-names = "sensor-channel";
 	};
 
@@ -1552,7 +1552,7 @@
 	};
 };
 
-&pmk8550_adc {
+&pmk8550_vadc {
 	pinctrl-names = "default";
 	pinctrl-0 = <&pm8550_therm_default &pmih0108_therm_default>;
 	status = "okay";

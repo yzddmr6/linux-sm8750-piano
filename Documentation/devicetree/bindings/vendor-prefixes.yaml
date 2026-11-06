@@ -1627,8 +1627,6 @@ patternProperties:
     description: Southchip Semiconductor Technology (Shanghai) Co., Ltd.
   "^spacemit,.*":
     description: SpacemiT (Hangzhou) Technology Co. Ltd
-  "^southchip,.*":
-    description: Southchip Semiconductor
   "^spansion,.*":
     description: Spansion Inc.
   "^sparkfun,.*":

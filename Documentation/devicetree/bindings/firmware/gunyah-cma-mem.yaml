@@ -18,32 +18,30 @@ description: |+
 
 properties:
   compatible:
-      - const: gunyah-cma-vm-mem
+    const: gunyah-cma-vm-mem
 
   memory-region:
-    $ref: '/schemas/types.yaml#/definitions/phandle'
-    items:
-      - description: |
-          Describes the specific reserved memory region that this allocator
-          will allocate memory from for a Virtual Machine. Refer to
-          Documentation/devicetree/bindings/reserved-memory/reserved-memory.txt
-          for more information.
+    minItems: 1
+    maxItems: 2
+    description: Reserved memory regions available for virtual machines.
 
   memory-region-names:
-    $ref: /schemas/types.yaml#/definitions/string-array
-    items:
-      - description: Name of the memory-region to be used by VMM for operation
+    minItems: 1
+    maxItems: 2
+    description: Names by which the VMM selects the reserved memory regions.
 
 required:
   - compatible
   - memory-region
   - memory-region-names
 
-example:
+additionalProperties: false
+
+examples:
   - |
     gunyah-cma-mem {
-	compatible = "gunyah-cma-vm-mem";
-	memory-region = <&trust_ui_vm_mem &oem_vm_mem>;
-	memory-region-names = "trustedvm_cma" , "oemvm_cma";
+        compatible = "gunyah-cma-vm-mem";
+        memory-region = <&trust_ui_vm_mem>, <&oem_vm_mem>;
+        memory-region-names = "trustedvm_cma" , "oemvm_cma";
     };
 
