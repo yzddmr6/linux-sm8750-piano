@@ -663,6 +663,8 @@ static const struct of_device_id qcom_pdm_domains[] __maybe_unused = {
 	{ .compatible = "qcom,sm8550", .data = sm8550_domains, },
 	{ .compatible = "qcom,sm8650", .data = sm8550_domains, },
 	{ .compatible = "qcom,sm8750", .data = sm8550_domains, },
+	/* ABL-booted SM8750 devices report the codename compatibles instead */
+	{ .compatible = "qcom,sun", .data = sm8550_domains, },
 	{ .compatible = "qcom,x1e80100", .data = x1e80100_domains, },
 	{ .compatible = "qcom,x1p42100", .data = x1e80100_domains, },
 	{},
