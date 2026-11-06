@@ -40,8 +40,6 @@
 	};
 
 	chosen {
-		stdout-path = "serial0:115200n8";
-
 		/* Early firmware console; native DRM removes this at KMS handoff. */
 		framebuffer {
 			compatible = "simple-framebuffer";
