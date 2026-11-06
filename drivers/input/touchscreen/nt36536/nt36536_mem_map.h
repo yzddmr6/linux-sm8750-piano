@@ -381,7 +381,7 @@ struct nvt_ts_trim_id_table {
  * Match order and id/mask values follow the vendor module trim_id_table.
  * NT36536 entries come first so an NT36532 id never shadows them.
  */
-static const struct nvt_ts_trim_id_table trim_id_table[] = {
+static const struct nvt_ts_trim_id_table trim_id_table[] __maybe_unused = {
 	{.id = {0x14, 0xFF, 0xFF, 0x23, 0x65, 0x03}, .mask = {1, 0, 0, 1, 1, 1},
 		.mmap = &NT36536_single_memory_map, .mmap_casc = &NT36536_cascade_memory_map, .hwinfo = &NT36536_hw_info},
 	{.id = {0x15, 0x0E, 0xFF, 0x23, 0x65, 0x03}, .mask = {1, 1, 0, 1, 1, 1},
