@@ -5344,7 +5344,7 @@
 		};
 
 		tcsrcc: clock-controller@f204008 {
-			compatible = "qcom,sm8750-tcsr-syscon", "syscon";
+			compatible = "qcom,sm8750-tcsr", "syscon";
 			reg = <0x0 0x0f204008 0x0 0x3004>;
 
 			clocks = <&rpmhcc RPMH_CXO_CLK>;
