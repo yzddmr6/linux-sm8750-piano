@@ -110,6 +110,10 @@ struct gunyah_rm_info {
  * @num_fragments: total number of fragments expected to be received.
  * @fragments_received: fragments received so far.
  * @reply: Fields used for request/reply sequences
+ * @reply.ret: Linux return code if there was an error processing the message
+ * @reply.seq: Sequence ID for the main message
+ * @reply.rm_error: Resource manager error code for standard replies
+ * @reply.seq_done: Signals the caller that the RM reply has been received
  */
 struct gunyah_rm_message {
 	void *payload;
@@ -120,12 +124,6 @@ struct gunyah_rm_message {
 	u8 num_fragments;
 	u8 fragments_received;
 
-	/**
-	 * @ret: Linux return code, there was an error processing message
-	 * @seq: Sequence ID for the main message.
-	 * @rm_error: For request/reply sequences with standard replies
-	 * @seq_done: Signals caller that the RM reply has been received
-	 */
 	struct {
 		int ret;
 		u16 seq;
@@ -146,8 +144,10 @@ struct gunyah_rm_message {
  * @send_lock: synchronization to allow only one request to be sent at a time
  * @send_ready: completed when we know Tx message queue can take more messages
  * @nh: notifier chain for clients interested in RM notification messages
+ * @adev: auxiliary device for the resource manager interface
  * @miscdev: /dev/gunyah
  * @parent_fwnode: Parent IRQ fwnode to translate Gunyah hwirqs to Linux irqs
+ * @pm_nb: notifier for restoring the resource manager after hibernation
  */
 struct gunyah_rm {
 	struct gunyah_resource tx_ghrsc;
