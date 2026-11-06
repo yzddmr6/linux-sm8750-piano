@@ -33,6 +33,15 @@ static bool psr_enabled = false;
 module_param(psr_enabled, bool, 0);
 MODULE_PARM_DESC(psr_enabled, "enable PSR for eDP and DP displays");
 
+/*
+ * In the reverse USB-C orientation, entering DP alternate mode can make a USB
+ * hub re-attach its upstream link, which leaves the AUX channel unusable for a
+ * few hundred milliseconds just when the sink capabilities are read. HPD stays
+ * asserted, so no new plug event follows: retry the read until AUX recovers.
+ */
+#define DP_SINK_CAPS_RETRIES		15
+#define DP_SINK_CAPS_RETRY_DELAY_MS	150
+
 #define HPD_STRING_SIZE 30
 
 enum {
@@ -269,21 +278,35 @@ static int msm_dp_display_lttpr_init(struct msm_dp_display_private *dp, u8 *dpcd
 	return lttpr_count;
 }
 
+static int msm_dp_display_read_link_caps(struct msm_dp_display_private *dp)
+{
+	u8 dpcd[DP_RECEIVER_CAP_SIZE];
+	int rc;
+
+	rc = drm_dp_read_dpcd_caps(dp->aux, dpcd);
+	if (rc)
+		return rc;
+
+	dp->link->lttpr_count = msm_dp_display_lttpr_init(dp, dpcd);
+
+	return msm_dp_panel_read_link_caps(dp->panel, dp->msm_dp_display.connector);
+}
+
 static int msm_dp_display_process_hpd_high(struct msm_dp_display_private *dp)
 {
 	struct drm_connector *connector = dp->msm_dp_display.connector;
 	const struct drm_display_info *info = &connector->display_info;
-	int rc = 0;
-	u8 dpcd[DP_RECEIVER_CAP_SIZE];
 	const struct drm_edid *drm_edid = NULL;
+	unsigned int tries = 0;
+	int rc;
 
-	rc = drm_dp_read_dpcd_caps(dp->aux, dpcd);
-	if (rc)
-		goto end;
-
-	dp->link->lttpr_count = msm_dp_display_lttpr_init(dp, dpcd);
-
-	rc = msm_dp_panel_read_link_caps(dp->panel, connector);
+	rc = msm_dp_display_read_link_caps(dp);
+	while (rc && tries++ < DP_SINK_CAPS_RETRIES) {
+		drm_dbg_dp(dp->drm_dev, "sink caps read failed (%d), retry %u/%u\n",
+			   rc, tries, DP_SINK_CAPS_RETRIES);
+		msleep(DP_SINK_CAPS_RETRY_DELAY_MS);
+		rc = msm_dp_display_read_link_caps(dp);
+	}
 	if (rc)
 		goto end;
 
