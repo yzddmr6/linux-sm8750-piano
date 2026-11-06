@@ -58,6 +58,7 @@ properties:
     maxItems: 1
 
   qcom,smem-state-names:
+    description: Name of the stop request state sent to SoCCP.
     maxItems: 1
 
   qcom,soccp-dstate:

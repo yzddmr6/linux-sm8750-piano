@@ -236,7 +236,6 @@ static struct rpmhpd qphy = {
 static struct rpmhpd gmxc = {
 	.pd = { .name = "gmxc", },
 	.res_name = "gmxc.lvl",
-	.skip_retention_level = true,
 };
 
 /* Eliza RPMH powerdomains */
