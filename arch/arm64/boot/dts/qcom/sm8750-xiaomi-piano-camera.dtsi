@@ -1,0 +1,343 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Camera nodes imported from blu-sharky/debian-piano:
+ * fd6266d73f3442b23362260c3aa0c86782e0b52c, boot/dtbo-piano-camera.dts.
+ * Overlay containers/labels converted to the existing upstream board tree;
+ * existing clock, QUP and RPMh providers are reused, not duplicated.
+ * Sensor modes and board wiring follow the community implementation.
+ * CSI endpoints use the standalone PHY graph of the common SoC tree.
+ */
+#include <dt-bindings/clock/qcom,sm8750-cambistmclkcc.h>
+#include <dt-bindings/clock/qcom,sm8750-camcc.h>
+
+&apps_rsc {
+	regulators-0 {
+		vreg_l6b_1p8: ldo6 {
+			regulator-name = "vreg_l6b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l7b_2p8: ldo7 {
+			regulator-name = "vreg_l7b_2p8";
+			regulator-min-microvolt = <2800000>;
+			regulator-max-microvolt = <2800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l10b_1p8: ldo10 {
+			regulator-name = "vreg_l10b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+};
+
+&apps_rsc {
+	regulators-2 {
+		vreg_l2g_1p2: ldo2 {
+			regulator-name = "vreg_l2g_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+};
+
+&apps_rsc {
+	regulators-5 {
+		vreg_l1i_1p1: ldo1 {
+			regulator-name = "vreg_l1i_1p1";
+			/* Stock L1I VSET readback is 1096 mV (2026-10-12). */
+			regulator-min-microvolt = <1096000>;
+			regulator-max-microvolt = <1096000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+};
+
+/ {
+	cam_wide_avdd: regulator-camera-wide-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam_wide_avdd";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		gpio = <&tlmm 175 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <100>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_wide_avdd_pins>;
+		pinctrl-1 = <&cam_wide_avdd_sleep>;
+	};
+
+	cam_front_avdd: regulator-camera-front-avdd {
+		compatible = "regulator-fixed";
+		regulator-name = "cam_front_avdd";
+		regulator-min-microvolt = <2800000>;
+		regulator-max-microvolt = <2800000>;
+		gpio = <&tlmm 176 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <100>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_front_avdd_pins>;
+		pinctrl-1 = <&cam_front_avdd_sleep>;
+	};
+};
+
+&tlmm {
+	cam_cci0_1: cam-cci0-1-state {
+		sda-pins {
+			pins = "gpio115";
+			function = "cci_i2c_sda";
+			drive-strength = <4>;
+			bias-disable;
+		};
+
+		scl-pins {
+			pins = "gpio116";
+			function = "cci_i2c_scl";
+			drive-strength = <4>;
+			bias-disable;
+		};
+	};
+
+	cam_wide: cam-wide-state {
+		mclk-pins {
+			pins = "gpio90";
+			function = "cam_mclk";
+			drive-strength = <4>;
+			bias-disable;
+		};
+
+		reset-pins {
+			pins = "gpio6";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-disable;
+		};
+	};
+
+	cam_front: cam-front-state {
+		mclk-pins {
+			pins = "gpio93";
+			function = "cam_aon_mclk4";
+			drive-strength = <2>;
+			bias-disable;
+		};
+
+		reset-pins {
+			pins = "gpio7";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-disable;
+		};
+	};
+
+	cam_wide_avdd_pins: cam-wide-avdd-state {
+		pins = "gpio175";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_front_avdd_pins: cam-front-avdd-state {
+		pins = "gpio176";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	cam_i2c9: cam-i2c9-state {
+		pins = "gpio4", "gpio5";
+		function = "qup2_se1";
+		drive-strength = <2>;
+		bias-disable;
+	};
+};
+
+&cci0 {
+	status = "okay";
+	assigned-clocks = <&camcc CAM_CC_CCI_0_CLK>;
+	assigned-clock-rates = <37500000>;
+	pinctrl-0 = <&cam_cci0_1>;
+	pinctrl-1 = <&cam_cci0_1>;
+};
+
+&cci0_i2c1 {
+	clock-frequency = <1000000>;
+
+	cam_wide_vcm: vcm@c {
+		/* Stock uses GT9764BA; its register protocol is unverified. */
+		status = "disabled";
+		compatible = "giantec,gt9769";
+		reg = <0x0c>;
+		vin-supply = <&vreg_l6b_1p8>;
+		vdd-supply = <&vreg_l7b_2p8>;
+	};
+
+	camera_wide: camera@10 {
+		compatible = "samsung,s5kjn1";
+		reg = <0x10>;
+		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
+		clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK1_CLK>;
+		assigned-clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK1_CLK>;
+		assigned-clock-rates = <24000000>;
+		reset-gpios = <&tlmm 6 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_wide>;
+		pinctrl-1 = <&cam_wide_sleep>;
+		afvdd-supply = <&vreg_l7b_2p8>;
+		vdda-supply = <&cam_wide_avdd>;
+		vddd-supply = <&vreg_l1i_1p1>;
+		vddio-supply = <&vreg_l6b_1p8>;
+		orientation = <1>;
+		rotation = <180>;
+
+		port {
+			cam_wide_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <700000000>;
+				remote-endpoint = <&csiphy1_in>;
+			};
+		};
+	};
+};
+
+&camss {
+	status = "okay";
+	ports {
+		/delete-node/ port@0;
+		/delete-node/ port@2;
+		/delete-node/ port@3;
+		/delete-node/ port@5;
+	};
+};
+
+&csiphy0_out {
+	/delete-property/ remote-endpoint;
+};
+
+&csiphy2_out {
+	/delete-property/ remote-endpoint;
+};
+
+&csiphy3_out {
+	/delete-property/ remote-endpoint;
+};
+
+&csiphy5_out {
+	/delete-property/ remote-endpoint;
+};
+
+&csiphy1 {
+	vdda-0p9-supply = <&vreg_l1f_0p88>;
+	vdda-1p2-supply = <&vreg_l3g_1p2>;
+	status = "okay";
+};
+
+&csiphy1_in {
+	bus-type = <4>;
+	data-lanes = <1 2 3 4>;
+	remote-endpoint = <&cam_wide_ep>;
+};
+
+&csiphy4 {
+	vdda-0p9-supply = <&vreg_l3i_0p88>;
+	vdda-1p2-supply = <&vreg_l3g_1p2>;
+	status = "okay";
+};
+
+&csiphy4_in {
+	bus-type = <4>;
+	data-lanes = <1 2 3 4>;
+	remote-endpoint = <&cam_front_ep>;
+};
+
+
+&i2c9 {
+	status = "okay";
+	pinctrl-names = "default", "sleep";
+	pinctrl-0 = <&cam_i2c9>;
+	pinctrl-1 = <&cam_i2c9_sleep>;
+	clock-frequency = <1000000>;
+
+	camera_front: camera@10 {
+		compatible = "ovti,ov32d40";
+		reg = <0x10>;
+		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
+		clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK4_CLK>;
+		assigned-clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK4_CLK>;
+		assigned-clock-rates = <19200000>;
+		reset-gpios = <&tlmm 7 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default", "sleep";
+		pinctrl-0 = <&cam_front>;
+		pinctrl-1 = <&cam_front_sleep>;
+		vddio-supply = <&vreg_l10b_1p8>;
+		dvdd-supply = <&vreg_l2g_1p2>;
+		avdd-supply = <&cam_front_avdd>;
+		orientation = <0>;
+		rotation = <0>;
+
+		port {
+			cam_front_ep: endpoint {
+				data-lanes = <1 2 3 4>;
+				link-frequencies = /bits/ 64 <842400000>;
+				remote-endpoint = <&csiphy4_in>;
+			};
+		};
+	};
+};
+
+&tlmm {
+	cam_wide_sleep: cam-wide-sleep-state {
+		mclk-pins {
+			pins = "gpio90";
+			function = "cam_mclk";
+			drive-strength = <4>;
+			bias-pull-down;
+		};
+		reset-pins {
+			pins = "gpio6";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-down;
+			output-low;
+		};
+	};
+	cam_front_sleep: cam-front-sleep-state {
+		mclk-pins {
+			pins = "gpio93";
+			function = "cam_aon_mclk4";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+		reset-pins {
+			pins = "gpio7";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-down;
+			output-low;
+		};
+	};
+	cam_i2c9_sleep: cam-i2c9-sleep-state {
+		pins = "gpio4", "gpio5";
+		function = "gpio";
+		drive-strength = <4>;
+	};
+	cam_wide_avdd_sleep: cam-wide-avdd-sleep-state {
+		pins = "gpio175";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-low;
+	};
+	cam_front_avdd_sleep: cam-front-avdd-sleep-state {
+		pins = "gpio176";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-low;
+	};
+};

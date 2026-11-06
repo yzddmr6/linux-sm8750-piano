@@ -1,0 +1,1995 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Clock definitions derived from sm8750-mtp.dts:
+ * Copyright (c) 2024 Qualcomm Innovation Center, Inc. All rights reserved.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/input/gpio-keys.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/regulator/qcom,rpmh-regulator.h>
+#include "sm8750.dtsi"
+#include "pm8550.dtsi"
+#include "pmih0108.dtsi"
+#include "pmk8550.dtsi"
+#include "sm8750-pmics.dtsi"
+
+/delete-node/ &cpusys_vm_mem;
+/delete-node/ &adspslpi_mem;
+/delete-node/ &oem_vm_mem;
+
+#define PIANO_MODEL		"Xiaomi Pad 8 Pro"
+#define PIANO_COMPATIBLE	"xiaomi,piano", "qcom,sm8750"
+
+/ {
+	model = PIANO_MODEL;
+	compatible = PIANO_COMPATIBLE;
+	chassis-type = "tablet";
+
+	/*
+	 * ABL replaces model/compatible with the stock DTBO's ("qcom,sun-mtp",
+	 * ...), which breaks root match tables. CONFIG_QCOM_ABL_ROOT_IDENTITY
+	 * restores them from these copies; the DTBO does not carry them.
+	 */
+	xiaomi,mainline-model = PIANO_MODEL;
+	xiaomi,mainline-compatible = PIANO_COMPATIBLE;
+
+	aliases {
+		serial0 = &uart7;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+
+		/* Early firmware console; native DRM removes this at KMS handoff. */
+		framebuffer {
+			compatible = "simple-framebuffer";
+			memory-region = <&splash_mem>;
+			/*
+			 * Scanout is owned by the bootloader until native MDSS
+			 * takes over. Hold the display power domains and the
+			 * clocks it left running, so dispcc and rpmhpd
+			 * sync_state do not power them off underneath the
+			 * framebuffer. MMCX is first so required-opps applies
+			 * to it; nom_l1 matches the 575 MHz MDP clock rate.
+			 */
+			clocks = <&gcc GCC_DISP_HF_AXI_CLK>,
+				 <&dispcc DISP_CC_MDSS_AHB_CLK>,
+				 <&dispcc DISP_CC_MDSS_MDP_CLK>,
+				 <&dispcc DISP_CC_MDSS_VSYNC_CLK>,
+				 <&dispcc DISP_CC_MDSS_BYTE0_CLK>,
+				 <&dispcc DISP_CC_MDSS_BYTE0_INTF_CLK>,
+				 <&dispcc DISP_CC_MDSS_PCLK0_CLK>,
+				 <&dispcc DISP_CC_MDSS_ESC0_CLK>,
+				 <&dispcc DISP_CC_MDSS_BYTE1_CLK>,
+				 <&dispcc DISP_CC_MDSS_BYTE1_INTF_CLK>,
+				 <&dispcc DISP_CC_MDSS_PCLK1_CLK>,
+				 <&dispcc DISP_CC_MDSS_ESC1_CLK>;
+			power-domains = <&rpmhpd RPMHPD_MMCX>,
+					<&dispcc MDSS_GDSC>,
+					<&dispcc MDSS_INT2_GDSC>;
+			required-opps = <&rpmhpd_opp_nom_l1>;
+			/*
+			 * The scanout fetches from DDR on the same path as the
+			 * native MDSS "mdp0-mem". Once interconnect sync_state
+			 * drops the boot-time floor, nothing else keeps that
+			 * path up, so the framebuffer votes its own bandwidth.
+			 */
+			interconnects = <&mmss_noc MASTER_MDP QCOM_ICC_TAG_ALWAYS
+					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+			interconnect-names = "mdp0-mem";
+			operating-points-v2 = <&framebuffer_opp_table>;
+			width = <3200>;
+			height = <2136>;
+			stride = <(3200 * 4)>;
+			format = "x8r8g8b8";
+
+			/*
+			 * Firmware scanout mode: 3200x2136 x8r8g8b8 (4 bytes
+			 * per pixel) at 120 Hz, measured from the INTF1/INTF2
+			 * frame counters (+60 per 0.5 s); vertical total 2310
+			 * lines (2136 active, front porch 68, back porch 104,
+			 * sync 2) from the stock 120 Hz panel timing.
+			 *
+			 * opp-avg-kBps: the frame read once per refresh,
+			 *   3200 * 2136 * 4 B * 120 Hz = 3280896 kB/s.
+			 * opp-peak-kBps: each active line is read within one
+			 *   line time of the 2310-line frame, plus the DPU bus
+			 *   inefficiency margin of 120/100 for SM8750, as in
+			 *   _dpu_plane_calc_bw() and _dpu_core_perf_calc_bw():
+			 *   3200 * 2310 * 4 B * 120 Hz * 1.2 = 4257792 kB/s.
+			 */
+			framebuffer_opp_table: opp-table {
+				compatible = "operating-points-v2";
+
+				opp-0 {
+					opp-peak-kBps = <4257792>;
+					opp-avg-kBps = <3280896>;
+				};
+			};
+		};
+	};
+
+	clocks {
+		xo_board: xo-board {
+			compatible = "fixed-clock";
+			clock-frequency = <76800000>;
+			#clock-cells = <0>;
+		};
+
+		sleep_clk: sleep-clk {
+			compatible = "fixed-clock";
+			clock-frequency = <32000>;
+			#clock-cells = <0>;
+		};
+
+		bi_tcxo_div2: bi-tcxo-div2-clk {
+			compatible = "fixed-factor-clock";
+			#clock-cells = <0>;
+			clocks = <&rpmhcc RPMH_CXO_CLK>;
+			clock-mult = <1>;
+			clock-div = <2>;
+		};
+
+		bi_tcxo_ao_div2: bi-tcxo-ao-div2-clk {
+			compatible = "fixed-factor-clock";
+			#clock-cells = <0>;
+			clocks = <&rpmhcc RPMH_CXO_CLK_A>;
+			clock-mult = <1>;
+			clock-div = <2>;
+		};
+	};
+
+	/* Xiaomi MCA battery protocol; USB roles use the standard UCSI client. */
+	pmic-glink {
+		compatible = "xiaomi,piano-pmic-glink", "qcom,sm8750-pmic-glink",
+			     "qcom,sm8550-pmic-glink", "qcom,pmic-glink";
+		xiaomi,charge-pump = <&sc8541>;
+		orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;
+		pinctrl-0 = <&usb_orientation_default>;
+		pinctrl-names = "default";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		connector@0 {
+			compatible = "usb-c-connector";
+			reg = <0>;
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					pmic_glink_hs_in: endpoint {
+						remote-endpoint = <&usb_dwc3_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+
+					pmic_glink_ss_in: endpoint {
+						remote-endpoint = <&usb_dp_qmpphy_out>;
+					};
+				};
+
+				port@2 {
+					reg = <2>;
+
+					pmic_glink_sbu: endpoint {
+						remote-endpoint = <&dio4485_sbu_mux>;
+					};
+				};
+			};
+		};
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		pinctrl-0 = <&volume_up_n>;
+		pinctrl-names = "default";
+
+		/* Stock gpio_keys vol_up: PM8550 GPIO6, active low, 32 ms. */
+		key-volume-up {
+			label = "Volume Up";
+			gpios = <&pm8550_gpios 6 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_VOLUMEUP>;
+			debounce-interval = <32>;
+			linux,can-disable;
+			wakeup-source;
+		};
+
+		/*
+		 * Same-model SunUEFI a485cc01c639 vendor/piano-linux/board.dtb,
+		 * /soc/piano-hall-ml: GPIO80 active low, SW_LID and wakeup-source,
+		 * no pinctrl; its desktop uses real cover close/open events.
+		 * GPIO80 maps to PDC 122. Wake only when the cover opens.
+		 */
+		switch-lid {
+			label = "Lid";
+			gpios = <&tlmm 80 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_LID>;
+			wakeup-source;
+			wakeup-event-action = <EV_ACT_DEASSERTED>;
+		};
+	};
+
+	/*
+	 * LCD bias rails of the panel (stock display_panel_vsp/vsn): fixed
+	 * 5.8 V outputs switched by TLMM GPIO117/118 and generated by the LCD
+	 * bias block of the backlight driver. Stock describes them as fixed
+	 * regulators without pin states and lists them as panel supplies.
+	 * The firmware leaves them on. They stay disabled until the panel node
+	 * consumes them: an enabled boot-on fixed regulator without a consumer
+	 * would be switched off by the regulator core 30 s after boot.
+	 */
+	panel_vsn: regulator-panel-vsn {
+		compatible = "regulator-fixed";
+		regulator-name = "display_panel_vsn";
+		regulator-min-microvolt = <5800000>;
+		regulator-max-microvolt = <5800000>;
+		regulator-enable-ramp-delay = <233>;
+		gpio = <&tlmm 118 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+
+		status = "disabled";
+	};
+
+	panel_vsp: regulator-panel-vsp {
+		compatible = "regulator-fixed";
+		regulator-name = "display_panel_vsp";
+		regulator-min-microvolt = <5800000>;
+		regulator-max-microvolt = <5800000>;
+		regulator-enable-ramp-delay = <233>;
+		gpio = <&tlmm 117 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		regulator-boot-on;
+
+		status = "disabled";
+	};
+
+	reserved-memory {
+		display_dump_mem: display-dump@81cf4000 {
+			reg = <0x0 0x81cf4000 0x0 0x800>;
+			no-map;
+		};
+
+		reserved@9b09c000 {
+			reg = <0x0 0x9b09c000 0x0 0x4000>;
+			no-map;
+		};
+
+		reserved@9eb80000 {
+			reg = <0x0 0x9eb80000 0x0 0x80000>;
+			no-map;
+		};
+
+		ramoops@a3500000 {
+			compatible = "ramoops";
+			reg = <0x0 0xa3500000 0x0 0x400000>;
+			console-size = <0x200000>;
+			pmsg-size = <0x200000>;
+		};
+
+		adspslpi_mem: adspslpi@b8200000 {
+			reg = <0x0 0xb8200000 0x0 0x5780000>;
+			no-map;
+		};
+
+		oem_vm_mem: oem-vm@f8800000 {
+			reg = <0x0 0xf8800000 0x0 0x3800000>;
+			no-map;
+		};
+
+		vm_shared_mem: vm-shared@fc000000 {
+			reg = <0x0 0xfc000000 0x0 0x400000>;
+			no-map;
+		};
+
+		/* ABL powers down the display unless this name is splash_region. */
+		splash_mem: splash_region@fc800000 {
+			reg = <0x0 0xfc800000 0x0 0x2b00000>;
+			no-map;
+		};
+	};
+
+	/*
+	 * WCN7860 (GANGES) package PMU. Inputs, enables and clock follow the
+	 * stock bt_peach/cnss nodes. The chip AON input is on S5F and the
+	 * WLMX (digital) input on S4D (stock qcom,pmu_vreg_map, stock BT
+	 * aon/dig supplies). The outputs are the PMU domains named in the
+	 * same map; consumers only reference them to find this sequencer.
+	 * Enabled only by the supervised bt-diag variant.
+	 */
+	wcn7860_pmu: wcn7860-pmu {
+		compatible = "qcom,wcn7860-pmu";
+
+		pinctrl-0 = <&wlan_en>, <&bt_en_default>;
+		pinctrl-names = "default";
+
+		wlan-enable-gpios = <&tlmm 16 GPIO_ACTIVE_HIGH>;
+		bt-enable-gpios = <&pm8550ve_f_gpios 3 GPIO_ACTIVE_HIGH>;
+		swctrl-gpios = <&tlmm 18 GPIO_ACTIVE_HIGH>;
+
+		vddio-supply = <&vreg_l3f_1p8>;
+		vddio1p2-supply = <&vreg_l2f_1p2>;
+		vddaon-supply = <&vreg_s5f_0p88>;
+		vdddig-supply = <&vreg_s4d_0p88>;
+		vddrfa1p2-supply = <&vreg_s7i_1p31>;
+		vddrfa1p8-supply = <&vreg_s3g_1p86>;
+
+		status = "disabled";
+
+		regulators {
+			vreg_pmu_aon_0p9: ldo0 {
+				regulator-name = "vreg_pmu_aon_0p9";
+			};
+
+			vreg_pmu_rfa_1p9: ldo1 {
+				regulator-name = "vreg_pmu_rfa_1p9";
+			};
+
+			vreg_pmu_rfa_1p3: ldo2 {
+				regulator-name = "vreg_pmu_rfa_1p3";
+			};
+
+			vreg_pmu_rfa_0p9: ldo3 {
+				regulator-name = "vreg_pmu_rfa_0p9";
+			};
+
+			vreg_pmu_wlmx_0p9: ldo4 {
+				regulator-name = "vreg_pmu_wlmx_0p9";
+			};
+
+			vreg_pmu_wlcx_0p9: ldo5 {
+				regulator-name = "vreg_pmu_wlcx_0p9";
+			};
+
+			vreg_pmu_btcx_0p9: ldo6 {
+				regulator-name = "vreg_pmu_btcx_0p9";
+			};
+
+			vreg_pmu_btcmx_0p9: ldo7 {
+				regulator-name = "vreg_pmu_btcmx_0p9";
+			};
+
+			vreg_pmu_pcie_1p2: ldo8 {
+				regulator-name = "vreg_pmu_pcie_1p2";
+			};
+
+			vreg_pmu_pcie_0p9: ldo9 {
+				regulator-name = "vreg_pmu_pcie_0p9";
+			};
+		};
+	};
+	xo_therm: thermal-sensor-xo {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x44>;
+		io-channel-names = "sensor-channel";
+	};
+
+	msm_therm: thermal-sensor-msm {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x144>;
+		io-channel-names = "sensor-channel";
+	};
+
+	flash_therm: thermal-sensor-flash {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x145>;
+		io-channel-names = "sensor-channel";
+	};
+
+	wifi_therm: thermal-sensor-wifi {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x146>;
+		io-channel-names = "sensor-channel";
+	};
+
+	display_therm: thermal-sensor-display {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x149>;
+		io-channel-names = "sensor-channel";
+	};
+
+	backlight_therm: thermal-sensor-backlight {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x14a>;
+		io-channel-names = "sensor-channel";
+	};
+
+	conn2_therm: thermal-sensor-conn2 {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x14b>;
+		io-channel-names = "sensor-channel";
+	};
+
+	battery_therm: thermal-sensor-battery {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x744>;
+		io-channel-names = "sensor-channel";
+	};
+
+	conn_therm: thermal-sensor-conn {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x747>;
+		io-channel-names = "sensor-channel";
+	};
+
+	quiet_therm: thermal-sensor-quiet {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x74a>;
+		io-channel-names = "sensor-channel";
+	};
+
+	charger1_therm: thermal-sensor-charger1 {
+		compatible = "generic-adc-thermal";
+		#thermal-sensor-cells = <0>;
+		io-channels = <&pmk8550_adc 0x74d>;
+		io-channel-names = "sensor-channel";
+	};
+
+	thermal-zones {
+		backlight-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&backlight_therm>;
+		};
+
+		battery-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&battery_therm>;
+		};
+
+		charger1-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&charger1_therm>;
+		};
+
+		conn-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&conn_therm>;
+		};
+
+		conn2-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&conn2_therm>;
+		};
+
+		display-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&display_therm>;
+		};
+
+		flash-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&flash_therm>;
+		};
+
+		skin-msm-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&msm_therm>;
+		};
+
+		skin-quiet-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&quiet_therm>;
+		};
+
+		wifi-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&wifi_therm>;
+		};
+
+		xo-thermal {
+			polling-delay-passive = <0>;
+			polling-delay = <0>;
+			thermal-sensors = <&xo_therm>;
+		};
+	};
+};
+
+/*
+ * Nothing on this board uses the Qualcomm Crypto Engine; the CPU crypto
+ * extensions serve the kernel crypto API. Leaving the node enabled without a
+ * bound driver would hold the interconnect providers' sync_state.
+ */
+&crypto {
+	status = "disabled";
+};
+
+/*
+ * The inline crypto engine is only used through UFS inline encryption,
+ * which this board's kernel does not build (SCSI_UFS_CRYPTO=n). No driver
+ * ever binds the node, which would hold the GCC sync_state. Disable it and
+ * drop the UFS reference below, so enabling UFS crypto later runs without
+ * ICE instead of failing the UFS probe on a missing ICE device.
+ */
+&ice {
+	status = "disabled";
+};
+
+&apps_rsc {
+	/*
+	 * Only stock-verified output rails (USB, UFS, PCIe0 PHY, WCN7860 PMU
+	 * inputs, keyboard bridge); input topology is not yet known. UFS, WCN and
+	 * keyboard rails carry no initial mode, so they send no RPMh vote until a
+	 * consumer enables them. WCN ranges are the intersection of the stock BT
+	 * and WLAN consumer ranges.
+	 */
+	regulators-0 {
+		compatible = "qcom,pm8550-rpmh-regulators";
+		qcom,pmic-id = "b";
+
+		vreg_l5b_3p1: ldo5 {
+			regulator-name = "vreg_l5b_3p1";
+			regulator-min-microvolt = <3100000>;
+			regulator-max-microvolt = <3148000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		/* Stock keyboard bridge dvdd (1800000 uV request, VSET reads 1800 mV). */
+		vreg_l11b_1p8: ldo11 {
+			regulator-name = "vreg_l11b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+		};
+
+		/*
+		 * Stock keyboard bridge vdd. The stock kernel requests 3300000 uV,
+		 * which is off the 8 mV PLDO step; the PMIC LDO14 VSET register on
+		 * this unit reads 0x0ce0 (3296 mV) while that request is active.
+		 */
+		/*
+		 * Panel I/O (stock vddil12b, display only). The stock request
+		 * of 1900000 uV is not on the 8 mV grid; the LDO12 VSET
+		 * register on this unit reads 0x0768 (1896 mV) with it.
+		 * Disabled until the panel is enabled.
+		 */
+		vreg_l12b_1p9: ldo12 {
+			regulator-name = "vreg_l12b_1p9";
+			regulator-min-microvolt = <1896000>;
+			regulator-max-microvolt = <1896000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+
+			status = "disabled";
+		};
+
+		vreg_l14b_3p3: ldo14 {
+			regulator-name = "vreg_l14b_3p3";
+			regulator-min-microvolt = <3296000>;
+			regulator-max-microvolt = <3296000>;
+		};
+
+		vreg_l15b_1p8: ldo15 {
+			regulator-name = "vreg_l15b_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l17b_2p5: ldo17 {
+			regulator-name = "vreg_l17b_2p5";
+			regulator-min-microvolt = <2504000>;
+			regulator-max-microvolt = <2504000>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-1 {
+		compatible = "qcom,pm8550ve-rpmh-regulators";
+		qcom,pmic-id = "d";
+
+		vreg_s4d_0p88: smps4 {
+			regulator-name = "vreg_s4d_0p88";
+			regulator-min-microvolt = <876000>;
+			regulator-max-microvolt = <1036000>;
+		};
+
+		vreg_l1d_1p2: ldo1 {
+			regulator-name = "vreg_l1d_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
+
+		vreg_l2d_0p88: ldo2 {
+			regulator-name = "vreg_l2d_0p88";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <912000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-2 {
+		compatible = "qcom,pm8550ve-rpmh-regulators";
+		qcom,pmic-id = "g";
+
+		/* Stock 1860000 uV is off the 8 mV step above 1376000 uV. */
+		vreg_s3g_1p86: smps3 {
+			regulator-name = "vreg_s3g_1p86";
+			regulator-min-microvolt = <1864000>;
+			regulator-max-microvolt = <2000000>;
+		};
+
+		vreg_l3g_1p2: ldo3 {
+			regulator-name = "vreg_l3g_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1256000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-3 {
+		compatible = "qcom,pm8550vs-rpmh-regulators";
+		qcom,pmic-id = "j";
+
+		/* The UFS PHY needs at least 912 mV within the 880-920 mV rail range. */
+		vreg_l1j_0p91: ldo1 {
+			regulator-name = "vreg_l1j_0p91";
+			regulator-min-microvolt = <912000>;
+			regulator-max-microvolt = <920000>;
+			regulator-allow-set-load;
+			regulator-allowed-modes = <RPMH_REGULATOR_MODE_LPM
+						   RPMH_REGULATOR_MODE_HPM>;
+		};
+	};
+
+	regulators-4 {
+		compatible = "qcom,pm8550ve-rpmh-regulators";
+		qcom,pmic-id = "f";
+
+		vreg_s5f_0p88: smps5 {
+			regulator-name = "vreg_s5f_0p88";
+			regulator-min-microvolt = <876000>;
+			regulator-max-microvolt = <1000000>;
+		};
+
+		/*
+		 * REFGEN_VDD_A_0P9 / VDD_A_PCIE_0_0P9 on the SM8750 power grid
+		 * (stock ufsphy_mem vdda-refgen-supply, 206 mA, and the eUSB2 PHY
+		 * vdd_refgen-supply). The UFS and eUSB2 PHY bindings have no
+		 * refgen supply, so the PCIe0 PHY would be its only switchable
+		 * consumer and could turn the UFS/USB reference off on a PCIe
+		 * probe deferral or link failure. Keep it on, as the stock
+		 * active-set vote (L1F_AO) does.
+		 */
+		vreg_l1f_0p88: ldo1 {
+			regulator-name = "vreg_l1f_0p88";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <920000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-always-on;
+		};
+
+		vreg_l2f_1p2: ldo2 {
+			regulator-name = "vreg_l2f_1p2";
+			regulator-min-microvolt = <1200000>;
+			regulator-max-microvolt = <1200000>;
+		};
+
+		vreg_l3f_1p8: ldo3 {
+			regulator-name = "vreg_l3f_1p8";
+			regulator-min-microvolt = <1800000>;
+			regulator-max-microvolt = <1800000>;
+		};
+	};
+
+	regulators-5 {
+		compatible = "qcom,pm8550ve-rpmh-regulators";
+		qcom,pmic-id = "i";
+
+		vreg_s7i_1p31: smps7 {
+			regulator-name = "vreg_s7i_1p31";
+			regulator-min-microvolt = <1312000>;
+			regulator-max-microvolt = <1340000>;
+		};
+
+		/*
+		 * Stock L3I (880-912 mV, HPM): the two DSI PHY vdda-0p9
+		 * supplies, but also the UFS PHY vdda-qref, the CSI PHYs and
+		 * another peripheral. The UFS QREF has no upstream consumer, so
+		 * a DSI PHY disable must not be able to drop the rail under the
+		 * root file system: keep it on, as the stock proxy vote does.
+		 * Disabled until the DSI PHYs are enabled.
+		 */
+		vreg_l3i_0p88: ldo3 {
+			regulator-name = "vreg_l3i_0p88";
+			regulator-min-microvolt = <880000>;
+			regulator-max-microvolt = <912000>;
+			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+			regulator-always-on;
+
+			status = "disabled";
+		};
+	};
+};
+
+/*
+ * Device-signed zap shader, taken from this unit's ODM image and supplied
+ * only through a private RAM-candidate firmware directory. The GPU itself
+ * stays disabled here; only the supervised gpu-diag variant enables it.
+ */
+/*
+ * CPU passive trips. Under stock Android this unit runs the prime cores at
+ * 4.32 GHz and the other cores at 3.53 GHz with these per-core zones at up
+ * to 104-105C (never above 105.5C in 2410 samples), so the 95C trips of the
+ * stock DT are not its effective limit; the stock DT also carries a 105C,
+ * 5C hysteresis trip on each of these zones. Hold them at that 105C. The
+ * hotspot rises by about 200C/s at load onset, which a 250 ms passive poll
+ * overshoots by about 10C, so poll every 10 ms while passive (stock polls
+ * these zones every 4 ms). The other per-core zones keep the stock 118C
+ * core-pause temperature. Every per-core zone throttles its cluster, the
+ * only CPU cooling device available. Stock has no kernel mitigation on the
+ * CPUSS zones, so their passive trip is dropped and only hot/critical remain.
+ */
+&{/thermal-zones/cpu-0-0-0-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_0_0_alert: cpu-0-0-0-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_0_0_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-0-1-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_0_1_alert: cpu-0-0-1-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_0_1_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-1-0-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_1_0_alert: cpu-0-1-0-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_1_0_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-1-1-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_1_1_alert: cpu-0-1-1-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_1_1_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-2-0-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_2_0_alert: cpu-0-2-0-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_2_0_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-2-1-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_2_1_alert: cpu-0-2-1-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_2_1_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-3-0-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_3_0_alert: cpu-0-3-0-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_3_0_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-3-1-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_3_1_alert: cpu-0-3-1-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_3_1_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-4-0-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_4_0_alert: cpu-0-4-0-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_4_0_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-4-1-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_4_1_alert: cpu-0-4-1-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_4_1_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-5-0-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_5_0_alert: cpu-0-5-0-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_5_0_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-0-5-1-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_0_5_1_alert: cpu-0-5-1-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_0_5_1_alert>;
+			cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-1-0-0-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_1_0_0_alert: cpu-1-0-0-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_1_0_0_alert>;
+			cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-1-0-1-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_1_0_1_alert: cpu-1-0-1-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_1_0_1_alert>;
+			cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-1-1-0-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_1_1_0_alert: cpu-1-1-0-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_1_1_0_alert>;
+			cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&{/thermal-zones/cpu-1-1-1-thermal} {
+	polling-delay-passive = <250>;
+	trips {
+		cpu_1_1_1_alert: cpu-1-1-1-alert {
+			temperature = <95000>;
+			hysteresis = <2000>;
+			type = "passive";
+		};
+	};
+	cooling-maps {
+		map0 {
+			trip = <&cpu_1_1_1_alert>;
+			cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+		};
+	};
+};
+
+&cpu_0_0_0_alert {
+	temperature = <105000>;
+	hysteresis = <5000>;
+};
+
+&cpu_0_0_1_alert {
+	temperature = <118000>;
+	hysteresis = <8000>;
+};
+
+&cpu_0_1_0_alert {
+	temperature = <118000>;
+	hysteresis = <8000>;
+};
+
+&cpu_0_1_1_alert {
+	temperature = <118000>;
+	hysteresis = <8000>;
+};
+
+&cpu_0_2_0_alert {
+	temperature = <105000>;
+	hysteresis = <5000>;
+};
+
+&cpu_0_2_1_alert {
+	temperature = <105000>;
+	hysteresis = <5000>;
+};
+
+&cpu_0_3_0_alert {
+	temperature = <118000>;
+	hysteresis = <8000>;
+};
+
+&cpu_0_3_1_alert {
+	temperature = <118000>;
+	hysteresis = <8000>;
+};
+
+&cpu_0_4_0_alert {
+	temperature = <105000>;
+	hysteresis = <5000>;
+};
+
+&cpu_0_4_1_alert {
+	temperature = <105000>;
+	hysteresis = <5000>;
+};
+
+&cpu_0_5_0_alert {
+	temperature = <118000>;
+	hysteresis = <8000>;
+};
+
+&cpu_0_5_1_alert {
+	temperature = <118000>;
+	hysteresis = <8000>;
+};
+
+&cpu_1_0_0_alert {
+	temperature = <105000>;
+	hysteresis = <5000>;
+};
+
+&cpu_1_0_1_alert {
+	temperature = <105000>;
+	hysteresis = <5000>;
+};
+
+&cpu_1_1_0_alert {
+	temperature = <105000>;
+	hysteresis = <5000>;
+};
+
+&cpu_1_1_1_alert {
+	temperature = <105000>;
+	hysteresis = <5000>;
+};
+
+&{/thermal-zones/cpu-0-0-0-thermal} {
+	polling-delay-passive = <10>;
+};
+
+&{/thermal-zones/cpu-0-2-0-thermal} {
+	polling-delay-passive = <10>;
+};
+
+&{/thermal-zones/cpu-0-2-1-thermal} {
+	polling-delay-passive = <10>;
+};
+
+&{/thermal-zones/cpu-0-4-0-thermal} {
+	polling-delay-passive = <10>;
+};
+
+&{/thermal-zones/cpu-0-4-1-thermal} {
+	polling-delay-passive = <10>;
+};
+
+&{/thermal-zones/cpu-1-0-0-thermal} {
+	polling-delay-passive = <10>;
+};
+
+&{/thermal-zones/cpu-1-0-1-thermal} {
+	polling-delay-passive = <10>;
+};
+
+&{/thermal-zones/cpu-1-1-0-thermal} {
+	polling-delay-passive = <10>;
+};
+
+&{/thermal-zones/cpu-1-1-1-thermal} {
+	polling-delay-passive = <10>;
+};
+
+&{/thermal-zones/cpuss-0-0-thermal} {
+	/delete-property/ polling-delay-passive;
+	/delete-node/ cooling-maps;
+};
+
+&{/thermal-zones/cpuss-0-1-thermal} {
+	/delete-property/ polling-delay-passive;
+	/delete-node/ cooling-maps;
+};
+
+&{/thermal-zones/cpuss-1-0-thermal} {
+	/delete-property/ polling-delay-passive;
+	/delete-node/ cooling-maps;
+};
+
+&{/thermal-zones/cpuss-1-1-thermal} {
+	/delete-property/ polling-delay-passive;
+	/delete-node/ cooling-maps;
+};
+
+
+&gpu_zap_shader {
+	firmware-name = "qcom/sm8750/xiaomi/piano/gen80000_zap.mbn";
+};
+
+&gunyah_hyp_mem {
+	reg = <0x0 0x80000000 0x0 0x1200000>;
+};
+
+/* Stock sets the TLMM I2C pull-up (qcom,i2c_pull) on the speaker amplifier bus. */
+&hub_i2c0_data_clk {
+	bias-pull-up = <2200>;
+};
+
+/* Stock sets the TLMM I2C pull-up (qcom,i2c_pull) on the backlight buses. */
+&hub_i2c3_data_clk {
+	bias-pull-up = <2200>;
+};
+
+/*
+ * Keep both buses disabled outside the supervised power-diag variant. SE5 is
+ * marked multi-EE (qcom,shared) in the stock tree; this kernel has no GPI
+ * lock/unlock support for sharing it with another execution environment.
+ */
+&iris {
+	firmware-name = "qcom/sm8750/vpu35_4v.mbn";
+	status = "okay";
+};
+
+&i2c5 {
+	/* This unit's stock SE5 / sc8541_master@6a. Policy is opt-in. */
+	sc8541: charger@6a {
+		compatible = "southchip,sc8541";
+		reg = <0x6a>;
+	};
+
+	fuel-gauge@55 {
+		compatible = "ti,bq27z561";
+		reg = <0x55>;
+	};
+};
+
+&i2c6 {
+	/* Stock qcom,clk-freq-out on the keyboard bridge bus. */
+	clock-frequency = <1000000>;
+
+	/* Stock wiring; the product desktop DTS enables this consumer. */
+	keyboard@4c {
+		compatible = "nanosic,wn8030-piano";
+		reg = <0x4c>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <97 IRQ_TYPE_EDGE_RISING>;
+		status-gpios = <&tlmm 95 GPIO_ACTIVE_HIGH>;
+		data-gpios = <&tlmm 97 GPIO_ACTIVE_HIGH>;
+		wakeup-source;
+		panel = <&panel>;
+
+		reset-gpios = <&tlmm 188 GPIO_ACTIVE_LOW>;
+		sleep-gpios = <&tlmm 3 GPIO_ACTIVE_LOW>;
+
+		dvdd-supply = <&vreg_l14b_3p3>;
+		vddio-supply = <&vreg_l11b_1p8>;
+
+		firmware-name = "nanosic/piano/MCU_Upgrade.bin";
+		nanosic,no-touchpad;
+
+		pinctrl-0 = <&keyboard_default>;
+		pinctrl-names = "default";
+
+		status = "disabled";
+	};
+};
+
+&i2c8 {
+	/* Stock has no qcom,clk-freq-out, so the vendor GENI driver uses 400 kHz. */
+	clock-frequency = <400000>;
+
+	/* Stock ktz8866,id = <1>; programmed together with the chip on I2C hub 3. */
+	backlight_secondary: backlight@11 {
+		compatible = "kinetic,ktz8866";
+		reg = <0x11>;
+		kinetic,secondary;
+	};
+};
+
+&i2c11 {
+	fuel-gauge@55 {
+		compatible = "ti,bq27z561";
+		reg = <0x55>;
+	};
+};
+
+/*
+ * Four FourSemi FS19xx speaker amplifiers (DEVID 0x2900 on all four in the
+ * stock boot log), each with its own shutdown and interrupt line. The
+ * register setup, including which TDM slot each one plays, comes from the
+ * vendor preset (stock /odm/firmware/fs19xx.fsm, one block per address):
+ * slot 0 is 0x35, 1 is 0x37, 2 is 0x34, 3 is 0x36. Stock runs the bus at
+ * 400 kHz (no qcom,clk-freq-out) and does not request the interrupts.
+ * The name prefixes are the positions in landscape with the front camera on
+ * top, from the preset positions (0x34 LTOP, 0x35 RTOP, 0x37 RBTM, 0x36 LBTM
+ * in the vendor's portrait terms); stock pinctrl names call 0x37 bottom-left
+ * and 0x36 bottom-right instead, so the bottom pair is still to be checked
+ * by ear. The bus stays disabled in the board DTB.
+ */
+&i2c_hub_0 {
+	clock-frequency = <400000>;
+
+	speaker_bottom_left: audio-codec@34 {
+		compatible = "foursemi,fs19xx";
+		reg = <0x34>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&tlmm 66 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 128 GPIO_ACTIVE_LOW>;
+		firmware-name = "foursemi/piano/fs19xx.fsm";
+		pinctrl-0 = <&speaker_amp_irq_bl>;
+		pinctrl-names = "default";
+		sound-name-prefix = "Bottom Left";
+	};
+
+	speaker_top_left: audio-codec@35 {
+		compatible = "foursemi,fs19xx";
+		reg = <0x35>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&tlmm 84 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 129 GPIO_ACTIVE_LOW>;
+		firmware-name = "foursemi/piano/fs19xx.fsm";
+		pinctrl-0 = <&speaker_amp_irq_tl>;
+		pinctrl-names = "default";
+		sound-name-prefix = "Top Left";
+	};
+
+	speaker_bottom_right: audio-codec@36 {
+		compatible = "foursemi,fs19xx";
+		reg = <0x36>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&tlmm 81 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 107 GPIO_ACTIVE_LOW>;
+		firmware-name = "foursemi/piano/fs19xx.fsm";
+		pinctrl-0 = <&speaker_amp_irq_br>;
+		pinctrl-names = "default";
+		sound-name-prefix = "Bottom Right";
+	};
+
+	speaker_top_right: audio-codec@37 {
+		compatible = "foursemi,fs19xx";
+		reg = <0x37>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&tlmm 67 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 108 GPIO_ACTIVE_LOW>;
+		firmware-name = "foursemi/piano/fs19xx.fsm";
+		pinctrl-0 = <&speaker_amp_irq_tr>;
+		pinctrl-names = "default";
+		sound-name-prefix = "Top Right";
+	};
+};
+
+/*
+ * The two KTZ8866 each drive half of the LED strings of the one LCD panel.
+ * The firmware turns them on and sets up the panel bias; the bias outputs
+ * are the panel's supplies (stock display_panel_vsp/vsn on GPIO117/118) and
+ * are not described here. Both buses stay disabled in the board DTB.
+ */
+&i2c_hub_3 {
+	/* Stock has no qcom,clk-freq-out, so the vendor GENI driver uses 400 kHz. */
+	clock-frequency = <400000>;
+
+	/* Stock ktz8866,id = <0>, the only one with ktz8866,hwen-gpio. */
+	backlight: backlight@11 {
+		compatible = "kinetic,ktz8866";
+		reg = <0x11>;
+		enable-gpios = <&tlmm 2 GPIO_ACTIVE_HIGH>;
+		/* The stock driver always writes BL_EN 0x7f/0x3f: six sinks. */
+		current-num-sinks = <6>;
+		kinetic,secondary-backlight = <&backlight_secondary>;
+	};
+};
+
+&mdss_dp0 {
+	status = "okay";
+};
+
+&mdss_dp0_out {
+	/* Stock limits the DP link clock to 540000 kHz (HBR2). */
+	link-frequencies = /bits/ 64 <1620000000 2700000000 5400000000>;
+};
+
+/*
+ * Native display path for the bonded dual-DSI DSC video-mode LCD, from the
+ * stock dsi-display-primary, mdss_dsi_ctrl0/1 and mdss_dsi_phy0/1 nodes:
+ * DSI0 is the clock master and both links run from its PHY PLL, four lanes
+ * per link, commands broadcast to both links. The desktop enables this
+ * path; chosen/framebuffer retains the early firmware console until KMS
+ * removes its aperture. Native takeover has not yet been tested here.
+ */
+&mdss_dsi0 {
+	/* Stock vdda-1p2 on both controllers: L3G, 16.6 mA. */
+	vdda-supply = <&vreg_l3g_1p2>;
+
+	qcom,dual-dsi-mode;
+	qcom,master-dsi;
+	qcom,sync-dual-dsi;
+
+	/*
+	 * Two panel modules share this board. The stock bootloader picks the
+	 * P81 profile from the module ID pin that the stock touch driver also
+	 * reads (novatek,lcd_id-gpio, TLMM GPIO100, no pinctrl state): low is
+	 * qcom,mdss_dsi_p81_42_02_0a_dualdsi_dsc_vid (CSOT), high is
+	 * qcom,mdss_dsi_p81_35_02_0b_dualdsi_dsc_vid (BOE).
+	 */
+	panel: panel@0 {
+		compatible = "xiaomi,piano-nt36532", "novatek,nt36532";
+		reg = <0>;
+
+		/* Stock qcom,platform-reset-gpio: TLMM GPIO98. */
+		reset-gpios = <&tlmm 98 GPIO_ACTIVE_LOW>;
+		id-gpios = <&tlmm 100 GPIO_ACTIVE_HIGH>;
+
+		vddio-supply = <&vreg_l12b_1p9>;
+		avdd-supply = <&panel_vsp>;
+		avee-supply = <&panel_vsn>;
+		backlight = <&backlight>;
+
+		/* Stock sde_dsi_active/suspend and sde_te_active/suspend. */
+		pinctrl-0 = <&panel_reset_active>, <&panel_te_default>;
+		pinctrl-1 = <&panel_reset_suspend>, <&panel_te_default>;
+		pinctrl-names = "default", "sleep";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+
+				panel_in_0: endpoint {
+					remote-endpoint = <&mdss_dsi0_out>;
+				};
+			};
+
+			port@1 {
+				reg = <1>;
+
+				panel_in_1: endpoint {
+					remote-endpoint = <&mdss_dsi1_out>;
+				};
+			};
+		};
+	};
+};
+
+&mdss_dsi0_out {
+	remote-endpoint = <&panel_in_0>;
+	data-lanes = <0 1 2 3>;
+};
+
+&mdss_dsi0_phy {
+	/* Stock vdda-0p9 on both PHYs: L3I, 98 mA. */
+	vdds-supply = <&vreg_l3i_0p88>;
+	/*
+	 * Panel-tuned D-PHY TIMING_CTRL_0..13 from the stock panel node
+	 * (qcom,mdss-dsi-panel-phy-timings, 1197.5 Mbps/lane). The generic
+	 * calculation yields a shorter hs_rqst and longer hs_zero/hs_exit/
+	 * clk_trail/clk_pre/clk_post than the vendor tuning.
+	 */
+	qcom,phy-timings = /bits/ 8 <0x00 0x27 0x0a 0x0a 0x1b 0x19 0x0a
+				     0x0b 0x0a 0x02 0x04 0x00 0x20 0x0f>;
+	/* Stock qcom,mdss-dsi-clk-strength: HS TX strength 0xff on both links. */
+	qcom,phy-hstx-strength = /bits/ 8 <0xff>;
+};
+
+&mdss_dsi1 {
+	vdda-supply = <&vreg_l3g_1p2>;
+
+	/* The host reparents both bonded links to PHY0 after PHY setup. */
+	clocks = <&dispcc DISP_CC_MDSS_BYTE1_CLK>,
+		 <&dispcc DISP_CC_MDSS_BYTE1_INTF_CLK>,
+		 <&dispcc DISP_CC_MDSS_PCLK1_CLK>,
+		 <&dispcc DISP_CC_MDSS_ESC1_CLK>,
+		 <&dispcc DISP_CC_MDSS_AHB_CLK>,
+		 <&gcc GCC_DISP_HF_AXI_CLK>,
+		 <&mdss_dsi0_phy DSI_PIXEL_PLL_CLK>,
+		 <&mdss_dsi0_phy DSI_BYTE_PLL_CLK>,
+		 <&dispcc DISP_CC_ESYNC1_CLK>,
+		 <&dispcc DISP_CC_OSC_CLK>,
+		 <&dispcc DISP_CC_MDSS_BYTE1_CLK_SRC>,
+		 <&dispcc DISP_CC_MDSS_PCLK1_CLK_SRC>;
+
+	qcom,dual-dsi-mode;
+	qcom,sync-dual-dsi;
+};
+
+&mdss_dsi1_out {
+	remote-endpoint = <&panel_in_1>;
+	data-lanes = <0 1 2 3>;
+};
+
+&mdss_dsi1_phy {
+	vdds-supply = <&vreg_l3i_0p88>;
+	qcom,phy-timings = /bits/ 8 <0x00 0x27 0x0a 0x0a 0x1b 0x19 0x0a
+				     0x0b 0x0a 0x02 0x04 0x00 0x20 0x0f>;
+	/* Stock qcom,mdss-dsi-clk-strength: HS TX strength 0xff on both links. */
+	qcom,phy-hstx-strength = /bits/ 8 <0xff>;
+};
+
+&mpss_mem {
+	status = "disabled";
+};
+
+/*
+ * WCN7860 WLAN on PCIe0, as in the stock pcie@1c00000/cnss-peach nodes:
+ * PERST# TLMM102, CLKREQ# TLMM103, WAKE# TLMM104 (stock pinctrl equals
+ * pcie0_default_state). The stock PHY rails are CESTA-managed and not named;
+ * L1F is VDD_A_PCIE_0_0P9 per the SM8750 power grid note kept in the stock
+ * UFS PHY node, and L3G is the 1.2 V PHY rail that also feeds the UFS, USB
+ * and USB/DP PHYs. Enabled only by the supervised wlan-diag variant.
+ */
+&pcie0 {
+	pinctrl-0 = <&pcie0_default_state>;
+	pinctrl-names = "default";
+};
+
+&pcie0_phy {
+	vdda-phy-supply = <&vreg_l1f_0p88>;
+	vdda-pll-supply = <&vreg_l3g_1p2>;
+};
+
+&pcieport0 {
+	wake-gpios = <&tlmm 104 GPIO_ACTIVE_LOW>;
+	reset-gpios = <&tlmm 102 GPIO_ACTIVE_LOW>;
+
+	/* Supplies are the WLAN-function outputs of qcom,pmu_vreg_map. */
+	wifi@0 {
+		compatible = "pci17cb,110e";
+		reg = <0x10000 0x0 0x0 0x0 0x0>;
+
+		vddaon-supply = <&vreg_pmu_aon_0p9>;
+		vddwlcx-supply = <&vreg_pmu_wlcx_0p9>;
+		vddwlmx-supply = <&vreg_pmu_wlmx_0p9>;
+		vddrfa0p9-supply = <&vreg_pmu_rfa_0p9>;
+		vddrfa1p3-supply = <&vreg_pmu_rfa_1p3>;
+		vddrfa1p9-supply = <&vreg_pmu_rfa_1p9>;
+		vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
+		vddpcie1p2-supply = <&vreg_pmu_pcie_1p2>;
+	};
+};
+
+&pm8550_gpios {
+	pm8550_therm_default: therm-default-state {
+		pins = "gpio2", "gpio3", "gpio4";
+		function = "normal";
+		bias-high-impedance;
+	};
+
+	/* Stock key_vol_up_default. */
+	volume_up_n: volume-up-n-state {
+		pins = "gpio6";
+		function = "normal";
+		power-source = <1>;
+		bias-pull-up;
+		input-enable;
+	};
+};
+
+&pm8550ve_f_gpios {
+	/* Stock bt_uwb_en: VIN1, no bias, output. */
+	bt_en_default: bt-en-default-state {
+		pins = "gpio3";
+		function = "normal";
+		power-source = <1>;
+		bias-disable;
+		output-low;
+	};
+};
+
+&pmih0108_gpios {
+	/*
+	 * charger1_therm is wired to gpio12, but that pin belongs to another
+	 * execution environment: the SPMI arbiter rejects writes from Linux,
+	 * and one rejected pin rolls back the whole default state. Leave it
+	 * to the firmware, which already keeps it high impedance.
+	 */
+	pmih0108_therm_default: therm-default-state {
+		pins = "gpio6";
+		function = "normal";
+		bias-high-impedance;
+	};
+};
+
+&pmk8550_adc {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pm8550_therm_default &pmih0108_therm_default>;
+	status = "okay";
+
+	channel@44 {
+		reg = <0x44>;
+		label = "pmk8550_xo_therm";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <1360>;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@144 {
+		reg = <0x144>;
+		label = "pm8550_cpu_therm";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <1360>;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@145 {
+		reg = <0x145>;
+		label = "pm8550_flash_therm";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <1360>;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@146 {
+		reg = <0x146>;
+		label = "pm8550_wifi_therm";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <1360>;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@149 {
+		reg = <0x149>;
+		label = "pm8550_display_therm";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <1360>;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@14a {
+		reg = <0x14a>;
+		label = "pm8550_backlight_therm";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <1360>;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@14b {
+		reg = <0x14b>;
+		label = "pm8550_conn_therm2";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <1360>;
+		qcom,hw-settle-time = <200>;
+	};
+
+	channel@744 {
+		reg = <0x744>;
+		label = "pmih010x_batt_therm";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <340>;
+		qcom,hw-settle-time = <15>;
+		qcom,adc5-gen4;
+	};
+
+	channel@747 {
+		reg = <0x747>;
+		label = "pmih010x_conn_therm";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <340>;
+		qcom,hw-settle-time = <15>;
+		qcom,adc5-gen4;
+	};
+
+	channel@74a {
+		reg = <0x74a>;
+		label = "pmih010x_quiet_therm";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <340>;
+		qcom,hw-settle-time = <15>;
+		qcom,adc5-gen4;
+	};
+
+	channel@74d {
+		reg = <0x74d>;
+		label = "pmih010x_charger1_therm";
+		qcom,ratiometric;
+		qcom,pre-scaling = <1 1>;
+		qcom,decimation = <340>;
+		qcom,hw-settle-time = <15>;
+		qcom,adc5-gen4;
+	};
+};
+
+&pmih0108_eusb2_repeater {
+	vdd18-supply = <&vreg_l15b_1p8>;
+	vdd3-supply = <&vreg_l5b_3p1>;
+
+	qcom,tune-usb2-amplitude = /bits/ 8 <0xe>;
+	qcom,tune-res-fsdif = /bits/ 8 <0x1>;
+	qcom,tune-usb2-disc-thres = /bits/ 8 <0x7>;
+	qcom,tune-usb2-preem = /bits/ 8 <0x6>;
+	qcom,squelch-detector-bp = <(-3000)>;
+};
+
+&pmk8550_rtc {
+	nvmem-cells = <&rtc_offset>;
+	nvmem-cell-names = "offset";
+};
+
+&pmk8550_sdam_2 {
+	rtc_offset: rtc-offset@72 {
+		reg = <0x72 0x4>;
+	};
+};
+
+&pon_pwrkey {
+	status = "okay";
+};
+
+/* Stock pon_hlos resin: linux,code 114. */
+&pon_resin {
+	linux,code = <KEY_VOLUMEDOWN>;
+
+	status = "okay";
+};
+
+/* Stock sets the TLMM I2C pull-up (qcom,i2c_pull) on both fuel-gauge buses. */
+&qup_i2c5_data_clk {
+	bias-pull-up = <2200>;
+};
+
+&qup_i2c11_data_clk {
+	bias-pull-up = <2200>;
+};
+
+/* Stock leaves the internal pull-up off on the keyboard bridge bus. */
+&qup_i2c6_data_clk {
+	/delete-property/ bias-pull-up;
+	bias-disable;
+};
+
+&qup_i2c8_data_clk {
+	bias-pull-up = <2200>;
+};
+
+&qupv3_1 {
+	status = "okay";
+};
+
+/* Enable only for a supervised THP test with panel power already present. */
+&spi2 {
+	status = "disabled";
+
+	touchscreen@0 {
+		compatible = "novatek,nt36532e";
+		panel = <&panel>;
+		reg = <0>;
+		spi-max-frequency = <19200000>;
+		interrupt-parent = <&tlmm>;
+		interrupts = <162 IRQ_TYPE_EDGE_RISING>;
+		/* Stock firmware per panel module, indexed by the ID pin level. */
+		novatek,lcd-id-gpios = <&tlmm 100 GPIO_ACTIVE_HIGH>;
+		firmware-name = "novatek/piano/novatek_nt36532_piano_fw_csot.bin",
+				"novatek/piano/novatek_nt36532_piano_fw_boe.bin";
+		status = "disabled";
+	};
+};
+
+&tlmm {
+	gpio-reserved-ranges = <36 4>, <48 4>, <74 1>;
+
+	usb_orientation_default: usb-orientation-default-state {
+		pins = "gpio61";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-disable;
+	};
+
+	/* Stock xiaomi_keyboard_{sleep_,}default: wake, reset and status pins. */
+	keyboard_default: keyboard-default-state {
+		wake-pins {
+			pins = "gpio3";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-pull-down;
+		};
+
+		reset-status-pins {
+			pins = "gpio95", "gpio188";
+			function = "gpio";
+			drive-strength = <2>;
+			bias-disable;
+		};
+	};
+
+	/*
+	 * Stock sec_tdm_pinctrl (tdm1_{clk,ws,din,dout}_active): the secondary
+	 * LPAIF TDM interface to the speaker amplifiers, 8 mA, no bias. DATA0
+	 * is the input (stock tdm1_din, amplifier feedback), DATA1 the output.
+	 */
+	sec_tdm_default: sec-tdm-default-state {
+		sck-pins {
+			pins = "gpio121";
+			function = "i2s1_sck";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		data0-pins {
+			pins = "gpio122";
+			function = "i2s1_data0";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		ws-pins {
+			pins = "gpio123";
+			function = "i2s1_ws";
+			drive-strength = <8>;
+			bias-disable;
+		};
+
+		data1-pins {
+			pins = "gpio124";
+			function = "i2s1_data1";
+			drive-strength = <8>;
+			bias-disable;
+		};
+	};
+
+	/*
+	 * Stock fs19xx_irq_active_*: no bias, 2 mA (named for portrait). Their
+	 * input-enable is left to the GPIO input direction on this TLMM.
+	 */
+	speaker_amp_irq_bl: speaker-amp-irq-bl-state {
+		pins = "gpio66";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	speaker_amp_irq_tr: speaker-amp-irq-tr-state {
+		pins = "gpio67";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	speaker_amp_irq_br: speaker-amp-irq-br-state {
+		pins = "gpio81";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	speaker_amp_irq_tl: speaker-amp-irq-tl-state {
+		pins = "gpio84";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	/* Stock sde_dsi_active: panel reset, 8 mA. */
+	panel_reset_active: panel-reset-active-state {
+		pins = "gpio98";
+		function = "gpio";
+		drive-strength = <8>;
+		bias-disable;
+	};
+
+	/* Stock sde_dsi_suspend. */
+	panel_reset_suspend: panel-reset-suspend-state {
+		pins = "gpio98";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	/*
+	 * Stock sde_te_active and sde_te_suspend are the same state. The panel
+	 * runs in video mode, so the TE input is not used for frame timing.
+	 */
+	panel_te_default: panel-te-default-state {
+		pins = "gpio86";
+		function = "mdp_vsync";
+		drive-strength = <2>;
+		bias-pull-down;
+	};
+
+	/* Stock cnss_wlan_en_sleep: WLAN held off unless its sequencer target is on. */
+	wlan_en: wlan-en-state {
+		pins = "gpio16";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-low;
+	};
+};
+
+/*
+ * The trace NOC has no consumer on this board (no CoreSight trace is used),
+ * and it never binds: the AMBA bus maps an unreadable PrimeCell/CoreSight ID
+ * to -EPROBE_DEFER, so piano lists "amba 109ab000.tn: deferred probe pending"
+ * at the deferred probe timeout (BigfootACA reports that the ID reads as 0 on
+ * this part). From BigfootACA/linux da72dd806bf0 (Junhao Xie, BSD-3-Clause);
+ * referenced by path because sm8750.dtsi has no label for the node.
+ */
+&{/soc@0/tn@109ab000} {
+	status = "disabled";
+};
+
+&trust_ui_vm_mem {
+	reg = <0x0 0xf3800000 0x0 0x5000000>;
+};
+
+/* Stock ttyHS0 (qupv3 SE14): TX/RX plus CTS/RTS for hardware flow control. */
+&uart14 {
+	pinctrl-0 = <&qup_uart14_default>, <&qup_uart14_cts_rts>;
+	pinctrl-names = "default";
+
+	status = "disabled";
+
+	bluetooth {
+		compatible = "qcom,wcn7860-bt";
+
+		vddaon-supply = <&vreg_pmu_aon_0p9>;
+		vddbtcx-supply = <&vreg_pmu_btcx_0p9>;
+		vddbtcmx-supply = <&vreg_pmu_btcmx_0p9>;
+		vddrfa0p9-supply = <&vreg_pmu_rfa_0p9>;
+		vddrfa1p3-supply = <&vreg_pmu_rfa_1p3>;
+		vddrfa1p9-supply = <&vreg_pmu_rfa_1p9>;
+
+		/* Baud index 0x11 (3.2 Mbaud) in every stock gngbtnv20 NVM. */
+		max-speed = <3200000>;
+	};
+};
+
+&uart7 {
+	status = "okay";
+};
+
+/*
+ * Only for a supervised read-only identification variant. The PHY QREF and
+ * REFGEN rails, the reset pad (PX14) rail and the VCCQ parent have no
+ * upstream consumer and stay as the boot firmware left them.
+ */
+&ufs_mem_hc {
+	/delete-property/ qcom,ice;
+
+	reset-gpios = <&tlmm 215 GPIO_ACTIVE_LOW>;
+
+	vcc-supply = <&vreg_l17b_2p5>;
+	vcc-max-microamp = <1300000>;
+	vccq-supply = <&vreg_l1d_1p2>;
+	vccq-max-microamp = <1200000>;
+
+	status = "disabled";
+};
+
+&ufs_mem_phy {
+	vdda-phy-supply = <&vreg_l1j_0p91>;
+	vdda-pll-supply = <&vreg_l3g_1p2>;
+
+	status = "disabled";
+};
+
+&usb {
+	dr_mode = "otg";
+	maximum-speed = "super-speed";
+	phys = <&usb_hsphy>, <&usb_dp_qmpphy QMP_USB43DP_USB3_PHY>;
+	phy-names = "usb2-phy", "usb3-phy";
+	usb-role-switch;
+
+	status = "okay";
+};
+
+&usb_dwc3_hs {
+	remote-endpoint = <&pmic_glink_hs_in>;
+};
+
+/* Stock combo PHY uses L2D for vdd and L3G for its 1.2 V core supply. */
+&usb_dp_qmpphy {
+	vdda-phy-supply = <&vreg_l2d_0p88>;
+	vdda-pll-supply = <&vreg_l3g_1p2>;
+
+	status = "okay";
+};
+
+&usb_dp_qmpphy_out {
+	remote-endpoint = <&pmic_glink_ss_in>;
+};
+
+&usb_hsphy {
+	vdd-supply = <&vreg_l2d_0p88>;
+	vdda12-supply = <&vreg_l3g_1p2>;
+	phys = <&pmih0108_eusb2_repeater>;
+
+	status = "okay";
+};
+
+&i2c3 {
+	status = "okay";
+
+	dio4485: typec-mux@42 {
+		compatible = "dioo,dio4485";
+		reg = <0x42>;
+		/* Stock does not describe the VCC rail; the supply is optional. */
+		mode-switch;
+		orientation-switch;
+		status = "okay";
+
+		port {
+			dio4485_sbu_mux: endpoint {
+				remote-endpoint = <&pmic_glink_sbu>;
+			};
+		};
+	};
+};
+
+&xbl_ramdump_mem {
+	reg = <0x0 0xb8000000 0x0 0x200000>;
+};
+
+#include "sm8750-xiaomi-piano-camera.dtsi"

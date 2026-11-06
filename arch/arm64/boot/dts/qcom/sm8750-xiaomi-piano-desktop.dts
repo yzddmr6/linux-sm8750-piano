@@ -1,0 +1,308 @@
+// SPDX-License-Identifier: BSD-3-Clause
+/*
+ * Xiaomi Pad 8 Pro (piano) as the installed desktop uses it: the board
+ * description plus the functions enabled on top of it. Each block was first
+ * enabled on its own in a supervised RAM diagnostic (kept on the piano/diag
+ * branch); enabling them together does not by itself establish their
+ * concurrent operation. USB3 and DP routing still need board validation.
+ */
+
+#include "sm8750-xiaomi-piano.dts"
+
+/ {
+	/*
+	 * Internal DMICs through the LPASS VA macro and the ADSP. Every stock DMIC
+	 * line reaches both the TX and the VA macro ("Digital MicN" feeds TX DMICn
+	 * and VA DMICn) and the DMIC clock control sits in VA for both; the VA
+	 * path owns the clock itself. Which DMIC feeds which decimator is a mixer
+	 * (UCM) choice. Unlike the other blocks, this route has not yet run in a
+	 * RAM diagnostic of its own.
+	 */
+	sound {
+		compatible = "xiaomi,piano-sndcard", "qcom,sm8750-sndcard",
+			     "qcom,sm8450-sndcard";
+		model = "Xiaomi-Pad-8-Pro";
+		pinctrl-0 = <&sec_tdm_default>;
+		pinctrl-names = "default";
+
+		/*
+		 * The four speaker amplifiers on the secondary TDM interface, as
+		 * stock runs it (backend TDM-LPAIF-RX-SECONDARY, 48 kHz, 4 x
+		 * 32-bit slots, slot mask 15; the vendor log shows a 6.144 MHz bit
+		 * clock). The SoC provides the clocks; each amplifier takes its
+		 * slot from the vendor preset. No speaker protection runs.
+		 */
+		speaker-dai-link {
+			link-name = "Speaker Playback";
+
+			cpu {
+				sound-dai = <&q6apmbedai SECONDARY_TDM_RX_0>;
+				dai-tdm-slot-num = <4>;
+				dai-tdm-slot-width = <32>;
+				dai-tdm-slot-rx-mask = <1 1 1 1>;
+			};
+
+			codec {
+				sound-dai = <&speaker_top_left>, <&speaker_top_right>,
+					    <&speaker_bottom_left>, <&speaker_bottom_right>;
+				dai-tdm-slot-num = <4>;
+				dai-tdm-slot-width = <32>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+
+		va-dai-link {
+			link-name = "VA Capture";
+
+			cpu {
+				sound-dai = <&q6apmbedai VA_CODEC_DMA_TX_0>;
+			};
+
+			codec {
+				sound-dai = <&lpass_vamacro 0>;
+			};
+
+			platform {
+				sound-dai = <&q6apm>;
+			};
+		};
+	};
+
+};
+
+/*
+ * The secondary TDM bit clock, without coupling. Stock sets
+ * qcom,tdm-clk-attribute = <4> (inverted) for its vendor PRM path, but with
+ * that attribute the ADSP refused to start the port on piano (speakers-2);
+ * with 1 the port starts and the amplifiers play (speakers-3, 2026-10-10).
+ */
+&q6apmbedai {
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	dai@28 {
+		reg = <SECONDARY_TDM_RX_0>;
+		clocks = <&q6prmcc LPASS_CLK_ID_SEC_TDM_IBIT
+				   LPASS_CLK_ATTRIBUTE_COUPLE_NO>;
+		clock-names = "bclk";
+	};
+};
+
+&remoteproc_adsp {
+	firmware-name = "qcom/sm8750/piano/adsp.mdt",
+			"qcom/sm8750/piano/adsp_dtb.mdt";
+	status = "okay";
+};
+
+&lpass_rxmacro {
+	status = "disabled";
+};
+
+/* Stock p81 active states of the four DMIC pairs: 4 mA, not 8 mA. */
+&dmic01_default {
+	clk-pins {
+		drive-strength = <4>;
+	};
+
+	data-pins {
+		drive-strength = <4>;
+	};
+};
+
+&dmic23_default {
+	clk-pins {
+		drive-strength = <4>;
+	};
+
+	data-pins {
+		drive-strength = <4>;
+	};
+};
+
+&lpass_tlmm {
+	dmic45_default: dmic45-default-state {
+		clk-pins {
+			pins = "gpio12";
+			function = "dmic3_clk";
+			drive-strength = <4>;
+			output-high;
+		};
+
+		data-pins {
+			pins = "gpio13";
+			function = "dmic3_data";
+			drive-strength = <4>;
+			input-enable;
+		};
+	};
+
+	dmic67_default: dmic67-default-state {
+		clk-pins {
+			pins = "gpio17";
+			function = "dmic4_clk";
+			drive-strength = <4>;
+			output-high;
+		};
+
+		data-pins {
+			pins = "gpio18";
+			function = "dmic4_data";
+			drive-strength = <4>;
+			input-enable;
+		};
+	};
+};
+
+&lpass_vamacro {
+	pinctrl-0 = <&dmic01_default>, <&dmic23_default>,
+		    <&dmic45_default>, <&dmic67_default>;
+	pinctrl-names = "default";
+
+	/* Stock divider 4 at 48 kHz for TX and VA, from the 9.6 MHz DMIC source. */
+	qcom,dmic-sample-rate = <2400000>;
+};
+
+&lpass_wsa2macro {
+	status = "disabled";
+};
+
+&lpass_wsamacro {
+	status = "disabled";
+};
+
+/* GENI engines whose FIFO the firmware disabled transfer through GPI DMA. */
+&gpi_dma1 {
+	status = "okay";
+};
+
+&gpi_dma2 {
+	status = "okay";
+};
+
+&spi2 {
+	status = "okay";
+
+	touchscreen@0 {
+		status = "okay";
+	};
+};
+
+/* Fuel gauges (I2C5, I2C11) and keyboard bridge (I2C6). */
+&i2c5 {
+	status = "okay";
+};
+
+&i2c6 {
+	status = "okay";
+
+	keyboard@4c {
+		status = "okay";
+	};
+};
+
+&i2c11 {
+	status = "okay";
+};
+
+/* The speaker amplifiers (I2C hub 0) and both KTZ8866 backlight chips (hub 3). */
+&i2c_hub_0 {
+	status = "okay";
+};
+
+&i2c_master_hub_0 {
+	status = "okay";
+};
+
+&i2c_hub_3 {
+	status = "okay";
+};
+
+&i2c8 {
+	status = "okay";
+};
+
+&vreg_l11b_1p8 {
+	regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+};
+
+&vreg_l14b_3p3 {
+	regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
+};
+
+&qupv3_2 {
+	status = "okay";
+};
+
+/* WCN7860: Bluetooth on UART14, WLAN on PCIe0. */
+&uart14 {
+	status = "okay";
+};
+
+&wcn7860_pmu {
+	status = "okay";
+};
+
+&pcie0 {
+	status = "okay";
+};
+
+&pcie0_phy {
+	status = "okay";
+};
+
+&gpu {
+	status = "okay";
+};
+
+/* The root file system. */
+&ufs_mem_hc {
+	status = "okay";
+};
+
+&ufs_mem_phy {
+	status = "okay";
+};
+
+/* Native dual-DSI display, wired from this unit's stock P81 profile. */
+&mdss {
+	status = "okay";
+};
+
+&mdss_mdp {
+	status = "okay";
+};
+
+&mdss_dsi0 {
+	status = "okay";
+};
+
+&mdss_dsi1 {
+	status = "okay";
+};
+
+&mdss_dsi0_phy {
+	status = "okay";
+};
+
+&mdss_dsi1_phy {
+	status = "okay";
+};
+
+&panel_vsp {
+	status = "okay";
+};
+
+&panel_vsn {
+	status = "okay";
+};
+
+&vreg_l12b_1p9 {
+	status = "okay";
+};
+
+&vreg_l3i_0p88 {
+	status = "okay";
+};

@@ -611,7 +611,8 @@ static int ktz8866_probe(struct i2c_client *client)
 		ret = ktz8868_register_bias(ktz);
 		if (ret)
 			return ret;
-			brightness = DEFAULT_BRIGHTNESS;
+
+		brightness = DEFAULT_BRIGHTNESS;
 		of_property_read_u32(client->dev.of_node, "default-brightness", &brightness);
 		sync = true;
 	} else {

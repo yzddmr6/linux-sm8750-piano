@@ -36,7 +36,7 @@ properties:
       - const: vfe_lite1
 
   clocks:
-    maxItems: 23
+    maxItems: 32
 
   clock-names:
     items:
@@ -63,6 +63,15 @@ properties:
       - const: vfe_lite_cphy_rx
       - const: vfe_lite_csid
       - const: qdss_debug_xo
+      - const: cpas_vfe0_bayer
+      - const: cpas_vfe1_bayer
+      - const: cpas_vfe2_bayer
+      - const: vfe0_bayer
+      - const: vfe0_bayer_fast_ahb
+      - const: vfe1_bayer
+      - const: vfe1_bayer_fast_ahb
+      - const: vfe2_bayer
+      - const: vfe2_bayer_fast_ahb
 
   interrupts:
     maxItems: 10
@@ -252,7 +261,16 @@ examples:
                      <&camcc CAM_CC_IFE_LITE_AHB_CLK>,
                      <&camcc CAM_CC_IFE_LITE_CPHY_RX_CLK>,
                      <&camcc CAM_CC_IFE_LITE_CSID_CLK>,
-                     <&camcc CAM_CC_QDSS_DEBUG_XO_CLK>;
+                     <&camcc CAM_CC_QDSS_DEBUG_XO_CLK>,
+                     <&camcc CAM_CC_CAMNOC_RT_TFE_0_BAYER_CLK>,
+                     <&camcc CAM_CC_CAMNOC_RT_TFE_1_BAYER_CLK>,
+                     <&camcc CAM_CC_CAMNOC_RT_TFE_2_BAYER_CLK>,
+                     <&camcc CAM_CC_TFE_0_BAYER_CLK>,
+                     <&camcc CAM_CC_TFE_0_BAYER_FAST_AHB_CLK>,
+                     <&camcc CAM_CC_TFE_1_BAYER_CLK>,
+                     <&camcc CAM_CC_TFE_1_BAYER_FAST_AHB_CLK>,
+                     <&camcc CAM_CC_TFE_2_BAYER_CLK>,
+                     <&camcc CAM_CC_TFE_2_BAYER_FAST_AHB_CLK>;
             clock-names = "camnoc_nrt_axi",
                           "camnoc_rt_axi",
                           "cpas_ahb",
@@ -275,7 +293,16 @@ examples:
                           "vfe_lite_ahb",
                           "vfe_lite_cphy_rx",
                           "vfe_lite_csid",
-                          "qdss_debug_xo";
+                          "qdss_debug_xo",
+                          "cpas_vfe0_bayer",
+                          "cpas_vfe1_bayer",
+                          "cpas_vfe2_bayer",
+                          "vfe0_bayer",
+                          "vfe0_bayer_fast_ahb",
+                          "vfe1_bayer",
+                          "vfe1_bayer_fast_ahb",
+                          "vfe2_bayer",
+                          "vfe2_bayer_fast_ahb";
 
             interrupts = <GIC_SPI 601 IRQ_TYPE_EDGE_RISING>,
                          <GIC_SPI 603 IRQ_TYPE_EDGE_RISING>,
