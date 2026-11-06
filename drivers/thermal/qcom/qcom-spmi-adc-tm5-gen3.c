@@ -225,8 +225,9 @@ static int adc_tm5_gen3_configure(struct adc_tm5_gen3_channel_props *prop,
 	if (ret < 0)
 		return ret;
 
-	/* Write SID */
-	buf[0] = FIELD_PREP(ADC5_GEN3_SID_MASK, prop->common_props.sid);
+	/* Use the same SID and bus encoding as immediate ADC conversions. */
+	buf[0] = FIELD_PREP(ADC5_GEN4_BUS_INDEX_MASK, prop->common_props.bus_index) |
+		 FIELD_PREP(ADC5_GEN4_SID_MASK, prop->common_props.sid);
 
 	/* Select TM channel and indicate there is an actual conversion request */
 	buf[1] = ADC5_GEN3_CHAN_CONV_REQ | prop->tm_chan_index;
@@ -306,7 +307,7 @@ static int adc_tm5_register_tzd(struct adc_tm5_gen3_chip *adc_tm5)
 	int ret;
 
 	for (int i = 0; i < adc_tm5->nchannels; i++) {
-		channel = ADC5_GEN3_V_CHAN(adc_tm5->chan_props[i].common_props);
+		channel = adc5_gen4_v_chan(&adc_tm5->chan_props[i].common_props);
 		tzd = devm_thermal_of_zone_register(adc_tm5->dev, channel,
 						    &adc_tm5->chan_props[i],
 						    &adc_tm_ops);
