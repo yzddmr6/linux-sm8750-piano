@@ -2168,14 +2168,16 @@ static unsigned int qcom_battmgr_sc8280xp_convert_temp(unsigned int temperature)
  * announce the change here. A supply that is not registered yet announces its
  * state when it is.
  */
-static void qcom_battmgr_sc8280xp_set_online(struct power_supply *psy,
-					     bool *online, bool value)
+static void qcom_battmgr_sc8280xp_set_online(struct qcom_battmgr *battmgr,
+					  struct power_supply *psy,
+					  bool *online, bool value)
 {
+	guard(spinlock_irqsave)(&battmgr->notify_lock);
 	if (*online == value)
 		return;
 
 	*online = value;
-	if (psy)
+	if (psy && !battmgr->removing)
 		power_supply_changed(psy);
 }
 
@@ -2254,11 +2256,11 @@ static void qcom_battmgr_sc8280xp_callback(struct qcom_battmgr *battmgr,
 			battmgr->status.status = POWER_SUPPLY_STATUS_NOT_CHARGING;
 
 		source = le32_to_cpu(resp->status.charging_source);
-		qcom_battmgr_sc8280xp_set_online(battmgr->ac_psy, &battmgr->ac.online,
+		qcom_battmgr_sc8280xp_set_online(battmgr, battmgr->ac_psy, &battmgr->ac.online,
 						 source == BATTMGR_CHARGING_SOURCE_AC);
-		qcom_battmgr_sc8280xp_set_online(battmgr->usb_psy, &battmgr->usb.online,
+		qcom_battmgr_sc8280xp_set_online(battmgr, battmgr->usb_psy, &battmgr->usb.online,
 						 source == BATTMGR_CHARGING_SOURCE_USB);
-		qcom_battmgr_sc8280xp_set_online(battmgr->wls_psy, &battmgr->wireless.online,
+		qcom_battmgr_sc8280xp_set_online(battmgr, battmgr->wls_psy, &battmgr->wireless.online,
 						 source == BATTMGR_CHARGING_SOURCE_WIRELESS);
 		if (battmgr->info.last_full_capacity != 0) {
 			/*
@@ -2457,10 +2459,11 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->usb.current_limit = le32_to_cpu(resp->intval.value);
 			break;
 		case USB_ADAP_TYPE:
-			battmgr->usb.usb_type = le32_to_cpu(resp->intval.value);
-			break;
-		case USB_ADAP_TYPE:
 			val = le32_to_cpu(resp->intval.value);
+			if (!(battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD)) {
+				battmgr->usb.usb_type = val;
+				break;
+			}
 			if (val == OPLUS_USB_TYPE_PD_SDP)
 				val = POWER_SUPPLY_USB_TYPE_PD;
 			else if (val >= 0x80 && val <= 0x82)
