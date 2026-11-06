@@ -505,6 +505,7 @@ static int sc820cs_disable_streams(struct v4l2_subdev *sd,
 }
 
 static int sc820cs_set_format(struct v4l2_subdev *sd,
+			     const struct v4l2_subdev_client_info *ci,
 			     struct v4l2_subdev_state *state,
 			     struct v4l2_subdev_format *fmt)
 {
@@ -559,7 +560,7 @@ static int sc820cs_init_state(struct v4l2_subdev *sd,
 {
 	struct v4l2_subdev_format fmt = { .pad = 0 };
 
-	return sc820cs_set_format(sd, state, &fmt);
+	return sc820cs_set_format(sd, NULL, state, &fmt);
 }
 
 static int sc820cs_enum_mbus_code(struct v4l2_subdev *sd,
@@ -585,6 +586,7 @@ static int sc820cs_enum_frame_size(struct v4l2_subdev *sd,
 }
 
 static int sc820cs_get_selection(struct v4l2_subdev *sd,
+			       const struct v4l2_subdev_client_info *ci,
 			       struct v4l2_subdev_state *state,
 			       struct v4l2_subdev_selection *sel)
 {

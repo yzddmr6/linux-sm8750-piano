@@ -1389,6 +1389,7 @@ static int ov32d40_get_fmt(struct v4l2_subdev *sd,
 }
 
 static int ov32d40_set_fmt(struct v4l2_subdev *sd,
+			   const struct v4l2_subdev_client_info *ci,
 			   struct v4l2_subdev_state *sd_state,
 			   struct v4l2_subdev_format *fmt)
 {
@@ -1441,6 +1442,7 @@ out_unlock:
 }
 
 static int ov32d40_get_selection(struct v4l2_subdev *sd,
+				 const struct v4l2_subdev_client_info *ci,
 				 struct v4l2_subdev_state *sd_state,
 				 struct v4l2_subdev_selection *sel)
 {
@@ -1485,7 +1487,7 @@ static int ov32d40_init_state(struct v4l2_subdev *sd,
 
 	fmt.which = sd_state ? V4L2_SUBDEV_FORMAT_TRY : V4L2_SUBDEV_FORMAT_ACTIVE;
 
-	ov32d40_set_fmt(sd, sd_state, &fmt);
+	ov32d40_set_fmt(sd, NULL, sd_state, &fmt);
 
 	return 0;
 }
