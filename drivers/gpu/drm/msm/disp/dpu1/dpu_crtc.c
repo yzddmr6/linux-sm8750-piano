@@ -862,9 +862,9 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 	if (!state->color_mgmt_changed && !drm_atomic_crtc_needs_modeset(state))
 		return;
 
-	/* GC2 uses the downstream broadcast programming model: submit once
-	 * for every assigned DSPP, then stage both flushes only after success.
-	 * Independent submissions could leave split-display halves unequal.
+	/*
+	 * Upload GC2 LUTs once for every assigned DSPP, then stage both flushes
+	 * only after success. Bypass uses a separate MMIO write to each DSPP.
 	 */
 	for (i = 0; i < cstate->num_mixers; i++) {
 		dspp = mixer[i].hw_dspp;
@@ -886,7 +886,7 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 			else
 				_dpu_crtc_get_gc_lut(state, gc_lut);
 		}
-		if (!gcv2_ret)
+		if (!gcv2_ret && gc_lut)
 			gcv2_ret = gc_master->ops.setup_gc(gc_master, gc_lut, mixer[0].lm_ctl, gc_mask);
 		kfree(gc_lut);
 	}
@@ -914,6 +914,8 @@ static void _dpu_crtc_setup_cp_blocks(struct drm_crtc *crtc)
 		if (dspp->ops.setup_gc) {
 			if (dspp->lutdma) {
 				ret = gcv2_ret;
+				if (!ret && !state->gamma_lut)
+					ret = dspp->ops.setup_gc(dspp, NULL, ctl, 0);
 			} else if (!state->gamma_lut) {
 				ret = dspp->ops.setup_gc(dspp, NULL, ctl, 0);
 			} else {
@@ -1464,9 +1466,10 @@ static struct msm_display_topology dpu_crtc_get_topology(
 	else
 		topology.num_lm = 1;
 
-	/* GC2 must program bypass while it still owns every broadcast target.
+	/*
+	 * GC2 must program bypass while it still owns every affected DSPP.
 	 * Keep the attached DSPPs reserved for the enabled CRTC, including an
-	 * empty LUT, instead of releasing them before the disable command.
+	 * empty LUT, instead of releasing them before the disable writes.
 	 */
 	if (dpu_kms->lutdma || crtc_state->ctm || crtc_state->gamma_lut)
 		topology.num_dspp = topology.num_lm;

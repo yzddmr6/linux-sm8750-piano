@@ -121,6 +121,14 @@ static int dpu_setup_dspp_gc(struct dpu_hw_dspp *ctx,
 static int dpu_setup_dspp_gcv2(struct dpu_hw_dspp *ctx,
 		struct dpu_hw_gc_lut *lut, struct dpu_hw_ctl *ctl, u32 dspp_mask)
 {
+	/* Like downstream GC v2, only LUT uploads need REGDMA. */
+	if (!lut) {
+		if (!dpu_lutdma_ready(ctx->lutdma))
+			return -EIO;
+		DPU_REG_WRITE(&ctx->hw, ctx->cap->sblk->gc.base, GC_DIS);
+		return 0;
+	}
+
 	return dpu_lutdma_submit_gc(ctx->lutdma, ctl, dspp_mask, lut);
 }
 
@@ -162,8 +170,9 @@ struct dpu_hw_dspp *dpu_hw_dspp_init(struct drm_device *dev,
 	c->cap = cfg;
 	if (c->cap->sblk->pcc.base)
 		c->ops.setup_pcc = dpu_setup_dspp_pcc;
-	/* GC v2 requires REGDMA; do not bind the legacy AHB implementation
-	 * merely because the catalog describes a nonzero register offset.
+	/*
+	 * GC v2 LUT uploads require REGDMA; do not bind the legacy AHB LUT
+	 * implementation merely because the catalog has a nonzero GC offset.
 	 */
 	if (c->cap->sblk->gc.base &&
 	    (c->cap->sblk->gc.version == 0x10007 ||
