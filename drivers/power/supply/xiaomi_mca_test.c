@@ -525,7 +525,7 @@ struct mca_policy_fixture {
 		int temp;
 		int capacity;
 		int voltage;
-		int current;
+		int current_ua;
 		int error;
 	} cells[2];
 	int error;
@@ -844,7 +844,7 @@ static void xiaomi_mca_test_policy_refusal(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2500), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3000), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3500), 0);
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3501), -EINVAL);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3501), -EPERM);
 	f->type = MCA_TYPE_PD;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3500), -EINVAL);
 	f->vbus = 5000000;
@@ -1632,7 +1632,7 @@ static int mca_test_cell_get(struct power_supply *psy, enum power_supply_propert
 		val->intval = f->cells[n].voltage;
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
-		val->intval = f->cells[n].current;
+		val->intval = f->cells[n].current_ua;
 		break;
 	default:
 		return -EINVAL;
@@ -2265,8 +2265,8 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	full_charge = true;
 	f->cells[0].voltage = 3449000;
 	f->cells[1].voltage = 4400000;
-	f->cells[0].current = 7000000;
-	f->cells[1].current = -1000000;
+	f->cells[0].current_ua = 7000000;
+	f->cells[1].current_ua = -1000000;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat,
 						&vmin, &imax), 0);
 	KUNIT_EXPECT_EQ(test, vbat, 4400);
