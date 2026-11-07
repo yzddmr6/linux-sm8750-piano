@@ -71,15 +71,16 @@
 #define SC8541_BUSOCP_STEP_MA	250
 
 /*
- * Protections programmed before switching starts.  The battery limit is
- * far below the stock 4800 mV: the caller leaves direct charging well
- * before the buck charger's float voltage, so this only trips if it does
- * not.  The bus limits fit a 2:1 stage fed from an 11 V PPS source; the
+ * Protections programmed before switching starts. Battery OVP/alarm stay
+ * below stock's 4800/4600 mV, with room for MCA's normal 4473 mV cutoff
+ * and its optional 4540 mV cutoff. The former 4300/4250 mV protections
+ * would stop the normal stock profile prematurely. The bus limits fit
+ * a 2:1 stage fed from an 11 V PPS source; the
  * bus over-current limit can be raised for sources that offer more than
  * 3 A, up to the stock value.
  */
-#define SC8541_BATOVP_MV	4300
-#define SC8541_BATOVP_ALM_MV	4250
+#define SC8541_BATOVP_MV	4600
+#define SC8541_BATOVP_ALM_MV	4550
 #define SC8541_BUSOVP_MV	11000
 #define SC8541_BUSOVP_ALM_MV	10500
 #define SC8541_BUSOCP_MA	3500
