@@ -286,12 +286,6 @@ module_param(full_charge, bool, 0644);
 MODULE_PARM_DESC(full_charge,
 		 "Use the stock full-charge voltage with thermal derating; needs charge_policy (default: off)");
 
-/* Voltage-only opt-in: retain the normal profile's lower current ceiling. */
-static bool ffc_charge;
-module_param(ffc_charge, bool, 0444);
-MODULE_PARM_DESC(ffc_charge,
-		 "Allow 4540 mV with verified MiPPS, both cells at 18-47 C and below 95 percent; needs full_charge (default: off, normal current limits retained)");
-
 /*
  * hv_charge: a PD source with a fixed 9 V PDO is asked for 9 V, as the
  * stock buck strategy does, whatever the battery temperature (that is left
@@ -345,15 +339,15 @@ MODULE_PARM_DESC(mipps_auth,
  * so the bus current stays at its target and the battery current (both
  * gauges) below the limit of xiaomi_mca_cp_ibat_limit().  The limits follow
  * the selected stock battery table, within a narrower thermal window.
- * The default is local normal (8 A then 7.23 A); global normal and FFC
- * require an explicit root-only selection and a freshly verified adapter.
+ * The Chinese lwn normal table is used unless authenticated PPS, both
+ * cells and pack at 18-47 C, and both cells below 95 percent allow FFC.
  * The charger firmware defaults to 4400 mV (readback = 2 * mV - 3600):
  * direct charging only runs from MCA_CP_VBAT_MIN_MV to MCA_CP_VBAT_MAX_MV
  * and from MCA_CP_TBAT_MIN to
  * MCA_CP_TBAT_EXIT degC, and the buck charger does the rest.  The bus
- * target is cp_ibus_max, at most MCA_CP_IBUS_MAX_MA (stock div_max_curr)
- * from a verified Xiaomi adapter and MCA_CP_THIRD_IBUS_MA (stock
- * third_pps_ibus_max) from other PPS sources, and is lowered while the
+ * budget follows the APDO and the 67 W source limit. DIV2 is limited to
+ * 12 A on the battery side, not 5 A on the bus. Third-party PPS sources
+ * are limited to 4100 mA total bus current. The target is lowered while the
  * stage is hot, see xiaomi_mca_cp_step().  Anything
  * unexpected (a read failure, the stage turning itself off, the bus out of
  * range, too little or too much current, detach, an ADSP restart, unbind)
@@ -388,7 +382,8 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_TBAT_HOLD_MS	30000
 #define MCA_CP_TBAT_RAMP_MA	500
 #define MCA_CP_TBAT_RAMP_MS	15000
-#define MCA_CP_IBAT_MAX_MA	12400	/* stock global normal / FFC maximum */
+#define MCA_CP_IBAT_MAX_MA	12000	/* stock div_max_curr[DIV2], battery side */
+#define MCA_CP_MAX_POWER_MW	67000	/* stock max_power */
 #define MCA_CP_IBAT_REDUCED_MA	4500
 /*
  * Stage temperature, 0.1 degC: from MCA_CP_TDIE_HOT the bus target drops
@@ -435,7 +430,6 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_PAR_FCC_MA	2000
 #define MCA_CP_PAR_ICL_MA	1500
 #define MCA_CP_PPS_MAX_MA	6000	/* current limit asked of the source */
-#define MCA_CP_IBUS_MAX_MA	5000
 #define MCA_CP_THIRD_IBUS_MA	4100
 /* bus over-current protection of the stage, above the target */
 #define MCA_CP_BUSOCP_MARGIN_MA	1000
@@ -465,49 +459,20 @@ module_param(cp_charge, bool, 0644);
 MODULE_PARM_DESC(cp_charge,
 		 "Charge through the SC8541 switched-capacitor stage from PPS sources; needs hv_charge and charge_current (default: off)");
 
-static unsigned int cp_ibus_max = 4000;
-module_param(cp_ibus_max, uint, 0444);
-MODULE_PARM_DESC(cp_ibus_max,
-		 "Bus current of the switched-capacitor stage, mA (500-5000, default 4000; source budget less buck share and 200 mA, unverified source total at most 4100)");
-
 static unsigned int cp_ibat_max;
 module_param(cp_ibat_max, uint, 0444);
 MODULE_PARM_DESC(cp_ibat_max,
-		 "Battery current ceiling, both cells, mA (0 follows selected stock table; 1000-12400 overrides downwards)");
+		 "Battery current ceiling, both cells, mA (0 follows selected stock table; 1000-12000 overrides downwards)");
 
 
-/* Stock local normal, global normal and FFC voltage/current tables. */
+/* Chinese lwn tables; the _gbl node is only for non-CN hardware. */
 enum xiaomi_mca_profile {
-	MCA_PROFILE_LOCAL,
-	MCA_PROFILE_GLOBAL,
+	MCA_PROFILE_NORMAL,
 	MCA_PROFILE_FFC,
 	MCA_PROFILE_COUNT,
 };
 
-static unsigned int cp_profile;
-
-static int xiaomi_mca_set_profile(const char *val, const struct kernel_param *kp)
-{
-	unsigned int profile;
-	int ret = kstrtouint(val, 0, &profile);
-
-	if (ret || profile >= MCA_PROFILE_COUNT)
-		return -EINVAL;
-	WRITE_ONCE(*(unsigned int *)kp->arg, profile);
-	return 0;
-}
-
-static const struct kernel_param_ops xiaomi_mca_profile_ops = {
-	.set = xiaomi_mca_set_profile,
-	.get = param_get_uint,
-};
-module_param_cb(cp_profile, &xiaomi_mca_profile_ops, &cp_profile, 0600);
-MODULE_PARM_DESC(cp_profile,
-	"Next direct-charge session: 0=local normal (default), 1=global normal, 2=FFC; existing protection limits still apply");
-
-static const char * const xiaomi_mca_profile_names[] = {
-	"local", "global", "ffc",
-};
+static const char * const xiaomi_mca_profile_names[] = { "normal", "ffc" };
 
 struct xiaomi_mca_charge_step {
 	u32 mv;
@@ -515,14 +480,13 @@ struct xiaomi_mca_charge_step {
 };
 
 static const struct xiaomi_mca_charge_step xiaomi_mca_profile_steps[][4] = {
-	[MCA_PROFILE_LOCAL] = { { 4150, 8000 }, { 4473, 7230 } },
-	[MCA_PROFILE_GLOBAL] = { { 4150, 12400 }, { 4473, 7230 } },
+	[MCA_PROFILE_NORMAL] = { { 4150, 8000 }, { 4473, 7230 } },
 	[MCA_PROFILE_FFC] = {
 		{ 4144, 12400 }, { 4300, 10650 }, { 4475, 9040 }, { 4540, 7230 },
 	},
 };
 
-static const unsigned int xiaomi_mca_profile_counts[] = { 2, 2, 4 };
+static const unsigned int xiaomi_mca_profile_counts[] = { 2, 4 };
 
 enum xiaomi_mca_hv {
 	MCA_HV_OFF,		/* 5 V, may ask for 9 V */
@@ -721,7 +685,8 @@ struct xiaomi_mca {
 	enum xiaomi_mca_cp cp;
 	struct power_supply *cp_psy;	/* the stage, held while not MCA_CP_OFF */
 	u32 cp_mv;		/* voltage asked of the PPS source */
-	u32 cp_ma;		/* its current limit */
+	u32 cp_ma;		/* APDO current limit, with source/authentication caps */
+	u32 cp_request_ma;	/* current in the most recent PPS request */
 	u32 cp_max_mv;		/* the most the source offers */
 	u32 cp_ibus_ma;		/* bus current target */
 	u32 cp_ibus_hot;	/* the target as lowered for the stage temperature */
@@ -729,8 +694,8 @@ struct xiaomi_mca {
 	/* jiffies when the limit was last that high, or the stage above target */
 	unsigned long cp_trip_at;
 	u32 cp_warm_ma;		/* battery limit as reduced for temperature */
-	enum xiaomi_mca_profile cp_profile; /* latched when CP enters OPENING */
-	unsigned int cp_stage; /* never move backwards within one CP session */
+	enum xiaomi_mca_profile cp_profile; /* follows the current FFC conditions */
+	unsigned int cp_stage; /* monotonic while the selected table is unchanged */
 	u32 cp_target_ma; /* effective battery target after table/thermal limits */
 	unsigned long cp_warm_at;	/* jiffies when it last changed */
 	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
@@ -1174,7 +1139,7 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	}
 	if (prop == MCA_PROP_TERM_VOLT) {
 		if (get_unaligned_le32(data) == MCA_TERM_FFC_MV &&
-		    !ffc_charge && mca->cp_profile != MCA_PROFILE_FFC)
+		    !mca->ffc_active)
 			return -EPERM;
 		/* Unlike source current limits, this also restores while unplugged. */
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
@@ -2002,6 +1967,16 @@ static int xiaomi_mca_gauges(int *vbat_mv, int *ibat_ma, int *tcool, int *tbat,
 	return 0;
 }
 
+static void xiaomi_mca_select_profile(struct xiaomi_mca *mca)
+{
+	enum xiaomi_mca_profile profile = mca->ffc_active ? MCA_PROFILE_FFC : MCA_PROFILE_NORMAL;
+
+	if (profile != mca->cp_profile) {
+		mca->cp_profile = profile;
+		mca->cp_stage = 0;
+	}
+}
+
 static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twarm)
 {
 	union power_supply_propval soc;
@@ -2030,12 +2005,6 @@ static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twa
 	return true;
 }
 
-static bool xiaomi_mca_ffc_allowed(struct xiaomi_mca *mca, int tcool, int twarm)
-{
-	return (ffc_charge || mca->cp_profile == MCA_PROFILE_FFC) &&
-	       xiaomi_mca_ffc_conditions(mca, tcool, twarm);
-}
-
 static int xiaomi_mca_restore_term_volt(struct xiaomi_mca *mca)
 {
 	int ret;
@@ -2061,8 +2030,10 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 	if (mca->sleeping)
 		return -EHOSTDOWN;
 	mca->ffc_active = false;
-	if (!full_charge || !charge_policy)
+	if (!full_charge || !charge_policy) {
+		xiaomi_mca_select_profile(mca);
 		return xiaomi_mca_restore_term_volt(mca);
+	}
 
 	ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
 	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax);
@@ -2071,12 +2042,13 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 	} else {
 		tbat = max_t(s32, tbat, tpack);
 		tcool = min_t(s32, tcool, tpack);
-		mca->ffc_active = xiaomi_mca_ffc_allowed(mca, tcool, tbat);
+		mca->ffc_active = xiaomi_mca_ffc_conditions(mca, tcool, tbat);
 		if (tbat >= MCA_TERM_HOT_DEGC)
 			mca->term_hot = true;
 		else if (tbat < MCA_TERM_COOL_DEGC)
 			mca->term_hot = false;
 	}
+	xiaomi_mca_select_profile(mca);
 	target = mca->term_hot ? MCA_TERM_HOT_MV : MCA_TERM_FULL_MV;
 	if (!mca->term_hot && mca->ffc_active)
 		target = MCA_TERM_FFC_MV;
@@ -2127,16 +2099,38 @@ static int xiaomi_mca_cp_set_busocp(struct xiaomi_mca *mca, u32 ma)
 					 &pv);
 }
 
+static u32 xiaomi_mca_cp_capability_ma(u32 apdo_ma, bool verified)
+{
+	return min_t(u32, apdo_ma, verified ? MCA_CP_PPS_MAX_MA : MCA_CP_THIRD_IBUS_MA);
+}
+
+/* milliamp budget at the requested PPS voltage, before buck sharing. */
+static u32 xiaomi_mca_cp_power_limit(u32 source_ma, u32 mv)
+{
+	if (!mv)
+		return 0;
+	return min(source_ma, (u32)(MCA_CP_MAX_POWER_MW * 1000 / mv));
+}
+
+static u32 xiaomi_mca_cp_div2_limit(u32 source_ma)
+{
+	/* Clamp before multiplying so even a malformed capability cannot wrap. */
+	return min_t(u32, source_ma, MCA_CP_IBAT_MAX_MA / 2) * 2;
+}
+
 static int xiaomi_mca_cp_request(struct xiaomi_mca *mca, u32 mv)
 {
+	u32 ma;
 	mv = clamp(rounddown(mv, 20), (u32)MCA_CP_PPS_MIN_MV,
 		   min_t(u32, mca->cp_max_mv, MCA_CP_PPS_MAX_MV));
-	if (mv == mca->cp_mv)
+	ma = rounddown(xiaomi_mca_cp_power_limit(mca->cp_ma, mv), 50);
+	if (mv == mca->cp_mv && ma == mca->cp_request_ma)
 		return 0;
 
 	mca->cp_mv = mv;
+	mca->cp_request_ma = ma;
 	return xiaomi_mca_write_u32(mca, MCA_PROP_PPS_SELECT,
-				   xiaomi_mca_pps_word(mv, mca->cp_ma));
+				   xiaomi_mca_pps_word(mv, ma));
 }
 
 /*
@@ -2400,7 +2394,9 @@ static void xiaomi_mca_cp_learn_drop(struct xiaomi_mca *mca)
 /* What the source gives: its APDO current, less once it dropped out */
 static u32 xiaomi_mca_cp_src_ma(struct xiaomi_mca *mca)
 {
-	return mca->cp_ibus_cap ? min(mca->cp_ma, mca->cp_ibus_cap) : mca->cp_ma;
+	u32 ma = mca->cp_ibus_cap ? min(mca->cp_ma, mca->cp_ibus_cap) : mca->cp_ma;
+
+	return xiaomi_mca_cp_power_limit(ma, max_t(u32, mca->cp_mv, MCA_CP_PPS_MIN_MV));
 }
 
 static u32 xiaomi_mca_cp_vbat_max(struct xiaomi_mca *mca)
@@ -2471,9 +2467,13 @@ static bool xiaomi_mca_cp_after_auth(struct xiaomi_mca *mca)
 static u32 xiaomi_mca_cp_ibat_limit(struct xiaomi_mca *mca, int vbat,
 				   int tcool, int twarm)
 {
-	const struct xiaomi_mca_charge_step *steps = xiaomi_mca_profile_steps[mca->cp_profile];
+	const struct xiaomi_mca_charge_step *steps;
 	u32 ma = cp_ibat_max ? clamp(cp_ibat_max, 1000U, (u32)MCA_CP_IBAT_MAX_MA) :
 		MCA_CP_IBAT_MAX_MA;
+
+	xiaomi_mca_select_profile(mca);
+	steps = xiaomi_mca_profile_steps[mca->cp_profile];
+	ma = min(ma, xiaomi_mca_cp_div2_limit(xiaomi_mca_cp_src_ma(mca)));
 
 	while (mca->cp_stage + 1 < xiaomi_mca_profile_counts[mca->cp_profile] &&
 	       vbat >= steps[mca->cp_stage].mv)
@@ -2500,26 +2500,10 @@ static u32 xiaomi_mca_cp_ibat_limit(struct xiaomi_mca *mca, int vbat,
 	return ma;
 }
 
-/* Only a new CP session can consume a pending profile selection. */
-static int xiaomi_mca_latch_profile(struct xiaomi_mca *mca, unsigned int profile)
-{
-	if (profile >= MCA_PROFILE_COUNT)
-		return -EINVAL;
-	if (mca->cp != MCA_CP_OFF)
-		return -EBUSY;
-	mca->cp_profile = profile;
-	mca->cp_stage = 0;
-	mca->cp_target_ma = 0;
-	mca->cp_warm_ma = MCA_CP_IBAT_MAX_MA;
-	mca->cp = MCA_CP_OPENING;
-	return 0;
-}
-
 /* Called from the poll at 9 V on the buck charger, or right after the auth */
 static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 {
 	int vbat, ibat, tcool, tbat, tpack, ret, vmin, imax;
-	unsigned int profile = READ_ONCE(cp_profile);
 	u32 start_mv, ma, src_ma, vbat_max, max_mv = 0;
 
 	if (!cp_charge || !hv_charge || !charge_current ||
@@ -2531,15 +2515,9 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	if (xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax))
 		return;
 	tpack = (s32)xiaomi_mca_read_u32(mca, MCA_PROP_PACK_TBAT);
-	/* Higher tables require current proof, never firmware's stale ID alone. */
-	if (profile != MCA_PROFILE_LOCAL && !xiaomi_mca_adapter_verified(mca))
-		return;
-	if (profile == MCA_PROFILE_FFC &&
-	    !xiaomi_mca_ffc_conditions(mca, min(tcool, tpack), max(tbat, tpack)))
-		return;
-	vbat_max = profile == MCA_PROFILE_FFC ? MCA_CP_VBAT_FFC_MV :
-		(full_charge ? MCA_CP_VBAT_MAX_MV :
-		 MCA_TERM_DEFAULT_MV - MCA_CP_VBAT_HYS_MV);
+	mca->ffc_active = xiaomi_mca_ffc_conditions(mca, min(tcool, tpack), max(tbat, tpack));
+	xiaomi_mca_select_profile(mca);
+	vbat_max = xiaomi_mca_cp_vbat_max(mca);
 	if (vmin < MCA_CP_VBAT_MIN_MV ||
 	    vbat >= vbat_max - MCA_CP_VBAT_HYS_MV ||
 	    imax >= MCA_CP_CELL_OCP_MA ||
@@ -2558,15 +2536,13 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	if (ma < MCA_CP_BUCK_MA + 1000)
 		return;
 
-	mca->cp_ma = min_t(u32, ma, MCA_CP_PPS_MAX_MA);
 	/* third_pps_ibus_max bounds the entire source, including the buck. */
-	if (!xiaomi_mca_adapter_verified(mca))
-		mca->cp_ma = min_t(u32, mca->cp_ma, MCA_CP_THIRD_IBUS_MA);
+	mca->cp_ma = xiaomi_mca_cp_capability_ma(ma, xiaomi_mca_adapter_verified(mca));
 	mca->cp_max_mv = max_mv;
+	mca->cp_mv = start_mv;
 	src_ma = xiaomi_mca_cp_src_ma(mca);
 	src_ma -= min_t(u32, src_ma, MCA_CP_BUCK_MA + 200);
-	mca->cp_ibus_ma = min(clamp(cp_ibus_max, 500U, (u32)MCA_CP_IBUS_MAX_MA),
-			      src_ma);
+	mca->cp_ibus_ma = min_t(u32, MCA_CP_IBAT_MAX_MA / 2, src_ma);
 	if (mca->cp_ibus_ma < 2 * MCA_CP_OPEN_IBUS_MA) {
 		mca->cp = MCA_CP_DONE;
 		return;
@@ -2587,24 +2563,24 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	}
 
 	mca->cp_mv = 0;
+	mca->cp_request_ma = 0;
 	mca->cp_polls = 0;
 	mca->cp_low = 0;
 	mca->cp_ibus_hot = mca->cp_ibus_ma;
 	mca->cp_ibat_trip = 0;
 	mca->cp_buck_par = false;
-	if (xiaomi_mca_latch_profile(mca, profile)) {
-		power_supply_put(mca->cp_psy);
-		mca->cp_psy = NULL;
-		return;
-	}
+	mca->cp_stage = 0;
+	mca->cp_target_ma = 0;
+	mca->cp_warm_ma = MCA_CP_IBAT_MAX_MA;
+	mca->cp = MCA_CP_OPENING;
 	/* Confirm the new FV before asking the source to open this session. */
 	ret = xiaomi_mca_full_charge_poll(mca);
-	if (ret || (profile == MCA_PROFILE_FFC && !mca->ffc_active)) {
+	if (ret) {
 		xiaomi_mca_cp_stop(mca, "profile float voltage not confirmed");
 		return;
 	}
 	dev_info(mca->dev, "direct-charge profile %s, source/cell/thermal limits retained\n",
-		 xiaomi_mca_profile_names[profile]);
+		 xiaomi_mca_profile_names[mca->cp_profile]);
 
 	if (xiaomi_mca_auth_pending(mca))
 		mca->auth_tried = true;
@@ -2640,12 +2616,10 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	}
 	tpack = (s32)xiaomi_mca_read_u32(mca, MCA_PROP_PACK_TBAT);
 
-	if (mca->cp_profile != MCA_PROFILE_LOCAL && !xiaomi_mca_adapter_verified(mca)) {
-		xiaomi_mca_cp_stop(mca, "profile authentication lost");
-		return;
-	}
-	if (mca->cp_profile == MCA_PROFILE_FFC && !mca->ffc_active) {
-		xiaomi_mca_cp_stop(mca, "FFC conditions lost");
+	xiaomi_mca_select_profile(mca);
+	/* Never continue a high-current APDO after authentication is revoked. */
+	if (mca->cp_ma > MCA_CP_THIRD_IBUS_MA && !xiaomi_mca_adapter_verified(mca)) {
+		xiaomi_mca_cp_stop(mca, "adapter authentication lost");
 		return;
 	}
 	if (vbat >= xiaomi_mca_cp_vbat_max(mca) || vmin < MCA_CP_VBAT_MIN_MV) {
@@ -3866,10 +3840,10 @@ static ssize_t charge_profile_show(struct device *dev,
 	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
 
 	guard(mutex)(&mca->lock);
-	return sysfs_emit(buf, "active=%s requested=%s stage=%u target_ma=%u ffc=%u cp=%u\n",
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_target_ma=%u\n",
 		 xiaomi_mca_profile_names[mca->cp_profile],
-		 xiaomi_mca_profile_names[READ_ONCE(cp_profile)],
-		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp);
+		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
+		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma);
 }
 static DEVICE_ATTR_RO(charge_profile);
 
