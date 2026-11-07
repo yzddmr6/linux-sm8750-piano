@@ -684,6 +684,12 @@ struct xiaomi_mca {
 	unsigned long cp_on_at;		/* jiffies when it came */
 	bool auth_ok;		/* adapter response matched our fresh challenge */
 	u32 auth_generation;
+	u32 auth_attach_generation;
+	u32 policy_attach_generation;
+	u32 attach_generation;	/* physical UCSI disconnects, under rx_lock */
+	int ucsi_state;
+	struct notifier_block psy_nb;
+	bool auth_cleanup;	/* verify_process clear still needs confirmation */
 	bool mipps_attempted;	/* one exchange per physical attachment */
 	unsigned long auth_at;	/* jiffies when it did */
 	bool auth_tried;	/* direct charging asked for before any reset */
@@ -715,9 +721,16 @@ struct xiaomi_mca {
 	struct xiaomi_mca_stats stats;
 };
 
+/* The poll mutex keeps the saved attachment fixed throughout an exchange. */
+static bool xiaomi_mca_auth_current(struct xiaomi_mca *mca, u32 generation)
+{
+	return generation == READ_ONCE(mca->service_generation) &&
+	       mca->auth_attach_generation == READ_ONCE(mca->attach_generation);
+}
+
 static bool xiaomi_mca_authenticated(struct xiaomi_mca *mca)
 {
-	return mca->auth_ok && mca->auth_generation == READ_ONCE(mca->service_generation);
+	return mca->auth_ok && xiaomi_mca_auth_current(mca, mca->auth_generation);
 }
 
 static int xiaomi_mca_read_type(struct xiaomi_mca *mca, u32 *type);
@@ -974,7 +987,7 @@ static int xiaomi_mca_restore_icl(struct xiaomi_mca *mca)
 		return 0;
 
 	/* Unknown also forbids automatic writes; wait for a recognized source. */
-	ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &real_type);
+	ret = xiaomi_mca_read_type(mca, &real_type);
 	if (ret || !xiaomi_mca_limits(real_type))
 		return ret ?: -EOPNOTSUPP;
 
@@ -1051,16 +1064,13 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 		return mipps_auth && len == sizeof(u32);
 	case MCA_PROP_VDM_SEED:
 	case MCA_PROP_VDM_AUTH:
-	case MCA_PROP_VDM_REVERSE:
 		return mipps_auth && len == MCA_VDM_LEN;
-	case MCA_PROP_DATA_ROLE:
-		return mipps_auth && len == sizeof(u32) &&
-		       (val == MCA_DATA_ROLE_UFP || val == MCA_DATA_ROLE_DFP);
 	case MCA_PROP_VDM_VERIFIED:
 	case MCA_PROP_VDM_REMOVE_COMP:
+		return mipps_auth && len == sizeof(u32) && val <= 1;
 	case MCA_PROP_PD_VERIFIED:
 	case MCA_PROP_VERIFY_PROCESS:
-		return mipps_auth && len == sizeof(u32) && val <= 1;
+		return len == sizeof(u32) && val <= 1 && (mipps_auth || !val);
 	default:
 		return false;
 	}
@@ -1140,7 +1150,13 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		memcpy(buf, data, len);
 		return xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
 	}
-	ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &type);
+	/* Clearing our authentication interlocks cannot raise source limits. */
+	if ((prop == MCA_PROP_VERIFY_PROCESS || prop == MCA_PROP_PD_VERIFIED) &&
+	    !get_unaligned_le32(data)) {
+		memcpy(buf, data, len);
+		return xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
+	}
+	ret = xiaomi_mca_read_type(mca, &type);
 	if (ret)
 		return ret;
 	if (!xiaomi_mca_limits(type))
@@ -1234,7 +1250,7 @@ static int xiaomi_mca_vdm(struct xiaomi_mca *mca, unsigned int generation,
 
 	/* Stock batterysecret retries an unanswered command once. */
 	for (attempt = 0; attempt < 2; attempt++) {
-		if (generation != READ_ONCE(mca->service_generation))
+		if (!xiaomi_mca_auth_current(mca, generation))
 			return -ENODEV;
 		ret = xiaomi_mca_write_blob(mca, MCA_PROP_VDM_BASE + cmd - 1,
 				      payload, len);
@@ -1243,7 +1259,7 @@ static int xiaomi_mca_vdm(struct xiaomi_mca *mca, unsigned int generation,
 		msleep(cmd == 4 || cmd == 5 ? 500 : 5);
 		deadline = jiffies + msecs_to_jiffies(1000);
 		do {
-			if (generation != READ_ONCE(mca->service_generation))
+			if (!xiaomi_mca_auth_current(mca, generation))
 				return -ENODEV;
 			ret = xiaomi_mca_read_blob(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus, sizeof(vbus));
 			if (ret || le32_to_cpu(vbus) < MCA_VBUS_ONLINE_UV)
@@ -1285,7 +1301,7 @@ static bool xiaomi_mca_mipps_digest(struct xiaomi_mca *mca,
 	 */
 	for (id = 0; id < 65536; id++) {
 		if (!(id & 255)) {
-			if (generation != READ_ONCE(mca->service_generation))
+			if (!xiaomi_mca_auth_current(mca, generation))
 				break;
 			cond_resched();
 		}
@@ -1297,7 +1313,7 @@ static bool xiaomi_mca_mipps_digest(struct xiaomi_mca *mca,
 			break;
 		}
 	}
- out:
+out:
 	memzero_explicit(&prepared, sizeof(prepared));
 	return matched;
 }
@@ -1309,6 +1325,7 @@ static void xiaomi_mca_mipps_authenticate(struct xiaomi_mca *mca)
 	u8 message[20], digest[SHA256_DIGEST_SIZE], response[MCA_VDM_LEN];
 	__le32 words[MCA_VDM_LEN / 4], version, vbus;
 	unsigned int generation = READ_ONCE(mca->service_generation);
+	u32 attachment = READ_ONCE(mca->attach_generation);
 	u32 adapter_id;
 	bool discovered = false, capable = false;
 	int i, ret;
@@ -1323,13 +1340,16 @@ static void xiaomi_mca_mipps_authenticate(struct xiaomi_mca *mca)
 		return;
 	for (i = 0; i < MCA_PD_MAX_PDOS; i++)
 		capable |= le32_to_cpu(pdos[i].max_mv) > 5000;
-	if (!capable)
+	if (!capable || generation != READ_ONCE(mca->service_generation) ||
+	    attachment != READ_ONCE(mca->attach_generation))
 		return;
 
+	mca->auth_attach_generation = attachment;
+	mca->auth_ok = false;
 	mca->mipps_attempted = true;
 	ret = xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 1);
 	if (ret)
-		goto out;
+		goto finish;
 
 	/* A Xiaomi VDM query works as UFP too. Never swap PC/hub data roles. */
 	ret = xiaomi_mca_vdm(mca, generation, 1, NULL, 0);
@@ -1377,29 +1397,34 @@ static void xiaomi_mca_mipps_authenticate(struct xiaomi_mca *mca)
 		goto finish;
 	ret = xiaomi_mca_read_blob(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus, sizeof(vbus));
 	if (ret || le32_to_cpu(vbus) < MCA_VBUS_ONLINE_UV ||
-	    generation != READ_ONCE(mca->service_generation)) {
+	    !xiaomi_mca_auth_current(mca, generation)) {
 		ret = ret ?: -ENODEV;
 		goto finish;
 	}
 	ret = xiaomi_mca_write_u32(mca, MCA_PROP_PD_VERIFIED, 1);
+	if (!ret && !xiaomi_mca_auth_current(mca, generation))
+		ret = -ENODEV;
 	if (!ret) {
 		mca->auth_generation = generation;
 		mca->auth_ok = true;
 		mca->auth_at = jiffies;
 		mca->auth_tried = false;
 	}
- finish:
+finish:
 	if (generation == READ_ONCE(mca->service_generation)) {
 		if (ret && discovered) {
 			xiaomi_mca_write_u32(mca, MCA_PROP_PD_VERIFIED, 0);
-			xiaomi_mca_vdm(mca, generation, 7, NULL, 0);
+			if (xiaomi_mca_auth_current(mca, generation))
+				xiaomi_mca_vdm(mca, generation, 7, NULL, 0);
 		}
-		xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 0);
+		/* An unconfirmed clear blocks voltage negotiation until it succeeds. */
+		mca->auth_cleanup = true;
+		if (!xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 0))
+			mca->auth_cleanup = false;
 	}
 	memzero_explicit(message, sizeof(message));
 	memzero_explicit(digest, sizeof(digest));
 	memzero_explicit(response, sizeof(response));
- out:
 	if (!ret)
 		dev_info(mca->dev, "MiPPS adapter %08x authenticated\n", adapter_id);
 	else if (discovered)
@@ -1570,12 +1595,12 @@ static int xiaomi_mca_ucsi_status(struct power_supply *psy, void *data)
 	struct device *parent = psy->dev.parent;
 	union power_supply_propval val;
 
+	if (psy == mca->psy || !parent || parent->parent != mca->dev->parent ||
+	    psy->desc->type != POWER_SUPPLY_TYPE_USB)
+		return MCA_UCSI_UNAVAILABLE;
 	/* UCSI frees its connector data after unregistering this supply. */
 	guard(rwsem_read)(&psy->epc_sem);
 	if (psy->removing)
-		return MCA_UCSI_UNAVAILABLE;
-	if (psy == mca->psy || !parent || parent->parent != mca->dev->parent ||
-	    psy->desc->type != POWER_SUPPLY_TYPE_USB)
 		return MCA_UCSI_UNAVAILABLE;
 	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val))
 		return MCA_UCSI_UNAVAILABLE;
@@ -1589,6 +1614,38 @@ static int xiaomi_mca_ucsi_status(struct power_supply *psy, void *data)
 	    val.intval != POWER_SUPPLY_STATUS_CHARGING)
 		return MCA_UCSI_CONNECTED;
 	return MCA_UCSI_PD_SINK;
+}
+
+/* Remember disconnects even when a complete replug fits between two polls. */
+static void xiaomi_mca_ucsi_update(struct xiaomi_mca *mca, int state)
+{
+	guard(spinlock_irqsave)(&mca->rx_lock);
+
+	if (state == MCA_UCSI_UNAVAILABLE)
+		return;
+	if (state == MCA_UCSI_OFFLINE && mca->ucsi_state != MCA_UCSI_OFFLINE) {
+		mca->attach_generation++;
+		if (mca->poll_ready)
+			mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
+	}
+	mca->ucsi_state = state;
+}
+
+static int xiaomi_mca_psy_notifier(struct notifier_block *nb,
+				 unsigned long event, void *data)
+{
+	struct xiaomi_mca *mca = container_of(nb, struct xiaomi_mca, psy_nb);
+
+	if (event == PSY_EVENT_PROP_CHANGED)
+		xiaomi_mca_ucsi_update(mca, xiaomi_mca_ucsi_status(data, mca));
+	return NOTIFY_OK;
+}
+
+static void xiaomi_mca_psy_notifier_remove(void *data)
+{
+	struct xiaomi_mca *mca = data;
+
+	power_supply_unreg_notifier(&mca->psy_nb);
 }
 
 /*
@@ -2297,7 +2354,7 @@ static u32 xiaomi_mca_cp_apdo(struct xiaomi_mca *mca, u32 start_mv, u32 *max_mv)
 /* The ADSP holds the adapter verified until the next authentication */
 static bool xiaomi_mca_adapter_verified(struct xiaomi_mca *mca)
 {
-	return mipps_auth && xiaomi_mca_authenticated(mca) && mca->real_type == MCA_TYPE_PD_VERIFY &&
+	return mipps_auth && xiaomi_mca_authenticated(mca) &&
 	       xiaomi_mca_read_u32(mca, MCA_PROP_PD_VERIFIED) == 1;
 }
 
@@ -2632,7 +2689,10 @@ static int xiaomi_mca_read_usb(struct xiaomi_mca *mca, enum xiaomi_mca_usb_index
 
 	if (!cached->valid || time_after_eq(jiffies, cached->expires)) {
 		cached->valid = false;
-		ret = xiaomi_mca_read(mca, xiaomi_mca_usb_property[index], &cached->value);
+		if (index == MCA_USB_REAL_TYPE)
+			ret = xiaomi_mca_read_type(mca, &cached->value);
+		else
+			ret = xiaomi_mca_read(mca, xiaomi_mca_usb_property[index], &cached->value);
 		if (ret)
 			return ret;
 
@@ -2720,7 +2780,7 @@ static int xiaomi_mca_usb_set_property(struct power_supply *psy,
 	/* The limits depend on the source attached now. */
 	ret = xiaomi_mca_read(mca, MCA_PROP_USB_ONLINE, &source.online);
 	if (!ret)
-		ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &source.real_type);
+		ret = xiaomi_mca_read_type(mca, &source.real_type);
 	if (ret)
 		return ret;
 
@@ -3001,11 +3061,30 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 {
 	bool online;
 	u32 real_type = MCA_TYPE_UNKNOWN, vbus;
+	u32 attachment = READ_ONCE(mca->attach_generation);
 
 	/* Do not change source voltage or restart a stage whose stop failed. */
 	if (mca->cp == MCA_CP_STOPPING) {
 		xiaomi_mca_cp_stop(mca, "pending stop");
 		return;
+	}
+
+	if (attachment != mca->policy_attach_generation) {
+		if (xiaomi_mca_cp_stop(mca, "physical disconnect"))
+			return;
+		mca->auth_ok = false;
+		mca->mipps_attempted = false;
+		mca->cp = MCA_CP_OFF;
+		mca->hv = MCA_HV_OFF;
+		mca->hv_renegs = 0;
+		mca->cp_ibus_cap = 0;
+		mca->online = false;
+		mca->policy_attach_generation = attachment;
+	}
+	if (mca->auth_cleanup) {
+		if (xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 0))
+			return;
+		mca->auth_cleanup = false;
 	}
 
 	if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus)) {
@@ -3100,6 +3179,8 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_step(mca);
 	} else if (charge_policy) {
 		xiaomi_mca_mipps_authenticate(mca);
+		if (mca->auth_cleanup || attachment != READ_ONCE(mca->attach_generation))
+			return;
 		xiaomi_mca_cp_try_start(mca);
 		if (!xiaomi_mca_cp_active(mca))
 			xiaomi_mca_apply_policy(mca);
@@ -3134,12 +3215,6 @@ static void xiaomi_mca_poll(struct work_struct *work)
 	int ret;
 
 	scoped_guard(mutex, &mca->lock) {
-		ret = xiaomi_mca_full_charge_poll(mca);
-		if (ret) {
-			dev_warn_ratelimited(mca->dev, "failed to set float voltage: %d\n", ret);
-			xiaomi_mca_cp_stop(mca, "float voltage not confirmed");
-			goto out;
-		}
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
 			generation = mca->service_generation;
 		xiaomi_mca_sync_config(mca);
@@ -3156,8 +3231,20 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->fcc_full = 0;
 			mca->auth_ok = false;
 			mca->mipps_attempted = false;
+			mca->auth_cleanup = false;
 			mca->online = false;
 			mca->policy_generation = generation;
+		}
+		if (mca->auth_cleanup) {
+			if (xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 0))
+				goto out;
+			mca->auth_cleanup = false;
+		}
+		ret = xiaomi_mca_full_charge_poll(mca);
+		if (ret) {
+			dev_warn_ratelimited(mca->dev, "failed to set float voltage: %d\n", ret);
+			xiaomi_mca_cp_stop(mca, "float voltage not confirmed");
+			goto out;
 		}
 		xiaomi_mca_process_notifications(mca);
 		ret = xiaomi_mca_charge_limit_poll(mca);
@@ -3184,7 +3271,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		}
 		if (xiaomi_mca_read(mca, MCA_PROP_USB_ONLINE, &now.online) ||
 		    xiaomi_mca_read(mca, MCA_PROP_CHGR_STATUS, &now.chgr_status) ||
-		    xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &now.real_type)) {
+		    xiaomi_mca_read_type(mca, &now.real_type)) {
 			mca->last_valid = false;
 		} else {
 			changed = !mca->last_valid || memcmp(&now, &mca->last, sizeof(now));
@@ -3221,7 +3308,7 @@ static ssize_t charger_type_show(struct device *dev,
 	const char *name;
 
 	guard(mutex)(&mca->lock);
-	if (xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &type))
+	if (xiaomi_mca_read_type(mca, &type))
 		return -ENODATA;
 	name = xiaomi_mca_type_name(type);
 
@@ -3675,7 +3762,7 @@ static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca)
 	if (!mca->icl_written && !mca->fcc_written)
 		return 0;
 
-	ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &type);
+	ret = xiaomi_mca_read_type(mca, &type);
 	if (ret)
 		return ret;
 	icl = xiaomi_mca_policy_icl(type);
@@ -3976,6 +4063,13 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 
 	/* Cancelled before the power supply is unregistered. */
 	INIT_DELAYED_WORK(&mca->poll_work, xiaomi_mca_poll);
+	mca->psy_nb.notifier_call = xiaomi_mca_psy_notifier;
+	ret = power_supply_reg_notifier(&mca->psy_nb);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, xiaomi_mca_psy_notifier_remove, mca);
+	if (ret)
+		return ret;
 	ret = devm_add_action_or_reset(dev, xiaomi_mca_stop_poll, mca);
 	if (ret)
 		return ret;
