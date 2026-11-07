@@ -40,6 +40,7 @@
 	};
 
 	smp2p-sleepstate {
+		status = "disabled";
 		compatible = "qcom,smp2p-sleepstate";
 		qcom,smem-states = <&smp2p_adsp_sleepstate_out 0>;
 		interrupt-parent = <&smp2p_adsp_sleepstate_in>;
@@ -2119,11 +2120,13 @@
 
 &{/smp2p-adsp} {
 	smp2p_adsp_sleepstate_out: sleepstate-out {
+		status = "disabled";
 		qcom,entry-name = "sleepstate";
 		#qcom,smem-state-cells = <1>;
 	};
 
 	smp2p_adsp_sleepstate_in: sleepstate-see {
+		status = "disabled";
 		qcom,entry-name = "sleepstate_see";
 		interrupt-controller;
 		#interrupt-cells = <2>;

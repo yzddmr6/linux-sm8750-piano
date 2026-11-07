@@ -114,6 +114,11 @@ static int smp2p_sleepstate_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(ss->state),
 				     "failed to acquire sleepstate entry\n");
 
+	/* A registered entry must not advertise an asleep AP before its first cycle. */
+	ret = qcom_smem_state_update_bits(ss->state, AWAKE_BIT, AWAKE_BIT);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to set the awake bit\n");
+
 	irq = of_irq_get_byname(dev->of_node, "smp2p-sleepstate-in");
 	if (irq < 0)
 		return dev_err_probe(dev, irq, "failed to get the sleepstate IRQ\n");
