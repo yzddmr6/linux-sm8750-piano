@@ -888,6 +888,47 @@ static void xiaomi_mca_test_temperature_follow(struct kunit *test)
 	mutex_unlock(&mca->lock);
 }
 
+static void xiaomi_mca_test_profile_switch(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	unsigned int requested = MCA_PROFILE_LOCAL;
+	struct kernel_param kp = { .arg = &requested };
+
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_set_profile("3", &kp), -EINVAL);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_set_profile("-1", &kp), -EINVAL);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_set_profile("12400", &kp), -EINVAL);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_set_profile("bad", &kp), -EINVAL);
+	KUNIT_EXPECT_EQ(test, requested, MCA_PROFILE_LOCAL);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_latch_profile(mca, requested), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 25, 25), 8000);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_set_profile("1\n", &kp), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_latch_profile(mca, requested), -EBUSY);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 25, 25), 8000);
+	mca->cp = MCA_CP_OFF;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_latch_profile(mca, requested), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 25, 25), 12400);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4150, 25, 25), 7230);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4100, 25, 25), 7230);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_set_profile("2", &kp), 0);
+	mca->cp = MCA_CP_OFF;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_latch_profile(mca, requested), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4143, 25, 25), 12400);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4144, 25, 25), 10650);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4300, 25, 25), 9040);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4475, 25, 25), 7230);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 25, 25), 7230);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 17, 25), 4500);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 25, 40), 4500);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_latch_profile(mca, MCA_PROFILE_COUNT), -EINVAL);
+	/* A queued downshift also leaves the running session untouched. */
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_set_profile("0", &kp), 0);
+	KUNIT_EXPECT_EQ(test, mca->cp_profile, MCA_PROFILE_FFC);
+	mca->cp = MCA_CP_OFF;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_latch_profile(mca, requested), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 25, 25), 8000);
+}
+
 static void xiaomi_mca_test_cp_limits(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_policy_fixture(test);
@@ -2231,7 +2272,7 @@ static void xiaomi_mca_test_ffc_conditions(struct kunit *test)
 	f->cells[0].capacity = f->cells[1].capacity = 94;
 	guard(mutex)(&mca->lock);
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_ffc_allowed(mca, 25, 25));
-	ffc_charge = true;
+	mca->cp_profile = MCA_PROFILE_FFC;
 	KUNIT_EXPECT_TRUE(test, xiaomi_mca_ffc_allowed(mca, 18, 47));
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_ffc_allowed(mca, 17, 25));
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_ffc_allowed(mca, 25, 48));
@@ -2510,6 +2551,7 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 }
 
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_profile_switch),
 	KUNIT_CASE(xiaomi_mca_test_pd_recovery),
 	KUNIT_CASE(xiaomi_mca_test_mipps_exchange),
 	KUNIT_CASE(xiaomi_mca_test_mipps_bad_digest),
