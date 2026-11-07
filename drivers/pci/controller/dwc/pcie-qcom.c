@@ -2469,6 +2469,14 @@ static int qcom_pcie_suspend_noirq(struct device *dev)
 		return ret;
 
 	if (pcie->pci->suspended) {
+		/*
+		 * A wakeup-enabled downstream device can propagate its wakeup
+		 * path here even after the link and PHY have been stopped.
+		 * Wakeup is out of band in this state, so genpd can power off
+		 * the controller's domain despite the inherited wakeup path.
+		 */
+		device_set_out_band_wakeup(dev);
+
 		ret = icc_disable(pcie->icc_mem);
 		if (ret)
 			dev_err(dev, "Failed to disable PCIe-MEM interconnect path: %d\n", ret);
