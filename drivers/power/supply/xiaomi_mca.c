@@ -1227,6 +1227,18 @@ static u32 xiaomi_mca_read_u32(struct xiaomi_mca *mca, u32 prop)
 	return le32_to_cpu(val);
 }
 
+static int xiaomi_mca_clear_auth(struct xiaomi_mca *mca)
+{
+	int ret;
+
+	if (!mca->auth_cleanup)
+		return 0;
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 0);
+	if (!ret)
+		mca->auth_cleanup = false;
+	return ret;
+}
+
 /*
  * MiPPS challenge/response from xiaomi-mipps-auth, with Piano's stock
  * command order. The transport and charging policy remain in this driver.
@@ -1261,7 +1273,8 @@ static int xiaomi_mca_vdm(struct xiaomi_mca *mca, unsigned int generation,
 		do {
 			if (!xiaomi_mca_auth_current(mca, generation))
 				return -ENODEV;
-			ret = xiaomi_mca_read_blob(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus, sizeof(vbus));
+			ret = xiaomi_mca_read_blob(mca, MCA_PROP_USB_VOLTAGE_NOW,
+						   &vbus, sizeof(vbus));
 			if (ret || le32_to_cpu(vbus) < MCA_VBUS_ONLINE_UV)
 				return ret ?: -ENODEV;
 			ret = xiaomi_mca_read_blob(mca, MCA_PROP_UVDM_STATE, &state, sizeof(state));
@@ -1419,8 +1432,7 @@ finish:
 		}
 		/* An unconfirmed clear blocks voltage negotiation until it succeeds. */
 		mca->auth_cleanup = true;
-		if (!xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 0))
-			mca->auth_cleanup = false;
+		xiaomi_mca_clear_auth(mca);
 	}
 	memzero_explicit(message, sizeof(message));
 	memzero_explicit(digest, sizeof(digest));
@@ -3087,11 +3099,8 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		mca->online = false;
 		mca->policy_attach_generation = attachment;
 	}
-	if (mca->auth_cleanup) {
-		if (xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 0))
-			return;
-		mca->auth_cleanup = false;
-	}
+	if (xiaomi_mca_clear_auth(mca))
+		return;
 
 	if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus)) {
 		/* Missing telemetry is neither a detach nor a source overload. */
@@ -3241,11 +3250,8 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->online = false;
 			mca->policy_generation = generation;
 		}
-		if (mca->auth_cleanup) {
-			if (xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 0))
-				goto out;
-			mca->auth_cleanup = false;
-		}
+		if (xiaomi_mca_clear_auth(mca))
+			goto out;
 		ret = xiaomi_mca_full_charge_poll(mca);
 		if (ret) {
 			dev_warn_ratelimited(mca->dev, "failed to set float voltage: %d\n", ret);
@@ -3738,6 +3744,9 @@ static void xiaomi_mca_unbind_restore(void *data)
 	int ret;
 
 	guard(mutex)(&mca->lock);
+	ret = xiaomi_mca_clear_auth(mca);
+	if (ret)
+		dev_warn(mca->dev, "failed to clear authentication interlock: %d\n", ret);
 	ret = xiaomi_mca_restore_term_volt(mca);
 	if (ret)
 		dev_warn(mca->dev, "failed to restore float voltage: %d\n", ret);
@@ -3805,6 +3814,9 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 	int ret;
 
 	ret = xiaomi_mca_cp_stop(mca, "system sleep");
+	if (ret)
+		return ret;
+	ret = xiaomi_mca_clear_auth(mca);
 	if (ret)
 		return ret;
 

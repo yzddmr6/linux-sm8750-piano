@@ -614,7 +614,8 @@ static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 				if (f->bad_digest)
 					digest[0] ^= 1;
 				for (i = 0; i < ARRAY_SIZE(f->auth_response); i++)
-					f->auth_response[i] = cpu_to_le32(get_unaligned_be32(digest + 4 * i));
+					f->auth_response[i] =
+						cpu_to_le32(get_unaligned_be32(digest + 4 * i));
 				if (f->restart_auth)
 					mca->service_generation++;
 				if (f->detach_auth)
@@ -2399,6 +2400,7 @@ static void xiaomi_mca_test_mipps_lost_ack(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->vdm_count, 0);
 	KUNIT_EXPECT_TRUE(test, f->mca.auth_cleanup);
 	KUNIT_EXPECT_FALSE(test, f->mca.auth_ok);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_quiesce(&f->mca), -EIO);
 	f->fail_clear = false;
 	mipps_auth = false; /* Cleanup also works after disabling the feature. */
 	xiaomi_mca_policy_poll(&f->mca);
@@ -2486,7 +2488,8 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 1500), 0);
 	f->vbus = 9000000;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 1600), 0);
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2500), -EINVAL);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2500),
+			-EINVAL);
 	f->ucsi_online = 0;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_read_type(&f->mca, &type), 0);
 	KUNIT_EXPECT_EQ(test, type, MCA_TYPE_UNKNOWN);
