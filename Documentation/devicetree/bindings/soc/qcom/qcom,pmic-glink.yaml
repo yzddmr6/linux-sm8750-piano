@@ -71,6 +71,20 @@ properties:
   '#size-cells':
     const: 0
 
+  regulators:
+    type: object
+    additionalProperties: false
+    description: Xiaomi MCA firmware-controlled pen transmitter supply.
+    properties:
+      pen-boost:
+        $ref: /schemas/regulator/regulator.yaml#
+        unevaluatedProperties: false
+        properties:
+          regulator-min-microvolt:
+            const: 6500000
+          regulator-max-microvolt:
+            const: 6500000
+
   orientation-gpios:
     description: Array of input gpios for the Type-C connector orientation indication.
       The GPIO indication is used to detect the orientation of the Type-C connector.
