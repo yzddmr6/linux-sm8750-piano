@@ -1381,7 +1381,10 @@ static void xiaomi_mca_test_otg_config_failure(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, f->writes, fail);
 		KUNIT_EXPECT_EQ(test, f->mca.config_result, -EIO);
 		xiaomi_mca_sync_config(&f->mca);
-		KUNIT_EXPECT_EQ(test, f->writes, fail);
+		KUNIT_EXPECT_EQ(test, f->writes, fail + 3);
+		KUNIT_EXPECT_EQ(test, f->mca.config_result, 0);
+		xiaomi_mca_sync_config(&f->mca);
+		KUNIT_EXPECT_EQ(test, f->writes, fail + 3);
 	}
 }
 
