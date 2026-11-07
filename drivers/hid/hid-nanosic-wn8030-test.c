@@ -139,7 +139,7 @@ static int wn8030_test_init(struct kunit *test)
 	i2c_set_clientdata(nano->client, nano);
 	spin_lock_init(&bus->trace_lock);
 	nano->variant = &nanosic_wn8030_piano;
-	nano->no_touchpad = true;
+	nano->keyboard_no_pointer = true;
 	nano->input_enabled = true;
 	nano->userspace_angle_enabled = true;
 	nano->follower.panel = &bus->panel;
@@ -297,7 +297,9 @@ static void wn8030_reports(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_dispatch(&bus->nano, consumer, sizeof(consumer)), 5);
 	KUNIT_EXPECT_FALSE(test, wn8030_key_down(bus->nano.hid_keyboard, KEY_VOLUMEUP));
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_dispatch(&bus->nano, touch, sizeof(touch)), 27);
-	KUNIT_EXPECT_PTR_EQ(test, bus->nano.hid_touchpad, NULL);
+	/* The legacy property only trims the keyboard pointer collection. */
+	KUNIT_EXPECT_NOT_NULL(test, bus->nano.hid_touchpad);
+	KUNIT_EXPECT_TRUE(test, bus->nano.touchpad_seen);
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_dispatch(&bus->nano, key, 8), 0);
 }
 
@@ -711,6 +713,15 @@ static void wn8030_wakeup_only_asleep(struct kunit *test)
 	nanosic_wn8030_wakeup_handler(nano->wake_irq, nano);
 	KUNIT_EXPECT_EQ(test, wn8030_test_count(bus, TEST_WAKE_KEY_DOWN), 0);
 	KUNIT_ASSERT_EQ(test, nanosic_wn8030_panel_disabling(&nano->follower), 0);
+	/* A sleeping bridge must not turn closed-cover pressure into KEY_WAKEUP. */
+	WRITE_ONCE(nano->lid_closed, true);
+	nanosic_wn8030_wakeup_handler(nano->wake_irq, nano);
+	KUNIT_EXPECT_EQ(test, wn8030_test_count(bus, TEST_WAKE_KEY_DOWN), 0);
+	KUNIT_ASSERT_EQ(test, nanosic_wn8030_suspend(nano->dev), 0);
+	KUNIT_EXPECT_FALSE(test, bus->wake_enabled);
+	KUNIT_EXPECT_FALSE(test, nano->wake_irq_enabled);
+	KUNIT_ASSERT_EQ(test, nanosic_wn8030_resume(nano->dev), 0);
+	WRITE_ONCE(nano->lid_closed, false);
 	nanosic_wn8030_wakeup_handler(nano->wake_irq, nano);
 	KUNIT_EXPECT_EQ(test, wn8030_test_count(bus, TEST_WAKE_KEY_DOWN), 1);
 	KUNIT_EXPECT_EQ(test, wn8030_test_count(bus, TEST_WAKE_KEY_UP), 1);
@@ -746,9 +757,7 @@ static void wn8030_pending_outputs_and_auth(struct kunit *test)
 	nano->waking = true;
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_set_indicator_led(nano, 0xfd), 0);
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_set_kbd_backlight(nano, 50), 0);
-	nano->no_touchpad = false;
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_set_touchpad(nano, true), 0);
-	nano->no_touchpad = true;
 	KUNIT_EXPECT_EQ(test, bus->transfers, transfers);
 	/* Dispatch must still reply to authentication in the pending frames. */
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_xm_auth_init(nano), 0);
