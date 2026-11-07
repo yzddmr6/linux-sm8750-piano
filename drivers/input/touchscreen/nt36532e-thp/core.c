@@ -857,8 +857,24 @@ static ssize_t panel_vendor_show(struct device *dev, struct device_attribute *at
 }
 static DEVICE_ATTR_RO(panel_vendor);
 
+/* Observe the owner's last acknowledged setting without opening the stream. */
+static ssize_t pen_scan_model_show(struct device *dev, struct device_attribute *attr,
+				 char *buf)
+{
+	struct nvt_thp *nvt = dev_get_drvdata(dev);
+	int model;
+
+	guard(mutex)(&nvt->lifecycle_lock);
+	model = !nvt->running ? 0 : nvt->pen_applied;
+	if (nvt->running && model != nvt->pen_model)
+		model = -1;
+	return sysfs_emit(buf, "%d\n", model);
+}
+static DEVICE_ATTR_RO(pen_scan_model);
+
 static struct attribute *nvt_panel_attrs[] = {
 	&dev_attr_panel_vendor.attr,
+	&dev_attr_pen_scan_model.attr,
 	NULL
 };
 
