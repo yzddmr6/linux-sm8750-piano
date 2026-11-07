@@ -253,6 +253,9 @@ static void sc96231_test_worker(struct kunit *test)
 	enable_delayed_work(&sc->work);
 	sc96231_work(&sc->work.work);
 	KUNIT_EXPECT_TRUE(test, sc->fault);
+	KUNIT_EXPECT_FALSE(test, sc->present);
+	KUNIT_EXPECT_FALSE(test, sc->soc_valid);
+	KUNIT_EXPECT_EQ(test, sc->address[0], '\0');
 	KUNIT_EXPECT_FALSE(test, sc->enabled);
 	f->attached = false;
 	sc96231_work(&sc->work.work);
@@ -265,6 +268,9 @@ static void sc96231_test_worker(struct kunit *test)
 	f->irq = SC_IRQ_FOD;
 	sc96231_work(&sc->work.work);
 	KUNIT_EXPECT_TRUE(test, sc->fault);
+	KUNIT_EXPECT_FALSE(test, sc->present);
+	KUNIT_EXPECT_FALSE(test, sc->soc_valid);
+	KUNIT_EXPECT_EQ(test, sc->address[0], '\0');
 	KUNIT_EXPECT_FALSE(test, sc->enabled);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&sc->work));
 	sc96231_work(&sc->work.work);
