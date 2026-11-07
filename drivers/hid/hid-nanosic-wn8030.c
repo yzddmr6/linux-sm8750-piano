@@ -1231,7 +1231,8 @@ static irqreturn_t nanosic_wn8030_wakeup_handler(int irq, void *data)
 {
 	struct nanosic_wn8030 *nanosic = data;
 
-	if (!READ_ONCE(nanosic->bridge_asleep))
+	/* The wake pulse bypasses HID dispatch, so apply the lid gate here too. */
+	if (!READ_ONCE(nanosic->bridge_asleep) || READ_ONCE(nanosic->lid_closed))
 		return IRQ_HANDLED;
 
 	/* Stock Nanosic_wakeup_irq: 1000 ms and a complete KEY_WAKEUP pulse. */
@@ -2217,7 +2218,8 @@ static int nanosic_wn8030_suspend(struct device *dev)
 	/* A subsequent panel-enable notification owns wake, even if PM was first. */
 	if (nanosic->follower.panel)
 		WRITE_ONCE(nanosic->panel_on, false);
-	if (!ret && device_may_wakeup(dev)) {
+	/* The lid's own GPIO wakes on opening; a closed cover must not wake us. */
+	if (!ret && device_may_wakeup(dev) && !READ_ONCE(nanosic->lid_closed)) {
 		ret = enable_irq_wake(nanosic->wake_irq);
 		if (!ret)
 			nanosic->wake_irq_enabled = true;

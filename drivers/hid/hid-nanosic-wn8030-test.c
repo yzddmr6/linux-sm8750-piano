@@ -713,6 +713,15 @@ static void wn8030_wakeup_only_asleep(struct kunit *test)
 	nanosic_wn8030_wakeup_handler(nano->wake_irq, nano);
 	KUNIT_EXPECT_EQ(test, wn8030_test_count(bus, TEST_WAKE_KEY_DOWN), 0);
 	KUNIT_ASSERT_EQ(test, nanosic_wn8030_panel_disabling(&nano->follower), 0);
+	/* A sleeping bridge must not turn closed-cover pressure into KEY_WAKEUP. */
+	WRITE_ONCE(nano->lid_closed, true);
+	nanosic_wn8030_wakeup_handler(nano->wake_irq, nano);
+	KUNIT_EXPECT_EQ(test, wn8030_test_count(bus, TEST_WAKE_KEY_DOWN), 0);
+	KUNIT_ASSERT_EQ(test, nanosic_wn8030_suspend(nano->dev), 0);
+	KUNIT_EXPECT_FALSE(test, bus->wake_enabled);
+	KUNIT_EXPECT_FALSE(test, nano->wake_irq_enabled);
+	KUNIT_ASSERT_EQ(test, nanosic_wn8030_resume(nano->dev), 0);
+	WRITE_ONCE(nano->lid_closed, false);
 	nanosic_wn8030_wakeup_handler(nano->wake_irq, nano);
 	KUNIT_EXPECT_EQ(test, wn8030_test_count(bus, TEST_WAKE_KEY_DOWN), 1);
 	KUNIT_EXPECT_EQ(test, wn8030_test_count(bus, TEST_WAKE_KEY_UP), 1);
