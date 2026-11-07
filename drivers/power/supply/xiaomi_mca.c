@@ -2889,9 +2889,10 @@ static void xiaomi_mca_sync_config(struct xiaomi_mca *mca)
 		generation = mca->service_generation;
 		up = mca->service_up;
 	}
-	if (!up || (mca->config_attempted && mca->config_generation == generation))
+	if (!up || (mca->config_attempted && mca->config_generation == generation &&
+		    !mca->config_result))
 		return;
-	/* Exactly one attempt per service generation, including failed writes. */
+	/* As in stock/SunUEFI, a failed configuration is retried by the poll. */
 	mca->config_attempted = true;
 	mca->config_generation = generation;
 	ret = xiaomi_mca_otg_cp(mca, SC8541_OTG_PRESENT);
@@ -2911,11 +2912,16 @@ static void xiaomi_mca_sync_config(struct xiaomi_mca *mca)
 	}
 	if (!ret)
 		ret = xiaomi_mca_write_blob(mca, MCA_PROP_CID_CFG, &cid, sizeof(cid));
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		if (mca->service_generation != generation || !mca->service_up)
+			ret = -ESTALE;
+	}
 	mca->config_result = ret;
-	dev_info(mca->dev, "OTG config generation %u CP present %u CID %#x result %d\n",
-		 generation, present, MCA_PIANO_CID_CFG, ret);
 	if (ret)
-		dev_warn(mca->dev, "OTG configuration sync failed: %d\n", ret);
+		dev_warn_ratelimited(mca->dev, "OTG configuration sync failed: %d\n", ret);
+	else
+		dev_info(mca->dev, "OTG config generation %u CP present %u CID %#x result 0\n",
+			 generation, present, MCA_PIANO_CID_CFG);
 }
 
 /* Process in the existing poll, preserving notification order. No retries. */
