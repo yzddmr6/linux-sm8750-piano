@@ -9,6 +9,7 @@
 
 #define pr_fmt(fmt)	"[drm:%s:%d] " fmt, __func__, __LINE__
 #include <linux/debugfs.h>
+#include <linux/iopoll.h>
 #include <linux/kthread.h>
 #include <linux/seq_file.h>
 
@@ -1381,6 +1382,45 @@ out:
 	mutex_unlock(&dpu_enc->enc_lock);
 }
 
+static void dpu_encoder_handoff_video_slave(struct dpu_encoder_phys *master,
+					    struct dpu_encoder_phys *slave)
+{
+	struct dpu_hw_ctl *ctl = master->hw_ctl;
+	struct dpu_hw_intf_status master_status = { 0 }, slave_status = { 0 };
+	u32 flush;
+	int ret;
+
+	/* Never reset a datapath that is still scanning the stopping frame. */
+	master->hw_intf->ops.get_status(master->hw_intf, &master_status);
+	slave->hw_intf->ops.get_status(slave->hw_intf, &slave_status);
+	if (master_status.is_en || slave_status.is_en)
+		return;
+
+	/*
+	 * The shared master gates the slave's timing engine. Removing the
+	 * master releases the slave's still-enabled local timing request.
+	 * Submit that handoff while all pixel resources remain bound, then
+	 * let the normal slave stop and status wait drain its final frame.
+	 * Reset first so the stopped CTL can consume the route submission.
+	 */
+	ret = ctl->ops.reset(ctl);
+	if (ret) {
+		DPU_ERROR("shared video CTL reset failed: %d\n", ret);
+		return;
+	}
+
+	ctl->ops.remove_intf(ctl, master->hw_intf->idx);
+	ctl->ops.update_pending_flush_intf(ctl, master->hw_intf->idx);
+	ctl->ops.update_pending_flush_intf(ctl, slave->hw_intf->idx);
+	ctl->ops.trigger_flush(ctl);
+	ctl->ops.trigger_start(ctl);
+	ctl->ops.clear_pending_flush(ctl);
+	ret = read_poll_timeout(ctl->ops.get_flush_register, flush, !flush,
+			       10, 40000, false, ctl);
+	if (ret)
+		DPU_ERROR("shared video CTL handoff did not flush: %x\n", flush);
+}
+
 static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
 					struct drm_atomic_commit *state)
 {
@@ -1412,11 +1452,21 @@ static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
 
 	dpu_encoder_resource_control(drm_enc, DPU_ENC_RC_EVENT_PRE_STOP);
 
-	if (dpu_enc->cur_slave && dpu_enc->cur_slave->ops.disable)
-		dpu_enc->cur_slave->ops.disable(dpu_enc->cur_slave);
-
-	if (dpu_enc->cur_master && dpu_enc->cur_master->ops.disable)
+	if (dpu_enc->cur_master && dpu_enc->cur_slave &&
+	    dpu_enc->cur_master->intf_mode == INTF_MODE_VIDEO &&
+	    dpu_enc->cur_slave->intf_mode == INTF_MODE_VIDEO &&
+	    dpu_enc->cur_slave->hw_ctl == dpu_enc->cur_master->hw_ctl &&
+	    dpu_enc->cur_master->hw_ctl->ops.remove_intf) {
 		dpu_enc->cur_master->ops.disable(dpu_enc->cur_master);
+		dpu_encoder_handoff_video_slave(dpu_enc->cur_master, dpu_enc->cur_slave);
+		dpu_enc->cur_slave->ops.disable(dpu_enc->cur_slave);
+	} else {
+		if (dpu_enc->cur_slave && dpu_enc->cur_slave->ops.disable)
+			dpu_enc->cur_slave->ops.disable(dpu_enc->cur_slave);
+
+		if (dpu_enc->cur_master && dpu_enc->cur_master->ops.disable)
+			dpu_enc->cur_master->ops.disable(dpu_enc->cur_master);
+	}
 
 	/*
 	 * Wait for the slave's stop to latch before resetting either datapath.
@@ -2391,11 +2441,9 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
 
 	/*
 	 * Both video timing engines have stopped. Remove every interface on
-	 * the shared CTL before flushing it: starting after removing only the
-	 * master leaves the slave in CTL_INTF_ACTIVE with its pingpong already
-	 * unbound and CTL_INTF_MASTER cleared. Do not start this partial path.
-	 * Clear the slave first so the master remains valid until the last
-	 * interface has been removed, then submit the empty path only once.
+	 * the shared CTL before flushing the empty path. The earlier master
+	 * handoff retained the pixel resources for the slave's final frame;
+	 * they can now be unbound without restarting an incomplete path.
 	 */
 	if (phys_enc == dpu_enc->cur_master && slave &&
 	    phys_enc->intf_mode == INTF_MODE_VIDEO &&

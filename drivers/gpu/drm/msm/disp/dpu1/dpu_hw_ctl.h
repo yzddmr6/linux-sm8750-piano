@@ -241,6 +241,15 @@ struct dpu_hw_ctl_ops {
 			struct dpu_hw_intf_cfg *cfg);
 
 	/**
+	 * @remove_intf: Remove an interface and its master selection from the CTL
+	 * route, without clearing the mixers, fetch pipes or DSC configuration.
+	 * The caller must flush the route change.
+	 * @ctx: ctl path ctx pointer
+	 * @intf: interface to remove
+	 */
+	void (*remove_intf)(struct dpu_hw_ctl *ctx, enum dpu_intf intf);
+
+	/**
 	 * @reset: reset function for this ctl type
 	 */
 	int (*reset)(struct dpu_hw_ctl *c);
