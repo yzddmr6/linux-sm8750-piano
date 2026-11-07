@@ -339,6 +339,9 @@ static void sc96231_work(struct work_struct *work)
 		goto out;
 	if (xchg(&sc->power_lost, false)) {
 		sc->fault = true;
+		sc->present = false;
+		sc->soc_valid = false;
+		memset(sc->address, 0, sizeof(sc->address));
 		sc96231_stop(sc);
 		goto notify;
 	}
