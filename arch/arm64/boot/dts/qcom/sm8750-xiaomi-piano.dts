@@ -39,6 +39,7 @@
 		serial0 = &uart7;
 	};
 
+
 	chosen {
 		stdout-path = "serial0:115200n8";
 
@@ -1248,15 +1249,22 @@
 		enable-gpios = <&tlmm 14 GPIO_ACTIVE_HIGH>;
 		lp-enable-gpios = <&tlmm 99 GPIO_ACTIVE_HIGH>;
 		hall-gpios = <&tlmm 200 GPIO_ACTIVE_LOW>,
-			     <&tlmm 196 GPIO_ACTIVE_LOW>;
+			     <&tlmm 196 GPIO_ACTIVE_LOW>,
+			     <&tlmm 201 GPIO_ACTIVE_LOW>,
+			     <&tlmm 197 GPIO_ACTIVE_LOW>,
+			     <&tlmm 55 GPIO_ACTIVE_LOW>,
+			     <&tlmm 59 GPIO_ACTIVE_LOW>;
+		/* GPIO80 is shared with the existing lid switch. */
+		keyboard-gpios = <&tlmm 80 GPIO_ACTIVE_LOW>,
+				 <&tlmm 11 GPIO_ACTIVE_LOW>;
 
 		interrupt-parent = <&tlmm>;
 		interrupts = <78 IRQ_TYPE_EDGE_FALLING>;
 
-		pinctrl-0 = <&sc96231_default_state>;
+		pinctrl-0 = <&sc96231_int_state &sc96231_enable_state
+			     &sc96231_lp_enable_state &sc96231_hall3_state
+			     &sc96231_hall4_state &sc96231_placement_state>;
 		pinctrl-names = "default";
-
-		wakeup-source;
 	};
 };
 
@@ -1806,45 +1814,51 @@
 	/* The pen transmitter of the dock: its interrupt, the switch of the
 	 * transmitter, its low power control and the two Hall sensors.
 	 */
-	sc96231_default_state: sc96231-default-state {
-		int-pins {
-			pins = "gpio78";
-			function = "gpio";
-			drive-strength = <2>;
-			bias-pull-up;
-		};
+	sc96231_int_state: sc96231-int-state {
+		pins = "gpio78";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
 
-		enable-pins {
-			pins = "gpio14";
-			function = "gpio";
-			drive-strength = <2>;
-			output-low;
-			bias-disable;
-		};
+	sc96231_enable_state: sc96231-enable-state {
+		pins = "gpio14";
+		function = "gpio";
+		drive-strength = <2>;
+		output-low;
+		bias-disable;
+	};
 
-		lp-enable-pins {
-			pins = "gpio99";
-			function = "gpio";
-			drive-strength = <2>;
-			output-high;
-			bias-disable;
-		};
+	sc96231_lp_enable_state: sc96231-lp-enable-state {
+		pins = "gpio99";
+		function = "gpio";
+		drive-strength = <2>;
+		output-high;
+		bias-disable;
+	};
 
-		hall3-pins {
-			pins = "gpio200";
-			function = "gpio";
-			drive-strength = <2>;
-			input-enable;
-			bias-pull-up;
-		};
+	sc96231_placement_state: sc96231-placement-state {
+		pins = "gpio201", "gpio197", "gpio55", "gpio59", "gpio11";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-pull-up;
+	};
 
-		hall4-pins {
-			pins = "gpio196";
-			function = "gpio";
-			drive-strength = <2>;
-			input-enable;
-			bias-pull-up;
-		};
+	sc96231_hall3_state: sc96231-hall3-state {
+		pins = "gpio200";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-pull-up;
+	};
+
+	sc96231_hall4_state: sc96231-hall4-state {
+		pins = "gpio196";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-pull-up;
 	};
 
 	/* Stock xiaomi_keyboard_{sleep_,}default: wake, reset and status pins. */
