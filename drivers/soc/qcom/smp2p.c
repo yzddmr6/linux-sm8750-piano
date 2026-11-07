@@ -120,6 +120,7 @@ struct smp2p_entry {
 
 /**
  * struct qcom_smp2p - device driver context
+ * @irq:	parent interrupt carrying inbound state changes
  * @dev:	device driver handle
  * @in:		pointer to the inbound smem item
  * @out:	pointer to the outbound smem item
@@ -140,6 +141,7 @@ struct smp2p_entry {
  */
 struct qcom_smp2p {
 	struct device *dev;
+	int irq;
 
 	struct smp2p_smem_item *in;
 	struct smp2p_smem_item *out;
@@ -449,11 +451,20 @@ static int smp2p_irq_get_irqchip_state(struct irq_data *irqd, enum irqchip_irq_s
 	return 0;
 }
 
+/* Balance each child wake request on the shared physical interrupt. */
+static int smp2p_set_irq_wake(struct irq_data *irqd, unsigned int on)
+{
+	struct smp2p_entry *entry = irq_data_get_irq_chip_data(irqd);
+
+	return irq_set_irq_wake(entry->smp2p->irq, on);
+}
+
 static struct irq_chip smp2p_irq_chip = {
 	.name           = "smp2p",
 	.irq_mask       = smp2p_mask_irq,
 	.irq_unmask     = smp2p_unmask_irq,
 	.irq_set_type	= smp2p_set_irq_type,
+	.irq_set_wake	= smp2p_set_irq_wake,
 	.irq_print_chip = smp2p_irq_print_chip,
 	.irq_get_irqchip_state = smp2p_irq_get_irqchip_state,
 };
@@ -662,6 +673,7 @@ static int qcom_smp2p_probe(struct platform_device *pdev)
 	irq = platform_get_irq(pdev, 0);
 	if (irq < 0)
 		return irq;
+	smp2p->irq = irq;
 
 	smp2p->mbox_client.dev = &pdev->dev;
 	smp2p->mbox_client.knows_txdone = true;

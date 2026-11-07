@@ -39,6 +39,14 @@
 		serial0 = &uart7;
 	};
 
+	smp2p-sleepstate {
+		compatible = "qcom,smp2p-sleepstate";
+		qcom,smem-states = <&smp2p_adsp_sleepstate_out 0>;
+		interrupt-parent = <&smp2p_adsp_sleepstate_in>;
+		interrupts = <0 IRQ_TYPE_EDGE_BOTH>;
+		interrupt-names = "smp2p-sleepstate-in";
+	};
+
 
 	chosen {
 		stdout-path = "serial0:115200n8";
@@ -1840,3 +1848,16 @@
 };
 
 #include "sm8750-xiaomi-piano-camera.dtsi"
+
+&{/smp2p-adsp} {
+	smp2p_adsp_sleepstate_out: sleepstate-out {
+		qcom,entry-name = "sleepstate";
+		#qcom,smem-state-cells = <1>;
+	};
+
+	smp2p_adsp_sleepstate_in: sleepstate-see {
+		qcom,entry-name = "sleepstate_see";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+};

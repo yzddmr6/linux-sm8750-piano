@@ -7,7 +7,7 @@ $schema: http://devicetree.org/meta-schemas/core.yaml#
 title: Qualcomm SMP2P sleep-state notifier
 
 maintainers:
-  - Bjorn Andersson <bjorn.andersson@linaro.org>
+  - Erwin <yzddmr7@gmail.com>
 
 description:
   Some Qualcomm SoCs publish an SMP2P entry that the remote processors use
@@ -30,9 +30,9 @@ properties:
   qcom,smem-states:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     items:
-      - description: phandle to the outbound SMP2P entry that carries the
-          sleep state
-      - description: index of the sleep state within that entry
+      - items:
+          - description: Outbound SMP2P entry carrying the sleep state
+          - description: State index within that entry
 
   interrupt-parent:
     description: phandle to the inbound SMP2P entry that carries the
