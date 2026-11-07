@@ -28,16 +28,12 @@ properties:
     const: qcom,smp2p-sleepstate
 
   qcom,smem-states:
+    description: Outbound SMP2P state used to publish the AP awake bit.
     $ref: /schemas/types.yaml#/definitions/phandle-array
     items:
       - items:
           - description: Outbound SMP2P entry carrying the sleep state
           - description: State index within that entry
-
-  interrupt-parent:
-    description: phandle to the inbound SMP2P entry that carries the
-      sleepstate interrupt
-    $ref: /schemas/types.yaml#/definitions/phandle
 
   interrupts:
     maxItems: 1
