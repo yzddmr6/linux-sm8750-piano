@@ -1,0 +1,10 @@
+What:           /sys/bus/i2c/devices/.../data_irq_wakeup
+Date:           November 2026
+Contact:        yzddmr6 <46088090+yzddmr6@users.noreply.github.com>
+Description:
+                Available on nanosic,wn8030-piano. Read/write boolean, default 0.
+                0 removes the data IRQ wake attachment installed by the I2C core;
+                1 restores that attachment for comparison with legacy behavior.
+                Changing it is serialized against system sleep. The separate
+                status IRQ and the device power/wakeup policy are unchanged.
+                The value is volatile and returns to 0 on driver probe.
