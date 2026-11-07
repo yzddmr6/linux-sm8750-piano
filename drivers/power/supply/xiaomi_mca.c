@@ -2171,6 +2171,7 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	dev_info(mca->dev, "direct charging stopped: %s\n", why);
 
 	mca->cp = MCA_CP_DONE;
+	mca->cp_target_ma = 0;
 	mca->hv = MCA_HV_OFF;
 	mca->hv_retry = jiffies;
 	return 0;
@@ -3840,7 +3841,7 @@ static ssize_t charge_profile_show(struct device *dev,
 	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
 
 	guard(mutex)(&mca->lock);
-	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_target_ma=%u\n",
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u\n",
 		 xiaomi_mca_profile_names[mca->cp_profile],
 		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
 		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma);
