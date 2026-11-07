@@ -1245,6 +1245,11 @@ config MACSMC_POWER
 
 	  Say Y or M here if you have an Apple Silicon based Mac.
 
+config CHARGER_SC96231_KUNIT_TEST
+	bool "SC96231 pen charger state tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && CHARGER_SC96231=y
+	default KUNIT_ALL_TESTS
+
 config CHARGER_SC96231
 	tristate "Southchip SC96231 wireless pen transmitter"
 	depends on I2C && GPIOLIB && INPUT && REGULATOR

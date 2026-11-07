@@ -3,8 +3,8 @@
  * Southchip SC96231 pen transmitter.
  *
  * Register protocol and sequencing recovered from the Piano HyperOS 4
- * sc96231_tx and mca_wireless_revchg drivers, checked against a live charge
- * cycle. Firmware remains on the chip; this driver does not program MTP.
+ * sc96231_tx and mca_wireless_revchg drivers. Firmware remains on the chip;
+ * this driver does not program MTP.
  */
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
@@ -18,9 +18,12 @@
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
-#include <linux/suspend.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
+
+#if IS_ENABLED(CONFIG_CHARGER_SC96231_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
 
 #define SC_FW_VERSION		0x0004
 #define SC_COMMAND		0x0100
@@ -45,9 +48,12 @@ struct sc96231 {
 	struct device *dev;
 	struct regmap *map;
 	struct regulator *vin;
+	struct notifier_block supply_notifier;
+	bool power_lost;
 	struct gpio_desc *tx_enable;
 	struct gpio_desc *lp_enable;
 	struct gpio_descs *hall;
+	struct gpio_descs *keyboard;
 	struct input_dev *dock;
 	struct power_supply *battery;
 	struct delayed_work work;
@@ -60,24 +66,19 @@ struct sc96231 {
 	bool full;
 	bool fault;
 	bool stopping;
+	bool suspended;
 	bool soc_valid;
 	int capacity;
 	unsigned long started;
 	unsigned long full_since;
-	/* The state that was reported to the power supply class. */
-	bool reported_present;
-	bool reported_full;
-	bool reported_fault;
-	bool reported_enabled;
-	bool reported_soc_valid;
-	int reported_capacity;
-	/* The state that was reported to the input device. */
-	bool pen_inserted;
 	char address[18];
 };
 
 static int sc96231_read(struct sc96231 *sc, u16 reg, void *data, size_t size)
 {
+#if IS_ENABLED(CONFIG_CHARGER_SC96231_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(sc96231_read, sc, reg, data, size);
+#endif
 	return regmap_raw_read(sc->map, reg, data, size);
 }
 
@@ -85,6 +86,9 @@ static int sc96231_write_u32(struct sc96231 *sc, u16 reg, u32 value)
 {
 	__le32 data = cpu_to_le32(value);
 
+#if IS_ENABLED(CONFIG_CHARGER_SC96231_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(sc96231_write_u32, sc, reg, value);
+#endif
 	return regmap_raw_write(sc->map, reg, &data, sizeof(data));
 }
 
@@ -92,6 +96,9 @@ static void sc96231_stop(struct sc96231 *sc)
 {
 	int ret;
 
+#if IS_ENABLED(CONFIG_CHARGER_SC96231_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(sc96231_stop, sc);
+#endif
 	if (!sc->enabled)
 		return;
 	ret = sc96231_write_u32(sc, SC_COMMAND, SC_TX_DISABLE);
@@ -112,6 +119,9 @@ static int sc96231_start(struct sc96231 *sc)
 	__le32 version, pending;
 	int ret;
 
+#if IS_ENABLED(CONFIG_CHARGER_SC96231_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(sc96231_start, sc);
+#endif
 	ret = regulator_enable(sc->vin);
 	if (ret)
 		return ret == -ENODEV ? -EPROBE_DEFER : ret;
@@ -162,18 +172,98 @@ fail:
 	return ret;
 }
 
+/* Active-low inputs, in binding order. PPE/S poles indicate wrong placement.
+ * Stock ignores Hall4-S when the keyboard is folded front or back.
+ */
+static bool sc96231_hall_docked(const bool hall[6], const bool keyboard[2])
+{
+	bool misplaced = hall[2] || hall[4] || hall[5] ||
+			 (hall[3] && !keyboard[0] && !keyboard[1]);
+
+	return (hall[0] || hall[1]) && !misplaced;
+}
+
 static int sc96231_docked(struct sc96231 *sc)
 {
-	unsigned int i;
-	int value, attached = 0;
+	bool hall[6], keyboard[2];
+	int value, i;
 
-	for (i = 0; i < sc->hall->ndescs; i++) {
+#if IS_ENABLED(CONFIG_CHARGER_SC96231_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(sc96231_docked, sc);
+#endif
+	for (i = 0; i < ARRAY_SIZE(hall); i++) {
 		value = gpiod_get_value_cansleep(sc->hall->desc[i]);
 		if (value < 0)
 			return value;
-		attached |= value;
+		hall[i] = value;
 	}
-	return attached;
+	for (i = 0; i < ARRAY_SIZE(keyboard); i++) {
+		value = gpiod_get_value_cansleep(sc->keyboard->desc[i]);
+		if (value < 0)
+			return value;
+		keyboard[i] = value;
+	}
+	return sc96231_hall_docked(hall, keyboard);
+}
+
+static void sc96231_new_session(struct sc96231 *sc)
+{
+	sc->full = false;
+	sc->fault = false;
+	sc->power_lost = false;
+	sc->soc_valid = false;
+	sc->full_since = 0;
+	/* A new attachment must identify itself before userspace may pair it. */
+	memset(sc->address, 0, sizeof(sc->address));
+	sc->present = false;
+}
+
+static bool sc96231_can_charge(const struct sc96231 *sc)
+{
+	return sc->docked && !sc->stopping && !sc->suspended && !sc->fault && !sc->full;
+}
+
+/* Only protocol deadlines, never idle polling or wake alarms. */
+static unsigned long sc96231_deadline(const struct sc96231 *sc, unsigned long now)
+{
+	unsigned long deadline;
+
+	if (!sc96231_can_charge(sc) || !sc->enabled)
+		return 0;
+	if (!sc->present)
+		deadline = sc->started + 20 * HZ;
+	else if (sc->soc_valid && sc->capacity == 100 && sc->full_since)
+		deadline = sc->full_since + 180 * HZ;
+	else
+		return 0;
+	return time_after(deadline, now) ? deadline - now : 1;
+}
+
+struct sc96231_visible {
+	bool present, enabled, full, fault, soc_valid;
+	int capacity;
+	char address[18];
+};
+
+static struct sc96231_visible sc96231_snapshot(const struct sc96231 *sc)
+{
+	struct sc96231_visible state = {
+		.present = sc->present, .enabled = sc->enabled, .full = sc->full,
+		.fault = sc->fault, .soc_valid = sc->soc_valid, .capacity = sc->capacity,
+	};
+
+	memcpy(state.address, sc->address, sizeof(state.address));
+	return state;
+}
+
+static bool sc96231_changed(const struct sc96231_visible *a,
+			    const struct sc96231_visible *b)
+{
+	return a->present != b->present || a->enabled != b->enabled ||
+		a->full != b->full || a->fault != b->fault ||
+		a->soc_valid != b->soc_valid ||
+		(a->soc_valid && a->capacity != b->capacity) ||
+		memcmp(a->address, b->address, sizeof(a->address));
 }
 
 static int sc96231_update_pen(struct sc96231 *sc, u32 irq)
@@ -222,44 +312,15 @@ static int sc96231_update_pen(struct sc96231 *sc, u32 irq)
 	return 0;
 }
 
-/* The power supply class is only told about a state that changed. The
- * transmitter reports every second while it runs, and the class would
- * otherwise wake up its readers once a second for nothing.
- */
-static bool sc96231_state_changed(struct sc96231 *sc)
-{
-	return sc->present != sc->reported_present ||
-	       sc->full != sc->reported_full ||
-	       sc->fault != sc->reported_fault ||
-	       sc->enabled != sc->reported_enabled ||
-	       sc->soc_valid != sc->reported_soc_valid ||
-	       sc->capacity != sc->reported_capacity;
-}
-
 static void sc96231_notify(struct sc96231 *sc)
 {
-	if (!sc96231_state_changed(sc))
-		return;
-	sc->reported_present = sc->present;
-	sc->reported_full = sc->full;
-	sc->reported_fault = sc->fault;
-	sc->reported_enabled = sc->enabled;
-	sc->reported_soc_valid = sc->soc_valid;
-	sc->reported_capacity = sc->capacity;
-	power_supply_changed(sc->battery);
-}
-
-/* The pen is reported as inserted once the transmitter has seen it. The
- * magnet of the keyboard can pull the Hall inputs of the dock, and that
- * must not be read as a pen in the dock.
- */
-static void sc96231_report_pen(struct sc96231 *sc, bool inserted)
-{
-	if (sc->pen_inserted == inserted)
-		return;
-	sc->pen_inserted = inserted;
-	input_report_switch(sc->dock, SW_PEN_INSERTED, inserted);
+#if IS_ENABLED(CONFIG_CHARGER_SC96231_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(sc96231_notify, sc);
+#endif
+	/* Magnetic placement alone is not proof of a receiver. */
+	input_report_switch(sc->dock, SW_PEN_INSERTED, sc->present);
 	input_sync(sc->dock);
+	power_supply_changed(sc->battery);
 }
 
 static void sc96231_work(struct work_struct *work)
@@ -269,53 +330,44 @@ static void sc96231_work(struct work_struct *work)
 	__le32 raw_irq;
 	u32 irq = 0;
 	int attached, ret;
+	unsigned long delay;
+	struct sc96231_visible before, after;
 
 	mutex_lock(&sc->lock);
-	if (sc->stopping)
+	before = sc96231_snapshot(sc);
+	if (sc->stopping || sc->suspended)
 		goto out;
+	if (xchg(&sc->power_lost, false)) {
+		sc->fault = true;
+		sc96231_stop(sc);
+		goto notify;
+	}
 	attached = sc96231_docked(sc);
-	if (attached < 0)
-		goto poll;
+	if (attached < 0) {
+		ret = attached;
+		goto failed;
+	}
 	if (attached != sc->docked) {
 		sc->docked = attached;
 		if (!attached) {
 			sc96231_stop(sc);
 			sc->present = false;
-			sc->full = false;
-			sc->fault = false;
-			sc->soc_valid = false;
-			sc->full_since = 0;
-			sc96231_report_pen(sc, false);
-			/* Retain the discovered address for reconnect after removal. */
+			sc96231_new_session(sc);
 			goto notify;
 		}
 	}
-	if (!sc->docked || sc->fault || sc->full) {
+	if (!sc96231_can_charge(sc)) {
 		sc96231_stop(sc);
 		goto notify;
 	}
 	if (!sc->enabled) {
 		ret = sc96231_start(sc);
-		if (ret == -EPROBE_DEFER)
-			goto poll;
 		if (ret) {
 			dev_err(sc->dev, "pen transmitter start failed: %d\n", ret);
 			sc->fault = true;
 			goto notify;
 		}
-		if (sc->full) {
-			/* A full pen is checked now and then: a pen that was
-			 * used and put back has to charge again.
-			 */
-			ret = sc96231_update_pen(sc, 0);
-			if (ret)
-				goto failed;
-			if (sc->full) {
-				sc96231_stop(sc);
-				goto notify;
-			}
-		}
-		goto poll;
+		goto notify;
 	}
 
 	ret = sc96231_read(sc, SC_IRQ_STATUS, &raw_irq, sizeof(raw_irq));
@@ -327,13 +379,9 @@ static void sc96231_work(struct work_struct *work)
 		if (ret)
 			goto failed;
 	}
-	if (irq & (SC_IRQ_RX_FOUND | SC_IRQ_RX_DETECTED | SC_IRQ_CONFIG))
-		sc->present = true;
 	ret = sc96231_update_pen(sc, irq);
 	if (ret)
 		goto failed;
-	if (sc->present)
-		sc96231_report_pen(sc, true);
 	if (sc->full) {
 		sc96231_stop(sc);
 		goto notify;
@@ -343,7 +391,7 @@ static void sc96231_work(struct work_struct *work)
 		goto failed;
 	}
 	/* Same 20-second no-receiver timeout as the original charging stack. */
-	if (!sc->present && time_after(jiffies, sc->started + 20 * HZ)) {
+	if (!sc->present && time_after_eq(jiffies, sc->started + 20 * HZ)) {
 		ret = -ETIMEDOUT;
 		goto failed;
 	}
@@ -351,30 +399,39 @@ static void sc96231_work(struct work_struct *work)
 failed:
 	dev_warn(sc->dev, "pen transmitter stopped: %d, IRQ %#x\n", ret, irq);
 	sc->fault = true;
+	sc->present = false;
+	sc->soc_valid = false;
+	memset(sc->address, 0, sizeof(sc->address));
 	sc96231_stop(sc);
 notify:
-	sc96231_notify(sc);
-poll:
-	if (!sc->stopping && !pm_suspend_in_progress() &&
-	    (sc->enabled || (sc->docked && !sc->fault))) {
-		unsigned long delay = HZ;
-
-		/* A full pen is looked at now and then, so that a pen that
-		 * was used and put back charges again.
-		 */
-		if (sc->full)
-			delay = 10 * HZ;
-		mod_delayed_work(system_freezable_wq, &sc->work, delay);
-	}
+	after = sc96231_snapshot(sc);
+	if (sc96231_changed(&before, &after))
+		sc96231_notify(sc);
+	delay = sc96231_deadline(sc, jiffies);
+	if (delay)
+		queue_delayed_work(system_freezable_wq, &sc->work, delay);
 out:
 	mutex_unlock(&sc->lock);
+}
+
+static int sc96231_supply_event(struct notifier_block *nb, unsigned long event, void *data)
+{
+	struct sc96231 *sc = container_of(nb, struct sc96231, supply_notifier);
+
+	if (!(event & REGULATOR_EVENT_FAIL) || READ_ONCE(sc->stopping))
+		return NOTIFY_DONE;
+	WRITE_ONCE(sc->power_lost, true);
+	/* Provider callbacks hold their own lock: stop asynchronously. */
+	if (!READ_ONCE(sc->suspended))
+		mod_delayed_work(system_freezable_wq, &sc->work, 0);
+	return NOTIFY_OK;
 }
 
 static irqreturn_t sc96231_irq(int irq, void *data)
 {
 	struct sc96231 *sc = data;
 
-	if (!READ_ONCE(sc->stopping) && !pm_suspend_in_progress())
+	if (!READ_ONCE(sc->stopping) && !READ_ONCE(sc->suspended))
 		mod_delayed_work(system_freezable_wq, &sc->work, msecs_to_jiffies(20));
 	return IRQ_HANDLED;
 }
@@ -493,7 +550,16 @@ static int sc96231_probe(struct i2c_client *client)
 	sc->hall = devm_gpiod_get_array(dev, "hall", GPIOD_IN);
 	if (IS_ERR(sc->hall))
 		return dev_err_probe(dev, PTR_ERR(sc->hall), "pen Hall GPIOs\n");
-	sc->hall_irqs = devm_kcalloc(dev, sc->hall->ndescs,
+	if (sc->hall->ndescs != 6)
+		return -EINVAL;
+	/* GPIO80 is already owned by the built-in lid switch. */
+	sc->keyboard = devm_gpiod_get_array(dev, "keyboard",
+					  GPIOD_IN | GPIOD_FLAGS_BIT_NONEXCLUSIVE);
+	if (IS_ERR(sc->keyboard))
+		return PTR_ERR(sc->keyboard);
+	if (sc->keyboard->ndescs != 2)
+		return -EINVAL;
+	sc->hall_irqs = devm_kcalloc(dev, sc->hall->ndescs + sc->keyboard->ndescs,
 				    sizeof(*sc->hall_irqs), GFP_KERNEL);
 	if (!sc->hall_irqs)
 		return -ENOMEM;
@@ -514,14 +580,21 @@ static int sc96231_probe(struct i2c_client *client)
 	ret = devm_add_action_or_reset(dev, sc96231_quiesce, sc);
 	if (ret)
 		return ret;
+	sc->supply_notifier.notifier_call = sc96231_supply_event;
+	ret = devm_regulator_register_notifier(sc->vin, &sc->supply_notifier);
+	if (ret)
+		return ret;
 	/* IRQ resources are registered last, so devres frees them before work. */
-	for (i = 0; i < sc->hall->ndescs; i++) {
-		ret = gpiod_to_irq(sc->hall->desc[i]);
+	for (i = 0; i < sc->hall->ndescs + sc->keyboard->ndescs; i++) {
+		struct gpio_desc *gpio = i < sc->hall->ndescs ? sc->hall->desc[i] :
+			sc->keyboard->desc[i - sc->hall->ndescs];
+
+		ret = gpiod_to_irq(gpio);
 		if (ret < 0)
 			return ret;
 		sc->hall_irqs[i] = ret;
-		ret = devm_request_threaded_irq(dev, ret, NULL, sc96231_irq,
-				IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+		ret = devm_request_irq(dev, ret, sc96231_irq,
+				IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_SHARED,
 				"sc96231-hall", sc);
 		if (ret)
 			return ret;
@@ -530,11 +603,6 @@ static int sc96231_probe(struct i2c_client *client)
 				       IRQF_ONESHOT, "sc96231", sc);
 	if (ret)
 		return ret;
-	if (device_property_read_bool(dev, "wakeup-source")) {
-		ret = devm_device_init_wakeup(dev);
-		if (ret)
-			return ret;
-	}
 	mod_delayed_work(system_freezable_wq, &sc->work, 0);
 	return 0;
 }
@@ -544,49 +612,45 @@ static void sc96231_shutdown(struct i2c_client *client)
 	sc96231_quiesce(i2c_get_clientdata(client));
 }
 
-static int sc96231_suspend(struct device *dev)
+/* prepare runs before the MCA provider can prohibit sleep-time transfers. */
+static int sc96231_prepare(struct device *dev)
 {
 	struct sc96231 *sc = dev_get_drvdata(dev);
-	int ret;
-	unsigned int i;
 
-	/* The poll stops with the system: a timer that fires while the
-	 * system sleeps wakes it up again. The resume re-arms the work.
-	 */
+	WRITE_ONCE(sc->suspended, true);
 	cancel_delayed_work_sync(&sc->work);
-
-	if (!device_may_wakeup(dev))
-		return 0;
-	ret = enable_irq_wake(sc->irq);
-	if (ret)
-		return ret;
-	for (i = 0; i < sc->hall->ndescs; i++) {
-		ret = enable_irq_wake(sc->hall_irqs[i]);
-		if (ret) {
-			while (i--)
-				disable_irq_wake(sc->hall_irqs[i]);
-			disable_irq_wake(sc->irq);
-			return ret;
-		}
+	mutex_lock(&sc->lock);
+	sc96231_stop(sc);
+	mutex_unlock(&sc->lock);
+	if (sc->enabled) {
+		WRITE_ONCE(sc->suspended, false);
+		return -EBUSY;
 	}
 	return 0;
 }
 
-static int sc96231_resume(struct device *dev)
+static void sc96231_complete(struct device *dev)
 {
 	struct sc96231 *sc = dev_get_drvdata(dev);
-	unsigned int i;
 
-	if (device_may_wakeup(dev)) {
-		for (i = 0; i < sc->hall->ndescs; i++)
-			disable_irq_wake(sc->hall_irqs[i]);
-		disable_irq_wake(sc->irq);
-	}
+	mutex_lock(&sc->lock);
+	/* A fresh charge session can discover a lower SOC after full charge. */
+	sc96231_new_session(sc);
+	sc->present = false;
+	sc->suspended = false;
+	sc96231_notify(sc);
+	mutex_unlock(&sc->lock);
 	mod_delayed_work(system_freezable_wq, &sc->work, 0);
-	return 0;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(sc96231_pm_ops, sc96231_suspend, sc96231_resume);
+static const struct dev_pm_ops sc96231_pm_ops = {
+	.prepare = sc96231_prepare,
+	.complete = sc96231_complete,
+};
+
+#if IS_ENABLED(CONFIG_CHARGER_SC96231_KUNIT_TEST)
+#include "sc96231_charger_test.c"
+#endif
 
 static const struct of_device_id sc96231_of_match[] = {
 	{ .compatible = "southchip,sc96231" },
