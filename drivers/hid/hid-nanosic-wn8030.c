@@ -1702,8 +1702,8 @@ static const struct input_device_id nanosic_wn8030_hall_ids[] = {
 		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
 			 INPUT_DEVICE_ID_MATCH_SWBIT,
 		.evbit = { [BIT_WORD(EV_SW)] = BIT_MASK(EV_SW) },
-		.swbit = { [BIT_WORD(SW_LID)] = BIT_MASK(SW_LID) |
-						BIT_MASK(SW_TABLET_MODE) },
+		/* Piano's gpio-keys lid does not also report tablet mode. */
+		.swbit = { [BIT_WORD(SW_LID)] = BIT_MASK(SW_LID) },
 	},
 	{ }
 };

@@ -303,6 +303,72 @@ static void wn8030_reports(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nanosic_wn8030_dispatch(&bus->nano, key, 8), 0);
 }
 
+static void wn8030_test_unregister_input(void *data)
+{
+	input_unregister_device(data);
+}
+
+static void wn8030_test_unregister_handler(void *data)
+{
+	input_unregister_handler(data);
+}
+
+static void wn8030_lid_only_switch(struct kunit *test)
+{
+	struct wn8030_test_bus *bus = test->priv;
+	struct nanosic_wn8030 *nano = &bus->nano;
+	struct input_dev *lid;
+	u8 attach[32] = { 0x23, 0x31, 0x38, 0x80, 0xa2, 0, 0, 0, 0, 3 };
+	u8 key[9] = { 5, 0, 0, 4 };
+	int ret;
+
+	lid = input_allocate_device();
+	KUNIT_ASSERT_NOT_NULL(test, lid);
+	lid->name = "wn8030-test-lid";
+	input_set_capability(lid, EV_SW, SW_LID);
+	__set_bit(SW_LID, lid->sw); /* Also cover binding with the lid closed. */
+	ret = input_register_device(lid);
+	if (ret)
+		input_free_device(lid);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+			wn8030_test_unregister_input, lid), 0);
+	nano->hall_handler = (struct input_handler) {
+		.event = nanosic_wn8030_hall_event,
+		.connect = nanosic_wn8030_hall_connect,
+		.disconnect = nanosic_wn8030_hall_disconnect,
+		.name = "wn8030-test-hall",
+		.id_table = nanosic_wn8030_hall_ids,
+		.private = nano,
+	};
+	KUNIT_ASSERT_EQ(test, input_register_handler(&nano->hall_handler), 0);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+			wn8030_test_unregister_handler, &nano->hall_handler), 0);
+	KUNIT_ASSERT_PTR_EQ(test, nano->hall_handle.dev, lid);
+	nanosic_wn8030_handle_vendor(nano, attach, sizeof(attach));
+	KUNIT_ASSERT_NOT_NULL(test, nano->hid_keyboard);
+	flush_work(&nano->input_state_work);
+	KUNIT_EXPECT_FALSE(test, nano->input_enabled);
+	nanosic_wn8030_dispatch(nano, key, sizeof(key));
+	KUNIT_EXPECT_FALSE(test, wn8030_key_down(nano->hid_keyboard, KEY_A));
+
+	input_report_switch(lid, SW_LID, 0);
+	input_sync(lid);
+	flush_work(&nano->input_state_work);
+	nanosic_wn8030_dispatch(nano, key, sizeof(key));
+	KUNIT_EXPECT_TRUE(test, wn8030_key_down(nano->hid_keyboard, KEY_A));
+	input_report_switch(lid, SW_LID, 1);
+	input_sync(lid);
+	flush_work(&nano->input_state_work);
+	KUNIT_EXPECT_FALSE(test, wn8030_key_down(nano->hid_keyboard, KEY_A));
+	nanosic_wn8030_dispatch(nano, key, sizeof(key));
+	KUNIT_EXPECT_FALSE(test, wn8030_key_down(nano->hid_keyboard, KEY_A));
+	input_report_switch(lid, SW_LID, 0);
+	input_sync(lid);
+	flush_work(&nano->input_state_work);
+	KUNIT_EXPECT_TRUE(test, nano->input_enabled);
+}
+
 /* The fake lines and IRQ chip below exercise gpiolib and IRQ ownership too. */
 static void wn8030_test_irq_noop(struct irq_data *data) { }
 static int wn8030_test_irq_type(struct irq_data *data, unsigned int type) { return 0; }
@@ -710,6 +776,7 @@ static struct kunit_case wn8030_cases[] = {
 	KUNIT_CASE(wn8030_initial_attached),
 	KUNIT_CASE(wn8030_firmware_transport),
 	KUNIT_CASE(wn8030_reports),
+	KUNIT_CASE(wn8030_lid_only_switch),
 	KUNIT_CASE(wn8030_panel_order_and_first_frame),
 	KUNIT_CASE(wn8030_system_sleep_no_i2c),
 	KUNIT_CASE(wn8030_blank_attach_detach),
