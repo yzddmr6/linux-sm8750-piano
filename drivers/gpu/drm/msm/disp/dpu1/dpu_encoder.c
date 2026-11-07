@@ -1419,10 +1419,9 @@ static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
 		dpu_enc->cur_master->ops.disable(dpu_enc->cur_master);
 
 	/*
-	 * A video-mode slave shares the master's CTL, and its cleanup resets
-	 * that CTL. The master's disable above waited for the frame in which
-	 * both timing engines stopped, so the slave is torn down only now;
-	 * doing it earlier underruns both INTFs for the final frame.
+	 * Wait for the slave's stop to latch before resetting either datapath.
+	 * In particular, do not reset a shared CTL from the master's disable
+	 * before checking the slave: it may still be scanning the last frame.
 	 */
 	if (dpu_enc->cur_slave && dpu_enc->cur_master &&
 	    dpu_enc->cur_slave->intf_mode == INTF_MODE_VIDEO) {
@@ -1440,8 +1439,13 @@ static void dpu_encoder_virt_atomic_disable(struct drm_encoder *drm_enc,
 		if (status.is_en)
 			DPU_ERROR("enc%d slave intf:%d still enabled before cleanup\n",
 				  drm_enc->base.id, slave->hw_intf->idx - INTF_0);
-		dpu_encoder_helper_phys_cleanup(slave);
+		/* A shared CTL is cleaned up once, through the master below. */
+		if (slave->hw_ctl != dpu_enc->cur_master->hw_ctl)
+			dpu_encoder_helper_phys_cleanup(slave);
 	}
+
+	if (dpu_enc->cur_master && dpu_enc->cur_master->intf_mode == INTF_MODE_VIDEO)
+		dpu_encoder_helper_phys_cleanup(dpu_enc->cur_master);
 
 	/* after phys waits for frame-done, should be no more frames pending */
 	if (atomic_xchg(&dpu_enc->frame_done_timeout_ms, 0)) {
@@ -2295,11 +2299,7 @@ static void dpu_encoder_unprep_dsc(struct dpu_encoder_virt *dpu_enc)
 	}
 }
 
-/**
- * dpu_encoder_helper_phys_cleanup - helper to cleanup dpu pipeline
- * @phys_enc: Pointer to physical encoder structure
- */
-void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
+static void dpu_encoder_phys_cleanup(struct dpu_encoder_phys *phys_enc)
 {
 	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
 	struct dpu_hw_intf_cfg intf_cfg = { 0 };
@@ -2308,15 +2308,6 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
 
 	dpu_enc = to_dpu_encoder_virt(phys_enc->parent);
 
-	ctl->ops.reset(ctl);
-
-	dpu_encoder_helper_reset_mixers(phys_enc);
-
-	/*
-	 * TODO: move the once-only operation like CTL flush/trigger
-	 * into dpu_encoder_virt_disable() and all operations which need
-	 * to be done per phys encoder into the phys_disable() op.
-	 */
 	if (phys_enc->hw_wb) {
 		/* disable the PP block */
 		if (phys_enc->hw_wb->ops.bind_pingpong_blk)
@@ -2383,6 +2374,35 @@ void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
 
 	if (ctl->ops.reset_intf_cfg)
 		ctl->ops.reset_intf_cfg(ctl, &intf_cfg);
+}
+
+/**
+ * dpu_encoder_helper_phys_cleanup - helper to cleanup dpu pipeline
+ * @phys_enc: Pointer to physical encoder structure
+ */
+void dpu_encoder_helper_phys_cleanup(struct dpu_encoder_phys *phys_enc)
+{
+	struct dpu_encoder_virt *dpu_enc = to_dpu_encoder_virt(phys_enc->parent);
+	struct dpu_encoder_phys *slave = dpu_enc->cur_slave;
+	struct dpu_hw_ctl *ctl = phys_enc->hw_ctl;
+
+	ctl->ops.reset(ctl);
+	dpu_encoder_helper_reset_mixers(phys_enc);
+
+	/*
+	 * Both video timing engines have stopped. Remove every interface on
+	 * the shared CTL before flushing it: starting after removing only the
+	 * master leaves the slave in CTL_INTF_ACTIVE with its pingpong already
+	 * unbound and CTL_INTF_MASTER cleared. Do not start this partial path.
+	 * Clear the slave first so the master remains valid until the last
+	 * interface has been removed, then submit the empty path only once.
+	 */
+	if (phys_enc == dpu_enc->cur_master && slave &&
+	    phys_enc->intf_mode == INTF_MODE_VIDEO &&
+	    slave->intf_mode == INTF_MODE_VIDEO && slave->hw_ctl == ctl)
+		dpu_encoder_phys_cleanup(slave);
+
+	dpu_encoder_phys_cleanup(phys_enc);
 
 	ctl->ops.trigger_flush(ctl);
 	ctl->ops.trigger_start(ctl);

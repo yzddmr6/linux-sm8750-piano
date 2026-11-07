@@ -615,10 +615,9 @@ static void dpu_encoder_phys_vid_disable(struct dpu_encoder_phys *phys_enc)
 	spin_unlock_irqrestore(phys_enc->enc_spinlock, lock_flags);
 
 	/*
-	 * A slave shares the master's CTL. Its cleanup resets that CTL, so
-	 * dpu_encoder_virt_atomic_disable() runs it only after the master
-	 * has waited for the last frame of both timing engines; resetting
-	 * the CTL while an engine still scans out underruns the INTFs.
+	 * The virtual encoder cleans up the datapaths after both timing
+	 * engines have stopped, resetting and flushing a shared CTL once.
+	 * Only the master receives the vblank used to wait for the last frame.
 	 */
 	if (!dpu_encoder_phys_vid_is_master(phys_enc)) {
 		phys_enc->enable_state = DPU_ENC_DISABLED;
@@ -663,7 +662,6 @@ static void dpu_encoder_phys_vid_disable(struct dpu_encoder_phys *phys_enc)
 		}
 	}
 
-	dpu_encoder_helper_phys_cleanup(phys_enc);
 	phys_enc->enable_state = DPU_ENC_DISABLED;
 }
 
