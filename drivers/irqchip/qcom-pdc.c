@@ -5,7 +5,6 @@
 
 #include <linux/bitfield.h>
 #include <linux/err.h>
-#include <linux/firmware/qcom/qcom_scm.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
@@ -57,12 +56,8 @@ struct pdc_pin_region {
 #define pin_to_hwirq(r, p)	((r)->parent_base + (p) - (r)->pin_base)
 
 struct spi_cfg_regs {
-	union {
-		u64 start;
-		void __iomem *base;
-	};
+	void __iomem *base;
 	resource_size_t size;
-	bool scm_io;
 };
 
 static struct spi_cfg_regs *spi_cfg;
@@ -172,52 +167,35 @@ static void qcom_pdc_gic_enable(struct irq_data *d)
 	irq_chip_enable_parent(d);
 }
 
-static u32 __spi_pin_read(unsigned int pin)
-{
-	void __iomem *cfg_reg = spi_cfg->base + pin * 4;
-	u64 scm_cfg_reg = spi_cfg->start + pin * 4;
-
-	if (spi_cfg->scm_io) {
-		unsigned int val;
-
-		qcom_scm_io_readl(scm_cfg_reg, &val);
-		return val;
-	} else {
-		return readl(cfg_reg);
-	}
-}
-
-static void __spi_pin_write(unsigned int pin, unsigned int val)
-{
-	void __iomem *cfg_reg = spi_cfg->base + pin * 4;
-	u64 scm_cfg_reg = spi_cfg->start + pin * 4;
-
-	if (spi_cfg->scm_io)
-		qcom_scm_io_writel(scm_cfg_reg, val);
-	else
-		writel(val, cfg_reg);
-}
-
+/* The interface uses one bit per GIC SPI: edge = 0, level = 1. */
 static int spi_configure_type(irq_hw_number_t hwirq, unsigned int type)
 {
-	int spi = hwirq - 32;
-	u32 pin = spi / 32;
-	u32 mask = BIT(spi % 32);
-	u32 val;
+	irq_hw_number_t spi;
+	resource_size_t offset;
+	void __iomem *reg;
 	unsigned long flags;
+	u32 mask, val;
 
 	if (!spi_cfg)
 		return 0;
 
-	if (pin * 4 > spi_cfg->size)
-		return -EFAULT;
+	if (hwirq < 32)
+		return -EINVAL;
+
+	spi = hwirq - 32;
+	offset = (spi / 32) * sizeof(u32);
+	if (offset >= spi_cfg->size || spi_cfg->size - offset < sizeof(u32))
+		return -EINVAL;
+
+	reg = spi_cfg->base + offset;
+	mask = BIT(spi % 32);
 
 	raw_spin_lock_irqsave(&pdc_lock, flags);
-	val = __spi_pin_read(pin);
+	val = readl(reg);
 	val &= ~mask;
 	if (type & IRQ_TYPE_LEVEL_MASK)
 		val |= mask;
-	__spi_pin_write(pin, val);
+	writel(val, reg);
 	raw_spin_unlock_irqrestore(&pdc_lock, flags);
 
 	return 0;
@@ -291,7 +269,6 @@ static int qcom_pdc_gic_set_type(struct irq_data *d, unsigned int type)
 	pdc_type |= (old_pdc_type & ~IRQ_i_CFG_TYPE_MASK);
 	pdc_reg_write(IRQ_i_CFG, d->hwirq, pdc_type);
 
-	/* Additionally, configure (only) the GPIO in the f/w */
 	ret = spi_configure_type(d->parent_data->hwirq, type);
 	if (ret)
 		return ret;
@@ -384,6 +361,14 @@ static int qcom_pdc_alloc(struct irq_domain *domain, unsigned int virq,
 	parent_fwspec.param[0]    = 0;
 	parent_fwspec.param[1]    = pin_to_hwirq(region, hwirq);
 	parent_fwspec.param[2]    = type;
+
+	/* pdc-ranges contains SPI numbers, whereas irq_data contains INTIDs. */
+	if (spi_cfg && type != IRQ_TYPE_NONE) {
+		ret = spi_configure_type((irq_hw_number_t)parent_fwspec.param[1] + 32,
+					 type);
+		if (ret)
+			return ret;
+	}
 
 	return irq_domain_alloc_irqs_parent(domain, virq, nr_irqs,
 					    &parent_fwspec);
@@ -491,24 +476,26 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
 		goto fail;
 	}
 
-	ret = of_address_to_resource(node, 1, &res);
-	if (!ret) {
-		spi_cfg = kcalloc(1, sizeof(*spi_cfg), GFP_KERNEL);
+	/* Older device trees need no SPI interface configuration. */
+	if (of_get_address(node, 1, NULL, NULL)) {
+		ret = of_address_to_resource(node, 1, &res);
+		if (ret)
+			goto fail;
+
+		spi_cfg = devm_kzalloc(&pdev->dev, sizeof(*spi_cfg), GFP_KERNEL);
 		if (!spi_cfg) {
 			ret = -ENOMEM;
 			goto fail;
 		}
-		spi_cfg->scm_io = of_find_property(node,
-						   "qcom,scm-spi-cfg", NULL);
 		spi_cfg->size = resource_size(&res);
-		if (spi_cfg->scm_io) {
-			spi_cfg->start = res.start;
-		} else {
-			spi_cfg->base = ioremap(res.start, spi_cfg->size);
-			if (!spi_cfg->base) {
-				ret = -ENOMEM;
-				goto fail;
-			}
+		if (spi_cfg->size < sizeof(u32)) {
+			ret = -EINVAL;
+			goto fail;
+		}
+		spi_cfg->base = devm_ioremap_resource(&pdev->dev, &res);
+		if (IS_ERR(spi_cfg->base)) {
+			ret = PTR_ERR(spi_cfg->base);
+			goto fail;
 		}
 	}
 
@@ -528,7 +515,6 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
 	return 0;
 
 fail:
-	kfree(spi_cfg);
 	kfree(pdc_region);
 	iounmap(pdc_base);
 	iounmap(pdc_prev_base);
