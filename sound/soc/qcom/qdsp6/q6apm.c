@@ -154,8 +154,8 @@ static void q6apm_put_audioreach_graph(struct kref *ref)
 static int q6apm_get_apm_state(struct q6apm *apm)
 {
 	int ret;
-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(0,
-								APM_CMD_GET_SPF_STATE, 0);
+	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_pkt(0,
+			APM_CMD_GET_SPF_STATE, 0, apm->gdev->svc.id);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
