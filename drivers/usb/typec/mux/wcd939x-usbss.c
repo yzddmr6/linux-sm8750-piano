@@ -268,9 +268,10 @@ static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
 		enable_usb = true;
 	} else if (usbss->svid) {
 		switch (usbss->mode) {
-		/* DP Only */
+		/* Four DP lanes leave the USB2 D+/D- pair available. */
 		case TYPEC_DP_STATE_C:
 		case TYPEC_DP_STATE_E:
+			enable_usb = true;
 			enable_dp = true;
 			break;
 
