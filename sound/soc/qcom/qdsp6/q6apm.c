@@ -27,6 +27,9 @@ struct apm_graph_mgmt_cmd {
 
 #define APM_GRAPH_MGMT_PSIZE(p, n) ALIGN(struct_size(p, sub_graph_id_list, n), 8)
 
+/* AudioReach AR_ENOTEXIST, returned before the APM service is registered. */
+#define APM_STATE_SERVICE_NOT_FOUND 19
+
 static struct q6apm *g_apm;
 static DEFINE_MUTEX(g_apm_lock);
 
@@ -994,6 +997,8 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 
 	switch (hdr->opcode) {
 	case APM_CMD_RSP_GET_SPF_STATE:
+		if (data->payload_size < sizeof(u32))
+			return -EINVAL;
 		apm->result.opcode = hdr->opcode;
 		apm->result.status = 0;
 		/* First word of result it state */
@@ -1001,7 +1006,17 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 		wake_up(&apm->wait);
 		break;
 	case GPR_BASIC_RSP_RESULT:
+		if (data->payload_size < sizeof(*result))
+			return -EINVAL;
 		switch (result->opcode) {
+		case APM_CMD_GET_SPF_STATE:
+			apm->state = 0;
+			apm->result = *result;
+			/* A missing service is not ready. The probing caller defers. */
+			if (result->status == APM_STATE_SERVICE_NOT_FOUND)
+				apm->result.status = 0;
+			wake_up(&apm->wait);
+			break;
 		case APM_CMD_SHARED_MEM_MAP_REGIONS:
 		case APM_CMD_GRAPH_START:
 		case APM_CMD_GRAPH_OPEN:
