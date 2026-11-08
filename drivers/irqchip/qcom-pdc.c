@@ -185,6 +185,17 @@ struct pdc_pin_region {
 
 #define pin_to_hwirq(r, p)	((r)->parent_base + (p) - (r)->pin_base)
 
+struct spi_cfg_regs {
+	union {
+		u64 start;
+		void __iomem *base;
+	};
+	resource_size_t size;
+	bool scm_io;
+};
+
+static struct spi_cfg_regs *spi_cfg;
+
 static struct pdc_desc *pdc;
 
 static void pdc_base_reg_write(void __iomem *base, int reg, u32 i, u32 val)
@@ -338,6 +349,57 @@ static void qcom_pdc_secondary_unmask(struct irq_data *d)
 	irq_chip_unmask_parent(d);
 }
 
+static u32 __spi_pin_read(unsigned int pin)
+{
+	void __iomem *cfg_reg = spi_cfg->base + pin * 4;
+	u64 scm_cfg_reg = spi_cfg->start + pin * 4;
+
+	if (spi_cfg->scm_io) {
+		unsigned int val;
+
+		qcom_scm_io_readl(scm_cfg_reg, &val);
+		return val;
+	} else {
+		return readl(cfg_reg);
+	}
+}
+
+static void __spi_pin_write(unsigned int pin, unsigned int val)
+{
+	void __iomem *cfg_reg = spi_cfg->base + pin * 4;
+	u64 scm_cfg_reg = spi_cfg->start + pin * 4;
+
+	if (spi_cfg->scm_io)
+		qcom_scm_io_writel(scm_cfg_reg, val);
+	else
+		writel(val, cfg_reg);
+}
+
+static int spi_configure_type(irq_hw_number_t hwirq, unsigned int type)
+{
+	int spi = hwirq - 32;
+	u32 pin = spi / 32;
+	u32 mask = BIT(spi % 32);
+	u32 val;
+	unsigned long flags;
+
+	if (!spi_cfg)
+		return 0;
+
+	if (pin * 4 > spi_cfg->size)
+		return -EFAULT;
+
+	raw_spin_lock_irqsave(&pdc->lock, flags);
+	val = __spi_pin_read(pin);
+	val &= ~mask;
+	if (type & IRQ_TYPE_LEVEL_MASK)
+		val |= mask;
+	__spi_pin_write(pin, val);
+	raw_spin_unlock_irqrestore(&pdc->lock, flags);
+
+	return 0;
+}
+
 /*
  * GIC does not handle falling edge or active low. To allow falling edge and
  * active low interrupts to be handled at GIC, PDC has an inverter that inverts
@@ -405,6 +467,11 @@ static int qcom_pdc_gic_set_type(struct irq_data *d, unsigned int type)
 	old_pdc_type = pdc_reg_read(pdc->regs->irq_cfg_reg, d->hwirq);
 	pdc_type |= (old_pdc_type & ~pdc->cfg_fields->irq_type);
 	pdc_reg_write(pdc->regs->irq_cfg_reg, d->hwirq, pdc_type);
+
+	/* Additionally, configure (only) the GPIO in the f/w */
+	ret = spi_configure_type(d->parent_data->hwirq, type);
+	if (ret)
+		return ret;
 
 	ret = irq_chip_set_type_parent(d, type);
 	if (ret)
@@ -745,6 +812,27 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
 	if (ret) {
 		pr_err("%pOF: failed to init PDC pin-hwirq mapping\n", node);
 		return ret;
+	}
+
+	ret = of_address_to_resource(node, 1, &res);
+	if (!ret) {
+		spi_cfg = devm_kzalloc(dev, sizeof(*spi_cfg), GFP_KERNEL);
+		if (!spi_cfg) {
+			ret = -ENOMEM;
+			return ret;
+		}
+		spi_cfg->scm_io = of_find_property(node,
+						   "qcom,scm-spi-cfg", NULL);
+		spi_cfg->size = resource_size(&res);
+		if (spi_cfg->scm_io) {
+			spi_cfg->start = res.start;
+		} else {
+			spi_cfg->base = devm_ioremap(dev, res.start, spi_cfg->size);
+			if (!spi_cfg->base) {
+				ret = -ENOMEM;
+				return ret;
+			}
+		}
 	}
 
 	pdc_domain = irq_domain_create_hierarchy(parent_domain, IRQ_DOMAIN_FLAG_QCOM_PDC_WAKEUP,
