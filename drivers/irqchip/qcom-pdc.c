@@ -108,6 +108,7 @@ struct pdc_irq_cfg {
  *
  * @base:           PDC base register for DRV2 / HLOS
  * @prev_base:      PDC DRV1 base, applicable only for x1e RTL bug.
+ * @spi_cfg:        Optional PDC-to-GIC SPI interface registers
  * @version:        PDC version
  * @num_spis:       Total number of direct SPI interrupts
  * @region:         PDC interrupt continuous range
@@ -124,6 +125,7 @@ struct pdc_irq_cfg {
 struct pdc_desc {
 	void __iomem			*base;
 	void __iomem			*prev_base;
+	struct spi_cfg_regs		*spi_cfg;
 	u32				version;
 	u32				num_spis;
 
@@ -189,8 +191,6 @@ struct spi_cfg_regs {
 	void __iomem *base;
 	resource_size_t size;
 };
-
-static struct spi_cfg_regs *spi_cfg;
 
 static struct pdc_desc *pdc;
 
@@ -354,7 +354,7 @@ static int spi_configure_type(irq_hw_number_t hwirq, unsigned int type)
 	unsigned long flags;
 	u32 mask, val;
 
-	if (!spi_cfg)
+	if (!pdc->spi_cfg)
 		return 0;
 
 	if (hwirq < 32)
@@ -362,10 +362,10 @@ static int spi_configure_type(irq_hw_number_t hwirq, unsigned int type)
 
 	spi = hwirq - 32;
 	offset = (spi / 32) * sizeof(u32);
-	if (offset >= spi_cfg->size || spi_cfg->size - offset < sizeof(u32))
+	if (offset >= pdc->spi_cfg->size || pdc->spi_cfg->size - offset < sizeof(u32))
 		return -EINVAL;
 
-	reg = spi_cfg->base + offset;
+	reg = pdc->spi_cfg->base + offset;
 	mask = BIT(spi % 32);
 
 	raw_spin_lock_irqsave(&pdc->lock, flags);
@@ -651,7 +651,7 @@ static int qcom_pdc_alloc(struct irq_domain *domain, unsigned int virq,
 	parent_fwspec.param[2]    = type;
 
 	/* pdc-ranges contains SPI numbers, whereas irq_data contains INTIDs. */
-	if (spi_cfg && type != IRQ_TYPE_NONE) {
+	if (pdc->spi_cfg && type != IRQ_TYPE_NONE) {
 		ret = spi_configure_type((irq_hw_number_t)parent_fwspec.param[1] + 32,
 					 type);
 		if (ret)
@@ -810,19 +810,19 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
 		if (ret)
 			return ret;
 
-		spi_cfg = devm_kzalloc(&pdev->dev, sizeof(*spi_cfg), GFP_KERNEL);
-		if (!spi_cfg) {
+		pdc->spi_cfg = devm_kzalloc(&pdev->dev, sizeof(*pdc->spi_cfg), GFP_KERNEL);
+		if (!pdc->spi_cfg) {
 			ret = -ENOMEM;
 			return ret;
 		}
-		spi_cfg->size = resource_size(&res);
-		if (spi_cfg->size < sizeof(u32)) {
+		pdc->spi_cfg->size = resource_size(&res);
+		if (pdc->spi_cfg->size < sizeof(u32)) {
 			ret = -EINVAL;
 			return ret;
 		}
-		spi_cfg->base = devm_ioremap_resource(&pdev->dev, &res);
-		if (IS_ERR(spi_cfg->base)) {
-			ret = PTR_ERR(spi_cfg->base);
+		pdc->spi_cfg->base = devm_ioremap_resource(&pdev->dev, &res);
+		if (IS_ERR(pdc->spi_cfg->base)) {
+			ret = PTR_ERR(pdc->spi_cfg->base);
 			return ret;
 		}
 	}
