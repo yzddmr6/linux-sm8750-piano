@@ -168,13 +168,30 @@ static int q6apm_get_apm_state(struct q6apm *apm)
 
 bool q6apm_is_adsp_ready(void)
 {
+	struct device *dev, *parent;
 	bool ready = false;
 
 	/* A DSP restart removes the APM device. Keep it alive for the whole
 	 * query, including the synchronous command's wait for a reply. */
 	mutex_lock(&g_apm_lock);
-	if (g_apm)
+	if (!g_apm)
+		goto out;
+
+	dev = g_apm->dev;
+	parent = dev->parent;
+	/* Synchronous child probes run before GLINK advertises receive intents.
+	 * Do not wait for a parent probe which is waiting for this child.
+	 */
+	if (!device_trylock(parent))
+		goto out;
+	if (!device_trylock(dev))
+		goto unlock_parent;
+	if (device_is_bound(parent) && device_is_bound(dev))
 		ready = q6apm_get_apm_state(g_apm) > 0;
+	device_unlock(dev);
+unlock_parent:
+	device_unlock(parent);
+out:
 	mutex_unlock(&g_apm_lock);
 
 	return ready;
