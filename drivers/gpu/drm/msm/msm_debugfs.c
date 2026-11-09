@@ -84,12 +84,19 @@ static int msm_gpu_open(struct inode *inode, struct file *file)
 	if (ret)
 		goto free_priv;
 
-	pm_runtime_get_sync(&gpu->pdev->dev);
-	msm_gpu_hw_init(gpu);
-	show_priv->state = gpu->funcs->gpu_state_get(gpu);
+	ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
+	if (ret < 0)
+		goto unlock;
+
+	ret = msm_gpu_hw_init(gpu);
+	if (!ret)
+		show_priv->state = gpu->funcs->gpu_state_get(gpu);
 	pm_runtime_put_sync(&gpu->pdev->dev);
 
+unlock:
 	mutex_unlock(&gpu->lock);
+	if (ret)
+		goto free_priv;
 
 	if (IS_ERR(show_priv->state)) {
 		ret = PTR_ERR(show_priv->state);

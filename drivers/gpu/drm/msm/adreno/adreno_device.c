@@ -312,7 +312,12 @@ MODULE_DEVICE_TABLE(of, dt_match);
 static int adreno_runtime_resume(struct device *dev)
 {
 	struct msm_gpu *gpu = dev_to_gpu(dev);
-	int ret = gpu->funcs->pm_resume(gpu);
+	int ret;
+
+	if (READ_ONCE(gpu->wedged))
+		return -EIO;
+
+	ret = gpu->funcs->pm_resume(gpu);
 	if (!ret)
 		ret = msm_perfcntr_resume(gpu);
 	return ret;

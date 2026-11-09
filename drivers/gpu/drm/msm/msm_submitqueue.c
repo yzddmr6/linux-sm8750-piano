@@ -9,7 +9,12 @@
 
 int msm_context_set_sysprof(struct msm_context *ctx, struct msm_gpu *gpu, int sysprof)
 {
+	int ret;
+
 	guard(rwsem_write)(&ctx->ctxlock);
+
+	if (sysprof && READ_ONCE(gpu->wedged))
+		return -EIO;
 
 	/*
 	 * Since pm_runtime and sysprof_active are both refcounts, we
@@ -21,7 +26,9 @@ int msm_context_set_sysprof(struct msm_context *ctx, struct msm_gpu *gpu, int sy
 	default:
 		return UERR(EINVAL, gpu->dev, "Invalid sysprof: %d", sysprof);
 	case 2:
-		pm_runtime_get_sync(&gpu->pdev->dev);
+		ret = pm_runtime_resume_and_get(&gpu->pdev->dev);
+		if (ret < 0)
+			return ret;
 		fallthrough;
 	case 1:
 		refcount_inc(&gpu->sysprof_active);
@@ -43,7 +50,7 @@ int msm_context_set_sysprof(struct msm_context *ctx, struct msm_gpu *gpu, int sy
 	}
 
 	/* Some gpu families require additional setup for sysprof */
-	if (gpu->funcs->sysprof_setup)
+	if (!READ_ONCE(gpu->wedged) && gpu->funcs->sysprof_setup)
 		gpu->funcs->sysprof_setup(gpu, false);
 
 	ctx->sysprof = sysprof;

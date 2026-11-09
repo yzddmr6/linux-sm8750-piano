@@ -14,13 +14,10 @@ module_param(num_hw_submissions, uint, 0600);
 static struct dma_fence *msm_job_run(struct drm_sched_job *job)
 {
 	struct msm_gem_submit *submit = to_msm_submit(job);
-	struct msm_fence_context *fctx = submit->ring->fctx;
 	struct msm_gpu *gpu = submit->gpu;
 	struct drm_device *dev = gpu->dev;
 	unsigned nr_cmds = submit->nr_cmds;
-	int i;
-
-	msm_fence_init(submit->hw_fence, fctx);
+	int i, ret;
 
 	mutex_lock(&dev->gem_lru_mutex);
 
@@ -37,14 +34,25 @@ static struct dma_fence *msm_job_run(struct drm_sched_job *job)
 	/* TODO move submit path over to using a per-ring lock.. */
 	mutex_lock(&gpu->lock);
 
+	if (gpu->wedged) {
+		mutex_unlock(&gpu->lock);
+		msm_submit_retire(submit);
+		return ERR_PTR(-EIO);
+	}
+
 	if (submit->queue->ctx->closed)
 		submit->nr_cmds = 0;
 
-	msm_gpu_submit(gpu, submit);
+	ret = msm_gpu_submit(gpu, submit);
 
 	submit->nr_cmds = nr_cmds;
 
 	mutex_unlock(&gpu->lock);
+
+	if (ret) {
+		msm_submit_retire(submit);
+		return ERR_PTR(ret);
+	}
 
 	return dma_fence_get(submit->hw_fence);
 }

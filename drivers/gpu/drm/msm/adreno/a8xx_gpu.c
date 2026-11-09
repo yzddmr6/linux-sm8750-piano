@@ -881,7 +881,6 @@ void a8xx_recover(struct msm_gpu *gpu)
 {
 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
 	struct a6xx_gpu *a6xx_gpu = to_a6xx_gpu(adreno_gpu);
-	struct a6xx_gmu *gmu = &a6xx_gpu->gmu;
 	int active_submits;
 
 	adreno_dump_info(gpu);
@@ -915,34 +914,11 @@ void a8xx_recover(struct msm_gpu *gpu)
 	 */
 	gpu->active_submits = 0;
 
-	reinit_completion(&gmu->pd_gate);
-	dev_pm_genpd_add_notifier(gmu->cxpd, &gmu->pd_nb);
-	dev_pm_genpd_synced_poweroff(gmu->cxpd);
-
-	/* Drop the rpm refcount from active submits */
-	if (active_submits)
-		pm_runtime_put(&gpu->pdev->dev);
-
-	/* And the final one from recover worker */
-	pm_runtime_put_sync(&gpu->pdev->dev);
-
-	if (!wait_for_completion_timeout(&gmu->pd_gate, msecs_to_jiffies(1000)))
-		DRM_DEV_ERROR(&gpu->pdev->dev, "cx gdsc didn't collapse\n");
-
-	dev_pm_genpd_remove_notifier(gmu->cxpd);
-
-	pm_runtime_use_autosuspend(&gpu->pdev->dev);
-
-	if (active_submits)
-		pm_runtime_get(&gpu->pdev->dev);
-
-	pm_runtime_get_sync(&gpu->pdev->dev);
+	a6xx_recover_pm(gpu, active_submits);
 
 	gpu->active_submits = active_submits;
 	mutex_unlock(&gpu->active_lock);
-
-	msm_gpu_hw_init(gpu);
-	a6xx_gpu->hung = false;
+	pm_runtime_use_autosuspend(&gpu->pdev->dev);
 }
 
 static const char *a8xx_uche_fault_block(struct msm_gpu *gpu, u32 mid)

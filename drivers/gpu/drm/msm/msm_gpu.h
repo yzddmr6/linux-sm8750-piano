@@ -212,6 +212,9 @@ struct msm_gpu {
 	/* does gpu need hw_init? */
 	bool needs_hw_init;
 
+	/* Terminal recovery failure; protected by lock, read with READ_ONCE. */
+	bool wedged;
+
 	/**
 	 * global_faults: number of GPU hangs not attributed to a particular
 	 * address space
@@ -742,7 +745,8 @@ void msm_devfreq_idle(struct msm_gpu *gpu);
 int msm_gpu_hw_init(struct msm_gpu *gpu);
 
 void msm_gpu_retire(struct msm_gpu *gpu);
-void msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit);
+void msm_gpu_recovery_failed(struct msm_gpu *gpu, int error, bool quiesced);
+int msm_gpu_submit(struct msm_gpu *gpu, struct msm_gem_submit *submit);
 
 int msm_gpu_init(struct drm_device *drm, struct platform_device *pdev,
 		struct msm_gpu *gpu, const struct msm_gpu_funcs *funcs,

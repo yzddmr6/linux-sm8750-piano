@@ -201,10 +201,8 @@ sel_worker(struct work_struct *w)
 	scoped_guard (mutex, &gpu->lock) {
 		guard(mutex)(&gpu->perfcntr_lock);
 
-		if (stream == gpu->perfcntrs->stream) {
-			msm_gpu_hw_init(gpu);
+		if (stream == gpu->perfcntrs->stream && !msm_gpu_hw_init(gpu))
 			gpu->funcs->perfcntr_configure(gpu, ring, stream);
-		}
 	}
 
 	pm_runtime_put_autosuspend(&gpu->pdev->dev);
@@ -245,6 +243,9 @@ sample_worker(struct kthread_work *work)
 		container_of(work, typeof(*stream), sample_work);
 	struct msm_gpu *gpu = stream->gpu;
 	struct msm_rbmemptrs *memptrs = gpu->rb[0]->memptrs;
+
+	if (READ_ONCE(gpu->wedged))
+		return;
 
 	if (memptrs->perfcntr_fence != stream->sel_fence)
 		return;
@@ -309,6 +310,9 @@ sample_timer(struct hrtimer *hrtimer)
 {
 	struct msm_perfcntr_stream *stream =
 		container_of(hrtimer, typeof(*stream), sample_timer);
+
+	if (READ_ONCE(stream->gpu->wedged))
+		return HRTIMER_NORESTART;
 
 	kthread_queue_work(stream->gpu->worker, &stream->sample_work);
 
