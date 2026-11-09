@@ -26,6 +26,8 @@
 / {
 	model = "OnePlus Pad 2 Pro";
 	compatible = "oneplus,erhai", "qcom,sm8750";
+	qcom,mainline-model = "OnePlus Pad 2 Pro";
+	qcom,mainline-compatible = "oneplus,erhai", "qcom,sm8750";
 	chassis-type = "tablet";
 
 	aliases {

@@ -19,13 +19,16 @@
 
 struct abl_root_identity {
 	const char *saved;
+	const char *fallback;
 	struct property prop;
 };
 
 /* Linked into the live root node, so not __initdata. */
 static struct abl_root_identity abl_root_identity[] = {
-	{ .saved = "xiaomi,mainline-model", .prop.name = "model" },
-	{ .saved = "xiaomi,mainline-compatible", .prop.name = "compatible" },
+	{ .saved = "qcom,mainline-model",
+	  .fallback = "xiaomi,mainline-model", .prop.name = "model" },
+	{ .saved = "qcom,mainline-compatible",
+	  .fallback = "xiaomi,mainline-compatible", .prop.name = "compatible" },
 };
 
 /*
@@ -37,13 +40,18 @@ static int abl_root_identity_prepare(const struct device_node *np,
 				     struct abl_root_identity *id)
 {
 	const struct property *saved, *live;
+	const char *name = id->saved;
 	int ret;
 
-	saved = of_find_property(np, id->saved, NULL);
+	saved = of_find_property(np, name, NULL);
+	if (!saved && id->fallback) {
+		name = id->fallback;
+		saved = of_find_property(np, name, NULL);
+	}
 	if (!saved)
 		return -ENOENT;
 
-	ret = of_property_count_strings(np, id->saved);
+	ret = of_property_count_strings(np, name);
 	if (ret < 0)
 		return ret;
 

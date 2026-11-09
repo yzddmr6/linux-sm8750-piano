@@ -23,8 +23,9 @@ config QCOM_ABL_ROOT_IDENTITY
 	  Some Qualcomm ABL builds copy the root "model" and "compatible" of
 	  the vendor DTBO they apply over those of the booted DTB, so root
 	  match tables no longer recognise the SoC. If the DTB keeps its own
-	  values in the root properties "xiaomi,mainline-model" and
-	  "xiaomi,mainline-compatible", put them back before core initcalls.
+	  values in the root properties "qcom,mainline-model" and
+	  "qcom,mainline-compatible", put them back before core initcalls.
+	  The older "xiaomi,mainline-*" properties remain supported.
 	  DTBs without those properties are left alone.
 
 config QCOM_ABL_ROOT_IDENTITY_KUNIT_TEST
