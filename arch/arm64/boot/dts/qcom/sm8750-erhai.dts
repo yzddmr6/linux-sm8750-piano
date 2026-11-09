@@ -21,6 +21,8 @@
 #include "pmk8550.dtsi"
 #include "sm8750-pmics.dtsi"
 
+/delete-node/ &cpusys_vm_mem;
+
 / {
 	model = "OnePlus Pad 2 Pro";
 	compatible = "oneplus,erhai", "qcom,sm8750";
@@ -2259,6 +2261,10 @@
 
 &gpu {
 	status = "okay";
+};
+
+&gunyah_hyp_mem {
+	reg = <0x0 0x80000000 0x0 0x1200000>;
 };
 
 &gpu_zap_shader {
