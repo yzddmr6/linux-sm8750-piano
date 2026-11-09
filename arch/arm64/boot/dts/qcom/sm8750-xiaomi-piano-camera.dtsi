@@ -191,6 +191,7 @@
 
 			camera_wide: camera@10 {
 				compatible = "samsung,s5kjn1";
+				flash-leds = <&piano_camera_flash>;
 				reg = <0x10>;
 				power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
 				clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK1_CLK>;
