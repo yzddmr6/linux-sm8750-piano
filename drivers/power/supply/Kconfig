@@ -267,9 +267,10 @@ config CHARGER_SC8541_KUNIT_TEST
 
 config CHARGER_XIAOMI_MCA
 	tristate "Xiaomi MCA charger firmware over PMIC GLINK"
-	depends on QCOM_PMIC_GLINK
+	depends on QCOM_PMIC_GLINK && REGULATOR
 	depends on CHARGER_SC8541 || !CHARGER_SC8541
 	select AUXILIARY_BUS
+	select CRYPTO_LIB_SHA256
 	help
 	  Say Y here to read the USB input from the Xiaomi MCA charger
 	  firmware, which some Xiaomi devices with Qualcomm SoCs, such as the
@@ -1288,5 +1289,19 @@ config MACSMC_POWER
 	  power supply framework.
 
 	  Say Y or M here if you have an Apple Silicon based Mac.
+
+config CHARGER_SC96231_KUNIT_TEST
+	bool "SC96231 pen charger state tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && CHARGER_SC96231=y
+	default KUNIT_ALL_TESTS
+
+config CHARGER_SC96231
+	tristate "Southchip SC96231 wireless pen transmitter"
+	depends on I2C && GPIOLIB && INPUT && REGULATOR
+	select REGMAP_I2C
+	help
+	  Supply and control an SC96231 pen transmitter using standard regulator,
+	  input switch and power supply interfaces. The device's installed
+	  firmware handles the wireless link; no firmware update is performed.
 
 endif # POWER_SUPPLY

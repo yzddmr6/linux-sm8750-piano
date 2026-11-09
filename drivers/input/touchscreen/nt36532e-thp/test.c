@@ -13,11 +13,11 @@ struct nvt_mock {
 	u8 *memory;
 	unsigned int calls, fail_call, uploaded, resets;
 	unsigned int host_commands, host_polls, busy_reads;
-	u8 host_command[4][5];
+	u8 host_command[8][5];
 	u8 reset_states[4];
 	unsigned int reset_count, reset_polls;
 	u16 readback_value;
-	bool bad_id, bad_info, boot_ready, stuck_command;
+	bool bad_id, bad_info, boot_ready, stuck_command, stuck_model;
 };
 
 static void nvt_test_release(void *data)
@@ -74,7 +74,8 @@ static int nvt_mock_write(void *context, const void *data, size_t count)
 	if (address >= SZ_2M || size > SZ_2M - address)
 		return -EINVAL;
 	memcpy(mock->memory + address, value, size);
-	if (address == 0x11c450 && (size == 3 || size == 5) && value[0] == 0xbf) {
+	if (address == 0x11c450 && (((size == 3 || size == 5) && value[0] == 0xbf) ||
+				    (size == 2 && value[0] == 0x7b))) {
 		if (mock->host_commands < ARRAY_SIZE(mock->host_command))
 			memcpy(mock->host_command[mock->host_commands], value, size);
 		mock->host_commands++;
@@ -124,7 +125,8 @@ static int nvt_mock_read(void *context, const void *reg, size_t reg_size,
 		if (size == 5)
 			put_unaligned_le16(mock->readback_value, value + 3);
 		mock->host_polls++;
-		if (mock->stuck_command || mock->busy_reads) {
+		if (mock->stuck_command || mock->busy_reads ||
+		    (mock->stuck_model && mock->memory[address] == 0x7b)) {
 			if (mock->busy_reads)
 				mock->busy_reads--;
 			value[0] = mock->memory[address];
@@ -636,7 +638,47 @@ static void nvt_test_get_extend_command(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mock->host_polls, 11U);
 }
 
+static void nvt_test_pen_commands(struct kunit *test)
+{
+	static const u8 expected[5][5] = {
+		{ 0xbf, 0x04, 0, 0, 0 }, { 0xbf, 0x19, 0, 1, 0 },
+		{ 0xbf, 0x01, 0, 2, 0 }, { 0xbf, 0x04, 0, 1, 0 },
+		{ 0x7b, 3, 0, 0, 0 },
+	};
+	struct nvt_mock *mock = kunit_kzalloc(test, sizeof(*mock), GFP_KERNEL);
+	struct nvt_thp_command_status last;
+	struct regmap *map = nvt_mock_map(test, mock);
+	unsigned int calls, i;
+
+	KUNIT_ASSERT_EQ(test, nvt_thp_apply_host_commands(map, &last), 0);
+	KUNIT_ASSERT_EQ(test, nvt_thp_set_pen(map, 3, &last), 0);
+	KUNIT_EXPECT_MEMEQ(test, mock->host_command, expected, sizeof(expected));
+	mock->host_commands = mock->calls = 0;
+	KUNIT_ASSERT_EQ(test, nvt_thp_set_pen(map, 3, &last), 0);
+	calls = mock->calls;
+	for (i = 1; i <= calls; i++) {
+		mock->calls = mock->host_commands = 0;
+		mock->fail_call = i;
+		KUNIT_EXPECT_EQ(test, nvt_thp_set_pen(map, 3, &last), -EREMOTEIO);
+		KUNIT_EXPECT_EQ(test, mock->calls, i);
+	}
+	mock->fail_call = 0;
+	mock->host_commands = 0;
+	KUNIT_ASSERT_EQ(test, nvt_thp_set_pen(map, 0, &last), 0);
+	KUNIT_EXPECT_EQ(test, mock->host_commands, 1U);
+	KUNIT_EXPECT_EQ(test, mock->host_command[0][3], 0);
+	KUNIT_EXPECT_EQ(test, nvt_thp_set_pen(map, 4, &last), -EINVAL);
+	mock->host_commands = 0;
+	mock->stuck_model = true;
+	KUNIT_EXPECT_EQ(test, nvt_thp_set_pen(map, 3, &last), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, last.sub_command, 0x7b);
+	KUNIT_EXPECT_EQ(test, last.status, 0x7b);
+	/* A pending model command is not rewritten by the poll loop. */
+	KUNIT_EXPECT_EQ(test, mock->host_commands, 2U);
+}
+
 static struct kunit_case nvt_cases[] = {
+	KUNIT_CASE(nvt_test_pen_commands),
 	KUNIT_CASE(nvt_test_layout),
 	KUNIT_CASE(nvt_test_bad_layout),
 	KUNIT_CASE(nvt_test_upload),

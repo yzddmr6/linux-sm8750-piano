@@ -77,8 +77,8 @@ static void sc8541_test_protections(struct kunit *test)
 	struct sc8541_test *f = sc8541_test_init(test);
 
 	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
-	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOVP], 46);
-	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOVP_ALM], 41);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOVP], 76);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOVP_ALM], 71);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BUSOVP], 80);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BUSOVP_ALM], 70);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BUSOCP] & 0x9f, 10);
@@ -233,7 +233,28 @@ static void sc8541_test_otg_failure(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->sc.otg_owned);
 }
 
+static void sc8541_test_pen_gate(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	f->regs[0x40] = 0x25;
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_PEN_ISOLATE), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[0x40], 0x45);
+	KUNIT_EXPECT_TRUE(test, f->sc.pen_owned);
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -EBUSY);
+	KUNIT_EXPECT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_OTG_REVERSE_ON), -EBUSY);
+	/* Re-applying after an ADSP epoch must not overwrite the saved gate. */
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_PEN_ISOLATE), 0);
+	KUNIT_ASSERT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_PEN_RESTORE), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[0x40], 0x25);
+	KUNIT_EXPECT_FALSE(test, f->sc.pen_owned);
+	f->sc.enabled = true;
+	KUNIT_EXPECT_EQ(test, sc8541_otg_locked(&f->sc, SC8541_PEN_ISOLATE), -EBUSY);
+	KUNIT_EXPECT_EQ(test, f->regs[0x40], 0x25);
+}
+
 static struct kunit_case sc8541_test_cases[] = {
+	KUNIT_CASE(sc8541_test_pen_gate),
 	KUNIT_CASE(sc8541_test_otg_failure),
 	KUNIT_CASE(sc8541_test_otg_detach),
 	KUNIT_CASE(sc8541_test_otg_sequence),

@@ -71,15 +71,16 @@
 #define SC8541_BUSOCP_STEP_MA	250
 
 /*
- * Protections programmed before switching starts.  The battery limit is
- * far below the stock 4800 mV: the caller leaves direct charging well
- * before the buck charger's float voltage, so this only trips if it does
- * not.  The bus limits fit a 2:1 stage fed from an 11 V PPS source; the
+ * Protections programmed before switching starts. Battery OVP/alarm stay
+ * below stock's 4800/4600 mV, with room for MCA's normal 4473 mV cutoff
+ * and its optional 4540 mV cutoff. The former 4300/4250 mV protections
+ * would stop the normal stock profile prematurely. The bus limits fit
+ * a 2:1 stage fed from an 11 V PPS source; the
  * bus over-current limit can be raised for sources that offer more than
  * 3 A, up to the stock value.
  */
-#define SC8541_BATOVP_MV	4300
-#define SC8541_BATOVP_ALM_MV	4250
+#define SC8541_BATOVP_MV	4600
+#define SC8541_BATOVP_ALM_MV	4550
 #define SC8541_BUSOVP_MV	11000
 #define SC8541_BUSOVP_ALM_MV	10500
 #define SC8541_BUSOCP_MA	3500
@@ -134,6 +135,8 @@ struct sc8541 {
 	struct mutex lock;		/* enabled, register sequences */
 	struct delayed_work watch;	/* kick timeout, or the check after a stop */
 	bool enabled;
+	bool pen_owned;
+	u32 pen_gate_saved;
 	bool otg_owned;		/* excludes the forward charging policy */
 	u32 busocp_ma;
 	struct dentry *dbg;
@@ -244,7 +247,7 @@ static int sc8541_enable(struct sc8541 *sc)
 	int ret = 0;
 
 	mutex_lock(&sc->lock);
-	if (sc->otg_owned) {
+	if (sc->otg_owned || sc->pen_owned) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -371,6 +374,33 @@ static int sc8541_otg_locked(struct sc8541 *sc, enum sc8541_otg_action action)
 		return 0;
 	if (sc->enabled)
 		return -EBUSY;
+	if (action == SC8541_PEN_ISOLATE) {
+		if (sc->otg_owned)
+			return -EBUSY;
+		if (!sc->pen_owned) {
+			ret = regmap_read(sc->regmap, SC8541_GATE_CTRL, &value);
+			if (ret)
+				return ret;
+			sc->pen_gate_saved = value;
+			sc->pen_owned = true;
+		}
+		/* Stock client 1 votes the OVP gate OFF before HBOOST. */
+		return sc8541_write_check(sc, SC8541_GATE_CTRL,
+				SC8541_ACDRV_MANUAL | SC8541_OVPGATE,
+				SC8541_ACDRV_MANUAL);
+	}
+	if (action == SC8541_PEN_RESTORE) {
+		if (!sc->pen_owned)
+			return 0;
+		ret = sc8541_write_check(sc, SC8541_GATE_CTRL,
+				SC8541_ACDRV_MANUAL | SC8541_OVPGATE,
+				sc->pen_gate_saved & (SC8541_ACDRV_MANUAL | SC8541_OVPGATE));
+		if (!ret)
+			sc->pen_owned = false;
+		return ret;
+	}
+	if (sc->pen_owned)
+		return -EBUSY;
 
 	/* Retain ownership after a partial write; do not start sink charging. */
 	if (action == SC8541_OTG_REVERSE_ON || action == SC8541_OTG_REVERSE_OFF)
@@ -492,7 +522,7 @@ static int sc8541_set_property(struct power_supply *psy,
 
 	if (psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT) {
 		mutex_lock(&sc->lock);
-		if (sc->otg_owned) {
+		if (sc->otg_owned || sc->pen_owned) {
 			mutex_unlock(&sc->lock);
 			return -EBUSY;
 		}

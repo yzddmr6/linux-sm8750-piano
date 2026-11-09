@@ -623,6 +623,7 @@
 			interrupt-controller;
 			#interrupt-cells = <2>;
 		};
+
 	};
 
 	smp2p-cdsp {

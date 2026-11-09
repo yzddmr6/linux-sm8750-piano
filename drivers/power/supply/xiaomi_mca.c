@@ -12,7 +12,7 @@
  * Standard power_supply telemetry and ICL/FCC writes retain their units,
  * checked replies/readback and unknown-source refusal. The complete community
  * charging policy is opt-in: source-bounded 9 V/PPS, battery-temperature FCC,
- * MiPPS relay, SC8541 direct charging and temperature-bounded float voltage.
+ * in-kernel MiPPS, SC8541 direct charging and temperature-bounded float voltage.
  * Optional battery thresholds use the stock charge-enable command. Firmware
  * JEITA is never disabled. All policy switches and thresholds default off.
  * USB-C port acknowledgments belong to the existing AltMode client.
@@ -22,6 +22,7 @@
 #include <linux/cleanup.h>
 #include <linux/completion.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
@@ -31,10 +32,12 @@
 #include <linux/ktime.h>
 #include <linux/power/sc8541_charger.h>
 #include <linux/mutex.h>
+#include <linux/regulator/driver.h>
 #include <linux/pm.h>
 #include <linux/pm_wakeup.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
+#include <linux/random.h>
 #include <linux/seq_file.h>
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
@@ -42,6 +45,9 @@
 #include <linux/unaligned.h>
 #include <linux/units.h>
 #include <linux/workqueue.h>
+#include <crypto/sha2.h>
+
+#include "xiaomi_mca_mipps.h"
 
 #if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
 #include <kunit/static_stub.h>
@@ -153,7 +159,7 @@ struct xiaomi_mca_pdo {
 
 /*
  * Xiaomi charger authentication (MiPPS): the ADSP exchanges the PD
- * unstructured VDMs with the adapter, userspace computes the digests.
+ * unstructured VDMs with the adapter; the kernel computes the digests.
  * Command n (1-8) goes to property 0x21003 + n - 1, as in the stock
  * adsp_pd_protocol_request_vdm_cmd().
  */
@@ -167,6 +173,8 @@ struct xiaomi_mca_pdo {
 #define MCA_PROP_VDM_REMOVE_COMP 0x21009
 #define MCA_PROP_VDM_REVERSE	0x2100a
 #define MCA_PROP_DATA_ROLE	0x2100c	/* 1 UFP, 2 DFP; write asks a swap */
+#define MCA_PROP_PD_STATE	0x2100d
+#define MCA_PD_SNK_READY		2
 #define MCA_PROP_ADAPTER_ID	0x2100e
 #define MCA_PROP_ADAPTER_SVID	0x2100f
 #define MCA_PROP_PD_VERIFIED	0x21010
@@ -249,7 +257,7 @@ MODULE_PARM_DESC(charge_policy,
  * ADSP restarts put the fallback value back.
  */
 #define MCA_FCC_MIN_MA		100
-#define MCA_FCC_MAX_MA		3000	/* the ADSP's own nominal value */
+#define MCA_FCC_MAX_MA		3500	/* stock buck chg_pps; PD stays at 3000 */
 #define MCA_FCC_DEFAULT_MA	500
 #define MCA_FCC_TBAT_MIN	15
 #define MCA_FCC_DERATE_FROM	38
@@ -268,6 +276,7 @@ MODULE_PARM_DESC(charge_current,
  */
 #define MCA_TERM_DEFAULT_MV	4400
 #define MCA_TERM_FULL_MV	4480
+#define MCA_TERM_FFC_MV		4540	/* below stock FFC FV 4550 */
 #define MCA_TERM_HOT_MV		4060
 #define MCA_TERM_HOT_DEGC	48
 #define MCA_TERM_COOL_DEGC	46
@@ -316,7 +325,7 @@ MODULE_PARM_DESC(hv_charge,
 static bool mipps_auth;
 module_param(mipps_auth, bool, 0644);
 MODULE_PARM_DESC(mipps_auth,
-		 "Expose the Xiaomi charger authentication (MiPPS) messages to userspace (default: off)");
+		 "Authenticate Xiaomi MiPPS adapters before PPS negotiation (default: off)");
 
 /*
  * cp_charge: direct charging through the SC8541 2:1 switched-capacitor
@@ -329,14 +338,16 @@ MODULE_PARM_DESC(mipps_auth,
  * time until current flows, then regulate the voltage every MCA_CP_POLL_MS
  * so the bus current stays at its target and the battery current (both
  * gauges) below the limit of xiaomi_mca_cp_ibat_limit().  The limits follow
- * stock's battery tables without FFC (the charger firmware defaults to
- * 4400 mV: readback 5200 = 2 * mV - 3600), within a narrower window:
+ * the selected stock battery table, within a narrower thermal window.
+ * The Chinese lwn normal table is used unless authenticated PPS, both
+ * cells and pack at 18-47 C, and both cells below 95 percent allow FFC.
+ * The charger firmware defaults to 4400 mV (readback = 2 * mV - 3600):
  * direct charging only runs from MCA_CP_VBAT_MIN_MV to MCA_CP_VBAT_MAX_MV
  * and from MCA_CP_TBAT_MIN to
  * MCA_CP_TBAT_EXIT degC, and the buck charger does the rest.  The bus
- * target is cp_ibus_max, at most MCA_CP_IBUS_MAX_MA (stock div_max_curr)
- * from a verified Xiaomi adapter and MCA_CP_THIRD_IBUS_MA (stock
- * third_pps_ibus_max) from other PPS sources, and is lowered while the
+ * budget follows the APDO and the 67 W source limit. DIV2 is limited to
+ * 12 A on the battery side, not 5 A on the bus. Third-party PPS sources
+ * are limited to 4100 mA total bus current. The target is lowered while the
  * stage is hot, see xiaomi_mca_cp_step().  Anything
  * unexpected (a read failure, the stage turning itself off, the bus out of
  * range, too little or too much current, detach, an ADSP restart, unbind)
@@ -345,9 +356,11 @@ MODULE_PARM_DESC(mipps_auth,
  * for 3 s, and its bus over-current protection is set 1 A above the target.
  */
 #define MCA_CP_POLL_MS		500
-#define MCA_CP_VBAT_MIN_MV	3500
-#define MCA_CP_VBAT_START_MV	4100	/* only starts below this */
-#define MCA_CP_VBAT_MAX_MV	4200
+#define MCA_CP_VBAT_MIN_MV	3450	/* stock min_vbat */
+#define MCA_CP_VBAT_MAX_MV	4473	/* normal_volt_para18_35/35_48 */
+#define MCA_CP_VBAT_FFC_MV	4540	/* ffc_volt_para18_35/35_48 */
+#define MCA_CP_VBAT_HYS_MV	13	/* pps_taper_vol_hys + quick_chg_fv_hys */
+#define MCA_CP_CELL_OCP_MA	7000	/* lower of stock ocp_threshold 9/7 A */
 /* stock normal_volt_para18_35: 8 A, 7.23 A from 4150 mV */
 #define MCA_CP_VSTEP_MV		4150
 #define MCA_CP_VSTEP_MA		7230
@@ -369,7 +382,8 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_TBAT_HOLD_MS	30000
 #define MCA_CP_TBAT_RAMP_MA	500
 #define MCA_CP_TBAT_RAMP_MS	15000
-#define MCA_CP_IBAT_MAX_MA	8000
+#define MCA_CP_IBAT_MAX_MA	12000	/* stock div_max_curr[DIV2], battery side */
+#define MCA_CP_MAX_POWER_MW	67000	/* stock max_power */
 #define MCA_CP_IBAT_REDUCED_MA	4500
 /*
  * Stage temperature, 0.1 degC: from MCA_CP_TDIE_HOT the bus target drops
@@ -399,7 +413,7 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_VBUS_MAX_DELTA_MV 1200
 #define MCA_CP_REQ_MAX_DELTA_MV	2000
 #define MCA_CP_PPS_MIN_MV	6000
-#define MCA_CP_PPS_MAX_MV	10000
+#define MCA_CP_PPS_MAX_MV	11000	/* stock third_pps_vbus_max */
 #define MCA_CP_BUCK_MA		500	/* buck input limit and charge current */
 /*
  * Stock (strategy_quickchg_pmic_single_cp_charging) has the buck charger
@@ -416,7 +430,6 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_PAR_FCC_MA	2000
 #define MCA_CP_PAR_ICL_MA	1500
 #define MCA_CP_PPS_MAX_MA	6000	/* current limit asked of the source */
-#define MCA_CP_IBUS_MAX_MA	5000
 #define MCA_CP_THIRD_IBUS_MA	4100
 /* bus over-current protection of the stage, above the target */
 #define MCA_CP_BUSOCP_MARGIN_MA	1000
@@ -446,17 +459,34 @@ module_param(cp_charge, bool, 0644);
 MODULE_PARM_DESC(cp_charge,
 		 "Charge through the SC8541 switched-capacitor stage from PPS sources; needs hv_charge and charge_current (default: off)");
 
-static unsigned int cp_ibus_max = 4000;
-module_param(cp_ibus_max, uint, 0444);
-MODULE_PARM_DESC(cp_ibus_max,
-		 "Bus current of the switched-capacitor stage, mA (500-5000, default 4000; at most what the source offers less 700, 4100 from unverified sources)");
-
-static unsigned int cp_ibat_max = MCA_CP_IBAT_MAX_MA;
+static unsigned int cp_ibat_max;
 module_param(cp_ibat_max, uint, 0444);
 MODULE_PARM_DESC(cp_ibat_max,
-		 "Battery current while direct charging, both cells, mA (1000-8000, default 8000; lower by battery voltage and temperature)");
+		 "Battery current ceiling, both cells, mA (0 follows selected stock table; 1000-12000 overrides downwards)");
 
 
+/* Chinese lwn tables; the _gbl node is only for non-CN hardware. */
+enum xiaomi_mca_profile {
+	MCA_PROFILE_NORMAL,
+	MCA_PROFILE_FFC,
+	MCA_PROFILE_COUNT,
+};
+
+static const char * const xiaomi_mca_profile_names[] = { "normal", "ffc" };
+
+struct xiaomi_mca_charge_step {
+	u32 mv;
+	u32 ma;
+};
+
+static const struct xiaomi_mca_charge_step xiaomi_mca_profile_steps[][4] = {
+	[MCA_PROFILE_NORMAL] = { { 4150, 8000 }, { 4473, 7230 } },
+	[MCA_PROFILE_FFC] = {
+		{ 4144, 12400 }, { 4300, 10650 }, { 4475, 9040 }, { 4540, 7230 },
+	},
+};
+
+static const unsigned int xiaomi_mca_profile_counts[] = { 2, 4 };
 
 enum xiaomi_mca_hv {
 	MCA_HV_OFF,		/* 5 V, may ask for 9 V */
@@ -590,6 +620,9 @@ struct xiaomi_mca_notify_record {
 	u32 data[4];
 };
 
+#define MCA_PROP_PEN_BOOST_ENABLE 0x200f
+#define MCA_PROP_PEN_BOOST_VOLTAGE 0x2010
+
 struct xiaomi_mca {
 	struct device *dev;
 	struct pmic_glink_client *client;
@@ -610,6 +643,10 @@ struct xiaomi_mca {
 	bool voltage_written;	/* a raised voltage request may have reached firmware */
 	struct xiaomi_mca_state icl_source;
 
+	struct regulator_dev *pen_rdev;
+	bool pen_requested, pen_on, pen_dirty;
+	u32 pen_generation, pen_attempt_generation;
+	bool pen_attempted;
 	bool piano_otg;
 	bool config_attempted;
 	u32 config_generation;
@@ -620,6 +657,7 @@ struct xiaomi_mca {
 	struct delayed_work poll_work;
 	bool term_written;	/* restore even after a lost write acknowledgment */
 	bool term_hot;		/* float-voltage thermal hysteresis */
+	bool ffc_active;		/* checked again every poll, never latched by auth */
 	/* Thresholds are shared by the two cells and protected by rx_lock. */
 	unsigned int charge_start, charge_end;
 	struct wakeup_source *charge_ws;
@@ -647,7 +685,8 @@ struct xiaomi_mca {
 	enum xiaomi_mca_cp cp;
 	struct power_supply *cp_psy;	/* the stage, held while not MCA_CP_OFF */
 	u32 cp_mv;		/* voltage asked of the PPS source */
-	u32 cp_ma;		/* its current limit */
+	u32 cp_ma;		/* APDO current limit, with source/authentication caps */
+	u32 cp_request_ma;	/* current in the most recent PPS request */
 	u32 cp_max_mv;		/* the most the source offers */
 	u32 cp_ibus_ma;		/* bus current target */
 	u32 cp_ibus_hot;	/* the target as lowered for the stage temperature */
@@ -655,6 +694,9 @@ struct xiaomi_mca {
 	/* jiffies when the limit was last that high, or the stage above target */
 	unsigned long cp_trip_at;
 	u32 cp_warm_ma;		/* battery limit as reduced for temperature */
+	enum xiaomi_mca_profile cp_profile; /* follows the current FFC conditions */
+	unsigned int cp_stage; /* monotonic while the selected table is unchanged */
+	u32 cp_target_ma; /* effective battery target after table/thermal limits */
 	unsigned long cp_warm_at;	/* jiffies when it last changed */
 	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
 	int cp_polls;		/* while opening: tries; then: polls */
@@ -663,7 +705,15 @@ struct xiaomi_mca {
 	u32 cp_ibus_cap;	/* learned from a source dropping out, 0 if none */
 	unsigned long cp_off_at;	/* jiffies when the source went away */
 	unsigned long cp_on_at;		/* jiffies when it came */
-	bool auth_ok;		/* xiaomi-mipps-auth reported the adapter verified */
+	bool auth_ok;		/* adapter response matched our fresh challenge */
+	u32 auth_generation;
+	u32 auth_attach_generation;
+	u32 policy_attach_generation;
+	u32 attach_generation;	/* physical UCSI disconnects, under rx_lock */
+	int ucsi_state;
+	struct notifier_block psy_nb;
+	bool auth_cleanup;	/* verify_process clear still needs confirmation */
+	bool mipps_attempted;	/* one exchange per physical attachment */
 	unsigned long auth_at;	/* jiffies when it did */
 	bool auth_tried;	/* direct charging asked for before any reset */
 	unsigned long hv_retry;	/* jiffies before which 9 V is not asked for */
@@ -693,6 +743,20 @@ struct xiaomi_mca {
 	size_t reply_len;
 	struct xiaomi_mca_stats stats;
 };
+
+/* The poll mutex keeps the saved attachment fixed throughout an exchange. */
+static bool xiaomi_mca_auth_current(struct xiaomi_mca *mca, u32 generation)
+{
+	return generation == READ_ONCE(mca->service_generation) &&
+	       mca->auth_attach_generation == READ_ONCE(mca->attach_generation);
+}
+
+static bool xiaomi_mca_authenticated(struct xiaomi_mca *mca)
+{
+	return mca->auth_ok && xiaomi_mca_auth_current(mca, mca->auth_generation);
+}
+
+static int xiaomi_mca_read_type(struct xiaomi_mca *mca, u32 *type);
 
 /* A write carries @value in the first four bytes of the data area, a read nothing. */
 static void xiaomi_mca_build_request(struct xiaomi_mca_request *req, u32 opcode,
@@ -764,7 +828,7 @@ static int xiaomi_mca_usb_type(u32 real_type)
 }
 
 static const struct xiaomi_mca_limits xiaomi_mca_pd_limits = { 1600, 3000 };
-static const struct xiaomi_mca_limits xiaomi_mca_pps_limits = { 2500, 3000 };
+static const struct xiaomi_mca_limits xiaomi_mca_pps_limits = { 2500, 3500 };
 
 static const struct xiaomi_mca_limits *xiaomi_mca_limits(u32 real_type)
 {
@@ -946,7 +1010,7 @@ static int xiaomi_mca_restore_icl(struct xiaomi_mca *mca)
 		return 0;
 
 	/* Unknown also forbids automatic writes; wait for a recognized source. */
-	ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &real_type);
+	ret = xiaomi_mca_read_type(mca, &real_type);
 	if (ret || !xiaomi_mca_limits(real_type))
 		return ret ?: -EOPNOTSUPP;
 
@@ -992,6 +1056,12 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	u32 val = len == sizeof(u32) ? get_unaligned_le32(data) : 0;
 
 	switch (prop) {
+	case MCA_PROP_PEN_BOOST_ENABLE:
+		return len == sizeof(u32) && (val == 0x20100 || val == 0x20101);
+	case MCA_PROP_PEN_BOOST_VOLTAGE:
+		return len == sizeof(u32) && (val == (BIT(16) | 5000) ||
+			val == (BIT(16) | 5200) || val == (BIT(16) | 5500) ||
+			val == (BIT(16) | 6000) || val == (BIT(16) | 6500));
 	case MCA_PROP_CID_CFG:
 		return len == sizeof(u32) && val == MCA_PIANO_CID_CFG;
 	case MCA_PROP_CHARGING_ENABLED:
@@ -1007,7 +1077,7 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	case MCA_PROP_TERM_VOLT:
 		return len == sizeof(u32) &&
 		       (val == MCA_TERM_HOT_MV || val == MCA_TERM_DEFAULT_MV ||
-			val == MCA_TERM_FULL_MV);
+			val == MCA_TERM_FULL_MV || val == MCA_TERM_FFC_MV);
 	case MCA_PROP_CHARGE_CURRENT:
 		return len == sizeof(u32) &&
 		       val >= MCA_FCC_MIN_MA && val <= MCA_FCC_MAX_MA;
@@ -1023,16 +1093,13 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 		return mipps_auth && len == sizeof(u32);
 	case MCA_PROP_VDM_SEED:
 	case MCA_PROP_VDM_AUTH:
-	case MCA_PROP_VDM_REVERSE:
 		return mipps_auth && len == MCA_VDM_LEN;
-	case MCA_PROP_DATA_ROLE:
-		return mipps_auth && len == sizeof(u32) &&
-		       (val == MCA_DATA_ROLE_UFP || val == MCA_DATA_ROLE_DFP);
 	case MCA_PROP_VDM_VERIFIED:
 	case MCA_PROP_VDM_REMOVE_COMP:
+		return mipps_auth && len == sizeof(u32) && val <= 1;
 	case MCA_PROP_PD_VERIFIED:
 	case MCA_PROP_VERIFY_PROCESS:
-		return mipps_auth && len == sizeof(u32) && val <= 1;
+		return len == sizeof(u32) && val <= 1 && (mipps_auth || !val);
 	default:
 		return false;
 	}
@@ -1071,6 +1138,9 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		return enabled == *(const u8 *)data ? 0 : -EIO;
 	}
 	if (prop == MCA_PROP_TERM_VOLT) {
+		if (get_unaligned_le32(data) == MCA_TERM_FFC_MV &&
+		    !mca->ffc_active)
+			return -EPERM;
 		/* Unlike source current limits, this also restores while unplugged. */
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
 			generation = mca->service_generation;
@@ -1106,13 +1176,20 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		}
 		return buf[0] == *(const u8 *)data ? 0 : -EIO;
 	}
-	if (prop == MCA_PROP_CP_STATE || prop == MCA_PROP_OTG_CFG || prop == MCA_PROP_CID_CFG) {
+	if (prop == MCA_PROP_CP_STATE || prop == MCA_PROP_OTG_CFG || prop == MCA_PROP_CID_CFG ||
+	    prop == MCA_PROP_PEN_BOOST_ENABLE || prop == MCA_PROP_PEN_BOOST_VOLTAGE) {
 		if (!mca->piano_otg)
 			return -EOPNOTSUPP;
 		memcpy(buf, data, len);
 		return xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
 	}
-	ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &type);
+	/* Clearing our authentication interlocks cannot raise source limits. */
+	if ((prop == MCA_PROP_VERIFY_PROCESS || prop == MCA_PROP_PD_VERIFIED) &&
+	    !get_unaligned_le32(data)) {
+		memcpy(buf, data, len);
+		return xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
+	}
+	ret = xiaomi_mca_read_type(mca, &type);
 	if (ret)
 		return ret;
 	if (!xiaomi_mca_limits(type))
@@ -1182,6 +1259,225 @@ static u32 xiaomi_mca_read_u32(struct xiaomi_mca *mca, u32 prop)
 
 	return le32_to_cpu(val);
 }
+
+static int xiaomi_mca_clear_auth(struct xiaomi_mca *mca)
+{
+	int ret;
+
+	if (!mca->auth_cleanup)
+		return 0;
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 0);
+	if (!ret)
+		mca->auth_cleanup = false;
+	return ret;
+}
+
+/*
+ * MiPPS challenge/response from xiaomi-mipps-auth, with Piano's stock
+ * command order. The transport and charging policy remain in this driver.
+ */
+static int xiaomi_mca_vdm(struct xiaomi_mca *mca, unsigned int generation,
+			 unsigned int cmd, const u8 *bytes, u32 flag)
+{
+	__le32 payload[MCA_VDM_LEN / 4] = {};
+	unsigned long deadline;
+	size_t len = sizeof(payload[0]);
+	__le32 state, vbus;
+	int attempt, i, ret;
+
+	if (bytes) {
+		for (i = 0; i < ARRAY_SIZE(payload); i++)
+			payload[i] = cpu_to_le32(get_unaligned_be32(bytes + 4 * i));
+		len = sizeof(payload);
+	} else {
+		payload[0] = cpu_to_le32(flag);
+	}
+
+	/* Stock batterysecret retries an unanswered command once. */
+	for (attempt = 0; attempt < 2; attempt++) {
+		if (!xiaomi_mca_auth_current(mca, generation))
+			return -ENODEV;
+		ret = xiaomi_mca_write_blob(mca, MCA_PROP_VDM_BASE + cmd - 1,
+				      payload, len);
+		if (ret)
+			return ret;
+		msleep(cmd == 4 || cmd == 5 ? 500 : 5);
+		deadline = jiffies + msecs_to_jiffies(1000);
+		do {
+			if (!xiaomi_mca_auth_current(mca, generation))
+				return -ENODEV;
+			ret = xiaomi_mca_read_blob(mca, MCA_PROP_USB_VOLTAGE_NOW,
+						   &vbus, sizeof(vbus));
+			if (ret || le32_to_cpu(vbus) < MCA_VBUS_ONLINE_UV)
+				return ret ?: -ENODEV;
+			ret = xiaomi_mca_read_blob(mca, MCA_PROP_UVDM_STATE, &state, sizeof(state));
+			if (ret)
+				return ret;
+			if (le32_to_cpu(state) == cmd)
+				return 0;
+			msleep(20);
+		} while (time_before(jiffies, deadline));
+	}
+	return -ETIMEDOUT;
+}
+
+static bool xiaomi_mca_mipps_digest(struct xiaomi_mca *mca,
+				  const struct piano_mipps_key *key,
+				  u8 message[20], const u8 response[MCA_VDM_LEN],
+				  u8 digest[SHA256_DIGEST_SIZE], u32 *adapter_id,
+				  unsigned int generation)
+{
+	struct hmac_sha256_key prepared;
+	u32 id;
+	bool matched = false;
+
+	hmac_sha256_preparekey(&prepared, key->key, sizeof(key->key));
+	put_unaligned_be32(*adapter_id, message + MCA_VDM_LEN);
+	hmac_sha256(&prepared, message, 20, digest);
+	if (*adapter_id && !memcmp(response, digest, MCA_VDM_LEN)) {
+		matched = true;
+		goto out;
+	}
+
+	/*
+	 * Firmware can omit or retain an old ID. Recover it only from a valid
+	 * answer to our fresh random challenge, never from a cached identity.
+	 * Limit work to 65536 guesses; reported 32-bit IDs are checked above.
+	 * No match simply leaves this source on ordinary PD/PPS.
+	 */
+	for (id = 0; id < 65536; id++) {
+		if (!(id & 255)) {
+			if (!xiaomi_mca_auth_current(mca, generation))
+				break;
+			cond_resched();
+		}
+		put_unaligned_be32(id, message + MCA_VDM_LEN);
+		hmac_sha256(&prepared, message, 20, digest);
+		if (!memcmp(response, digest, MCA_VDM_LEN)) {
+			*adapter_id = id;
+			matched = true;
+			break;
+		}
+	}
+out:
+	memzero_explicit(&prepared, sizeof(prepared));
+	return matched;
+}
+
+static void xiaomi_mca_mipps_authenticate(struct xiaomi_mca *mca)
+{
+	struct xiaomi_mca_pdo pdos[MCA_PD_MAX_PDOS];
+	const struct piano_mipps_key *key;
+	u8 message[20], digest[SHA256_DIGEST_SIZE], response[MCA_VDM_LEN];
+	__le32 words[MCA_VDM_LEN / 4], version, vbus;
+	unsigned int generation = READ_ONCE(mca->service_generation);
+	u32 attachment = READ_ONCE(mca->attach_generation);
+	u32 adapter_id;
+	bool discovered = false, capable = false;
+	int i, ret;
+
+	if (!mipps_auth || mca->mipps_attempted || xiaomi_mca_authenticated(mca) ||
+	    mca->hv != MCA_HV_OFF || mca->cp != MCA_CP_OFF ||
+	    (mca->real_type != MCA_TYPE_PD &&
+	     mca->real_type != MCA_TYPE_PD_VERIFY &&
+	     mca->real_type != MCA_TYPE_PD_PPS))
+		return;
+	if (xiaomi_mca_read_blob(mca, MCA_PROP_PDOS, pdos, sizeof(pdos)))
+		return;
+	for (i = 0; i < MCA_PD_MAX_PDOS; i++)
+		capable |= le32_to_cpu(pdos[i].max_mv) > 5000;
+	if (!capable || generation != READ_ONCE(mca->service_generation) ||
+	    attachment != READ_ONCE(mca->attach_generation))
+		return;
+
+	mca->auth_attach_generation = attachment;
+	mca->auth_ok = false;
+	mca->mipps_attempted = true;
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 1);
+	if (ret)
+		goto finish;
+
+	/* A Xiaomi VDM query works as UFP too. Never swap PC/hub data roles. */
+	ret = xiaomi_mca_vdm(mca, generation, 1, NULL, 0);
+	if (ret)
+		goto finish;
+	ret = xiaomi_mca_read_blob(mca, MCA_PROP_VDM_VERSION, &version, sizeof(version));
+	if (ret || !le32_to_cpu(version) || le32_to_cpu(version) == U32_MAX) {
+		ret = ret ?: -ENODEV;
+		goto finish;
+	}
+	discovered = true;
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_PD_VERIFIED, 0);
+	if (ret)
+		goto finish;
+	for (i = 2; i <= 3; i++) {
+		ret = xiaomi_mca_vdm(mca, generation, i, NULL, 0);
+		if (ret)
+			goto finish;
+	}
+
+	key = &piano_mipps_keys[get_random_u32_below(ARRAY_SIZE(piano_mipps_keys))];
+	get_random_bytes(message, MCA_VDM_LEN);
+	ret = xiaomi_mca_vdm(mca, generation, 4, key->seed, 0);
+	if (ret)
+		goto finish;
+	ret = xiaomi_mca_vdm(mca, generation, 5, message, 0);
+	if (ret)
+		goto finish;
+	ret = xiaomi_mca_read_blob(mca, MCA_PROP_VDM_AUTH, words, sizeof(words));
+	if (ret)
+		goto finish;
+	for (i = 0; i < ARRAY_SIZE(words); i++)
+		put_unaligned_be32(le32_to_cpu(words[i]), response + 4 * i);
+	adapter_id = xiaomi_mca_read_u32(mca, MCA_PROP_ADAPTER_ID);
+	if (!xiaomi_mca_mipps_digest(mca, key, message, response, digest,
+				    &adapter_id, generation)) {
+		ret = -EKEYREJECTED;
+		goto finish;
+	}
+
+	/* Piano batterysecret sends 7 then 6. Command 8 stalls this firmware. */
+	ret = xiaomi_mca_vdm(mca, generation, 7, NULL, 1);
+	ret = ret ?: xiaomi_mca_vdm(mca, generation, 6, NULL, 1);
+	if (ret)
+		goto finish;
+	ret = xiaomi_mca_read_blob(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus, sizeof(vbus));
+	if (ret || le32_to_cpu(vbus) < MCA_VBUS_ONLINE_UV ||
+	    !xiaomi_mca_auth_current(mca, generation)) {
+		ret = ret ?: -ENODEV;
+		goto finish;
+	}
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_PD_VERIFIED, 1);
+	if (!ret && !xiaomi_mca_auth_current(mca, generation))
+		ret = -ENODEV;
+	if (!ret) {
+		mca->auth_generation = generation;
+		mca->auth_ok = true;
+		mca->auth_at = jiffies;
+		mca->auth_tried = false;
+	}
+finish:
+	if (generation == READ_ONCE(mca->service_generation)) {
+		if (ret && discovered) {
+			xiaomi_mca_write_u32(mca, MCA_PROP_PD_VERIFIED, 0);
+			if (xiaomi_mca_auth_current(mca, generation))
+				xiaomi_mca_vdm(mca, generation, 7, NULL, 0);
+		}
+		/* An unconfirmed clear blocks voltage negotiation until it succeeds. */
+		mca->auth_cleanup = true;
+		xiaomi_mca_clear_auth(mca);
+	}
+	memzero_explicit(message, sizeof(message));
+	memzero_explicit(digest, sizeof(digest));
+	memzero_explicit(response, sizeof(response));
+	if (!ret)
+		dev_info(mca->dev, "MiPPS adapter %08x authenticated\n", adapter_id);
+	else if (discovered)
+		dev_info(mca->dev,
+			 "MiPPS authentication failed (%d); using standard PD/PPS\n", ret);
+	power_supply_changed(mca->psy);
+}
+
 
 static const char *xiaomi_mca_type_name(u32 type)
 {
@@ -1270,9 +1566,10 @@ static u32 xiaomi_mca_policy_fcc(u32 real_type, bool hv)
 
 	if (!limits)
 		return 0;
-	if (hv && (real_type == MCA_TYPE_PD || real_type == MCA_TYPE_PD_VERIFY ||
-		   real_type == MCA_TYPE_PD_PPS))
-		return MCA_FCC_MAX_MA;
+	if (hv && real_type == MCA_TYPE_PD)
+		return xiaomi_mca_pd_limits.charge_current_ma;
+	if (hv && (real_type == MCA_TYPE_PD_VERIFY || real_type == MCA_TYPE_PD_PPS))
+		return xiaomi_mca_pps_limits.charge_current_ma;
 	/* The community policy does not raise FCC for unclassified Type-C. */
 	if (real_type == MCA_TYPE_C)
 		return MCA_FCC_DEFAULT_MA;
@@ -1329,6 +1626,117 @@ static bool xiaomi_mca_is_pd(u32 real_type)
 	       real_type == MCA_TYPE_PD_PPS;
 }
 
+enum xiaomi_mca_ucsi_state {
+	MCA_UCSI_UNAVAILABLE,
+	MCA_UCSI_OFFLINE,
+	MCA_UCSI_CONNECTED,
+	MCA_UCSI_PD_SINK,
+};
+
+/* The UCSI supply belongs to another child of this PMIC GLINK instance. */
+static int xiaomi_mca_ucsi_status(struct power_supply *psy, void *data)
+{
+	struct xiaomi_mca *mca = data;
+	struct device *parent = psy->dev.parent;
+	union power_supply_propval val;
+
+	if (psy == mca->psy || !parent || parent->parent != mca->dev->parent ||
+	    psy->desc->type != POWER_SUPPLY_TYPE_USB)
+		return MCA_UCSI_UNAVAILABLE;
+	/* UCSI frees its connector data after unregistering this supply. */
+	guard(rwsem_read)(&psy->epc_sem);
+	if (psy->removing)
+		return MCA_UCSI_UNAVAILABLE;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val))
+		return MCA_UCSI_UNAVAILABLE;
+	if (!val.intval)
+		return MCA_UCSI_OFFLINE;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_USB_TYPE, &val) ||
+	    (val.intval != POWER_SUPPLY_USB_TYPE_PD &&
+	     val.intval != POWER_SUPPLY_USB_TYPE_PD_PPS))
+		return MCA_UCSI_CONNECTED;
+	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &val) ||
+	    val.intval != POWER_SUPPLY_STATUS_CHARGING)
+		return MCA_UCSI_CONNECTED;
+	return MCA_UCSI_PD_SINK;
+}
+
+/* Remember disconnects even when a complete replug fits between two polls. */
+static void xiaomi_mca_ucsi_update(struct xiaomi_mca *mca, int state)
+{
+	guard(spinlock_irqsave)(&mca->rx_lock);
+
+	if (state == MCA_UCSI_UNAVAILABLE)
+		return;
+	if (state == MCA_UCSI_OFFLINE && mca->ucsi_state != MCA_UCSI_OFFLINE) {
+		mca->attach_generation++;
+		if (mca->poll_ready)
+			mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
+	}
+	mca->ucsi_state = state;
+}
+
+static int xiaomi_mca_psy_notifier(struct notifier_block *nb,
+				 unsigned long event, void *data)
+{
+	struct xiaomi_mca *mca = container_of(nb, struct xiaomi_mca, psy_nb);
+
+	if (event == PSY_EVENT_PROP_CHANGED)
+		xiaomi_mca_ucsi_update(mca, xiaomi_mca_ucsi_status(data, mca));
+	return NOTIFY_OK;
+}
+
+static void xiaomi_mca_psy_notifier_remove(void *data)
+{
+	struct xiaomi_mca *mca = data;
+
+	power_supply_unreg_notifier(&mca->psy_nb);
+}
+
+/*
+ * REAL_TYPE can remain Unknown after a PD reconnect. The stock
+ * qcom_adsp_pd_protocol driver names PD_STATE 2 "SNK_Ready", but the state
+ * and cached PDOs alone do not establish a current PD connection. Also
+ * require UCSI to report an online PD sink with its charging path enabled.
+ * Classify it conservatively as ordinary PD; the existing policy still
+ * checks source PDOs and temperature before negotiating voltage/current.
+ */
+static int xiaomi_mca_read_type(struct xiaomi_mca *mca, u32 *type)
+{
+	struct xiaomi_mca_pdo pdos[MCA_PD_MAX_PDOS];
+	__le32 val;
+	int ret, i;
+
+	ret = xiaomi_mca_read_blob(mca, MCA_PROP_USB_REAL_TYPE, &val, sizeof(val));
+	if (ret)
+		return ret;
+	*type = le32_to_cpu(val);
+	if (*type != MCA_TYPE_UNKNOWN)
+		return 0;
+	if (power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status) != MCA_UCSI_PD_SINK)
+		return 0;
+
+	ret = xiaomi_mca_read_blob(mca, MCA_PROP_PD_STATE, &val, sizeof(val));
+	if (ret || le32_to_cpu(val) != MCA_PD_SNK_READY)
+		return ret;
+	ret = xiaomi_mca_read_blob(mca, MCA_PROP_PDOS, pdos, sizeof(pdos));
+	if (ret)
+		return ret;
+
+	for (i = 0; i < MCA_PD_MAX_PDOS; i++) {
+		u32 ma = le32_to_cpu(pdos[i].max_ma);
+
+		if (le32_to_cpu(pdos[i].min_mv) == 5000 &&
+		    le32_to_cpu(pdos[i].max_mv) == 5000 &&
+		    ma >= MCA_ICL_MIN_MA && ma <= 5000) {
+			*type = MCA_TYPE_PD;
+			break;
+		}
+	}
+	return 0;
+}
+
+
 /*
  * Current a PD source offers at 9 V, 0 if none: its fixed 9 V PDO when it
  * has one, as stock prefers, otherwise a PPS APDO whose range covers 9 V
@@ -1382,7 +1790,7 @@ static int xiaomi_mca_request_volt(struct xiaomi_mca *mca, u32 mv)
  */
 static bool xiaomi_mca_auth_pending(struct xiaomi_mca *mca)
 {
-	return mipps_auth && mca->auth_ok &&
+	return mipps_auth && xiaomi_mca_authenticated(mca) &&
 	       !time_after(mca->cp_on_at, mca->auth_at) &&
 	       time_before(jiffies, mca->auth_at +
 				    msecs_to_jiffies(MCA_AUTH_RESET_WAIT_MS));
@@ -1521,10 +1929,12 @@ static void xiaomi_mca_apply_policy(struct xiaomi_mca *mca)
 static char *xiaomi_mca_supplied_to[] = { "bq27z561-0", "bq27z561-1" };
 
 /*
- * Both fuel gauges: the higher cell voltage (mV) and temperature (degC) and
- * the sum of the currents (mA, positive while charging)
+ * Both fuel gauges: voltage and temperature extremes, total charging
+ * current and largest absolute cell current. A low or overloaded cell
+ * must not be hidden by the other cell's voltage or opposite current.
  */
-static int xiaomi_mca_gauges(int *vbat_mv, int *ibat_ma, int *tcool, int *tbat)
+static int xiaomi_mca_gauges(int *vbat_mv, int *ibat_ma, int *tcool, int *tbat,
+			     int *vmin_mv, int *imax_ma)
 {
 	union power_supply_propval v, i, t;
 	struct power_supply *psy;
@@ -1534,6 +1944,8 @@ static int xiaomi_mca_gauges(int *vbat_mv, int *ibat_ma, int *tcool, int *tbat)
 	*ibat_ma = 0;
 	*tbat = INT_MIN;
 	*tcool = INT_MAX;
+	*vmin_mv = INT_MAX;
+	*imax_ma = 0;
 	for (n = 0; n < ARRAY_SIZE(xiaomi_mca_supplied_to); n++) {
 		psy = power_supply_get_by_name(xiaomi_mca_supplied_to[n]);
 		if (!psy)
@@ -1545,12 +1957,52 @@ static int xiaomi_mca_gauges(int *vbat_mv, int *ibat_ma, int *tcool, int *tbat)
 		if (ret)
 			return ret;
 		*vbat_mv = max(*vbat_mv, v.intval / 1000);
+		*vmin_mv = min(*vmin_mv, v.intval / 1000);
 		*ibat_ma += i.intval / 1000;
+		*imax_ma = max(*imax_ma, abs(i.intval / 1000));
 		*tbat = max(*tbat, t.intval / 10);
 		*tcool = min(*tcool, t.intval / 10);
 	}
 
 	return 0;
+}
+
+static void xiaomi_mca_select_profile(struct xiaomi_mca *mca)
+{
+	enum xiaomi_mca_profile profile = mca->ffc_active ? MCA_PROFILE_FFC : MCA_PROFILE_NORMAL;
+
+	if (profile != mca->cp_profile) {
+		mca->cp_profile = profile;
+		mca->cp_stage = 0;
+	}
+}
+
+static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twarm)
+{
+	union power_supply_propval soc;
+	struct power_supply *psy;
+	int n, ret;
+
+	/* Stock buck ffc_temp_low/high and allow_start_ffc_batt_soc_thr. */
+	if (!full_charge || !mipps_auth || !xiaomi_mca_authenticated(mca) ||
+	    mca->policy_generation != READ_ONCE(mca->service_generation) ||
+	    tcool < 18 || twarm >= 48 ||
+	    xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE) != 1 ||
+	    xiaomi_mca_read_u32(mca, MCA_PROP_USB_REAL_TYPE) != MCA_TYPE_PD_VERIFY ||
+	    xiaomi_mca_read_u32(mca, MCA_PROP_PD_VERIFIED) != 1 ||
+	    xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
+		return false;
+
+	for (n = 0; n < ARRAY_SIZE(xiaomi_mca_supplied_to); n++) {
+		psy = power_supply_get_by_name(xiaomi_mca_supplied_to[n]);
+		if (!psy)
+			return false;
+		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &soc);
+		power_supply_put(psy);
+		if (ret || soc.intval < 0 || soc.intval >= 95)
+			return false;
+	}
+	return true;
 }
 
 static int xiaomi_mca_restore_term_volt(struct xiaomi_mca *mca)
@@ -1570,28 +2022,36 @@ static int xiaomi_mca_restore_term_volt(struct xiaomi_mca *mca)
 
 static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 {
-	int vbat, ibat, tcool, tbat;
+	int vbat, ibat, tcool, tbat, vmin, imax;
 	u32 tpack, target, readback;
 	int ret;
 
 	lockdep_assert_held(&mca->lock);
 	if (mca->sleeping)
 		return -EHOSTDOWN;
-	if (!full_charge || !charge_policy)
+	mca->ffc_active = false;
+	if (!full_charge || !charge_policy) {
+		xiaomi_mca_select_profile(mca);
 		return xiaomi_mca_restore_term_volt(mca);
+	}
 
 	ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
-	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat);
+	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax);
 	if (ret) {
 		mca->term_hot = true;
 	} else {
 		tbat = max_t(s32, tbat, tpack);
+		tcool = min_t(s32, tcool, tpack);
+		mca->ffc_active = xiaomi_mca_ffc_conditions(mca, tcool, tbat);
 		if (tbat >= MCA_TERM_HOT_DEGC)
 			mca->term_hot = true;
 		else if (tbat < MCA_TERM_COOL_DEGC)
 			mca->term_hot = false;
 	}
+	xiaomi_mca_select_profile(mca);
 	target = mca->term_hot ? MCA_TERM_HOT_MV : MCA_TERM_FULL_MV;
+	if (!mca->term_hot && mca->ffc_active)
+		target = MCA_TERM_FFC_MV;
 
 	/* Read every poll: detach or an ADSP restart can discard the vote. */
 	ret = xiaomi_mca_read(mca, MCA_PROP_TERM_VOLT, &readback);
@@ -1639,16 +2099,38 @@ static int xiaomi_mca_cp_set_busocp(struct xiaomi_mca *mca, u32 ma)
 					 &pv);
 }
 
+static u32 xiaomi_mca_cp_capability_ma(u32 apdo_ma, bool verified)
+{
+	return min_t(u32, apdo_ma, verified ? MCA_CP_PPS_MAX_MA : MCA_CP_THIRD_IBUS_MA);
+}
+
+/* milliamp budget at the requested PPS voltage, before buck sharing. */
+static u32 xiaomi_mca_cp_power_limit(u32 source_ma, u32 mv)
+{
+	if (!mv)
+		return 0;
+	return min(source_ma, (u32)(MCA_CP_MAX_POWER_MW * 1000 / mv));
+}
+
+static u32 xiaomi_mca_cp_div2_limit(u32 source_ma)
+{
+	/* Clamp before multiplying so even a malformed capability cannot wrap. */
+	return min_t(u32, source_ma, MCA_CP_IBAT_MAX_MA / 2) * 2;
+}
+
 static int xiaomi_mca_cp_request(struct xiaomi_mca *mca, u32 mv)
 {
+	u32 ma;
 	mv = clamp(rounddown(mv, 20), (u32)MCA_CP_PPS_MIN_MV,
 		   min_t(u32, mca->cp_max_mv, MCA_CP_PPS_MAX_MV));
-	if (mv == mca->cp_mv)
+	ma = rounddown(xiaomi_mca_cp_power_limit(mca->cp_ma, mv), 50);
+	if (mv == mca->cp_mv && ma == mca->cp_request_ma)
 		return 0;
 
 	mca->cp_mv = mv;
+	mca->cp_request_ma = ma;
 	return xiaomi_mca_write_u32(mca, MCA_PROP_PPS_SELECT,
-				   xiaomi_mca_pps_word(mv, mca->cp_ma));
+				   xiaomi_mca_pps_word(mv, ma));
 }
 
 /*
@@ -1689,6 +2171,7 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	dev_info(mca->dev, "direct charging stopped: %s\n", why);
 
 	mca->cp = MCA_CP_DONE;
+	mca->cp_target_ma = 0;
 	mca->hv = MCA_HV_OFF;
 	mca->hv_retry = jiffies;
 	return 0;
@@ -1821,7 +2304,7 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 	struct power_supply *psy;
 	unsigned int start, end;
 	int soc = 0, n, ret = 0, stop_ret;
-	int vbat, ibat, tcool, tbat;
+	int vbat, ibat, tcool, tbat, vmin, imax;
 	u32 tpack;
 
 	lockdep_assert_held(&mca->lock);
@@ -1864,7 +2347,7 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		}
 	}
 	ret = ret ?: xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
-	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat);
+	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax);
 	if (!ret) {
 		tbat = max_t(s32, tbat, tpack);
 		tcool = min_t(s32, tcool, tpack);
@@ -1912,11 +2395,23 @@ static void xiaomi_mca_cp_learn_drop(struct xiaomi_mca *mca)
 /* What the source gives: its APDO current, less once it dropped out */
 static u32 xiaomi_mca_cp_src_ma(struct xiaomi_mca *mca)
 {
-	return mca->cp_ibus_cap ? min(mca->cp_ma, mca->cp_ibus_cap) : mca->cp_ma;
+	u32 ma = mca->cp_ibus_cap ? min(mca->cp_ma, mca->cp_ibus_cap) : mca->cp_ma;
+
+	return xiaomi_mca_cp_power_limit(ma, max_t(u32, mca->cp_mv, MCA_CP_PPS_MIN_MV));
+}
+
+static u32 xiaomi_mca_cp_vbat_max(struct xiaomi_mca *mca)
+{
+	if (mca->ffc_active)
+		return MCA_CP_VBAT_FFC_MV;
+	/* Do not bypass the default buck FV when full_charge is disabled. */
+	return full_charge ? MCA_CP_VBAT_MAX_MV :
+		MCA_TERM_DEFAULT_MV - MCA_CP_VBAT_HYS_MV;
 }
 
 /* The PPS APDO direct charging can use, 0 if none */
-static u32 xiaomi_mca_cp_apdo(struct xiaomi_mca *mca, u32 start_mv, u32 *max_mv)
+static u32 xiaomi_mca_cp_apdo(struct xiaomi_mca *mca, u32 start_mv,
+			    u32 vbat_max, u32 *max_mv)
 {
 	struct xiaomi_mca_pdo pdos[MCA_PD_MAX_PDOS];
 	u32 ma = 0;
@@ -1930,7 +2425,7 @@ static u32 xiaomi_mca_cp_apdo(struct xiaomi_mca *mca, u32 start_mv, u32 *max_mv)
 		u32 hi_mv = le32_to_cpu(pdos[i].max_mv);
 
 		if (min_mv < hi_mv && min_mv <= start_mv &&
-		    hi_mv >= 2 * MCA_CP_VBAT_MAX_MV + MCA_CP_DELTA_MV &&
+		    hi_mv >= 2 * vbat_max + MCA_CP_DELTA_MV &&
 		    le32_to_cpu(pdos[i].max_ma) > ma) {
 			ma = le32_to_cpu(pdos[i].max_ma);
 			*max_mv = hi_mv;
@@ -1943,7 +2438,7 @@ static u32 xiaomi_mca_cp_apdo(struct xiaomi_mca *mca, u32 start_mv, u32 *max_mv)
 /* The ADSP holds the adapter verified until the next authentication */
 static bool xiaomi_mca_adapter_verified(struct xiaomi_mca *mca)
 {
-	return mipps_auth &&
+	return mipps_auth && xiaomi_mca_authenticated(mca) &&
 	       xiaomi_mca_read_u32(mca, MCA_PROP_PD_VERIFIED) == 1;
 }
 
@@ -1959,7 +2454,7 @@ static bool xiaomi_mca_cp_after_auth(struct xiaomi_mca *mca)
 	if (!mipps_auth || mca->hv == MCA_HV_REQUESTED ||
 	    mca->vbus_uv >= MCA_HV_VBUS_5V_MAX_UV)
 		return false;
-	if (mca->auth_ok && time_after(mca->cp_on_at, mca->auth_at))
+	if (xiaomi_mca_authenticated(mca) && time_after(mca->cp_on_at, mca->auth_at))
 		return true;
 	if (xiaomi_mca_auth_pending(mca) && mca->auth_tried)
 		return false;
@@ -1973,7 +2468,18 @@ static bool xiaomi_mca_cp_after_auth(struct xiaomi_mca *mca)
 static u32 xiaomi_mca_cp_ibat_limit(struct xiaomi_mca *mca, int vbat,
 				   int tcool, int twarm)
 {
-	u32 ma = clamp(cp_ibat_max, 1000U, (u32)MCA_CP_IBAT_MAX_MA);
+	const struct xiaomi_mca_charge_step *steps;
+	u32 ma = cp_ibat_max ? clamp(cp_ibat_max, 1000U, (u32)MCA_CP_IBAT_MAX_MA) :
+		MCA_CP_IBAT_MAX_MA;
+
+	xiaomi_mca_select_profile(mca);
+	steps = xiaomi_mca_profile_steps[mca->cp_profile];
+	ma = min(ma, xiaomi_mca_cp_div2_limit(xiaomi_mca_cp_src_ma(mca)));
+
+	while (mca->cp_stage + 1 < xiaomi_mca_profile_counts[mca->cp_profile] &&
+	       vbat >= steps[mca->cp_stage].mv)
+		mca->cp_stage++;
+	ma = min(ma, steps[mca->cp_stage].ma);
 
 	if (twarm >= MCA_CP_TBAT_WARM) {
 		mca->cp_warm_ma = MCA_CP_IBAT_REDUCED_MA;
@@ -1991,17 +2497,15 @@ static u32 xiaomi_mca_cp_ibat_limit(struct xiaomi_mca *mca, int vbat,
 	ma = min(ma, mca->cp_warm_ma);
 	if (tcool < MCA_CP_TBAT_FULL)
 		ma = min_t(u32, ma, MCA_CP_IBAT_REDUCED_MA);
-	if (vbat >= MCA_CP_VSTEP_MV)
-		ma = min_t(u32, ma, MCA_CP_VSTEP_MA);
-
+	mca->cp_target_ma = ma;
 	return ma;
 }
 
 /* Called from the poll at 9 V on the buck charger, or right after the auth */
 static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 {
-	int vbat, ibat, tcool, tbat, tpack, ret;
-	u32 start_mv, ma, src_ma, max_mv = 0;
+	int vbat, ibat, tcool, tbat, tpack, ret, vmin, imax;
+	u32 start_mv, ma, src_ma, vbat_max, max_mv = 0;
 
 	if (!cp_charge || !hv_charge || !charge_current ||
 	    !xiaomi_mca_is_pd(mca->real_type) ||
@@ -2009,34 +2513,37 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	    (mca->hv != MCA_HV_ON && !xiaomi_mca_cp_after_auth(mca)))
 		return;
 
-	if (xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat))
+	if (xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax))
 		return;
 	tpack = (s32)xiaomi_mca_read_u32(mca, MCA_PROP_PACK_TBAT);
-	if (vbat < MCA_CP_VBAT_MIN_MV || vbat >= MCA_CP_VBAT_START_MV ||
+	mca->ffc_active = xiaomi_mca_ffc_conditions(mca, min(tcool, tpack), max(tbat, tpack));
+	xiaomi_mca_select_profile(mca);
+	vbat_max = xiaomi_mca_cp_vbat_max(mca);
+	if (vmin < MCA_CP_VBAT_MIN_MV ||
+	    vbat >= vbat_max - MCA_CP_VBAT_HYS_MV ||
+	    imax >= MCA_CP_CELL_OCP_MA ||
 	    min(tcool, tpack) < MCA_CP_TBAT_MIN ||
 	    max(tbat, tpack) >= MCA_CP_TBAT_WARM - MCA_CP_TBAT_HYS ||
 	    xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
 		return;
 	/* PD requests in the middle of the authentication break it */
-	if (mipps_auth && !mca->auth_ok &&
+	if (mipps_auth && !xiaomi_mca_authenticated(mca) &&
 	    time_before(jiffies, mca->cp_on_at +
 				 msecs_to_jiffies(MCA_CP_AUTH_WAIT_MS)))
 		return;
 
 	start_mv = 2 * vbat + MCA_CP_DELTA_MV;
-	ma = xiaomi_mca_cp_apdo(mca, start_mv, &max_mv);
+	ma = xiaomi_mca_cp_apdo(mca, start_mv, vbat_max, &max_mv);
 	if (ma < MCA_CP_BUCK_MA + 1000)
 		return;
 
-	mca->cp_ma = min_t(u32, ma, MCA_CP_PPS_MAX_MA);
+	/* third_pps_ibus_max bounds the entire source, including the buck. */
+	mca->cp_ma = xiaomi_mca_cp_capability_ma(ma, xiaomi_mca_adapter_verified(mca));
 	mca->cp_max_mv = max_mv;
+	mca->cp_mv = start_mv;
 	src_ma = xiaomi_mca_cp_src_ma(mca);
 	src_ma -= min_t(u32, src_ma, MCA_CP_BUCK_MA + 200);
-	mca->cp_ibus_ma = min(clamp(cp_ibus_max, 500U, (u32)MCA_CP_IBUS_MAX_MA),
-			      src_ma);
-	if (!xiaomi_mca_adapter_verified(mca))
-		mca->cp_ibus_ma = min_t(u32, mca->cp_ibus_ma,
-					MCA_CP_THIRD_IBUS_MA);
+	mca->cp_ibus_ma = min_t(u32, MCA_CP_IBAT_MAX_MA / 2, src_ma);
 	if (mca->cp_ibus_ma < 2 * MCA_CP_OPEN_IBUS_MA) {
 		mca->cp = MCA_CP_DONE;
 		return;
@@ -2057,13 +2564,24 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	}
 
 	mca->cp_mv = 0;
+	mca->cp_request_ma = 0;
 	mca->cp_polls = 0;
 	mca->cp_low = 0;
 	mca->cp_ibus_hot = mca->cp_ibus_ma;
 	mca->cp_ibat_trip = 0;
-	mca->cp_warm_ma = MCA_CP_IBAT_MAX_MA;
 	mca->cp_buck_par = false;
+	mca->cp_stage = 0;
+	mca->cp_target_ma = 0;
+	mca->cp_warm_ma = MCA_CP_IBAT_MAX_MA;
 	mca->cp = MCA_CP_OPENING;
+	/* Confirm the new FV before asking the source to open this session. */
+	ret = xiaomi_mca_full_charge_poll(mca);
+	if (ret) {
+		xiaomi_mca_cp_stop(mca, "profile float voltage not confirmed");
+		return;
+	}
+	dev_info(mca->dev, "direct-charge profile %s, source/cell/thermal limits retained\n",
+		 xiaomi_mca_profile_names[mca->cp_profile]);
 
 	if (xiaomi_mca_auth_pending(mca))
 		mca->auth_tried = true;
@@ -2088,19 +2606,29 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 {
 	int vbat, ibat, tcool, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibus, over;
-	int ibat_max, target, ibus_all;
+	int ibat_max, target, ibus_all, vmin, imax;
 	u32 mv = mca->cp_mv;
 	bool par;
 
-	if (xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat) ||
+	if (xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax) ||
 	    xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &on)) {
 		xiaomi_mca_cp_stop(mca, "read failed");
 		return;
 	}
 	tpack = (s32)xiaomi_mca_read_u32(mca, MCA_PROP_PACK_TBAT);
 
-	if (vbat >= MCA_CP_VBAT_MAX_MV) {
+	xiaomi_mca_select_profile(mca);
+	/* Never continue a high-current APDO after authentication is revoked. */
+	if (mca->cp_ma > MCA_CP_THIRD_IBUS_MA && !xiaomi_mca_adapter_verified(mca)) {
+		xiaomi_mca_cp_stop(mca, "adapter authentication lost");
+		return;
+	}
+	if (vbat >= xiaomi_mca_cp_vbat_max(mca) || vmin < MCA_CP_VBAT_MIN_MV) {
 		xiaomi_mca_cp_stop(mca, "battery voltage reached");
+		return;
+	}
+	if (imax >= MCA_CP_CELL_OCP_MA) {
+		xiaomi_mca_cp_stop(mca, "cell current too high");
 		return;
 	}
 	if (min(tcool, tpack) < MCA_CP_TBAT_MIN ||
@@ -2269,7 +2797,10 @@ static int xiaomi_mca_read_usb(struct xiaomi_mca *mca, enum xiaomi_mca_usb_index
 
 	if (!cached->valid || time_after_eq(jiffies, cached->expires)) {
 		cached->valid = false;
-		ret = xiaomi_mca_read(mca, xiaomi_mca_usb_property[index], &cached->value);
+		if (index == MCA_USB_REAL_TYPE)
+			ret = xiaomi_mca_read_type(mca, &cached->value);
+		else
+			ret = xiaomi_mca_read(mca, xiaomi_mca_usb_property[index], &cached->value);
 		if (ret)
 			return ret;
 
@@ -2290,6 +2821,12 @@ static int xiaomi_mca_usb_get_property(struct power_supply *psy,
 	enum xiaomi_mca_usb_index index;
 	u32 value;
 	int ret;
+
+	if (psp == POWER_SUPPLY_PROP_AUTHENTIC) {
+		guard(mutex)(&mca->lock);
+		val->intval = mca->online && xiaomi_mca_authenticated(mca);
+		return 0;
+	}
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_ONLINE:
@@ -2351,7 +2888,7 @@ static int xiaomi_mca_usb_set_property(struct power_supply *psy,
 	/* The limits depend on the source attached now. */
 	ret = xiaomi_mca_read(mca, MCA_PROP_USB_ONLINE, &source.online);
 	if (!ret)
-		ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &source.real_type);
+		ret = xiaomi_mca_read_type(mca, &source.real_type);
 	if (ret)
 		return ret;
 
@@ -2399,6 +2936,7 @@ static const enum power_supply_property xiaomi_mca_usb_props[] = {
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	POWER_SUPPLY_PROP_USB_TYPE,
+	POWER_SUPPLY_PROP_AUTHENTIC,
 	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT,
 };
 
@@ -2436,6 +2974,158 @@ static int xiaomi_mca_otg_cp(struct xiaomi_mca *mca, enum sc8541_otg_action acti
 	return ret;
 }
 
+/* No independent timer: only an explicit consumer or an ADSP epoch applies it. */
+static void xiaomi_mca_pen_delay(unsigned int ms)
+{
+#if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(xiaomi_mca_pen_delay, ms);
+#endif
+	msleep(ms);
+}
+
+static int xiaomi_mca_pen_off(struct xiaomi_mca *mca)
+{
+	int ret;
+
+	lockdep_assert_held(&mca->lock);
+	if (!mca->pen_dirty)
+		return 0;
+	/* Even a failed voltage write must not prevent an attempt to stop. */
+	xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_VOLTAGE, BIT(16) | 5200);
+	xiaomi_mca_pen_delay(10);
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_ENABLE, 0x20100);
+	if (ret)
+		return ret;
+	mca->pen_on = false;
+	ret = xiaomi_mca_otg_cp(mca, SC8541_PEN_RESTORE);
+	if (!ret)
+		mca->pen_dirty = false;
+	return ret;
+}
+
+static int xiaomi_mca_pen_on(struct xiaomi_mca *mca)
+{
+	u32 generation, vbus, mv;
+	int ret;
+
+	lockdep_assert_held(&mca->lock);
+	if (mca->sleeping || mca->otg_active)
+		return -EBUSY;
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		if (!mca->service_up)
+			return -ENOTCONN;
+		generation = mca->service_generation;
+	}
+	mca->pen_attempted = true;
+	mca->pen_attempt_generation = generation;
+	/* Do not disconnect a wired charger for an unverified source switch. */
+	ret = xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus);
+	if (ret || vbus >= MCA_VBUS_ONLINE_UV)
+		return ret ?: -EBUSY;
+	if (mca->pen_on && mca->pen_generation == generation)
+		return 0;
+	ret = xiaomi_mca_otg_cp(mca, SC8541_PEN_ISOLATE);
+	if (ret) {
+		xiaomi_mca_otg_cp(mca, SC8541_PEN_RESTORE);
+		return ret;
+	}
+	mca->pen_dirty = true;
+	xiaomi_mca_pen_delay(100);
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_VOLTAGE, BIT(16) | 5000);
+	ret = ret ?: xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_ENABLE, 0x20101);
+	for (mv = 5500; !ret && mv <= 6500; mv += 500) {
+		xiaomi_mca_pen_delay(20);
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_VOLTAGE, BIT(16) | mv);
+	}
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		if (!mca->service_up || generation != mca->service_generation)
+			ret = -ECONNRESET;
+	}
+	if (ret)
+		goto fail;
+	mca->pen_on = true;
+	mca->pen_generation = generation;
+	return 0;
+fail:
+	xiaomi_mca_pen_off(mca);
+	return ret;
+}
+
+static void xiaomi_mca_pen_supply_failed(struct xiaomi_mca *mca)
+{
+	if (mca->pen_requested && mca->pen_rdev) {
+		mca->pen_requested = false;
+		regulator_notifier_call_chain(mca->pen_rdev, REGULATOR_EVENT_FAIL, NULL);
+	}
+}
+
+static int xiaomi_mca_pen_enable(struct regulator_dev *rdev)
+{
+	struct xiaomi_mca *mca = rdev_get_drvdata(rdev);
+	int ret;
+
+	guard(mutex)(&mca->lock);
+	ret = xiaomi_mca_pen_on(mca);
+	if (!ret)
+		mca->pen_requested = true;
+	return ret;
+}
+
+static int xiaomi_mca_pen_disable(struct regulator_dev *rdev)
+{
+	struct xiaomi_mca *mca = rdev_get_drvdata(rdev);
+
+	guard(mutex)(&mca->lock);
+	mca->pen_requested = false;
+	return xiaomi_mca_pen_off(mca);
+}
+
+static int xiaomi_mca_pen_is_enabled(struct regulator_dev *rdev)
+{
+	struct xiaomi_mca *mca = rdev_get_drvdata(rdev);
+
+	guard(mutex)(&mca->lock);
+	return mca->pen_on && mca->pen_generation == READ_ONCE(mca->service_generation);
+}
+
+static const struct regulator_ops xiaomi_mca_pen_ops = {
+	.enable = xiaomi_mca_pen_enable,
+	.disable = xiaomi_mca_pen_disable,
+	.is_enabled = xiaomi_mca_pen_is_enabled,
+	.list_voltage = regulator_list_voltage_linear,
+};
+
+static const struct regulator_desc xiaomi_mca_pen_desc = {
+	.name = "piano-pen-boost",
+	.of_match = "pen-boost",
+	.regulators_node = "regulators",
+	.type = REGULATOR_VOLTAGE,
+	.owner = THIS_MODULE,
+	.ops = &xiaomi_mca_pen_ops,
+	.n_voltages = 1,
+	.min_uV = 6500000,
+	.fixed_uV = 6500000,
+};
+
+static int xiaomi_mca_register_pen(struct xiaomi_mca *mca)
+{
+	struct regulator_config cfg = { .dev = mca->dev, .driver_data = mca };
+	struct device_node *regulators, *pen;
+	struct regulator_dev *rdev;
+
+	regulators = of_get_child_by_name(mca->dev->of_node, "regulators");
+	pen = of_get_child_by_name(regulators, "pen-boost");
+	of_node_put(regulators);
+	if (!pen)
+		return 0;
+	of_node_put(pen);
+	rdev = devm_regulator_register(mca->dev, &xiaomi_mca_pen_desc, &cfg);
+	if (IS_ERR(rdev))
+		return PTR_ERR(rdev);
+	mca->pen_rdev = rdev;
+	return 0;
+}
+
 static void xiaomi_mca_cp_missing(struct xiaomi_mca *mca, int ret)
 {
 	if ((ret == -ENODEV || ret == -EOPNOTSUPP) && !mca->cp_absent_warned) {
@@ -2459,9 +3149,10 @@ static void xiaomi_mca_sync_config(struct xiaomi_mca *mca)
 		generation = mca->service_generation;
 		up = mca->service_up;
 	}
-	if (!up || (mca->config_attempted && mca->config_generation == generation))
+	if (!up || (mca->config_attempted && mca->config_generation == generation &&
+		    !mca->config_result))
 		return;
-	/* Exactly one attempt per service generation, including failed writes. */
+	/* As in stock/SunUEFI, a failed configuration is retried by the poll. */
 	mca->config_attempted = true;
 	mca->config_generation = generation;
 	ret = xiaomi_mca_otg_cp(mca, SC8541_OTG_PRESENT);
@@ -2481,11 +3172,16 @@ static void xiaomi_mca_sync_config(struct xiaomi_mca *mca)
 	}
 	if (!ret)
 		ret = xiaomi_mca_write_blob(mca, MCA_PROP_CID_CFG, &cid, sizeof(cid));
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		if (mca->service_generation != generation || !mca->service_up)
+			ret = -ESTALE;
+	}
 	mca->config_result = ret;
-	dev_info(mca->dev, "OTG config generation %u CP present %u CID %#x result %d\n",
-		 generation, present, MCA_PIANO_CID_CFG, ret);
 	if (ret)
-		dev_warn(mca->dev, "OTG configuration sync failed: %d\n", ret);
+		dev_warn_ratelimited(mca->dev, "OTG configuration sync failed: %d\n", ret);
+	else
+		dev_info(mca->dev, "OTG config generation %u CP present %u CID %#x result 0\n",
+			 generation, present, MCA_PIANO_CID_CFG);
 }
 
 /* Process in the existing poll, preserving notification order. No retries. */
@@ -2631,12 +3327,28 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 {
 	bool online;
 	u32 real_type = MCA_TYPE_UNKNOWN, vbus;
+	u32 attachment = READ_ONCE(mca->attach_generation);
 
 	/* Do not change source voltage or restart a stage whose stop failed. */
 	if (mca->cp == MCA_CP_STOPPING) {
 		xiaomi_mca_cp_stop(mca, "pending stop");
 		return;
 	}
+
+	if (attachment != mca->policy_attach_generation) {
+		if (xiaomi_mca_cp_stop(mca, "physical disconnect"))
+			return;
+		mca->auth_ok = false;
+		mca->mipps_attempted = false;
+		mca->cp = MCA_CP_OFF;
+		mca->hv = MCA_HV_OFF;
+		mca->hv_renegs = 0;
+		mca->cp_ibus_cap = 0;
+		mca->online = false;
+		mca->policy_attach_generation = attachment;
+	}
+	if (xiaomi_mca_clear_auth(mca))
+		return;
 
 	if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus)) {
 		/* Missing telemetry is neither a detach nor a source overload. */
@@ -2650,7 +3362,10 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 	if (online) {
 		mca->ibus_ua = xiaomi_mca_read_u32(mca, MCA_PROP_USB_CURRENT_NOW);
 		mca->icl_ma = xiaomi_mca_read_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT);
-		real_type = xiaomi_mca_read_u32(mca, MCA_PROP_USB_REAL_TYPE);
+		if (xiaomi_mca_read_type(mca, &real_type)) {
+			xiaomi_mca_cp_stop(mca, "charger type read failed");
+			return;
+		}
 		if (mca->ibus_ua == -1 || mca->icl_ma == -1) {
 			xiaomi_mca_cp_stop(mca, "telemetry read failed");
 			return;
@@ -2670,8 +3385,10 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 	if (online && !mca->online) {
 		/* away longer than a reset takes: another attach */
 		if (time_after(jiffies, mca->cp_off_at +
-				msecs_to_jiffies(MCA_CP_DROP_FORGET_MS)))
+				msecs_to_jiffies(MCA_CP_DROP_FORGET_MS))) {
 			mca->auth_ok = false;
+			mca->mipps_attempted = false;
+		}
 		mca->cp_on_at = jiffies;
 		/* a voltage change under way breaks the identity exchange */
 		if (mipps_auth)
@@ -2683,10 +3400,28 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		if (mca->fcc_written)
 			xiaomi_mca_reset_fcc(mca);
 	}
+	/* A restored PD classification must not stay blocked by an earlier
+	 * Unknown sample. Keep the same bounded retry budget until detach.
+	 */
+	if (online && xiaomi_mca_is_pd(real_type) &&
+	    !xiaomi_mca_is_pd(mca->real_type) && mca->hv == MCA_HV_BLOCKED &&
+	    mca->hv_renegs < MCA_HV_RENEG_MAX) {
+		mca->hv_renegs++;
+		mca->hv = MCA_HV_OFF;
+		if (time_before(mca->hv_retry,
+				jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS)))
+			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS);
+	}
 	mca->online = online;
 	mca->real_type = real_type;
 
 	if (!online) {
+		/* Preserve an authentication reset only while its cable is connected. */
+		if (!xiaomi_mca_auth_pending(mca) ||
+		    power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status) < MCA_UCSI_CONNECTED) {
+			mca->auth_ok = false;
+			mca->mipps_attempted = false;
+		}
 		xiaomi_mca_cp_learn_drop(mca);
 		if (xiaomi_mca_cp_stop(mca, "detached"))
 			return;
@@ -2706,10 +3441,26 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 	} else if (charge_policy && xiaomi_mca_cp_active(mca)) {
 		xiaomi_mca_cp_step(mca);
 	} else if (charge_policy) {
+		xiaomi_mca_mipps_authenticate(mca);
+		if (mca->auth_cleanup || attachment != READ_ONCE(mca->attach_generation))
+			return;
 		xiaomi_mca_cp_try_start(mca);
 		if (!xiaomi_mca_cp_active(mca))
 			xiaomi_mca_apply_policy(mca);
 	}
+}
+
+static bool xiaomi_mca_identity_changed(struct xiaomi_mca *mca)
+{
+	u32 svid;
+
+	if (!mipps_auth || xiaomi_mca_read(mca, MCA_PROP_ADAPTER_SVID, &svid) ||
+	    svid == mca->adapter_svid)
+		return false;
+
+	dev_info(mca->dev, "adapter SVID %#06x -> %#06x\n", mca->adapter_svid, svid);
+	mca->adapter_svid = svid;
+	return true;
 }
 
 /*
@@ -2722,14 +3473,11 @@ static void xiaomi_mca_poll(struct work_struct *work)
 	struct xiaomi_mca *mca = container_of(to_delayed_work(work), struct xiaomi_mca,
 					      poll_work);
 	struct xiaomi_mca_state now;
-	u32 generation, svid;
+	u32 generation;
 	bool changed = false;
 	int ret;
 
 	scoped_guard(mutex, &mca->lock) {
-		ret = xiaomi_mca_full_charge_poll(mca);
-		if (ret)
-			dev_warn_ratelimited(mca->dev, "failed to set float voltage: %d\n", ret);
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
 			generation = mca->service_generation;
 		xiaomi_mca_sync_config(mca);
@@ -2745,8 +3493,37 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->fcc_written = false;
 			mca->fcc_full = 0;
 			mca->auth_ok = false;
+			mca->mipps_attempted = false;
+			mca->auth_cleanup = false;
 			mca->online = false;
 			mca->policy_generation = generation;
+		}
+		if (mca->pen_requested && (!mca->pen_attempted ||
+		    mca->pen_attempt_generation != generation)) {
+			int ret = xiaomi_mca_pen_on(mca);
+
+			if (ret) {
+				dev_warn(mca->dev, "pen supply restore failed: %d\n", ret);
+				xiaomi_mca_pen_supply_failed(mca);
+			}
+		}
+		/* A newly attached source has priority over optional pen charging. */
+		if (mca->pen_dirty) {
+			u32 vbus;
+
+			if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus) ||
+			    vbus >= MCA_VBUS_ONLINE_UV) {
+				xiaomi_mca_pen_off(mca);
+				xiaomi_mca_pen_supply_failed(mca);
+			}
+		}
+		if (xiaomi_mca_clear_auth(mca))
+			goto out;
+		ret = xiaomi_mca_full_charge_poll(mca);
+		if (ret) {
+			dev_warn_ratelimited(mca->dev, "failed to set float voltage: %d\n", ret);
+			xiaomi_mca_cp_stop(mca, "float voltage not confirmed");
+			goto out;
 		}
 		xiaomi_mca_process_notifications(mca);
 		ret = xiaomi_mca_charge_limit_poll(mca);
@@ -2756,10 +3533,10 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		}
 		if (mca->charge_blocked)
 			goto out;
-		if (charge_policy && !mca->otg_active) {
+		if (charge_policy && !mca->otg_active && !mca->pen_dirty) {
 			mca->policy_active = true;
 			xiaomi_mca_policy_poll(mca);
-		} else if (!mca->otg_active && mca->policy_active) {
+		} else if (!mca->otg_active && !mca->pen_dirty && mca->policy_active) {
 			if (xiaomi_mca_cp_stop(mca, "policy disabled"))
 				goto out;
 			xiaomi_mca_restore_icl(mca);
@@ -2773,7 +3550,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		}
 		if (xiaomi_mca_read(mca, MCA_PROP_USB_ONLINE, &now.online) ||
 		    xiaomi_mca_read(mca, MCA_PROP_CHGR_STATUS, &now.chgr_status) ||
-		    xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &now.real_type)) {
+		    xiaomi_mca_read_type(mca, &now.real_type)) {
 			mca->last_valid = false;
 		} else {
 			changed = !mca->last_valid || memcmp(&now, &mca->last, sizeof(now));
@@ -2785,13 +3562,9 @@ static void xiaomi_mca_poll(struct work_struct *work)
 				xiaomi_mca_restore_icl(mca);
 		}
 
-		if (mipps_auth && !xiaomi_mca_read(mca, MCA_PROP_ADAPTER_SVID, &svid) &&
-		    svid != mca->adapter_svid) {
-			mca->adapter_svid = svid;
-			changed = true;
-		}
-
 out:
+		/* Identity discovery must also reach userspace while charging is held. */
+		changed |= xiaomi_mca_identity_changed(mca);
 		/* The uevent must not report what was cached before the change. */
 		if (changed)
 			xiaomi_mca_invalidate(mca);
@@ -2814,7 +3587,7 @@ static ssize_t charger_type_show(struct device *dev,
 	const char *name;
 
 	guard(mutex)(&mca->lock);
-	if (xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &type))
+	if (xiaomi_mca_read_type(mca, &type))
 		return -ENODATA;
 	name = xiaomi_mca_type_name(type);
 
@@ -2917,20 +3690,7 @@ static const struct attribute_group xiaomi_mca_usb_group = {
 	.attrs = xiaomi_mca_usb_attrs,
 };
 
-/*
- * MiPPS relay, in the format of the sheng battmgr "xiaomi" nodes that the
- * xiaomi-mipps-auth tool drives:
- *
- *   request_vdm_cmd  write "<cmd>[,<hex>]": 1-3 query the adapter, 4, 5
- *                    and 8 send 16 bytes (seed, challenge, reverse digest),
- *                    6 and 7 send a 4-byte flag; read "<state>,<result>"
- *   adapter_id, adapter_svid, pdo2, real_type, pd_verifed
- *   verify_process   1 while an authentication runs, as stock batterysecret
- *                    sets it; 9 V is not newly asked for meanwhile
- *   data_role        "ufp" or "dfp"; writing asks the adapter for a PD data
- *                    role swap (stock request_vdm_cmd 200), as the ADSP
- *                    reads the adapter identity only as DFP
- */
+/* Read-only protocol diagnostics. Adapter authentication is kernel-owned. */
 static struct xiaomi_mca *xiaomi_mca_from_dev(struct device *dev)
 {
 	return power_supply_get_drvdata(to_power_supply(dev));
@@ -2971,54 +3731,7 @@ static ssize_t request_vdm_cmd_show(struct device *dev,
 	}
 }
 
-static ssize_t request_vdm_cmd_store(struct device *dev,
-				     struct device_attribute *attr,
-				     const char *buf, size_t count)
-{
-	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
-	__le32 data[MCA_VDM_LEN / sizeof(__le32)] = {};
-	u8 bytes[MCA_VDM_LEN];
-	char hex[2 * MCA_VDM_LEN + 1] = {};
-	unsigned int cmd;
-	size_t len;
-	int i, ret;
-
-	guard(mutex)(&mca->lock);
-
-	if (sscanf(buf, "%u,%32s", &cmd, hex) < 1)
-		return -EINVAL;
-
-	switch (cmd) {
-	case 1 ... 3:
-		len = sizeof(u32);
-		break;
-	case 4:
-	case 5:
-	case 8:
-		/* the adapter takes the 16 bytes as big-endian words */
-		if (strlen(hex) != 2 * MCA_VDM_LEN ||
-		    hex2bin(bytes, hex, MCA_VDM_LEN))
-			return -EINVAL;
-		for (i = 0; i < ARRAY_SIZE(data); i++)
-			data[i] = cpu_to_le32(get_unaligned_be32(&bytes[4 * i]));
-		len = MCA_VDM_LEN;
-		break;
-	case 6:
-	case 7:
-		if (strlen(hex) != 2 * sizeof(u32) ||
-		    hex2bin(bytes, hex, sizeof(u32)))
-			return -EINVAL;
-		data[0] = cpu_to_le32(get_unaligned_le32(bytes));
-		len = sizeof(u32);
-		break;
-	default:
-		return -EINVAL;
-	}
-
-	ret = xiaomi_mca_write_blob(mca, MCA_PROP_VDM_BASE + cmd - 1, data, len);
-	return ret ? ret : count;
-}
-static DEVICE_ATTR_RW(request_vdm_cmd);
+static DEVICE_ATTR_RO(request_vdm_cmd);
 
 static ssize_t xiaomi_mca_show_u32(struct device *dev, char *buf, u32 prop,
 				  const char *fmt)
@@ -3036,21 +3749,6 @@ static ssize_t xiaomi_mca_show_u32(struct device *dev, char *buf, u32 prop,
 	return sysfs_emit(buf, fmt, le32_to_cpu(val));
 }
 
-static ssize_t xiaomi_mca_store_flag(struct device *dev, const char *buf,
-				    size_t count, u32 prop)
-{
-	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
-	bool flag;
-	int ret;
-
-	guard(mutex)(&mca->lock);
-
-	if (kstrtobool(buf, &flag))
-		return -EINVAL;
-
-	ret = xiaomi_mca_write_u32(mca, prop, flag);
-	return ret ? ret : count;
-}
 
 static ssize_t adapter_id_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
@@ -3101,24 +3799,7 @@ static ssize_t pd_verifed_show(struct device *dev,
 	return xiaomi_mca_show_u32(dev, buf, MCA_PROP_PD_VERIFIED, "%u\n");
 }
 
-static ssize_t pd_verifed_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
-	ssize_t ret = xiaomi_mca_store_flag(dev, buf, count, MCA_PROP_PD_VERIFIED);
-	bool flag;
-
-	guard(mutex)(&mca->lock);
-
-	if (ret == count && !kstrtobool(buf, &flag)) {
-		mca->auth_at = jiffies;
-		mca->auth_ok = flag;
-		mca->auth_tried = false;
-	}
-	return ret;
-}
-static DEVICE_ATTR_RW(pd_verifed);
+static DEVICE_ATTR_RO(pd_verifed);
 
 static ssize_t verify_process_show(struct device *dev,
 				   struct device_attribute *attr, char *buf)
@@ -3126,20 +3807,7 @@ static ssize_t verify_process_show(struct device *dev,
 	return xiaomi_mca_show_u32(dev, buf, MCA_PROP_VERIFY_PROCESS, "%u\n");
 }
 
-static ssize_t verify_process_store(struct device *dev,
-				    struct device_attribute *attr,
-				    const char *buf, size_t count)
-{
-	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
-	ssize_t ret = xiaomi_mca_store_flag(dev, buf, count, MCA_PROP_VERIFY_PROCESS);
-	bool flag;
-
-	/* the authentication is over: direct charging need not wait a poll */
-	if (ret == count && !kstrtobool(buf, &flag) && !flag)
-		mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
-	return ret;
-}
-static DEVICE_ATTR_RW(verify_process);
+static DEVICE_ATTR_RO(verify_process);
 
 static ssize_t data_role_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
@@ -3165,30 +3833,23 @@ static ssize_t data_role_show(struct device *dev,
 	}
 }
 
-static ssize_t data_role_store(struct device *dev,
-			       struct device_attribute *attr,
-			       const char *buf, size_t count)
+static DEVICE_ATTR_RO(data_role);
+
+static ssize_t charge_profile_show(struct device *dev,
+				   struct device_attribute *attr, char *buf)
 {
 	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
-	u32 role;
-	int ret;
 
 	guard(mutex)(&mca->lock);
-
-	if (sysfs_streq(buf, "ufp"))
-		role = MCA_DATA_ROLE_UFP;
-	else if (sysfs_streq(buf, "dfp"))
-		role = MCA_DATA_ROLE_DFP;
-	else
-		return -EINVAL;
-
-	ret = xiaomi_mca_write_u32(mca, MCA_PROP_DATA_ROLE,
-				  role);
-	return ret ? ret : count;
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u\n",
+		 xiaomi_mca_profile_names[mca->cp_profile],
+		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
+		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma);
 }
-static DEVICE_ATTR_RW(data_role);
+static DEVICE_ATTR_RO(charge_profile);
 
 static struct attribute *xiaomi_mca_xiaomi_attrs[] = {
+	&dev_attr_charge_profile.attr,
 	&dev_attr_request_vdm_cmd.attr,
 	&dev_attr_adapter_id.attr,
 	&dev_attr_adapter_svid.attr,
@@ -3364,6 +4025,10 @@ static void xiaomi_mca_unbind_restore(void *data)
 	int ret;
 
 	guard(mutex)(&mca->lock);
+	xiaomi_mca_pen_off(mca);
+	ret = xiaomi_mca_clear_auth(mca);
+	if (ret)
+		dev_warn(mca->dev, "failed to clear authentication interlock: %d\n", ret);
 	ret = xiaomi_mca_restore_term_volt(mca);
 	if (ret)
 		dev_warn(mca->dev, "failed to restore float voltage: %d\n", ret);
@@ -3394,7 +4059,7 @@ static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca)
 	if (!mca->icl_written && !mca->fcc_written)
 		return 0;
 
-	ret = xiaomi_mca_read(mca, MCA_PROP_USB_REAL_TYPE, &type);
+	ret = xiaomi_mca_read_type(mca, &type);
 	if (ret)
 		return ret;
 	icl = xiaomi_mca_policy_icl(type);
@@ -3430,7 +4095,13 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 	u32 vbus;
 	int ret;
 
+	ret = xiaomi_mca_pen_off(mca);
+	if (ret)
+		return ret;
 	ret = xiaomi_mca_cp_stop(mca, "system sleep");
+	if (ret)
+		return ret;
+	ret = xiaomi_mca_clear_auth(mca);
 	if (ret)
 		return ret;
 
@@ -3465,6 +4136,7 @@ out:
 	mca->hv_renegs = 0;
 	mca->fcc_full = 0;
 	mca->auth_ok = false;
+	mca->mipps_attempted = false;
 	mca->online = false;
 	mca->policy_active = false;
 	return 0;
@@ -3516,6 +4188,7 @@ static void xiaomi_mca_complete(struct device *dev)
 		if (!mca->sleeping)
 			return;
 		mca->sleeping = false;
+		mca->pen_attempted = false;
 	}
 	enable_delayed_work(&mca->poll_work);
 	schedule_delayed_work(&mca->poll_work, 0);
@@ -3682,6 +4355,10 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 	if (ret)
 		return ret;
 
+	ret = xiaomi_mca_register_pen(mca);
+	if (ret)
+		return ret;
+
 	psy_cfg.attr_grp = xiaomi_mca_usb_groups;
 	psy_cfg.supplied_to = xiaomi_mca_supplied_to;
 	psy_cfg.num_supplicants = ARRAY_SIZE(xiaomi_mca_supplied_to);
@@ -3694,6 +4371,13 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 
 	/* Cancelled before the power supply is unregistered. */
 	INIT_DELAYED_WORK(&mca->poll_work, xiaomi_mca_poll);
+	mca->psy_nb.notifier_call = xiaomi_mca_psy_notifier;
+	ret = power_supply_reg_notifier(&mca->psy_nb);
+	if (ret)
+		return ret;
+	ret = devm_add_action_or_reset(dev, xiaomi_mca_psy_notifier_remove, mca);
+	if (ret)
+		return ret;
 	ret = devm_add_action_or_reset(dev, xiaomi_mca_stop_poll, mca);
 	if (ret)
 		return ret;

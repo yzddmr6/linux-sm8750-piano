@@ -6,6 +6,8 @@
  */
 #include <drm/drm_panel.h>
 #include <linux/firmware.h>
+#include <linux/compat.h>
+#include <uapi/linux/piano-touch.h>
 #include <linux/gpio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/kfifo.h>
@@ -41,6 +43,7 @@
 #define NVT_FRAME_VALID	BIT(0)
 #define NVT_FRAME_EPOCH	BIT(1)
 #define NVT_IRQ_ENABLED	0
+#define NVT_STATE_CHANGED	1
 /* Vendor nvt_check_fw_reset_state() budget for post-INIT states: 50 x 10 ms. */
 #define NVT_FIRST_FRAME_MS	500
 /* Consecutive frame reads allowed to fail with a recovered SPI channel. */
@@ -69,11 +72,15 @@ struct nvt_thp {
 	struct work_struct start_work;
 	struct work_struct charger_work;
 	struct notifier_block charger_notifier;
+	bool state_events; /* Only an explicit GET_STATE reader arms notifications. */
+	u32 pen_model; /* lifecycle_lock; zero until the stream owner requests a pen. */
+	int pen_applied;
 	int charger_state, charger_sent; /* lifecycle_lock; -1 means unknown. */
 	bool start_requested; /* transition_lock; one attempt until the next stop. */
 #if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
 	int (*test_start)(struct nvt_thp *nvt);
 	void (*test_stop)(struct nvt_thp *nvt);
+	int (*test_pen)(struct nvt_thp *nvt);
 	struct completion *test_quiescing;
 #endif
 	struct mutex read_lock; /* Keeps the FIFO single-consumer across shared fds. */
@@ -387,7 +394,35 @@ static void nvt_read_modes(struct nvt_thp *nvt, const char *phase, int modes[3])
 		 phase, modes[0], modes[1], modes[2]);
 }
 
-/* Caller holds lifecycle_lock, with the IRQ stopped. */
+/* lifecycle_lock serializes commands; regmap serializes individual IRQ reads. */
+static int nvt_apply_pen(struct nvt_thp *nvt)
+{
+	struct nvt_thp_command_status last;
+	int ret;
+
+	lockdep_assert_held(&nvt->lifecycle_lock);
+	if (READ_ONCE(nvt->dead) || READ_ONCE(nvt->panel_off) ||
+	    READ_ONCE(nvt->suspended) || !READ_ONCE(nvt->running) ||
+	    nvt->pen_applied == nvt->pen_model)
+		return 0;
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
+	if (nvt->test_pen) {
+		ret = nvt->test_pen(nvt);
+		goto done;
+	}
+#endif
+	ret = nvt_thp_set_pen(nvt->map, nvt->pen_model, &last);
+	if (ret)
+		dev_warn_ratelimited(&nvt->spi->dev,
+			"THP pen command %02x failed: %d, status %#04x; keeping fingers\n",
+			last.sub_command, ret, last.status);
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_NT36532E_THP_KUNIT_TEST)
+done:
+#endif
+	nvt->pen_applied = ret ? -1 : nvt->pen_model;
+	return ret;
+}
+
 static int nvt_start_stream(struct nvt_thp *nvt)
 {
 	const struct firmware *firmware;
@@ -490,6 +525,9 @@ static int nvt_start_stream(struct nvt_thp *nvt)
 		 "THP stream ready, payload %u bytes; reset-to-REK %lld ms, reset-to-first-frame %lld ms, BF sequence %lld ms, last reset state %#04x (read %d); first-frame reset state %#04x, first-frame-to-NORMAL_RUN %lld ms\n",
 		 payload_length, boot.rek_ms, reset_to_frame_ms, commands_ms,
 		 nvt->reset_state, state_ret, first_frame_state, normal_run_ms);
+	/* BF04 above reset the pen state. A pen failure never stops fingers. */
+	nvt->pen_applied = 0;
+	nvt_apply_pen(nvt);
 	/* Firmware reload loses the setting, even if ONLINE has not changed. */
 	nvt->charger_sent = -1;
 	queue_work(system_freezable_wq, &nvt->charger_work);
@@ -559,6 +597,27 @@ static void nvt_quiesce(struct nvt_thp *nvt)
 	mutex_unlock(&nvt->lifecycle_lock);
 }
 
+static u32 nvt_state(struct nvt_thp *nvt)
+{
+	return !nvt->panel_off && !nvt->suspended ? PIANO_TOUCH_STATE_ACTIVE : 0;
+}
+
+static void nvt_state_changed(struct nvt_thp *nvt)
+{
+	if (nvt->state_events) {
+		char *env[] = {
+			nvt_state(nvt) ? "PIANO_TOUCH_ACTIVE=1" : "PIANO_TOUCH_ACTIVE=0",
+			NULL,
+		};
+
+		set_bit(NVT_STATE_CHANGED, &nvt->flags);
+		wake_up_interruptible(&nvt->wait);
+		/* The optional BLE controller also follows the physical panel. */
+		if (nvt->misc.this_device)
+			kobject_uevent_env(&nvt->misc.this_device->kobj, KOBJ_CHANGE, env);
+	}
+}
+
 static int nvt_panel_disabling(struct drm_panel_follower *follower)
 {
 	struct nvt_thp *nvt = container_of(follower, struct nvt_thp, follower);
@@ -566,6 +625,7 @@ static int nvt_panel_disabling(struct drm_panel_follower *follower)
 	mutex_lock(&nvt->transition_lock);
 	if (!nvt->panel_off && !nvt->dead) {
 		WRITE_ONCE(nvt->panel_off, true);
+		nvt_state_changed(nvt);
 		nvt_quiesce(nvt);
 	}
 	mutex_unlock(&nvt->transition_lock);
@@ -581,6 +641,7 @@ static int nvt_panel_enabled(struct drm_panel_follower *follower)
 		if (nvt->panel_off) {
 			WRITE_ONCE(nvt->error, 0);
 			WRITE_ONCE(nvt->panel_off, false);
+			nvt_state_changed(nvt);
 		}
 		/* Preserve queued bytes, including a partially read NTP1 record. */
 		wake_up_interruptible(&nvt->wait);
@@ -645,6 +706,11 @@ static int nvt_release(struct inode *inode, struct file *file)
 	WRITE_ONCE(nvt->opened, false);
 	if (!nvt->dead)
 		nvt_quiesce(nvt);
+	mutex_lock(&nvt->lifecycle_lock);
+	nvt->pen_model = 0;
+	nvt->state_events = false;
+	clear_bit(NVT_STATE_CHANGED, &nvt->flags);
+	mutex_unlock(&nvt->lifecycle_lock);
 	mutex_unlock(&nvt->transition_lock);
 	nvt_put(nvt);
 	return 0;
@@ -695,15 +761,53 @@ unlock:
 static __poll_t nvt_poll(struct file *file, poll_table *wait)
 {
 	struct nvt_thp *nvt = file->private_data;
+	__poll_t events;
 
 	poll_wait(file, &nvt->wait, wait);
+	events = test_bit(NVT_STATE_CHANGED, &nvt->flags) ? EPOLLPRI : 0;
 	if (READ_ONCE(nvt->dead))
 		return EPOLLERR | EPOLLHUP;
 	if (READ_ONCE(nvt->panel_off) || READ_ONCE(nvt->suspended))
-		return 0;
+		return events;
 	if (READ_ONCE(nvt->error))
 		return EPOLLERR | EPOLLHUP;
-	return kfifo_is_empty(&nvt->fifo) ? 0 : EPOLLIN | EPOLLRDNORM;
+	return events | (kfifo_is_empty(&nvt->fifo) ? 0 : EPOLLIN | EPOLLRDNORM);
+}
+
+static long nvt_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct nvt_thp *nvt = file->private_data;
+	u32 model;
+	int ret;
+
+	if (cmd != PIANO_TOUCH_SET_PEN && cmd != PIANO_TOUCH_GET_STATE)
+		return -ENOTTY;
+	if (cmd == PIANO_TOUCH_SET_PEN) {
+		if (copy_from_user(&model, (void __user *)arg, sizeof(model)))
+			return -EFAULT;
+		if (model > 3)
+			return -EINVAL;
+	}
+	ret = mutex_lock_interruptible(&nvt->transition_lock);
+	if (ret)
+		return ret;
+	mutex_lock(&nvt->lifecycle_lock);
+	if (nvt->dead) {
+		ret = -ENODEV;
+	} else if (cmd == PIANO_TOUCH_GET_STATE) {
+		model = nvt_state(nvt);
+		ret = copy_to_user((void __user *)arg, &model, sizeof(model)) ? -EFAULT : 0;
+		if (!ret) {
+			nvt->state_events = true;
+			clear_bit(NVT_STATE_CHANGED, &nvt->flags);
+		}
+	} else {
+		nvt->pen_model = model;
+		ret = nvt_apply_pen(nvt);
+	}
+	mutex_unlock(&nvt->lifecycle_lock);
+	mutex_unlock(&nvt->transition_lock);
+	return ret;
 }
 
 static const struct file_operations nvt_fops = {
@@ -712,6 +816,8 @@ static const struct file_operations nvt_fops = {
 	.release = nvt_release,
 	.read = nvt_read,
 	.poll = nvt_poll,
+	.unlocked_ioctl = nvt_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
 };
 
 /* Stock p81 lcd_id levels: 0 is the CSOT panel module, 1 the BOE module. */
@@ -751,8 +857,24 @@ static ssize_t panel_vendor_show(struct device *dev, struct device_attribute *at
 }
 static DEVICE_ATTR_RO(panel_vendor);
 
+/* Observe the owner's last acknowledged setting without opening the stream. */
+static ssize_t pen_scan_model_show(struct device *dev, struct device_attribute *attr,
+				 char *buf)
+{
+	struct nvt_thp *nvt = dev_get_drvdata(dev);
+	int model;
+
+	guard(mutex)(&nvt->lifecycle_lock);
+	model = !nvt->running ? 0 : nvt->pen_applied;
+	if (nvt->running && model != nvt->pen_model)
+		model = -1;
+	return sysfs_emit(buf, "%d\n", model);
+}
+static DEVICE_ATTR_RO(pen_scan_model);
+
 static struct attribute *nvt_panel_attrs[] = {
 	&dev_attr_panel_vendor.attr,
+	&dev_attr_pen_scan_model.attr,
 	NULL
 };
 
@@ -919,6 +1041,7 @@ static int nvt_suspend(struct device *dev)
 	mutex_lock(&nvt->transition_lock);
 	panel_off = nvt->panel_off;
 	WRITE_ONCE(nvt->suspended, true);
+	nvt_state_changed(nvt);
 	/* A disabled panel has already cancelled work and stopped its IRQ. */
 	if (!nvt->dead && !panel_off)
 		nvt_quiesce(nvt);
@@ -935,6 +1058,7 @@ static int nvt_resume(struct device *dev)
 
 	mutex_lock(&nvt->transition_lock);
 	WRITE_ONCE(nvt->suspended, false);
+	nvt_state_changed(nvt);
 	/* The later of panel enable and SPI resume queues the single attempt. */
 	nvt_queue_start(nvt);
 	wake_up_interruptible(&nvt->wait);
@@ -1570,7 +1694,57 @@ static struct kunit_suite nvt_select_suite = {
 	.test_cases = nvt_select_cases,
 };
 
+static void nvt_test_state_events(struct kunit *test)
+{
+	struct nvt_thp nvt = {};
+
+	init_waitqueue_head(&nvt.wait);
+	KUNIT_EXPECT_EQ(test, nvt_state(&nvt), PIANO_TOUCH_STATE_ACTIVE);
+	nvt_state_changed(&nvt);
+	KUNIT_EXPECT_FALSE(test, test_bit(NVT_STATE_CHANGED, &nvt.flags));
+	nvt.state_events = true;
+	nvt.panel_off = true;
+	nvt_state_changed(&nvt);
+	KUNIT_EXPECT_EQ(test, nvt_state(&nvt), 0U);
+	KUNIT_EXPECT_TRUE(test, test_bit(NVT_STATE_CHANGED, &nvt.flags));
+	nvt.panel_off = false;
+	nvt.suspended = true;
+	KUNIT_EXPECT_EQ(test, nvt_state(&nvt), 0U);
+	nvt.suspended = false;
+	KUNIT_EXPECT_EQ(test, nvt_state(&nvt), PIANO_TOUCH_STATE_ACTIVE);
+}
+
+static int nvt_test_pen_fail(struct nvt_thp *nvt)
+{
+	return -EREMOTEIO;
+}
+
+static void nvt_test_pen_isolation(struct kunit *test)
+{
+	struct nvt_thp nvt = { .running = true, .pen_model = 3,
+			       .test_pen = nvt_test_pen_fail };
+
+	mutex_init(&nvt.lifecycle_lock);
+	mutex_lock(&nvt.lifecycle_lock);
+	nvt.panel_off = true;
+	KUNIT_EXPECT_EQ(test, nvt_apply_pen(&nvt), 0);
+	nvt.panel_off = false;
+	nvt.suspended = true;
+	KUNIT_EXPECT_EQ(test, nvt_apply_pen(&nvt), 0);
+	nvt.suspended = false;
+	KUNIT_EXPECT_EQ(test, nvt_apply_pen(&nvt), -EREMOTEIO);
+	KUNIT_EXPECT_TRUE(test, nvt.running);
+	KUNIT_EXPECT_EQ(test, nvt.error, 0);
+	KUNIT_EXPECT_EQ(test, nvt.pen_applied, -1);
+	/* No pen after a reload: BF04=0 is already applied, no extra I/O. */
+	nvt.pen_model = nvt.pen_applied = 0;
+	KUNIT_EXPECT_EQ(test, nvt_apply_pen(&nvt), 0);
+	mutex_unlock(&nvt.lifecycle_lock);
+}
+
 static struct kunit_case nvt_panel_cases[] = {
+	KUNIT_CASE(nvt_test_pen_isolation),
+	KUNIT_CASE(nvt_test_state_events),
 	KUNIT_CASE(nvt_test_charger_changes),
 	KUNIT_CASE(nvt_test_charger_lifecycle_gates),
 	KUNIT_CASE(nvt_test_charger_restore_and_error),

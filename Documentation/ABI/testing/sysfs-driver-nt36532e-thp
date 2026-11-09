@@ -1,0 +1,10 @@
+What:           /sys/bus/spi/devices/.../pen_scan_model
+Date:           November 2026
+Contact:        Erwin <yzddmr7@gmail.com>
+Description:
+                Read-only status of optional pen scanning. Zero means the
+                stream is stopped or its last acknowledged pen command
+                disabled scanning; 1, 2 and 3 are M80P, N83P and P81C.
+                -1 means the requested setting is not confirmed. Reading
+                this attribute does not open the stream or access hardware.
+                Requests remain owned by the exclusive stream ioctl.

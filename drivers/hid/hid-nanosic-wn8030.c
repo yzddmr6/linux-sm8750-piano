@@ -22,6 +22,8 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/poll.h>
+#include <linux/pm_wakeirq.h>
+#include <linux/suspend.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -107,6 +109,7 @@ struct nanosic_wn8030 {
 	bool waking;
 	int wake_irq;
 	bool wake_irq_enabled;
+	bool data_irq_wakeup;
 	struct work_struct input_state_work;
 	struct input_handler hall_handler;
 	struct input_handle hall_handle;
@@ -1231,7 +1234,8 @@ static irqreturn_t nanosic_wn8030_wakeup_handler(int irq, void *data)
 {
 	struct nanosic_wn8030 *nanosic = data;
 
-	if (!READ_ONCE(nanosic->bridge_asleep))
+	/* The wake pulse bypasses HID dispatch, so apply the lid gate here too. */
+	if (!READ_ONCE(nanosic->bridge_asleep) || READ_ONCE(nanosic->lid_closed))
 		return IRQ_HANDLED;
 
 	/* Stock Nanosic_wakeup_irq: 1000 ms and a complete KEY_WAKEUP pulse. */
@@ -1702,8 +1706,8 @@ static const struct input_device_id nanosic_wn8030_hall_ids[] = {
 		.flags = INPUT_DEVICE_ID_MATCH_EVBIT |
 			 INPUT_DEVICE_ID_MATCH_SWBIT,
 		.evbit = { [BIT_WORD(EV_SW)] = BIT_MASK(EV_SW) },
-		.swbit = { [BIT_WORD(SW_LID)] = BIT_MASK(SW_LID) |
-						BIT_MASK(SW_TABLET_MODE) },
+		/* Piano's gpio-keys lid does not also report tablet mode. */
+		.swbit = { [BIT_WORD(SW_LID)] = BIT_MASK(SW_LID) },
 	},
 	{ }
 };
@@ -1929,6 +1933,52 @@ static int nanosic_wn8030_register_tablet(struct nanosic_wn8030 *nanosic)
 	return ret;
 }
 
+/* Retain the I2C core's data-IRQ wake attachment only when requested.
+ * This control changes no GPIO95 handling or device wakeup capability.
+ */
+static ssize_t data_irq_wakeup_show(struct device *dev,
+                                  struct device_attribute *attr, char *buf)
+{
+	struct nanosic_wn8030 *nanosic = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", READ_ONCE(nanosic->data_irq_wakeup));
+}
+
+static ssize_t data_irq_wakeup_store(struct device *dev,
+                                   struct device_attribute *attr,
+                                   const char *buf, size_t count)
+{
+	struct nanosic_wn8030 *nanosic = dev_get_drvdata(dev);
+	bool enable;
+	unsigned int sleep_flags;
+	int ret;
+
+	ret = kstrtobool(buf, &enable);
+	if (ret)
+		return ret;
+	/* Keep the attachment stable throughout suspend/resume. */
+	sleep_flags = lock_system_sleep();
+	if (enable != nanosic->data_irq_wakeup) {
+		if (enable)
+			ret = dev_pm_set_wake_irq(dev, nanosic->client->irq);
+		else
+			dev_pm_clear_wake_irq(dev);
+		if (!ret)
+			WRITE_ONCE(nanosic->data_irq_wakeup, enable);
+	}
+	unlock_system_sleep(sleep_flags);
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(data_irq_wakeup);
+
+static struct attribute *nanosic_wn8030_piano_attrs[] = {
+	&dev_attr_data_irq_wakeup.attr,
+	NULL,
+};
+static const struct attribute_group nanosic_wn8030_piano_group = {
+	.attrs = nanosic_wn8030_piano_attrs,
+};
+
 static int nanosic_wn8030_probe(struct i2c_client *client)
 {
 	struct nanosic_wn8030 *nanosic;
@@ -2121,6 +2171,16 @@ static int nanosic_wn8030_probe(struct i2c_client *client)
 					"nanosic_wn8030_wakeup", nanosic);
 	if (ret)
 		goto err_irq;
+	if (of_device_is_compatible(nanosic->dev->of_node, "nanosic,wn8030-piano")) {
+		/* GPIO97 carries data after bridge transitions. Sleeping keyboard
+		 * input has its own GPIO95 IRQ, armed by our PM callbacks.
+		 */
+		dev_pm_clear_wake_irq(nanosic->dev);
+		ret = devm_device_add_group(nanosic->dev, &nanosic_wn8030_piano_group);
+		if (ret)
+			goto err_wake_irq;
+	}
+
 	if (drm_is_panel_follower(nanosic->dev)) {
 		nanosic->follower.funcs = &nanosic_wn8030_panel_funcs;
 		ret = nanosic_wn8030_panel_disabling(&nanosic->follower);
@@ -2217,7 +2277,8 @@ static int nanosic_wn8030_suspend(struct device *dev)
 	/* A subsequent panel-enable notification owns wake, even if PM was first. */
 	if (nanosic->follower.panel)
 		WRITE_ONCE(nanosic->panel_on, false);
-	if (!ret && device_may_wakeup(dev)) {
+	/* The lid's own GPIO wakes on opening; a closed cover must not wake us. */
+	if (!ret && device_may_wakeup(dev) && !READ_ONCE(nanosic->lid_closed)) {
 		ret = enable_irq_wake(nanosic->wake_irq);
 		if (!ret)
 			nanosic->wake_irq_enabled = true;

@@ -39,9 +39,17 @@
 		serial0 = &uart7;
 	};
 
-	chosen {
-		stdout-path = "serial0:115200n8";
+	smp2p-sleepstate {
+		status = "disabled";
+		compatible = "qcom,smp2p-sleepstate";
+		qcom,smem-states = <&smp2p_adsp_sleepstate_out 0>;
+		interrupt-parent = <&smp2p_adsp_sleepstate_in>;
+		interrupts = <0 IRQ_TYPE_EDGE_BOTH>;
+		interrupt-names = "smp2p-sleepstate-in";
+	};
 
+
+	chosen {
 		/* Early firmware console; native DRM removes this at KMS handoff. */
 		framebuffer {
 			compatible = "simple-framebuffer";
@@ -147,10 +155,21 @@
 			     "qcom,sm8550-pmic-glink", "qcom,pmic-glink";
 		xiaomi,charge-pump = <&sc8541>;
 		orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;
+
 		pinctrl-0 = <&usb_orientation_default>;
 		pinctrl-names = "default";
 		#address-cells = <1>;
 		#size-cells = <0>;
+
+		/* The firmware of the charger switches the supply of the pen
+		 * transmitter in its dock.
+		 */
+		regulators {
+			pen_boost: pen-boost {
+				regulator-min-microvolt = <6500000>;
+				regulator-max-microvolt = <6500000>;
+			};
+		};
 
 		connector@0 {
 			compatible = "usb-c-connector";
@@ -1191,6 +1210,26 @@
 	status = "okay";
 };
 
+/* The two factory wired outputs of the flash controller of the camera.
+ * The factory uses them as one lamp: the flash and the torch both drive
+ * the two channels together.
+ */
+&pm8550_flash {
+	status = "okay";
+
+	piano_camera_flash: led-0 {
+		function = "flash";
+		function-enumerator = <0>;
+		/* Factory qcom,id 0 is standard channel 1, qcom,id 1 is
+		 * standard channel 2.
+		 */
+		led-sources = <1 2>;
+		led-max-microamp = <100000>;
+		flash-max-microamp = <400000>;
+		flash-max-timeout-us = <300000>;
+	};
+};
+
 &i2c5 {
 	/* This unit's stock SE5 / sc8541_master@6a. Policy is opt-in. */
 	sc8541: charger@6a {
@@ -1201,6 +1240,38 @@
 	fuel-gauge@55 {
 		compatible = "ti,bq27z561";
 		reg = <0x55>;
+	};
+};
+
+&i2c13 {
+	status = "okay";
+
+	/* The wireless transmitter of the pen in its dock. */
+	pen-transmitter@38 {
+		compatible = "southchip,sc96231";
+		reg = <0x38>;
+
+		vin-supply = <&pen_boost>;
+
+		enable-gpios = <&tlmm 14 GPIO_ACTIVE_HIGH>;
+		lp-enable-gpios = <&tlmm 99 GPIO_ACTIVE_HIGH>;
+		hall-gpios = <&tlmm 200 GPIO_ACTIVE_LOW>,
+			     <&tlmm 196 GPIO_ACTIVE_LOW>,
+			     <&tlmm 201 GPIO_ACTIVE_LOW>,
+			     <&tlmm 197 GPIO_ACTIVE_LOW>,
+			     <&tlmm 55 GPIO_ACTIVE_LOW>,
+			     <&tlmm 59 GPIO_ACTIVE_LOW>;
+		/* GPIO80 is shared with the existing lid switch. */
+		keyboard-gpios = <&tlmm 80 GPIO_ACTIVE_LOW>,
+				 <&tlmm 11 GPIO_ACTIVE_LOW>;
+
+		interrupt-parent = <&tlmm>;
+		interrupts = <78 IRQ_TYPE_EDGE_FALLING>;
+
+		pinctrl-0 = <&sc96231_int_state &sc96231_enable_state
+			     &sc96231_lp_enable_state &sc96231_hall3_state
+			     &sc96231_hall4_state &sc96231_placement_state>;
+		pinctrl-names = "default";
 	};
 };
 
@@ -1747,6 +1818,56 @@
 		output-disable;
 	};
 
+	/* The pen transmitter of the dock: its interrupt, the switch of the
+	 * transmitter, its low power control and the two Hall sensors.
+	 */
+	sc96231_int_state: sc96231-int-state {
+		pins = "gpio78";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-up;
+	};
+
+	sc96231_enable_state: sc96231-enable-state {
+		pins = "gpio14";
+		function = "gpio";
+		drive-strength = <2>;
+		output-low;
+		bias-disable;
+	};
+
+	sc96231_lp_enable_state: sc96231-lp-enable-state {
+		pins = "gpio99";
+		function = "gpio";
+		drive-strength = <2>;
+		output-high;
+		bias-disable;
+	};
+
+	sc96231_placement_state: sc96231-placement-state {
+		pins = "gpio201", "gpio197", "gpio55", "gpio59", "gpio11";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-pull-up;
+	};
+
+	sc96231_hall3_state: sc96231-hall3-state {
+		pins = "gpio200";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-pull-up;
+	};
+
+	sc96231_hall4_state: sc96231-hall4-state {
+		pins = "gpio196";
+		function = "gpio";
+		drive-strength = <2>;
+		input-enable;
+		bias-pull-up;
+	};
+
 	/* Stock xiaomi_keyboard_{sleep_,}default: wake, reset and status pins. */
 	keyboard_default: keyboard-default-state {
 		wake-pins {
@@ -1994,3 +2115,18 @@
 };
 
 #include "sm8750-xiaomi-piano-camera.dtsi"
+
+&{/smp2p-adsp} {
+	smp2p_adsp_sleepstate_out: sleepstate-out {
+		status = "disabled";
+		qcom,entry-name = "sleepstate";
+		#qcom,smem-state-cells = <1>;
+	};
+
+	smp2p_adsp_sleepstate_in: sleepstate-see {
+		status = "disabled";
+		qcom,entry-name = "sleepstate_see";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+};
