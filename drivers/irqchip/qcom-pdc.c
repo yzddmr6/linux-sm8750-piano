@@ -362,8 +362,9 @@ static int spi_configure_type(irq_hw_number_t hwirq, unsigned int type)
 
 	spi = hwirq - 32;
 	offset = (spi / 32) * sizeof(u32);
+	/* Routes outside the optional interface retain their firmware type. */
 	if (offset >= pdc->spi_cfg->size || pdc->spi_cfg->size - offset < sizeof(u32))
-		return -EINVAL;
+		return 0;
 
 	reg = pdc->spi_cfg->base + offset;
 	mask = BIT(spi % 32);
@@ -709,6 +710,23 @@ static int pdc_setup_pin_mapping(struct device *dev)
 	return 0;
 }
 
+static void pdc_log_unsynced_spis(struct device *dev)
+{
+	u64 limit = (pdc->spi_cfg->size / sizeof(u32)) * 32;
+	int n;
+
+	for (n = 0; n < pdc->region_cnt; n++) {
+		const struct pdc_pin_region *r = &pdc->region[n];
+		u64 first = max_t(u64, r->parent_base, limit);
+		u64 end = (u64)r->parent_base + r->cnt;
+
+		if (first < end)
+			dev_info(dev, "PDC%llu-%llu / SPI%llu-%llu outside SPI config window: skipping type synchronization\n",
+				 (u64)r->pin_base + first - r->parent_base,
+				 (u64)r->pin_base + r->cnt - 1, first, end - 1);
+	}
+}
+
 static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *parent)
 {
 	struct irq_domain *parent_domain, *pdc_domain;
@@ -825,6 +843,8 @@ static int qcom_pdc_probe(struct platform_device *pdev, struct device_node *pare
 			ret = PTR_ERR(pdc->spi_cfg->base);
 			return ret;
 		}
+
+		pdc_log_unsynced_spis(dev);
 	}
 
 	pdc_domain = irq_domain_create_hierarchy(parent_domain, IRQ_DOMAIN_FLAG_QCOM_PDC_WAKEUP,
