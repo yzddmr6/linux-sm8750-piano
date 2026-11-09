@@ -1210,9 +1210,11 @@ static irqreturn_t qcom_geni_serial_isr(int isr, void *dev)
 	struct tty_port *tport = &uport->state->port;
 	struct qcom_geni_serial_port *port = to_dev_port(uport);
 
-	if (uport->suspended)
-		return IRQ_NONE;
-
+	/*
+	 * serial core sets suspended before stopping RX and calling shutdown.
+	 * Acknowledge interrupts in that window; shutdown synchronizes this
+	 * IRQ before releasing the runtime PM reference.
+	 */
 	uart_port_lock(uport);
 
 	s_irq_status = readl(uport->membase + SE_GENI_S_IRQ_STATUS);
@@ -1311,14 +1313,23 @@ static void qcom_geni_serial_shutdown(struct uart_port *uport)
 	/* Atomic console output queues tx_kick without taking the port lock. */
 	WRITE_ONCE(port->tx_kick_enabled, false);
 	irq_work_sync(&port->tx_kick);
-	disable_irq(uport->irq);
-
 	uart_port_lock_irq(uport);
 	qcom_geni_serial_stop_tx(uport);
 	qcom_geni_serial_stop_rx(uport);
-
 	qcom_geni_serial_cancel_tx_cmd(uport);
+
+	/* Drain cancellation status before masking the dedicated IRQ. */
+	writel(readl(uport->membase + SE_GENI_M_IRQ_STATUS),
+	       uport->membase + SE_GENI_M_IRQ_CLEAR);
+	writel(readl(uport->membase + SE_GENI_S_IRQ_STATUS),
+	       uport->membase + SE_GENI_S_IRQ_CLEAR);
+	writel(readl(uport->membase + SE_DMA_TX_IRQ_STAT),
+	       uport->membase + SE_DMA_TX_IRQ_CLR);
+	writel(readl(uport->membase + SE_DMA_RX_IRQ_STAT),
+	       uport->membase + SE_DMA_RX_IRQ_CLR);
+	disable_irq_nosync(uport->irq);
 	uart_port_unlock_irq(uport);
+	synchronize_irq(uport->irq);
 
 	pm_runtime_put_sync(uport->dev);
 }
