@@ -54,8 +54,10 @@ static void put_iova_spaces(struct drm_gem_object *obj, struct drm_gpuvm *vm,
 
 static void msm_gem_close(struct drm_gem_object *obj, struct drm_file *file)
 {
+	struct msm_drm_private *priv = obj->dev->dev_private;
 	struct msm_context *ctx = file->driver_priv;
 	struct drm_exec exec;
+	long ret;
 
 	update_ctx_mem(file, -obj->size);
 	msm_gem_vma_put(obj);
@@ -77,11 +79,23 @@ static void msm_gem_close(struct drm_gem_object *obj, struct drm_file *file)
 		return;
 
 	/*
-	 * TODO we might need to kick this to a queue to avoid blocking
-	 * in CLOSE ioctl
+	 * Recovery may be unable to stop DMA. In that case it must retain
+	 * pending fences and BO references, but close must still let the
+	 * process exit. Leave the mappings to msm_gem_free_object() instead
+	 * of unmapping memory that the GPU might still access. The same is
+	 * safe if a signal interrupts the wait: submits hold the BO and VM.
+	 *
+	 * Recheck the terminal state once a second; this is not a deadline
+	 * for releasing buffers or for completing externally owned fences.
 	 */
-	dma_resv_wait_timeout(obj->resv, DMA_RESV_USAGE_BOOKKEEP, false,
-			      MAX_SCHEDULE_TIMEOUT);
+	while (!dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_BOOKKEEP)) {
+		if (READ_ONCE(priv->gpu->wedged))
+			return;
+		ret = dma_resv_wait_timeout(obj->resv, DMA_RESV_USAGE_BOOKKEEP,
+					    true, HZ);
+		if (ret < 0)
+			return;
+	}
 
 	msm_gem_lock_vm_and_obj(&exec, obj, ctx->vm);
 	put_iova_spaces(obj, ctx->vm, true, "close");
