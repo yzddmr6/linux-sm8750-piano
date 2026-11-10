@@ -127,16 +127,27 @@ int wcd_interrupt_callback(struct sdw_slave *slave, struct irq_domain *slave_irq
 {
 	struct regmap *regmap = dev_get_regmap(&slave->dev, NULL);
 	u32 sts1, sts2, sts3;
+	int ret;
 
 	do {
 		handle_nested_irq(irq_find_mapping(slave_irq, 0));
-		regmap_read(regmap, wcd_intr_status0, &sts1);
-		regmap_read(regmap, wcd_intr_status1, &sts2);
-		regmap_read(regmap, wcd_intr_status2, &sts3);
+
+		/* RX has no local regmap; its shared interrupt is handled above. */
+		if (!regmap)
+			return 0;
+		ret = regmap_read(regmap, wcd_intr_status0, &sts1);
+		if (ret)
+			return ret;
+		ret = regmap_read(regmap, wcd_intr_status1, &sts2);
+		if (ret)
+			return ret;
+		ret = regmap_read(regmap, wcd_intr_status2, &sts3);
+		if (ret)
+			return ret;
 
 	} while (sts1 || sts2 || sts3);
 
-	return IRQ_HANDLED;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(wcd_interrupt_callback);
 

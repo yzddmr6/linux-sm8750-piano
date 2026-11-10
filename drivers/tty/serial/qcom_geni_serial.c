@@ -135,6 +135,7 @@ struct qcom_geni_serial_port {
 	dma_addr_t tx_dma_addr;
 	dma_addr_t rx_dma_addr;
 	bool setup;
+	bool suspend_irq_masked;
 	unsigned long poll_timeout_us;
 	unsigned long clk_rate;
 	void *rx_buf;
@@ -1071,9 +1072,11 @@ static irqreturn_t qcom_geni_serial_isr(int isr, void *dev)
 	struct tty_port *tport = &uport->state->port;
 	struct qcom_geni_serial_port *port = to_dev_port(uport);
 
-	if (uport->suspended)
-		return IRQ_NONE;
-
+	/*
+	 * serial core sets suspended before stopping RX and calling shutdown.
+	 * Acknowledge interrupts in that window; shutdown synchronizes this
+	 * IRQ before serial core can power the port down.
+	 */
 	uart_port_lock(uport);
 
 	m_irq_status = readl(uport->membase + SE_GENI_M_IRQ_STATUS);
@@ -1174,14 +1177,23 @@ static int setup_fifos(struct qcom_geni_serial_port *port)
 
 static void qcom_geni_serial_shutdown(struct uart_port *uport)
 {
-	disable_irq(uport->irq);
-
 	uart_port_lock_irq(uport);
 	qcom_geni_serial_stop_tx(uport);
 	qcom_geni_serial_stop_rx(uport);
-
 	qcom_geni_serial_cancel_tx_cmd(uport);
+
+	/* Drain cancellation status before masking the dedicated IRQ. */
+	writel(readl(uport->membase + SE_GENI_M_IRQ_STATUS),
+	       uport->membase + SE_GENI_M_IRQ_CLEAR);
+	writel(readl(uport->membase + SE_GENI_S_IRQ_STATUS),
+	       uport->membase + SE_GENI_S_IRQ_CLEAR);
+	writel(readl(uport->membase + SE_DMA_TX_IRQ_STAT),
+	       uport->membase + SE_DMA_TX_IRQ_CLR);
+	writel(readl(uport->membase + SE_DMA_RX_IRQ_STAT),
+	       uport->membase + SE_DMA_RX_IRQ_CLR);
+	disable_irq_nosync(uport->irq);
 	uart_port_unlock_irq(uport);
+	synchronize_irq(uport->irq);
 }
 
 static void qcom_geni_serial_flush_buffer_fifo(struct uart_port *uport)
@@ -1977,6 +1989,14 @@ static int __maybe_unused qcom_geni_serial_runtime_resume(struct device *dev)
 	return ret;
 }
 
+static void qcom_geni_serial_restore_suspend_irq(struct qcom_geni_serial_port *port)
+{
+	if (port->suspend_irq_masked) {
+		port->suspend_irq_masked = false;
+		enable_irq(port->uport.irq);
+	}
+}
+
 static int qcom_geni_serial_suspend(struct device *dev)
 {
 	struct qcom_geni_serial_port *port = dev_get_drvdata(dev);
@@ -1993,18 +2013,34 @@ static int qcom_geni_serial_suspend(struct device *dev)
 		geni_icc_set_bw(&port->se);
 	}
 
-	ret = uart_suspend_port(private_data->drv, uport);
-	if (ret)
-		return ret;
+	/* Keep a no_console_suspend console live, including its IRQ. */
+	if (!console_suspend_enabled && uart_console(uport))
+		return uart_suspend_port(private_data->drv, uport);
 
 	/*
-	 * When no_console_suspend is set the console must remain active
-	 * across system sleep, so skip the force suspend path.
+	 * Cover the whole transition, including the TTY wakeup path which
+	 * skips shutdown() before force-suspend removes power. This owns a
+	 * separate disable depth from startup()/shutdown(). Keep it masked
+	 * if force-resume fails; a later transition must not nest it again.
 	 */
-	if (!console_suspend_enabled && uart_console(uport))
+	if (!port->suspend_irq_masked) {
+		disable_irq(uport->irq);
+		port->suspend_irq_masked = true;
+	}
+
+	ret = uart_suspend_port(private_data->drv, uport);
+	if (ret)
+		goto restore_irq;
+
+	ret = pm_runtime_force_suspend(dev);
+	if (!ret)
 		return 0;
 
-	return pm_runtime_force_suspend(dev);
+	/* The PM core does not resume a device whose suspend callback failed. */
+	uart_resume_port(private_data->drv, uport);
+restore_irq:
+	qcom_geni_serial_restore_suspend_irq(port);
+	return ret;
 }
 
 static int qcom_geni_serial_resume(struct device *dev)
@@ -2021,6 +2057,7 @@ static int qcom_geni_serial_resume(struct device *dev)
 	}
 
 	ret = uart_resume_port(private_data->drv, uport);
+	qcom_geni_serial_restore_suspend_irq(port);
 	if (uart_console(uport)) {
 		geni_icc_set_tag(&port->se, QCOM_ICC_TAG_ALWAYS);
 		geni_icc_set_bw(&port->se);
