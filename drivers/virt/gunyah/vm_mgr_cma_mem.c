@@ -24,6 +24,7 @@ struct gunyah_cma {
 	unsigned long max_size;
 	unsigned long mapped_size;
 	bool is_shared_parcel;
+	bool quarantined;
 	struct rw_semaphore parcel_lock;
 	struct mm_struct *owner_mm;
 };
@@ -230,7 +231,24 @@ int gunyah_cma_share_parcel(struct gunyah_vm *ghvm, struct gunyah_vm_parcel *vm_
 		cpu_to_le64(page_to_phys(cma->page + b->cma.offset + offset));
 
 	down_write(&cma->parcel_lock);
+	if (cma->quarantined) {
+		up_write(&cma->parcel_lock);
+		ret = -EBUSY;
+		goto free_mem_entries;
+	}
 	ret = gunyah_rm_mem_share(ghvm->rm, parcel);
+	if (ret == -ENOTRECOVERABLE) {
+		/* Keep the acquired file reference: release would free owned memory. */
+		cma->quarantined = true;
+		cma->is_shared_parcel = true;
+		vm_parcel->quarantined = true;
+		up_write(&cma->parcel_lock);
+		kfree(parcel->mem_entries);
+		parcel->mem_entries = NULL;
+		parcel->n_mem_entries = 0;
+		dev_err(ghvm->parent, "CMA share was not rolled back: retaining its backing\n");
+		return ret;
+	}
 	if (ret) {
 		up_write(&cma->parcel_lock);
 		goto free_mem_entries;
@@ -258,6 +276,10 @@ int gunyah_vm_binding_cma_alloc(struct gunyah_vm *ghvm,
 	struct file *file;
 	loff_t max_size;
 	int ret = 0;
+
+	/* Keep region parcel labels out of the runtime-share namespace. */
+	if (cma_map->label & BIT(31))
+		return -EINVAL;
 
 	if (!cma_map->size || !PAGE_ALIGNED(cma_map->size) ||
 		!PAGE_ALIGNED(cma_map->guest_addr))
