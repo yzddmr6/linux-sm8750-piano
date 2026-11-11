@@ -10,7 +10,7 @@ maintainers:
   - Erwin <yzddmr7@gmail.com>
 
 description:
-  When Qualcomm ABL applies the stock DTBO of some Xiaomi boards, it copies
+  When Qualcomm ABL applies the stock DTBO of some boards, it copies
   the overlay's root model and compatible over those of the booted DTB. The
   board DTB keeps its own values in these root properties, which the DTBO
   does not carry, so that the OS can restore them early in boot.
@@ -19,12 +19,23 @@ select:
   properties:
     $nodename:
       const: '/'
-  required:
-    - xiaomi,mainline-compatible
+  anyOf:
+    - required:
+        - xiaomi,mainline-compatible
+    - required:
+        - qcom,mainline-compatible
 
 properties:
   $nodename:
     const: '/'
+
+  qcom,mainline-compatible:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description: Copy of the root compatible defined by this DTB.
+
+  qcom,mainline-model:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Copy of the root model defined by this DTB.
 
   xiaomi,mainline-compatible:
     $ref: /schemas/types.yaml#/definitions/string-array
@@ -34,7 +45,10 @@ properties:
     $ref: /schemas/types.yaml#/definitions/string
     description: Copy of the root model defined by this DTB.
 
-required:
-  - xiaomi,mainline-compatible
+anyOf:
+  - required:
+      - xiaomi,mainline-compatible
+  - required:
+      - qcom,mainline-compatible
 
 additionalProperties: true

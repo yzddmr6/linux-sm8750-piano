@@ -1848,7 +1848,6 @@
 		pins = "gpio201", "gpio197", "gpio55", "gpio59", "gpio11";
 		function = "gpio";
 		drive-strength = <2>;
-		input-enable;
 		bias-pull-up;
 	};
 
@@ -1856,7 +1855,6 @@
 		pins = "gpio200";
 		function = "gpio";
 		drive-strength = <2>;
-		input-enable;
 		bias-pull-up;
 	};
 
@@ -1864,7 +1862,6 @@
 		pins = "gpio196";
 		function = "gpio";
 		drive-strength = <2>;
-		input-enable;
 		bias-pull-up;
 	};
 
