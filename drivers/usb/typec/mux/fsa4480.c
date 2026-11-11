@@ -336,7 +336,7 @@ static int fsa4480_probe(struct i2c_client *client)
 	if (!data)
 		return -ENODEV;
 
-	fsa = devm_kzalloc(dev, sizeof(*fsa), GFP_KERNEL);
+	fsa = devm_kzalloc_obj(dev, *fsa);
 	if (!fsa)
 		return -ENOMEM;
 

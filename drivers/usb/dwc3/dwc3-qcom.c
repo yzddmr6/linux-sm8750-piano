@@ -695,7 +695,7 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	int			ret;
 	bool			wakeup_source;
 
-	qcom = devm_kzalloc(&pdev->dev, sizeof(*qcom), GFP_KERNEL);
+	qcom = devm_kzalloc_obj(&pdev->dev, *qcom);
 	if (!qcom)
 		return -ENOMEM;
 

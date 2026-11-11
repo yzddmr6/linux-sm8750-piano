@@ -471,7 +471,7 @@ static int dw9768_probe(struct i2c_client *client)
 	unsigned int i;
 	int ret;
 
-	dw9768 = devm_kzalloc(dev, sizeof(*dw9768), GFP_KERNEL);
+	dw9768 = devm_kzalloc_obj(dev, *dw9768);
 	if (!dw9768)
 		return -ENOMEM;
 

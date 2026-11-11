@@ -1590,7 +1590,7 @@ static int va_macro_probe(struct platform_device *pdev)
 	int ret;
 	int rpm_ret;
 
-	va = devm_kzalloc(dev, sizeof(*va), GFP_KERNEL);
+	va = devm_kzalloc_obj(dev, *va);
 	if (!va)
 		return -ENOMEM;
 

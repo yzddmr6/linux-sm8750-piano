@@ -904,11 +904,9 @@ static int apm_probe(gpr_device_t *gdev)
 	struct q6apm *apm;
 	int ret;
 
-	apm = devm_kzalloc(dev, sizeof(*apm), GFP_KERNEL);
+	apm = devm_kzalloc_obj(dev, *apm);
 	if (!apm)
 		return -ENOMEM;
-
-	dev_set_drvdata(dev, apm);
 
 	mutex_init(&apm->lock);
 	apm->dev = dev;
@@ -923,6 +921,7 @@ static int apm_probe(gpr_device_t *gdev)
 
 	idr_init(&apm->modules_idr);
 
+	dev_set_drvdata(dev, apm);
 	q6apm_get_apm_state(apm);
 
 	ret = snd_soc_register_component(dev, &q6apm_audio_component, NULL, 0);
@@ -970,6 +969,9 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 	struct gpr_ibasic_rsp_result_t *result;
 	const struct gpr_hdr *hdr = &data->hdr;
 	int graph_id, is_pos_buf;
+
+	if (!apm)
+		return 0;
 
 	result = data->payload;
 
