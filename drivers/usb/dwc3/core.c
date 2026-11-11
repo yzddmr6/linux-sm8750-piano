@@ -169,14 +169,22 @@ static void __dwc3_set_mode(struct work_struct *work)
 	int ret;
 	u32 reg;
 	u32 desired_dr_role;
+	enum usb_role requested_role;
+	bool notify_glue;
 	int i;
 
 	mutex_lock(&dwc->mutex);
 	spin_lock_irqsave(&dwc->lock, flags);
 	desired_dr_role = dwc->desired_dr_role;
+	requested_role = dwc->requested_role;
+	notify_glue = dwc->requested_role_pending;
+	dwc->requested_role_pending = false;
 	spin_unlock_irqrestore(&dwc->lock, flags);
 
 	pm_runtime_get_sync(dwc->dev);
+
+	if (notify_glue)
+		dwc3_pre_set_role(dwc, requested_role);
 
 	if (dwc->current_dr_role == DWC3_GCTL_PRTCAP_OTG)
 		dwc3_otg_update(dwc, 0);
@@ -287,7 +295,8 @@ out:
 	mutex_unlock(&dwc->mutex);
 }
 
-void dwc3_set_mode(struct dwc3 *dwc, u32 mode)
+static void __dwc3_queue_mode(struct dwc3 *dwc, u32 mode, enum usb_role role,
+			      bool notify_glue)
 {
 	unsigned long flags;
 
@@ -296,9 +305,23 @@ void dwc3_set_mode(struct dwc3 *dwc, u32 mode)
 
 	spin_lock_irqsave(&dwc->lock, flags);
 	dwc->desired_dr_role = mode;
+	if (notify_glue) {
+		dwc->requested_role = role;
+		dwc->requested_role_pending = true;
+	}
 	spin_unlock_irqrestore(&dwc->lock, flags);
 
 	queue_work(system_freezable_wq, &dwc->drd_work);
+}
+
+void dwc3_set_mode(struct dwc3 *dwc, u32 mode)
+{
+	__dwc3_queue_mode(dwc, mode, USB_ROLE_NONE, false);
+}
+
+void dwc3_set_role(struct dwc3 *dwc, u32 mode, enum usb_role role)
+{
+	__dwc3_queue_mode(dwc, mode, role, true);
 }
 
 u32 dwc3_core_fifo_space(struct dwc3_ep *dep, u8 type)

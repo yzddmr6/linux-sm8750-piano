@@ -439,8 +439,7 @@ static int dwc3_drd_notifier(struct notifier_block *nb,
 	enum usb_role role = mode == DWC3_GCTL_PRTCAP_HOST ?
 				     USB_ROLE_HOST : USB_ROLE_DEVICE;
 
-	dwc3_pre_set_role(dwc, role);
-	dwc3_set_mode(dwc, mode);
+	dwc3_set_role(dwc, mode, role);
 
 	return NOTIFY_DONE;
 }
@@ -468,8 +467,7 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw,
 		break;
 	}
 
-	dwc3_pre_set_role(dwc, role);
-	dwc3_set_mode(dwc, mode);
+	dwc3_set_role(dwc, mode, role);
 	return 0;
 }
 
