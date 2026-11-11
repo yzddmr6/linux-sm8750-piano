@@ -506,6 +506,7 @@ struct gunyah_auth_desc {
  * @mem_handle: OUT - resource-manager memparcel handle for the guest to accept.
  * @reserved: Must be zero.
  */
+/* Labels passed to memory-region and protected-share ioctls must be < 2^31. */
 struct gunyah_protected_share {
 	__u32 label;
 	__u32 flags;

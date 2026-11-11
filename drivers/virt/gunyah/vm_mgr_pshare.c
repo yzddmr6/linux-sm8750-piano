@@ -17,7 +17,6 @@
  * hypervisor may still map must never return to the allocator.
  */
 
-#include <linux/delay.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/mm.h>
@@ -34,9 +33,6 @@
  * The guest is unaffected: it accepts by handle with validate_label = 0.
  */
 #define GUNYAH_PSHARE_LABEL_NS		BIT(31)
-
-/* The RM transiently refuses a share while a just-reclaimed parcel settles. */
-#define GUNYAH_PSHARE_SHARE_TRIES	8
 
 struct gunyah_vm_pshare {
 	struct list_head node;
@@ -207,7 +203,7 @@ static void gunyah_vm_pshare_free(struct gunyah_vm *ghvm,
 static int gunyah_vm_pshare_submit(struct gunyah_vm *ghvm,
 				   struct gunyah_vm_pshare *ps, u32 *mem_handle)
 {
-	int ret, tries;
+	int ret;
 
 	mutex_lock(&ghvm->pshares_lock);
 	if (gunyah_vm_pshare_find(ghvm, ps->label)) {
@@ -215,12 +211,7 @@ static int gunyah_vm_pshare_submit(struct gunyah_vm *ghvm,
 		goto unlock;
 	}
 
-	for (tries = 0; tries < GUNYAH_PSHARE_SHARE_TRIES; tries++) {
-		ret = gunyah_rm_mem_share(ghvm->rm, &ps->parcel);
-		if (!ret || ret == -ENOTRECOVERABLE)
-			break;
-		usleep_range(500, 1500);
-	}
+	ret = gunyah_rm_mem_share(ghvm->rm, &ps->parcel);
 	if (ret) {
 		dev_warn(ghvm->parent,
 			 "Failed to share parcel label %u to VM %u: %d\n",
@@ -250,6 +241,8 @@ int gunyah_vm_pshare_user(struct gunyah_vm *ghvm,
 	u64 end;
 	int ret;
 
+	if (args->label & GUNYAH_PSHARE_LABEL_NS)
+		return -EINVAL;
 	if (args->flags & ~GUNYAH_MEM_ALLOW_RWX)
 		return -EINVAL;
 	if (!args->memory_size || !PAGE_ALIGNED(args->memory_size) ||
@@ -357,6 +350,8 @@ int gunyah_vm_pshare_dmabuf(struct gunyah_vm *ghvm,
 	u64 end;
 	int ret;
 
+	if (args->label & GUNYAH_PSHARE_LABEL_NS)
+		return -EINVAL;
 	if (args->flags & ~GUNYAH_MEM_ALLOW_RWX)
 		return -EINVAL;
 	if (!args->memory_size || !PAGE_ALIGNED(args->memory_size) ||

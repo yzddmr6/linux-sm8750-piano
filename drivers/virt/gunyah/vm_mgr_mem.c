@@ -440,6 +440,10 @@ int gunyah_vm_binding_alloc(struct gunyah_vm *ghvm,
 	struct gunyah_vm_binding *binding;
 	int ret = 0;
 
+	/* Bit 31 separates runtime protected shares from region parcels. */
+	if (region->label & BIT(31))
+		return -EINVAL;
+
 	if (!region->memory_size || !PAGE_ALIGNED(region->memory_size) ||
 		!PAGE_ALIGNED(region->userspace_addr) ||
 		!PAGE_ALIGNED(region->guest_phys_addr))
