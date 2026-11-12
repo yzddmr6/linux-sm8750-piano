@@ -40,6 +40,16 @@ config UDMABUF
 	  A driver to let userspace turn memfd regions into dma-bufs.
 	  Qemu can use this to create host dmabufs for guest framebuffers.
 
+config UDMABUF_LIST_LIMIT
+	int "Default maximum number of regions in a udmabuf"
+	depends on UDMABUF
+	range 1 2147483647
+	default 1024
+	help
+	  Maximum number of memfd regions accepted by UDMABUF_CREATE_LIST.
+	  Virtual GPU backends may need a larger limit for large resources.
+	  The udmabuf.list_limit parameter can override this default.
+
 config DMABUF_DEBUG
 	bool "DMA-BUF debug checks"
 	depends on DMA_SHARED_BUFFER
