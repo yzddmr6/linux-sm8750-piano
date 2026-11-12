@@ -91,6 +91,12 @@
 	};
 };
 
+&remoteproc_cdsp {
+	firmware-name = "qcom/sm8750/piano/cdsp.mdt",
+			"qcom/sm8750/piano/cdsp_dtb.mdt";
+	status = "okay";
+};
+
 &remoteproc_adsp {
 	firmware-name = "qcom/sm8750/piano/adsp.mdt",
 			"qcom/sm8750/piano/adsp_dtb.mdt";

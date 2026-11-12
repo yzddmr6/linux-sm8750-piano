@@ -1970,6 +1970,12 @@
 	firmware-name = "qcom/sm8750/erhai/soccp.mbn";
 };
 
+&remoteproc_cdsp {
+	firmware-name = "qcom/sm8750/erhai/cdsp.mdt",
+			"qcom/sm8750/erhai/cdsp_dtb.mdt";
+	status = "okay";
+};
+
 &remoteproc_adsp {
 	firmware-name = "qcom/sm8750/erhai/adsp.mdt",
 			"qcom/sm8750/erhai/adsp_dtb.mdt";
