@@ -2595,6 +2595,7 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 		if (!PMSG_IS_AUTO(msg) &&
 		    (!device_may_wakeup(dwc->dev) || dwc->needs_full_reinit)) {
 			dwc3_core_exit(dwc);
+			dwc->xhci_power_lost = 1;
 			break;
 		}
 
@@ -2631,6 +2632,8 @@ static int dwc3_suspend_common(struct dwc3 *dwc, pm_message_t msg)
 
 		dwc3_otg_exit(dwc);
 		dwc3_core_exit(dwc);
+		if (dwc->current_otg_role == DWC3_OTG_ROLE_HOST)
+			dwc->xhci_power_lost = 1;
 		break;
 	default:
 		/* do nothing */
