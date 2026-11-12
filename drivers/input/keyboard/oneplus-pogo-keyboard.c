@@ -213,7 +213,7 @@ static const struct {
 	{ 0x00e9, KEY_VOLUMEUP, KEY_F12 },
 	{ 0x00ea, KEY_VOLUMEDOWN, KEY_F11 },
 	{ 0x01d0, KEY_FN },
-	{ 0x0224, KEY_BACK },
+	{ 0x0224, KEY_ESC },
 	{ 0x0244, KEY_APPSELECT },
 	{ 0x02fa, KEY_ASSISTANT },
 	{ 0x038e, KEY_SCREENLOCK, KEY_F6 },
