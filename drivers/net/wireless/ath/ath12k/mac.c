@@ -5853,6 +5853,9 @@ abort:
 				continue;
 
 			ar = arvif->ar;
+			if (!ar)
+				continue;
+
 			if (ar->scan.arvif == arvif) {
 				wiphy_work_cancel(hw->wiphy, &ar->scan.vdev_clean_wk);
 				spin_lock_bh(&ar->data_lock);
