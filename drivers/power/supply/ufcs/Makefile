@@ -1,4 +1,5 @@
 ufcs_class-y := ufcs_core.o
+ufcs_class-y += sc8547a_ufcs.o
 ufcs_class-y += ufcs_event.o
 ufcs_class-y += ufcs_event_ctrl.o
 ufcs_class-y += ufcs_event_data.o

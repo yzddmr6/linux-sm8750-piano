@@ -1,5 +1,6 @@
 config OPLUS_UFCS_CLASS
 	tristate "Oplus UFCS sink protocol and SC8547A PHY"
+	select REGMAP
 	default CHARGER_SC8547A
 	help
 	  Negotiate Universal Fast Charging Specification contracts over the
