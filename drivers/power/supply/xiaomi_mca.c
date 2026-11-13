@@ -304,7 +304,6 @@ MODULE_PARM_DESC(full_charge,
  */
 #define MCA_HV_VBUS_5V_MAX_UV	6000000
 #define MCA_HV_RENEG_MS		10000
-#define MCA_HV_RENEG_MAX	3
 /* Current limit asked of a PPS source */
 #define MCA_HV_PPS_MIN_MA	500
 #define MCA_HV_PPS_MAX_MA	3000
@@ -466,7 +465,7 @@ enum xiaomi_mca_hv {
 	MCA_HV_OFF,		/* 5 V, may ask for 9 V */
 	MCA_HV_REQUESTED,	/* 9 V asked for, waiting for the bus */
 	MCA_HV_ON,		/* bus at 9 V */
-	MCA_HV_BLOCKED,		/* back at 5 V until detach */
+	MCA_HV_COOLDOWN,	/* renegotiate once back at 5 V */
 };
 
 enum xiaomi_mca_cp {
@@ -653,7 +652,6 @@ struct xiaomi_mca {
 	int fcc_set_ma;		/* last current written by charge_current, 0 if none */
 	enum xiaomi_mca_hv hv;
 	int hv_polls;
-	int hv_renegs;		/* times the source went back to 5 V on its own */
 	bool hv_pps;		/* 9 V is asked of a PPS APDO */
 	u32 hv_pps_ma;		/* its requested current limit */
 	enum xiaomi_mca_cp cp;
@@ -1808,8 +1806,18 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
 	u32 ma = 0;
 	int ret;
 
-	if (!hv_charge || mca->hv == MCA_HV_BLOCKED)
+	if (!hv_charge)
 		return 0;
+	if (mca->hv == MCA_HV_COOLDOWN) {
+		if (time_before(jiffies, mca->hv_retry))
+			return 0;
+		if (mca->vbus_uv >= MCA_HV_VBUS_5V_MAX_UV) {
+			xiaomi_mca_request_volt(mca, 5000);
+			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS);
+			return 0;
+		}
+		mca->hv = MCA_HV_OFF;
+	}
 
 	if (xiaomi_mca_is_pd(mca->real_type))
 		ma = xiaomi_mca_pd_9v_ma(mca, &pps);
@@ -1862,8 +1870,7 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
 	case MCA_HV_ON:
 		if (ma && vbus_hv)
 			return ma;
-		if (ma && mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV &&
-		    mca->hv_renegs++ < MCA_HV_RENEG_MAX) {
+		if (ma && mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV) {
 			dev_info(mca->dev, "source back at 5 V, asking again in %u s\n",
 				 MCA_HV_RENEG_MS / 1000);
 			mca->hv = MCA_HV_OFF;
@@ -1878,7 +1885,8 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
 	/* Not reached, dropped or refused: 5 V until detach */
 	dev_info(mca->dev, "back to 5 V (bus %d mV)\n", mca->vbus_uv / 1000);
 	xiaomi_mca_request_volt(mca, 5000);
-	mca->hv = MCA_HV_BLOCKED;
+	mca->hv = MCA_HV_COOLDOWN;
+	mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS);
 	return 0;
 }
 
@@ -2488,7 +2496,7 @@ static bool xiaomi_mca_adapter_verified(struct xiaomi_mca *mca)
  */
 static bool xiaomi_mca_cp_after_auth(struct xiaomi_mca *mca)
 {
-	if (mca->hv == MCA_HV_REQUESTED ||
+	if (mca->hv != MCA_HV_OFF || time_before(jiffies, mca->hv_retry) ||
 	    mca->vbus_uv >= MCA_HV_VBUS_5V_MAX_UV)
 		return false;
 	if (!mipps_auth || (mca->mipps_attempted && !mca->auth_cleanup &&
@@ -3407,11 +3415,11 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		mca->mipps_attempted = false;
 		mca->cp = MCA_CP_OFF;
 		mca->hv = MCA_HV_OFF;
-		mca->hv_renegs = 0;
 		mca->cp_ibus_cap = 0;
 		mca->online = false;
 		mca->cp_fault = false;
 		mca->cp_recharge = false;
+		mca->hv_retry = jiffies;
 		mca->policy_attach_generation = attachment;
 	}
 	if (xiaomi_mca_clear_auth(mca))
@@ -3472,18 +3480,6 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		if (mca->fcc_written)
 			xiaomi_mca_reset_fcc(mca);
 	}
-	/* A restored PD classification must not stay blocked by an earlier
-	 * Unknown sample. Keep the same bounded retry budget until detach.
-	 */
-	if (online && xiaomi_mca_is_pd(real_type) &&
-	    !xiaomi_mca_is_pd(mca->real_type) && mca->hv == MCA_HV_BLOCKED &&
-	    mca->hv_renegs < MCA_HV_RENEG_MAX) {
-		mca->hv_renegs++;
-		mca->hv = MCA_HV_OFF;
-		if (time_before(mca->hv_retry,
-				jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS)))
-			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS);
-	}
 	mca->online = online;
 	mca->real_type = real_type;
 
@@ -3511,7 +3507,6 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		if (mca->hv == MCA_HV_REQUESTED)
 			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_RETRY_MS);
 		mca->hv = MCA_HV_OFF;
-		mca->hv_renegs = 0;
 	} else if (!xiaomi_mca_limits(real_type) ||
 		   (xiaomi_mca_cp_active(mca) && !xiaomi_mca_is_pd(real_type))) {
 		xiaomi_mca_cp_stop(mca, "unknown source");
@@ -3563,7 +3558,6 @@ static void xiaomi_mca_poll(struct work_struct *work)
 				goto out;
 			mca->cp = MCA_CP_OFF;
 			mca->hv = MCA_HV_OFF;
-			mca->hv_renegs = 0;
 			mca->icl_written = false;
 			mca->icl_set_ma = 0;
 			mca->fcc_set_ma = 0;
@@ -4245,7 +4239,6 @@ out:
 	mca->hv = fixed_ma ? MCA_HV_ON : MCA_HV_OFF;
 	mca->voltage_written = !!fixed_ma;
 	mca->hv_pps = false;
-	mca->hv_renegs = 0;
 	mca->ffc_active = false;
 	mca->auth_ok = false;
 	mca->mipps_attempted = false;
@@ -4440,6 +4433,7 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 		return -ENOMEM;
 
 	mca->dev = dev;
+	mca->hv_retry = jiffies;
 	mca->charge_end = 100;
 	mca->piano_otg = of_device_is_compatible(dev->of_node, "xiaomi,piano-pmic-glink");
 	dev_set_drvdata(dev, mca);

@@ -722,6 +722,7 @@ static struct mca_policy_fixture *mca_policy_fixture(struct kunit *test)
 	struct mca_policy_fixture *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->mca.hv_retry = jiffies;
 	f->mca.dev = kunit_device_register(test, "mca-policy-test");
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, f->mca.dev);
 	mutex_init(&f->mca.lock);
@@ -793,8 +794,14 @@ static void xiaomi_mca_test_hv_fixed(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_ON);
 	f->vbus = mca->vbus_uv = 10000000;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
-	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_BLOCKED);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_COOLDOWN);
+	f->vbus = mca->vbus_uv = 5000000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_COOLDOWN);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->last_data), 5000);
+	mca->hv_retry = jiffies;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_REQUESTED);
 	mutex_unlock(&mca->lock);
 	hv_charge = false;
 }
