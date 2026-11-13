@@ -2776,7 +2776,7 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	f->cells[0].current_ua = 7000000;
 	f->cells[1].current_ua = -1000000;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_gauges(&f->mca, &vbat, &ibat, &tcool, &tbat,
-						&vmin, &imax), 0);
+						&vmin, &imax, NULL), 0);
 	KUNIT_EXPECT_EQ(test, vbat, 4400);
 	KUNIT_EXPECT_EQ(test, vmin, 3449);
 	KUNIT_EXPECT_EQ(test, ibat, 6000);
@@ -2801,8 +2801,36 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	f->stage_on = true;
 	xiaomi_mca_cp_step(&f->mca);
 	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_COOLDOWN);
-	KUNIT_EXPECT_TRUE(test, f->mca.cp_fault);
+	KUNIT_EXPECT_FALSE(test, f->mca.cp_fault);
 	KUNIT_EXPECT_FALSE(test, f->stage_on);
+	f->cells[0].current_ua = 9001000;
+	f->mca.cp_psy = power_supply_get_by_name("mca-pm-test-cp");
+	f->mca.cp = MCA_CP_ON;
+	f->stage_on = true;
+	xiaomi_mca_cp_step(&f->mca);
+	KUNIT_EXPECT_TRUE(test, f->mca.cp_fault);
+}
+
+static void xiaomi_mca_test_pack_limit_recovers(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	mca_test_stage(test, f);
+	mca->cp_ma = 5000;
+	mca->cp_max_mv = 11000;
+	mca->cp_ibat_trip = 12000;
+	f->stage_mv = 8400;
+	f->stage_ma = 1500;
+	f->cells[0].current_ua = f->cells[1].current_ua = 6100000;
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
+	KUNIT_EXPECT_STREQ(test, mca->cp_last_exit, "battery current too high");
+	KUNIT_EXPECT_FALSE(test, mca->cp_fault);
+	mca->cp_retry_at = jiffies;
+	xiaomi_mca_cp_try_start(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
 }
 
 static void xiaomi_mca_test_bus_voltage_fault(struct kunit *test)
@@ -3392,6 +3420,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_ffc_conditions),
 	KUNIT_CASE(xiaomi_mca_test_ffc_handoff),
 	KUNIT_CASE(xiaomi_mca_test_cp_cell_guards),
+	KUNIT_CASE(xiaomi_mca_test_pack_limit_recovers),
 	KUNIT_CASE(xiaomi_mca_test_bus_voltage_fault),
 	KUNIT_CASE(xiaomi_mca_test_qc_regulation),
 	KUNIT_CASE(xiaomi_mca_test_measured_buck_share),

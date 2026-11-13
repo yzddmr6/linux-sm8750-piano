@@ -599,6 +599,7 @@ struct xiaomi_mca_notify_record {
 
 struct xiaomi_mca_cells {
 	int vmax, vmin, ibat, imax, cold, hot;
+	bool cell_ocp;
 	int status;
 };
 
@@ -2218,7 +2219,33 @@ static char *xiaomi_mca_supplied_to[] = { "bq27z561-0", "bq27z561-1" };
  * current and largest absolute cell current. A low or overloaded cell
  * must not be hidden by the other cell's voltage or opposite current.
  */
-static void xiaomi_mca_sample_cells(struct xiaomi_mca_cells *cells)
+static bool xiaomi_mca_cell_ocp(struct xiaomi_mca *mca, struct power_supply *psy,
+				int ua)
+{
+	struct fwnode_handle *pump, *pump_bus, *gauge_bus;
+	bool exceeded;
+
+	if (ua <= MCA_CP_CELL_OCP_MA * 1000)
+		return false;
+	if (ua > 9000000)
+		return true; /* Above both Piano gauge thresholds. */
+
+	/* The master gauge and SC8541 share SE5. Only the slave on SE11
+	 * crosses its stock OCP between 7 A and 9 A.
+	 */
+	pump = fwnode_find_reference(dev_fwnode(mca->dev), "xiaomi,charge-pump", 0);
+	if (IS_ERR_OR_NULL(pump))
+		return false;
+	pump_bus = fwnode_get_parent(pump);
+	gauge_bus = fwnode_get_parent(dev_fwnode(&psy->dev));
+	exceeded = pump_bus && gauge_bus && pump_bus != gauge_bus;
+	fwnode_handle_put(gauge_bus);
+	fwnode_handle_put(pump_bus);
+	fwnode_handle_put(pump);
+	return exceeded;
+}
+
+static void xiaomi_mca_sample_cells(struct xiaomi_mca *mca, struct xiaomi_mca_cells *cells)
 {
 	union power_supply_propval v, i, t;
 	struct power_supply *psy;
@@ -2238,6 +2265,8 @@ static void xiaomi_mca_sample_cells(struct xiaomi_mca_cells *cells)
 		}
 		ret = ret ?: power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &v);
 		ret = ret ?: power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &i);
+		if (!ret)
+			cells->cell_ocp |= xiaomi_mca_cell_ocp(mca, psy, abs(i.intval));
 		power_supply_put(psy);
 		if (ret) {
 			cells->status = ret;
@@ -2251,13 +2280,13 @@ static void xiaomi_mca_sample_cells(struct xiaomi_mca_cells *cells)
 }
 
 static int xiaomi_mca_gauges(struct xiaomi_mca *mca, int *vbat, int *ibat, int *cold,
-			     int *hot, int *vmin, int *imax)
+			     int *hot, int *vmin, int *imax, bool *ocp)
 {
 	struct xiaomi_mca_cells local;
 	const struct xiaomi_mca_cells *cells = mca->poll_cells;
 
 	if (!cells) {
-		xiaomi_mca_sample_cells(&local);
+		xiaomi_mca_sample_cells(mca, &local);
 		cells = &local;
 	}
 	*vbat = cells->vmax;
@@ -2266,6 +2295,8 @@ static int xiaomi_mca_gauges(struct xiaomi_mca *mca, int *vbat, int *ibat, int *
 	*hot = cells->hot;
 	*vmin = cells->vmin;
 	*imax = cells->imax;
+	if (ocp)
+		*ocp = cells->cell_ocp;
 	return cells->status;
 }
 
@@ -2425,7 +2456,7 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 
 	ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
 	mca->fv_derated = !!ret;
-	if (!ret && xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax)) {
+	if (!ret && xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, NULL)) {
 		/* Hold the last vote for one missed observation. A measured
 		 * hot sensor always takes precedence over that grace period.
 		 */
@@ -2812,7 +2843,7 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		}
 	}
 	pack_ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
-	cell_ret = xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax);
+	cell_ret = xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, NULL);
 	if (!pack_ret) {
 		tbat = max_t(int, tbat, (s32)tpack);
 		tcool = min_t(int, tcool, (s32)tpack);
@@ -3063,7 +3094,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	     (!xiaomi_mca_is_pd(mca->real_type) || !xiaomi_mca_cp_after_auth(mca))))
 		return;
 
-	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax))
+	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, NULL))
 		return;
 	if (xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack))
 		return;
@@ -3229,10 +3260,10 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	int ibat_max, target, ibus_all, buck_ma, budget, vmin, imax;
 	int band = xiaomi_mca_cp_band(mca->cp_type);
 	u32 mv = mca->cp_mv, cv;
-	bool taper;
+	bool taper, ocp;
 	u32 fcc, icl;
 
-	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax) ||
+	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, &ocp) ||
 	    xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &on)) {
 		xiaomi_mca_cp_stop(mca, "read failed");
 		return;
@@ -3259,7 +3290,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		}
 	}
 	if (imax >= MCA_CP_CELL_OCP_MA) {
-		mca->cp_fault = true;
+		mca->cp_fault = ocp;
 		xiaomi_mca_cp_stop(mca, "cell current too high");
 		return;
 	}
@@ -3371,8 +3402,8 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_stop(mca, "bus current too high");
 		return;
 	}
-	if (ibat > (int)mca->cp_ibat_trip + MCA_CP_TRIP_IBAT_MA) {
-		mca->cp_fault = ibat > MCA_CP_IBAT_MAX_MA;
+	if (ibat > MCA_CP_IBAT_MAX_MA || ibat > (int)mca->cp_ibat_trip + MCA_CP_TRIP_IBAT_MA) {
+		/* div_max_curr is a regulation limit, not a pack OCP flag. */
 		xiaomi_mca_cp_stop(mca, "battery current too high");
 		return;
 	}
@@ -4231,7 +4262,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			goto out;
 		xiaomi_mca_process_notifications(mca);
 		if (charge_policy || READ_ONCE(mca->charge_end) < 100 || mca->charge_disabled) {
-			xiaomi_mca_sample_cells(&cells);
+			xiaomi_mca_sample_cells(mca, &cells);
 			mca->poll_cells = &cells;
 		}
 		ret = xiaomi_mca_full_charge_poll(mca);
