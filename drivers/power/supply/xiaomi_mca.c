@@ -2297,10 +2297,14 @@ static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twa
 	if (!full_charge || mca->cell_zone < 18 || tcool < 18 || twarm >= MCA_TERM_HOT_DEGC ||
 	    mca->policy_generation != READ_ONCE(mca->service_generation) ||
 	    online != 1 ||
-	    xiaomi_mca_read_type(mca, &type) || !xiaomi_mca_limits(type) ||
+	    xiaomi_mca_read_type(mca, &type) ||
+	    (!xiaomi_mca_limits(type) && type != MCA_TYPE_UNKNOWN) ||
 	    type == MCA_TYPE_SDP || type == MCA_TYPE_CDP)
 		return false;
 
+	if ((type == MCA_TYPE_C || xiaomi_mca_probe_5v(type)) &&
+	    xiaomi_mca_5v_input(mca, type) <= MCA_POLICY_ICL_DEFAULT_MA)
+		return false;
 	running = mca->ffc_active && mca->ffc_type == type && mca->ffc_attach == attached;
 	mca->ffc_type = type;
 	mca->ffc_attach = attached;

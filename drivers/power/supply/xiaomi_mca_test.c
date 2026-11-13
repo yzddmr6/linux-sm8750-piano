@@ -2626,7 +2626,7 @@ static void xiaomi_mca_test_threshold_wakeup_prepare(struct kunit *test)
 static void xiaomi_mca_test_ffc_conditions(struct kunit *test)
 {
 	static const u32 types[] = { MCA_TYPE_PD_VERIFY, MCA_TYPE_PD_PPS, MCA_TYPE_PD,
-				     MCA_TYPE_C, MCA_TYPE_HVDCP_3P5, MCA_TYPE_FLOAT };
+				     MCA_TYPE_DCP, MCA_TYPE_HVDCP_3P5 };
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
 	int i;
 
@@ -2639,6 +2639,9 @@ static void xiaomi_mca_test_ffc_conditions(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, f->term_readback, 5480);
 		KUNIT_EXPECT_EQ(test, f->mca.cp_profile, MCA_PROFILE_FFC);
 	}
+	f->type = MCA_TYPE_FLOAT;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
 	f->type = MCA_TYPE_SDP;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
