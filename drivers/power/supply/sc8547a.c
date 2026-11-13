@@ -422,6 +422,7 @@ struct sc8547a_device {
 	struct ufcs_dev *ufcs;
 	u64 ufcs_mode;
 	unsigned int ufcs_cable_ma;
+	unsigned int ufcs_granted_ma;
 	unsigned long ufcs_packet_at;
 #endif
 	bool ufcs_owner;
@@ -2663,6 +2664,7 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	}
 	if (best) {
 		sc->ufcs_cable_ma = UFCS_CABLE_INFO_CURR_MAX(cable);
+		sc->ufcs_granted_ma = 0;
 		sc->ufcs_packet_at = jiffies;
 		return best;
 	}
@@ -2693,6 +2695,7 @@ int sc8547a_ufcs_request(unsigned int *mv, unsigned int *ma)
 	if (ret)
 		return ret;
 	*ma = applied;
+	sc->ufcs_granted_ma = applied;
 	sc->ufcs_packet_at = jiffies;
 	return 0;
 }
@@ -2702,13 +2705,22 @@ int sc8547a_ufcs_request(unsigned int *mv, unsigned int *ma)
 int sc8547a_ufcs_monitor(void)
 {
 	struct sc8547a_device *sc;
+	u32 changes[UFCS_OUTPUT_MODE_MAX];
 	u64 info;
-	int ret;
+	int i, ret;
 
 	guard(mutex)(&sc8547_ufcs_lock);
 	sc = sc8547_master_dev;
 	if (!sc || !sc->ufcs_owner || !ufcs_handshake_success(sc->ufcs))
 		return -ENOLINK;
+	ret = ufcs_intf_get_power_change_info(sc->ufcs, changes, ARRAY_SIZE(changes));
+	if (ret < 0)
+		return ret;
+	for (i = 0; i < ret; i++) {
+		if (UFCS_POWER_CHANGE_INDEX(changes[i]) == UFCS_OUTPUT_MODE_INDEX(sc->ufcs_mode) &&
+		    UFCS_POWER_CHANGE_CURR_MAX(changes[i]) < sc->ufcs_granted_ma)
+			return -EAGAIN;
+	}
 	if (time_before(jiffies, sc->ufcs_packet_at + HZ))
 		return 0;
 	ret = ufcs_intf_get_source_info(sc->ufcs, &info);
