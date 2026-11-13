@@ -653,6 +653,8 @@ struct xiaomi_mca {
 	u32 cp_type;	/* protocol at stage entry */
 	enum xiaomi_mca_cp cp;
 	const char *cp_last_exit;
+	const char *hv_last_exit;
+	u32 cp_exits;
 	struct power_supply *cp_psy;	/* the stage, held while not MCA_CP_OFF */
 	u32 cp_mv;		/* voltage asked of the PPS source */
 	u32 cp_ma;		/* APDO current limit, with source/authentication caps */
@@ -1773,7 +1775,8 @@ static u32 xiaomi_mca_5v_input(struct xiaomi_mca *mca, u32 type)
 		else if (state == MCA_UCSI_RP_3000)
 			ma = 3000;
 	} else if (xiaomi_mca_is_pd(type)) {
-		ma = min(xiaomi_mca_pd_5v_ma(mca), xiaomi_mca_contract_ma(mca, 5000, 1500));
+		ma = xiaomi_mca_pd_5v_ma(mca);
+		ma = min(ma, xiaomi_mca_contract_ma(mca, 5000, min(ma, 3000U)));
 	}
 	return min_t(u32, ma, MCA_ICL_5V_MAX_MA);
 }
@@ -1987,6 +1990,7 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
 		mca->hv_pps_ma = ma;
 		ret = xiaomi_mca_request_volt(mca, MCA_HV_MV);
 		if (ret) {
+			mca->hv_last_exit = "request-refused";
 			dev_warn(mca->dev, "9 V request refused: %d (adsp %d)\n",
 				 ret, mca->retcode);
 			break;
@@ -2004,10 +2008,12 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
 		}
 		if (ma && ++mca->hv_polls < MCA_HV_SETTLE_POLLS)
 			return 0;
+		mca->hv_last_exit = "contract-not-reached";
 		break;
 	case MCA_HV_ON:
 		if (ma && vbus_hv)
 			return ma;
+		mca->hv_last_exit = "contract-lost";
 		if (ma && mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV) {
 			dev_info(mca->dev, "source back at 5 V, asking again in %u s\n",
 				 MCA_HV_RENEG_MS / 1000);
@@ -2096,8 +2102,13 @@ static void xiaomi_mca_apply_policy(struct xiaomi_mca *mca)
 	aicl = mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV && mca->hv == MCA_HV_OFF &&
 	       (mca->real_type == MCA_TYPE_FLOAT || mca->real_type == MCA_TYPE_C ||
 		xiaomi_mca_is_pd(mca->real_type));
-	if (aicl && xiaomi_mca_aicl(mca, false))
-		return;
+	if (aicl) {
+		ret = xiaomi_mca_aicl(mca, false);
+		if (ret) {
+			dev_warn_ratelimited(mca->dev, "cannot enable input current detection: %d\n", ret);
+			return;
+		}
+	}
 	ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, target);
 	if (!ret && aicl)
 		ret = xiaomi_mca_aicl(mca, true);
@@ -2391,6 +2402,7 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	power_supply_put(mca->cp_psy);
 	mca->cp_psy = NULL;
 	mca->cp_last_exit = why;
+	mca->cp_exits++;
 	dev_info(mca->dev, "direct charging stopped: %s\n", why);
 
 	xiaomi_mca_cp_backoff(mca);
@@ -2893,6 +2905,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		}
 		if (!mipps_auth || !xiaomi_mca_authenticated(mca) || verified != 1) {
 			mca->auth_lost = true;
+			mca->auth_ok = false;
 			xiaomi_mca_cp_stop(mca, "adapter authentication lost");
 			return;
 		}
@@ -3650,6 +3663,9 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		mca->online = false;
 		mca->auth_lost = false;
 		mca->cp_fault = false;
+		mca->cp_exits = 0;
+		mca->cp_last_exit = NULL;
+		mca->hv_last_exit = NULL;
 		mca->cp_recharge = false;
 		mca->hv_retry = jiffies;
 		mca->policy_attach_generation = attachment;
@@ -3835,13 +3851,16 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		}
 		if (xiaomi_mca_clear_auth(mca))
 			goto out;
+		xiaomi_mca_process_notifications(mca);
 		ret = xiaomi_mca_full_charge_poll(mca);
 		if (ret) {
 			dev_warn_ratelimited(mca->dev, "failed to set float voltage: %d\n", ret);
-			xiaomi_mca_cp_stop(mca, "float voltage not confirmed");
+			if (!full_charge || !charge_policy)
+				xiaomi_mca_cp_stop(mca, "float voltage not confirmed");
+			else
+				xiaomi_mca_charge_stop(mca);
 			goto out;
 		}
-		xiaomi_mca_process_notifications(mca);
 		ret = xiaomi_mca_charge_limit_poll(mca);
 		if (ret) {
 			dev_warn_ratelimited(mca->dev, "failed to apply battery limit: %d\n", ret);
@@ -4157,12 +4176,13 @@ static ssize_t charge_profile_show(struct device *dev,
 	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
 
 	guard(mutex)(&mca->lock);
-	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u last_exit=%s\n",
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u hv_exit=%s last_exit=%s\n",
 		 xiaomi_mca_profile_names[mca->cp_profile],
 		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
 		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma, mca->hv, mca->hv_pps,
 		 xiaomi_mca_cp_active(mca) ? mca->cp_mv : 0, READ_ONCE(mca->attach_generation),
-		 mca->cp_last_exit ?: "none");
+		 mca->real_type, xiaomi_mca_cp_active(mca) ? mca->cp_type : 0, mca->cp_exits,
+		 mca->hv_last_exit ?: "none", mca->cp_last_exit ?: "none");
 }
 static DEVICE_ATTR_RO(charge_profile);
 
