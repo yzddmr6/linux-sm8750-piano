@@ -1336,6 +1336,8 @@ static unsigned int erhai_pps_update(void *data, bool caps_changed)
 	pps_cp_backstop(p);
 	pps_trace_sample(p);
 	delay = pps_cp_is_engaged() || p->cp_lift_since ? pps_cp_feed_ms : pps_poll_ms;
+	if (p->ufcs)
+		delay = min(delay, 500U); /* stock UFCS_WD_TIME_MS */
 	p->next_poll = jiffies + msecs_to_jiffies(delay);
 	return delay;
 }

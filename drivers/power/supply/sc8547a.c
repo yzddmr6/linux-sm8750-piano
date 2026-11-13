@@ -2778,6 +2778,12 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	ret = ufcs_handshake(sc->ufcs);
 	if (ret)
 		goto out;
+	/* Stock sets the CP watchdog to 5 s after PHY handshake. The
+	 * source packet watchdog is a separate 3 s contract.
+	 */
+	ret = sc->ufcs->ops->watchdog_config(sc->ufcs, 5000);
+	if (ret)
+		goto out;
 	ret = ufcs_intf_config_watchdog(sc->ufcs, 3000);
 	if (ret)
 		goto out;
@@ -2860,11 +2866,19 @@ int sc8547a_ufcs_monitor(void)
 	u32 changes[UFCS_OUTPUT_MODE_MAX];
 	u64 info;
 	int i, ret;
+	u8 control;
 
 	guard(mutex)(&sc8547_ufcs_lock);
 	sc = sc8547_master_dev;
 	if (!sc || !sc->ufcs_owner || !ufcs_handshake_success(sc->ufcs))
 		return -ENOLINK;
+	/* oplus_hal_sc8547a.c: CP_WATCHDOG_RESET reads REG07. Service
+	 * the PHY even after a recoverable drop has returned load to buck.
+	 * A still-running 2:1 pump retains its tighter 1 s watchdog.
+	 */
+	ret = sc8547_read_byte(sc, SC8547_REG_07, &control);
+	if (ret)
+		return ret;
 	ret = ufcs_intf_get_power_change_info(sc->ufcs, changes, ARRAY_SIZE(changes));
 	if (ret < 0)
 		return ret;
