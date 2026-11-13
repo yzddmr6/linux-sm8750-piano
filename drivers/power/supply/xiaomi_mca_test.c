@@ -2643,7 +2643,22 @@ static void xiaomi_mca_test_ffc_conditions(struct kunit *test)
 	}
 	f->usb_online = 0;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
+	KUNIT_EXPECT_TRUE(test, f->mca.ffc_done);
+	f->mca.attach_generation++;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
 	KUNIT_EXPECT_FALSE(test, f->mca.ffc_done);
+	f->usb_online = 1;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
+	KUNIT_ASSERT_TRUE(test, f->mca.ffc_voted);
+	f->type = MCA_TYPE_SDP;
+	f->term_stuck = true;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), -EIO);
+	KUNIT_EXPECT_FALSE(test, f->mca.ffc_active);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_quiesce(&f->mca), -EIO);
+	f->term_stuck = false;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_quiesce(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
+	KUNIT_EXPECT_FALSE(test, f->mca.ffc_voted);
 }
 
 static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)

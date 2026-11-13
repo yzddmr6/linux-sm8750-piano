@@ -636,6 +636,7 @@ struct xiaomi_mca {
 	int cell_zone;		/* coldest sensor: 0, 8, 13 or 18 C row */
 	bool zone_valid, ffc_warm;
 	bool ffc_done;
+	bool ffc_voted;	/* high FV may have reached firmware */
 	u32 ffc_type, ffc_attach;
 	bool ffc_active;		/* checked again every poll, never latched by auth */
 	/* Thresholds are shared by the two cells and protected by rx_lock. */
@@ -1165,6 +1166,8 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
 			generation = mca->service_generation;
 		mca->term_written = true;
+		if (get_unaligned_le32(data) == MCA_TERM_FFC_MV)
+			mca->ffc_voted = true;
 		memcpy(buf, data, len);
 		ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
 		if (ret)
@@ -1176,7 +1179,10 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 			if (generation != mca->service_generation || !mca->service_up)
 				return -ECONNRESET;
 		}
-		return readback == 2 * get_unaligned_le32(data) - 3600 ? 0 : -EIO;
+		if (readback != 2 * get_unaligned_le32(data) - 3600)
+			return -EIO;
+		mca->ffc_voted = get_unaligned_le32(data) == MCA_TERM_FFC_MV;
+		return 0;
 	}
 	if (prop == MCA_PROP_CC_TOGGLE) {
 		if (!mca->piano_otg)
@@ -2240,10 +2246,7 @@ static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twa
 	if (mca->ffc_attach != attached || vbat < 4350)
 		mca->ffc_done = false;
 	online = xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE);
-	if (!online) {
-		mca->ffc_done = false;
-		return false;
-	}
+	/* USB_ONLINE also drops during PD hard resets on the same cable. */
 	if (!full_charge || mca->cell_zone < 18 || tcool < 18 || twarm >= MCA_TERM_HOT_DEGC ||
 	    mca->policy_generation != READ_ONCE(mca->service_generation) ||
 	    online != 1 ||
@@ -2317,6 +2320,7 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 	ret = xiaomi_mca_read(mca, MCA_PROP_TERM_VOLT, &readback);
 	if (!ret && readback == 2 * target - 3600) {
 		mca->term_written = true;
+		mca->ffc_voted = target == MCA_TERM_FFC_MV;
 		return 0;
 	}
 
@@ -4607,8 +4611,9 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 	ret = xiaomi_mca_cp_stop(mca, "system sleep");
 	if (ret)
 		return ret;
-	if (mca->ffc_active) {
-		ret = xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, MCA_TERM_FULL_MV);
+	if (mca->ffc_voted) {
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT,
+					   mca->term_hot ? MCA_TERM_HOT_MV : MCA_TERM_FULL_MV);
 		if (ret)
 			return ret;
 		mca->ffc_active = false;
