@@ -43,6 +43,25 @@ erhai_curve_select(const struct erhai_charge_curve curves[][7],
 	return &curves[s][t];
 }
 
+/* oplus_chg_comm.h BATT_TEMP_HYST = 20 deci-C. Retain the previous
+ * region near a boundary. The caller also applies the raw region's
+ * voltage/current limits immediately when they are tighter.
+ */
+static inline int erhai_curve_temp(int last, int temp)
+{
+	static const int bounds[] = { 0, 50, 120, 160, 210, 350, 440, 510 };
+	unsigned int i;
+
+	for (i = 1; i < ARRAY_SIZE(bounds); i++) {
+		if (last >= bounds[i - 1] && last < bounds[i]) {
+			if (temp >= bounds[i - 1] - 20 && temp < bounds[i] + 20)
+				return last;
+			break;
+		}
+	}
+	return temp;
+}
+
 /* PPS starts below its voltage target, SUPERVOOC also accepts equality. */
 static inline unsigned int erhai_curve_start(const struct erhai_charge_curve *curve,
 					    int mv, bool inclusive)

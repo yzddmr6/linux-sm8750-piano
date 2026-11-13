@@ -359,6 +359,8 @@ struct erhai_pps {
 	int			soc;
 	int			temp_ddc;
 	const struct erhai_charge_curve *curve;
+	int curve_temp;
+	unsigned int curve_ma;
 	unsigned int		curve_idx;
 	unsigned int		source_ma;
 	unsigned int		cell_ma;
@@ -484,12 +486,17 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 	const struct erhai_charge_curve *curve;
 	const struct erhai_charge_step *step;
 
-	curve = erhai_curve_select(svooc_curves, p->soc, p->temp_ddc);
-	if (!curve || p->vbat_mv < (int)pps_vbat_min_mv ||
-	    p->vbat_mv >= erhai_cell_cv(p->temp_ddc))
+	const struct erhai_charge_curve *raw;
+	unsigned int limit;
+
+	raw = erhai_curve_select(svooc_curves, p->soc, p->temp_ddc);
+	p->curve_temp = entering || !p->curve ? p->temp_ddc : erhai_curve_temp(p->curve_temp, p->temp_ddc);
+	curve = erhai_curve_select(svooc_curves, p->soc, p->curve_temp);
+	if (!raw || !curve || p->vbat_mv < (int)pps_vbat_min_mv ||
+	    p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp)))
 		return 0;
 
-	if (entering || p->curve != curve) {
+	if (entering || !p->curve || p->curve->steps != curve->steps) {
 		p->curve = curve;
 		p->curve_idx = erhai_curve_start(curve, p->vbat_mv, true);
 		p->over_since = 0;
@@ -507,7 +514,11 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 		}
 	}
 
-	return curve->steps[p->curve_idx].ma;
+	limit = curve->steps[p->curve_idx].ma;
+	if (raw->steps != curve->steps)
+		limit = min_t(unsigned int, limit, raw->steps[erhai_curve_start(raw, p->vbat_mv, true)].ma);
+	p->curve_ma = entering || !p->curve_ma ? limit : min(p->curve_ma, limit);
+	return p->curve_ma;
 }
 
 /* A fresh source APDO is checked by the caller. A stale firmware type
@@ -955,7 +966,7 @@ static void pps_poll(struct erhai_pps *p)
 		cell_ma = pps_cell_limit(p, false);
 		if (!cell_ma) {
 			if (p->temp_ddc >= 0 && p->temp_ddc < 510 &&
-			    p->vbat_mv >= erhai_cell_cv(p->temp_ddc))
+			    p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp)))
 				erhai_charge_tail_complete();
 			pps_exit(p, "battery limit");
 			return;

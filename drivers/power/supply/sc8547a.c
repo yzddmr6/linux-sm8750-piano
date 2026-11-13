@@ -477,7 +477,9 @@ struct sc8547a_device {
 	bool			fastchg_auto;	/* one-shot master arm (kill-switch) */
 	enum sc8547_auto_state	auto_state;
 	unsigned long		auto_identify_deadline;
-	const struct erhai_charge_curve *auto_curve;	/* selected CC/CV table */
+	const struct erhai_charge_curve *auto_curve;
+	int curve_temp;
+	unsigned int curve_ma;	/* selected CC/CV table */
 	int			auto_curve_idx;	/* current row (descends only) */
 	bool			auto_protection;
 	u8 pump_faults;
@@ -2030,13 +2032,18 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 	const struct erhai_charge_curve *curve;
 	const struct erhai_charge_step *step;
 
-	curve = erhai_curve_select(svooc_curves, soc, temp);
+	const struct erhai_charge_curve *raw;
+	unsigned int limit;
+
+	raw = erhai_curve_select(svooc_curves, soc, temp);
+	sc->curve_temp = entering || !sc->auto_curve ? temp : erhai_curve_temp(sc->curve_temp, temp);
+	curve = erhai_curve_select(svooc_curves, soc, sc->curve_temp);
 	/* vooc_high_temp (entry) and over_high_temp (running). */
-	if (!curve || mv <= SC8547_CELL_MIN_VALID_MV ||
-	    mv >= erhai_cell_cv(temp))
+	if (!raw || !curve || mv <= SC8547_CELL_MIN_VALID_MV ||
+	    mv >= min(erhai_cell_cv(temp), erhai_cell_cv(sc->curve_temp)))
 		return false;
 
-	if (entering || curve != sc->auto_curve) {
+	if (entering || !sc->auto_curve || sc->auto_curve->steps != curve->steps) {
 		sc->auto_curve = curve;
 		sc->auto_curve_idx = erhai_curve_start(curve, mv, true);
 		sc->auto_step_cnt = 0;
@@ -2062,7 +2069,11 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 	} else {
 		sc->auto_taper_cnt = 0;
 	}
-	sc->fastchg_curr_code = min_t(unsigned int, step->ma / 100, sc->adapter_cap);
+	limit = curve->steps[sc->auto_curve_idx].ma;
+	if (raw->steps != curve->steps)
+		limit = min_t(unsigned int, limit, raw->steps[erhai_curve_start(raw, mv, true)].ma);
+	sc->curve_ma = entering || !sc->curve_ma ? limit : min(sc->curve_ma, limit);
+	sc->fastchg_curr_code = min_t(unsigned int, sc->curve_ma / 100, sc->adapter_cap);
 	return true;
 }
 
@@ -2403,7 +2414,7 @@ static void sc8547_attach_work(struct work_struct *work)
 		if (gret || cpbat <= 0 || vbus <= 0 || cibus < 0 || slave_ma < 0 ||
 		    !sc8547_auto_update_curve(sc, gsoc, gtemp, cvbat, cibus_total, false)) {
 			if (!gret && gtemp >= 0 && gtemp < 510 && gvbat > 0 &&
-			    (gvbat >= erhai_cell_cv(gtemp) ||
+			    (gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp)) ||
 			     sc->auto_taper_cnt >= SC8547_AUTO_STEP_DEBOUNCE))
 				erhai_charge_tail_complete();
 			sc8547_auto_finish(sc, "pack or pump outside delivery envelope");
