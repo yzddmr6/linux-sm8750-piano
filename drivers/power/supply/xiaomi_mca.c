@@ -3123,7 +3123,7 @@ static bool xiaomi_mca_cp_bus_trip(struct xiaomi_mca *mca, int ibus)
 static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 {
 	int vbat, ibat, tcool, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibus, over;
-	int ibat_max, target, ibus_all, vmin, imax;
+	int ibat_max, target, ibus_all, buck_ma, budget, vmin, imax;
 	int band = xiaomi_mca_cp_band(mca->cp_type);
 	u32 mv = mca->cp_mv, cv;
 	bool taper;
@@ -3239,7 +3239,8 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		return;
 	}
 	ibus = ibus_ua / 1000;
-	mca->cp_ibus_last = max(ibus + mca->ibus_ua / 1000, 0);
+	buck_ma = mca->ibus_ua / 1000;
+	mca->cp_ibus_last = max(ibus + buck_ma, 0);
 	if (2 * vbat > mca->cp_max_mv) {
 		xiaomi_mca_cp_stop(mca, "source voltage range exhausted");
 		return;
@@ -3302,14 +3303,18 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		}
 
 		/* only from a source that feeds both at that bus current */
-		ibus_all = ibus + mca->ibus_ua / 1000;
+		ibus_all = ibus + buck_ma;
 		fcc = xiaomi_mca_parallel_fcc(ibat_max, ibus_all, mca->fcc_set_ma);
 		icl = fcc / 2 + (fcc > 1000 ? 500 : 0);
 		/* The stock vbat_threshold ends parallel boosting near CV. */
 		if (vbat >= 4480 || taper)
 			fcc = icl = MCA_CP_BUCK_MA;
-		target = min(target, (int)xiaomi_mca_cp_src_ma(mca) - 200 - (int)icl);
-		/* Make headroom on the bus before raising the buck vote. */
+		budget = (int)xiaomi_mca_cp_src_ma(mca) - 200;
+		/* While raising a vote, allow for the load step before its ADC
+		 * sample is available. Steady regulation uses measured draw.
+		 */
+		if (fcc > mca->fcc_set_ma)
+			target = min(target, budget - (int)icl);
 		if (fcc != mca->fcc_set_ma &&
 		    (fcc < mca->fcc_set_ma || ibus <= target)) {
 			if (xiaomi_mca_cp_set_buck(mca, icl, fcc)) {
@@ -3317,8 +3322,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 				return;
 			}
 		}
-		target = min(target, (int)xiaomi_mca_cp_src_ma(mca) - 200 -
-			     (int)mca->icl_set_ma);
+		target = min(target, budget - buck_ma);
 		/*
 		 * The stage gives the battery about twice its bus current,
 		 * next to the buck charger's share.  The gauges average over
@@ -3949,7 +3953,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 			xiaomi_mca_cp_stop(mca, "charger type read failed");
 			return;
 		}
-		if (mca->ibus_ua == -1 || mca->icl_ma == -1) {
+		if (mca->ibus_ua < 0 || mca->icl_ma == -1) {
 			xiaomi_mca_cp_stop(mca, "telemetry read failed");
 			return;
 		}

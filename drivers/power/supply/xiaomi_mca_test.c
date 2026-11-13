@@ -2818,6 +2818,34 @@ static void xiaomi_mca_test_qc_regulation(struct kunit *test)
 	xiaomi_mca_cp_stop(mca, "test complete");
 }
 
+static void xiaomi_mca_test_measured_buck_share(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	full_charge = hv_charge = cp_charge = mipps_auth = true;
+	mca_test_stage(test, f);
+	mca->auth_ok = true;
+	f->verified = 1;
+	mca->ffc_active = true;
+	mca->cp_ma = mca->cp_request_ma = 6000;
+	mca->cp_mv = f->stage_mv = 8400;
+	mca->cp_max_mv = 11000;
+	mca->cp_ibus_ma = mca->cp_ibus_hot = 3800;
+	mca->icl_set_ma = 2500;
+	mca->fcc_set_ma = 4000;
+	mca->ibus_ua = 2000000;
+	f->stage_ma = 3600;
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_cp_step(mca);
+	KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_EQ(test, mca->cp_mv, 8420);
+	mca->ibus_ua = 2500000;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_LT(test, mca->cp_mv, 8420);
+	xiaomi_mca_cp_stop(mca, "test complete");
+}
+
 static void xiaomi_mca_test_taper_handoff(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3252,6 +3280,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_cp_cell_guards),
 	KUNIT_CASE(xiaomi_mca_test_bus_voltage_fault),
 	KUNIT_CASE(xiaomi_mca_test_qc_regulation),
+	KUNIT_CASE(xiaomi_mca_test_measured_buck_share),
 	KUNIT_CASE(xiaomi_mca_test_taper_handoff),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_values),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_errors),
