@@ -1246,6 +1246,11 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 			     !xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus) &&
 			     vbus >= MCA_VBUS_ONLINE_UV && vbus < MCA_HV_VBUS_5V_MAX_UV;
 
+		if (prop == MCA_PROP_CHARGE_CURRENT && get_unaligned_le32(data) == MCA_FCC_DEFAULT_MA &&
+		    mca->fcc_written) {
+			memcpy(buf, data, len);
+			return xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
+		}
 		if (prop == MCA_PROP_INPUT_CURRENT_LIMIT && mca->icl_written &&
 		    get_unaligned_le32(data) == MCA_ICL_DEFAULT_MA) {
 			memcpy(buf, data, len);
@@ -2328,6 +2333,8 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 		return -EHOSTDOWN;
 	if (!full_charge || !charge_policy) {
 		mca->ffc_active = false;
+		if (charge_policy && mca->gauge_failures)
+			return 0;
 		return xiaomi_mca_restore_term_volt(mca);
 	}
 
@@ -2735,15 +2742,28 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		 * missing gauge from stranding an otherwise healthy pack.
 		 */
 		ret = xiaomi_mca_cp_stop(mca, "gauge unavailable");
-		if (!ret && !mca->term_hot && full_charge) {
+		if (!ret && !(full_charge && charge_policy && mca->fv_derated)) {
 			mca->ffc_active = false;
 			mca->term_hot = true;
 			ret = xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, MCA_TERM_HOT_MV);
 		}
-		if (!ret && mca->fcc_set_ma != MCA_FCC_DEFAULT_MA) {
+		if (!ret && (mca->fcc_set_ma != MCA_FCC_DEFAULT_MA || mca->fcc_written)) {
 			ret = xiaomi_mca_reset_fcc(mca);
 			if (!ret)
 				mca->fcc_set_ma = MCA_FCC_DEFAULT_MA;
+		}
+		if (!ret && xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE) == 1) {
+			u32 icl, type;
+
+			ret = xiaomi_mca_read_type(mca, &type);
+			ret = ret ?: xiaomi_mca_read(mca, MCA_PROP_INPUT_CURRENT_LIMIT, &icl);
+			if (!ret && icl < MCA_FCC_DEFAULT_MA && xiaomi_mca_limits(type)) {
+				/* A fresh boot starts with a 100 mA host vote. */
+				ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT,
+							   MCA_FCC_DEFAULT_MA);
+				if (!ret)
+					mca->icl_set_ma = MCA_FCC_DEFAULT_MA;
+			}
 		}
 		if (!ret)
 			ret = xiaomi_mca_charge_enable(mca, true);

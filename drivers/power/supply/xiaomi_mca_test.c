@@ -2389,6 +2389,7 @@ static void xiaomi_mca_test_gauge_fallback(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), -ENODEV);
 		KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
 		KUNIT_EXPECT_EQ(test, f->fcc, 500);
+		KUNIT_EXPECT_EQ(test, f->icl, 500);
 		KUNIT_EXPECT_EQ(test, f->term_readback, 4520);
 		KUNIT_EXPECT_TRUE(test, f->mca.charge_blocked);
 	}
