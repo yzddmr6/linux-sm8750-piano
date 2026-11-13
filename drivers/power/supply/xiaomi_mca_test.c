@@ -2655,6 +2655,12 @@ static void xiaomi_mca_test_ffc_conditions(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
 	f->pdos[0].max_ma = cpu_to_le32(3000);
+	f->vbus = 9000000;
+	f->pdos[1] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(9000), cpu_to_le32(9000), cpu_to_le32(500) };
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
+	f->vbus = 5000000;
 	f->type = MCA_TYPE_SDP;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);

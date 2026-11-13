@@ -2303,17 +2303,30 @@ static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twa
 		return false;
 
 	/* The gauges average over several seconds. A sample can still
-	 * describe the previous source when the next one is already at 5 V.
+	 * describe the previous source after the contract has changed.
 	 * Even at 100% efficiency the source must supply iterm at cell voltage.
 	 */
 	if (xiaomi_mca_is_pd(type) || type == MCA_TYPE_C || xiaomi_mca_probe_5v(type)) {
-		u32 vbus;
+		u32 ma = 0, vbus;
 
 		if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus) ||
 		    vbus < MCA_VBUS_ONLINE_UV)
 			return false;
-		if (vbus < MCA_HV_VBUS_5V_MAX_UV &&
-		    xiaomi_mca_5v_input(mca, type) * (vbus / 1000) <= iterm * vmin)
+
+		if (vbus < MCA_HV_VBUS_5V_MAX_UV)
+			ma = xiaomi_mca_5v_input(mca, type);
+		else if (xiaomi_mca_is_pd(type) && mca->cp != MCA_CP_ON &&
+			 mca->cp != MCA_CP_OPENING && !mca->hv_pps) {
+			bool pps;
+			u32 offered = xiaomi_mca_pd_9v_ma(mca, &pps);
+
+			if (!offered || pps || vbus < MCA_HV_VBUS_MIN_UV ||
+			    vbus > MCA_HV_VBUS_MAX_UV)
+				return false;
+			ma = min3(offered, xiaomi_mca_contract_ma(mca, MCA_HV_MV, 1600),
+				  (u32)MCA_ICL_HV_MAX_MA);
+		}
+		if (ma && ma * (vbus / 1000) <= iterm * vmin)
 			return false;
 	}
 	running = mca->ffc_active && mca->ffc_type == type && mca->ffc_attach == attached;
