@@ -1362,7 +1362,7 @@ static int qcom_battmgr_pd_fcc(struct qcom_battmgr *b)
 	    hmac == 1 &&
 	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM_MAX, &max_fcc) &&
 	    max_fcc > 0 && max_fcc <= INT_MAX) {
-		step = erhai_cell_entry(soc / 100, (s32)temp < 0 ? -1 : temp / 10, uv / 1000);
+		step = erhai_cell_entry(soc / 100, (s32)temp < 0 ? -1 : (s32)temp / 10, uv / 1000);
 		/* Outside the direct-charge table the ADSP retains CV/JEITA. */
 		if (step)
 			want = min(max_fcc, step->ma * 2000U);
@@ -2969,7 +2969,8 @@ static void qcom_battmgr_otg_worker(struct work_struct *work)
 	if (!battmgr->service_up || on == battmgr->otg_vbus)
 		return;
 
-	if (on && qcom_battmgr_pps_stop(battmgr))
+	if (on && (qcom_battmgr_pps_stop(battmgr) ||
+		   qcom_battmgr_pd_stop(battmgr, false, "USB source role")))
 		return;
 
 	/* The vendor kernel sets the boost current limit before the boost */

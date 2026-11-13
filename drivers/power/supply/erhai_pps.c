@@ -121,6 +121,7 @@ static int pps_cp_drop(void)
 #define PPS_PROP_USB_PPS_VOOCPHY_ENABLE	49
 /* battery_property_id (BC_BATTERY_PROPERTY_* / opcode 0x30,0x31) */
 #define PPS_PROP_BATT_CHG_CTRL_LIM	10
+#define PPS_PROP_BATT_CHG_CTRL_MAX	11
 #define PPS_PROP_BATT_TEMP		12
 #define PPS_PROP_BATT_CHG_EN		24
 #define PPS_PROP_BATT_AP_FASTCHG_ALLOW	46
@@ -196,11 +197,6 @@ module_param(pps_iclim_ma, uint, 0444);
 MODULE_PARM_DESC(pps_iclim_ma,
 		 "USB_INPUT_CURR_LIMIT written on PPS entry (mA); the ADSP honours 3000 when "
 		 "the battery demand is granted (validated 2026-09-24)");
-
-static unsigned int pps_fcc_ma = 4400;
-module_param(pps_fcc_ma, uint, 0444);
-MODULE_PARM_DESC(pps_fcc_ma,
-		 "pack charge demand granted via BATT_CHG_CTRL_LIM (mA); Android draws ~4.4 A at 2 A/8.4 V in");
 
 static unsigned int pps_vbat_min_mv = 3300;
 module_param(pps_vbat_min_mv, uint, 0444);
@@ -350,6 +346,8 @@ struct erhai_pps {
 	bool ufcs;
 	bool restore_fcc;
 	u32 saved_fcc_ua;
+	u32 fcc_ceiling_ua;
+	u32 applied_fcc_ua;
 	bool protection;
 	bool ufcs_protection;
 	bool pps_protection;
@@ -546,6 +544,39 @@ static bool pps_deployable(struct erhai_pps *p, bool *vooc_engaged)
 }
 
 
+/* Same pack table while the buck supplies the system or carries part
+ * of the charge. The firmware reports its buck FCC rating in microamps.
+ */
+static int pps_buck_fcc(struct erhai_pps *p)
+{
+	u32 want = min(p->fcc_ceiling_ua, p->cell_ma * 2000U);
+	int ret;
+
+	if (want == p->applied_fcc_ua)
+		return 0;
+	p->restore_fcc = true;
+	ret = pps_batt_set(PPS_PROP_BATT_CHG_CTRL_LIM, want);
+	if (!ret)
+		p->applied_fcc_ua = want;
+	return ret;
+}
+
+static int pps_save_buck_fcc(struct erhai_pps *p)
+{
+	int saved, ceiling;
+
+	saved = erhai_otg_adsp_prop_get(PPS_BATT_OP_GET, PPS_PROP_BATT_CHG_CTRL_LIM);
+	if (saved < 0)
+		return saved;
+	ceiling = erhai_otg_adsp_prop_get(PPS_BATT_OP_GET, PPS_PROP_BATT_CHG_CTRL_MAX);
+	if (ceiling <= 0)
+		return ceiling ?: -ENODATA;
+	p->saved_fcc_ua = saved;
+	p->applied_fcc_ua = saved;
+	p->fcc_ceiling_ua = ceiling;
+	return 0;
+}
+
 /* ---- the 5 V revert ---- */
 static int pps_revert(struct erhai_pps *p)
 {
@@ -561,18 +592,18 @@ static int pps_revert(struct erhai_pps *p)
 		PPS_RESTORE(pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, 5000));
 		PPS_RESTORE(pps_usb_set(PPS_PROP_USB_PPS_MOS_CTRL, 0));
 		PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_AP_FASTCHG_ALLOW, 0));
-		if (p->restore_fcc) {
-			rc = pps_batt_set(PPS_PROP_BATT_CHG_CTRL_LIM, p->saved_fcc_ua);
-			if (!rc)
-				p->restore_fcc = false;
-			else if (!err)
-				err = rc;
-		}
 		PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_CHG_EN,
 				       erhai_otg_charge_inhibited() ? 0 : 1));
 		PPS_RESTORE(pps_usb_set(PPS_PROP_USB_PPS_VOOCPHY_ENABLE, 0));
 		/* Explicitly leave the APDO as well as lowering its requested voltage. */
 		PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_SET_PDO, 5000));
+	}
+	if (p->restore_fcc) {
+		rc = pps_batt_set(PPS_PROP_BATT_CHG_CTRL_LIM, p->saved_fcc_ua);
+		if (!rc)
+			p->restore_fcc = false;
+		else if (!err)
+			err = rc;
 	}
 	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_INPUT_CURR_LIMIT, PPS_ICL_UNSUSPEND));
 #undef PPS_RESTORE
@@ -944,6 +975,10 @@ static void pps_poll(struct erhai_pps *p)
 			p->ibat_over_since = 0;
 		}
 		p->cell_ma = cell_ma;
+		if (pps_buck_fcc(p)) {
+			pps_exit(p, "buck FCC unavailable");
+			return;
+		}
 		p->target_curr_ma = min3(p->source_ma, cell_ma, p->pump_limit_ma);
 		if (p->set_curr_ma > p->target_curr_ma &&
 		    pps_pdo_set(p, p->set_volt_mv, p->target_curr_ma)) {
@@ -996,10 +1031,9 @@ static void pps_poll(struct erhai_pps *p)
 		p->ibat_over_since = 0;
 		p->target_curr_ma = min3(p->source_ma, cell_ma, p->pump_limit_ma);
 		p->set_curr_ma = min(pps_start_curr_ma, p->target_curr_ma);
-		rc = erhai_otg_adsp_prop_get(PPS_BATT_OP_GET, PPS_PROP_BATT_CHG_CTRL_LIM);
-		if (rc < 0)
+		rc = pps_save_buck_fcc(p);
+		if (rc)
 			goto fail;
-		p->saved_fcc_ua = rc;
 		p->cleanup = true;
 		/*
 		 * Entry sequence — ORDER IS LOAD-BEARING (live-validated 2026-09-24,
@@ -1040,8 +1074,7 @@ static void pps_poll(struct erhai_pps *p)
 				  erhai_otg_charge_inhibited() ? 0 : 1);
 		if (rc)
 			goto fail;
-		p->restore_fcc = true; /* a lost ACK can still have changed FCC */
-		rc = pps_batt_set(PPS_PROP_BATT_CHG_CTRL_LIM, pps_fcc_ma * 1000);
+		rc = pps_buck_fcc(p);
 		if (rc)
 			goto fail;
 		if (pps_cp_init) {
@@ -1317,7 +1350,7 @@ static unsigned int erhai_ufcs_update(void *data)
 	    erhai_otg_charge_inhibited() || pps_read_battery(p))
 		return 0;
 	p->cell_ma = pps_cell_limit(p, true);
-	if (!p->cell_ma)
+	if (!p->cell_ma || pps_save_buck_fcc(p))
 		return 0;
 	ma = sc8547a_ufcs_start(pps_target_volt_mv, pps_cp_max_volt_mv);
 	if (ma <= 0) {
@@ -1337,7 +1370,8 @@ static unsigned int erhai_ufcs_update(void *data)
 	p->ibat_over_since = 0;
 	p->next_poll = jiffies;
 	pps_enter(p, PPS_CHARGING, "UFCS");
-	rc = pps_pdo_set(p, pps_target_volt_mv, min(pps_start_curr_ma, p->target_curr_ma));
+	rc = pps_buck_fcc(p);
+	rc = rc ?: pps_pdo_set(p, pps_target_volt_mv, min(pps_start_curr_ma, p->target_curr_ma));
 	if (rc)
 		pps_exit(p, "UFCS initial request");
 	return pps_cp_feed_ms;
