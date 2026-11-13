@@ -634,7 +634,7 @@ struct xiaomi_mca {
 	bool fv_derated;
 	unsigned int gauge_failures;
 	int cell_zone;		/* coldest sensor: 0, 8, 13 or 18 C row */
-	bool zone_valid, ffc_warm;
+	bool zone_valid, ffc_warm, cold_fv;
 	bool ffc_done;
 	bool ffc_voted;	/* high FV may have reached firmware */
 	u32 ffc_type, ffc_attach;
@@ -2245,6 +2245,11 @@ static void xiaomi_mca_update_zones(struct xiaomi_mca *mca, int cold, int warm)
 		zone = edge;
 	}
 	mca->cell_zone = zone;
+	/* The cold row permits a HIGHER float voltage. Enter it only once
+	 * every sensor has cooled; withdraw it immediately at 18 C.
+	 */
+	if (!mca->zone_valid || warm >= 18 || warm <= 16)
+		mca->cold_fv = warm < 18;
 	if (warm >= 35)
 		mca->ffc_warm = true;
 	else if (warm <= 33)
@@ -2257,7 +2262,7 @@ static void xiaomi_mca_select_profile(struct xiaomi_mca *mca, int tcool, int twa
 	enum xiaomi_mca_profile profile;
 
 	xiaomi_mca_update_zones(mca, tcool, twarm);
-	mca->cp_normal_cv = twarm >= 18 && mca->cell_zone < 18;
+	mca->cp_normal_cv = !mca->cold_fv && mca->cell_zone < 18;
 
 	if (twarm >= MCA_TERM_HOT_DEGC || mca->term_hot)
 		profile = MCA_PROFILE_WARM;
@@ -2382,7 +2387,7 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 	if (!ret)
 		xiaomi_mca_select_profile(mca, tcool, tbat);
 	target = mca->term_hot ? MCA_TERM_HOT_MV : MCA_TERM_FULL_MV;
-	if (!mca->term_hot && tbat < 18)
+	if (!mca->term_hot && mca->cell_zone < 18 && mca->cold_fv)
 		target = MCA_TERM_COLD_MV;
 	if (!mca->term_hot && mca->ffc_active)
 		target = MCA_TERM_FFC_MV;

@@ -2122,6 +2122,29 @@ static void xiaomi_mca_test_full_charge_temperature(struct kunit *test)
 	}
 }
 
+static void xiaomi_mca_test_cold_float_hysteresis(struct kunit *test)
+{
+	static const int samples[][3] = {
+		{ 16, 16, 5400 }, { 17, 17, 5400 }, { 18, 18, 5360 },
+		{ 17, 17, 5360 }, { 18, 18, 5360 }, { 16, 18, 5360 },
+		{ 16, 16, 5400 },
+	};
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	int i;
+
+	f->type = MCA_TYPE_SDP;
+	full_charge = charge_policy = true;
+	guard(mutex)(&f->mca.lock);
+	for (i = 0; i < ARRAY_SIZE(samples); i++) {
+		f->tbat = samples[i][0];
+		f->cells[0].temp = samples[i][0] * 10;
+		f->cells[1].temp = samples[i][1] * 10;
+		KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
+		KUNIT_EXPECT_EQ(test, f->term_readback, samples[i][2]);
+	}
+	KUNIT_EXPECT_EQ(test, f->term_writes, 3);
+}
+
 static void xiaomi_mca_test_full_charge_readback(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3297,6 +3320,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_otg_config),
 	KUNIT_CASE(xiaomi_mca_test_policy_defaults),
 	KUNIT_CASE(xiaomi_mca_test_full_charge_temperature),
+	KUNIT_CASE(xiaomi_mca_test_cold_float_hysteresis),
 	KUNIT_CASE(xiaomi_mca_test_full_charge_readback),
 	KUNIT_CASE(xiaomi_mca_test_full_charge_restore),
 	KUNIT_CASE(xiaomi_mca_test_full_charge_sleep),
