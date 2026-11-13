@@ -1167,7 +1167,7 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 
 	if (!qcom_battmgr_charge_limited(battmgr)) {
 		battmgr->charge_policy_hold = false;
-		if (battmgr->charge_inhibited &&
+		if ((battmgr->charge_inhibited || battmgr->charge_error) &&
 		    !qcom_battmgr_charge_enable(battmgr, true)) {
 			battmgr->charge_inhibited = false;
 			dev_info(battmgr->dev, "charge limit removed, charging resumed\n");
@@ -1183,25 +1183,27 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 	}
 
 	soc = battmgr->status.percent;
-	if (soc >= end) {
+	if (soc >= end)
 		battmgr->charge_policy_hold = true;
-		/*
-		 * Repeat the request on every check: the firmware may turn
-		 * charging back on by itself, for example on a new charger.
-		 */
-		if (!qcom_battmgr_charge_enable(battmgr, false) &&
-		    !battmgr->charge_inhibited) {
+	else if (soc <= start)
+		battmgr->charge_policy_hold = false;
+
+	/* An unacknowledged command may have reached the firmware. Keep
+	 * the hysteresis decision and reconcile it on the next poll, even
+	 * when SOC has since moved between the thresholds.
+	 */
+	if (battmgr->charge_policy_hold) {
+		if ((soc >= end || !battmgr->charge_inhibited || battmgr->charge_error) &&
+		    !qcom_battmgr_charge_enable(battmgr, false) && !battmgr->charge_inhibited) {
 			battmgr->charge_inhibited = true;
 			dev_info(battmgr->dev, "charging stopped at %u%% (end threshold %u%%)\n",
 				 soc, end);
 		}
-	} else if (soc <= start) {
-		battmgr->charge_policy_hold = false;
-		if (battmgr->charge_inhibited && !qcom_battmgr_charge_enable(battmgr, true)) {
-			battmgr->charge_inhibited = false;
-			dev_info(battmgr->dev, "charging resumed at %u%% (start threshold %u%%)\n",
-				 soc, start);
-		}
+	} else if ((battmgr->charge_inhibited || battmgr->charge_error) &&
+		   !qcom_battmgr_charge_enable(battmgr, true)) {
+		battmgr->charge_inhibited = false;
+		dev_info(battmgr->dev, "charging resumed at %u%% (start threshold %u%%)\n",
+			 soc, start);
 	}
 
 	/* Keep checking until a stop request succeeds; never sleep past the limit. */
@@ -2146,7 +2148,8 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 		delay = min(delay, 4000U);
 
 	/* Also retry turning charging back on after the limit was removed */
-	if (!delay && (qcom_battmgr_charge_limited(battmgr) || battmgr->charge_inhibited))
+	if (!delay && (qcom_battmgr_charge_limited(battmgr) ||
+		       battmgr->charge_inhibited || battmgr->charge_error))
 		delay = CHARGE_CTRL_POLL_MS;
 
 	mutex_unlock(&battmgr->charge_lock);
@@ -2170,7 +2173,7 @@ static void qcom_battmgr_charge_kick(struct qcom_battmgr *battmgr)
  */
 static void qcom_battmgr_usb_event(struct qcom_battmgr *battmgr)
 {
-	if (qcom_battmgr_charge_limited(battmgr) || battmgr->charge_inhibited ||
+	if (qcom_battmgr_charge_limited(battmgr) || battmgr->charge_inhibited || battmgr->charge_error ||
 	    (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD))
 		qcom_battmgr_charge_kick(battmgr);
 }
