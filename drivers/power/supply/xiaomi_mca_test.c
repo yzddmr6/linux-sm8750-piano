@@ -1419,7 +1419,8 @@ static void xiaomi_mca_test_sleep_fixed_pd(struct kunit *test)
 
 static void xiaomi_mca_test_retry_schedule(struct kunit *test)
 {
-	struct xiaomi_mca *mca = &mca_policy_fixture(test)->mca;
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
 	static const u32 delays[] = { 10000, 20000, 40000, 80000, 160000, 300000, 300000 };
 	int n;
 
@@ -1428,6 +1429,16 @@ static void xiaomi_mca_test_retry_schedule(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, mca->cp_retry_ms, delays[n]);
 	}
 	xiaomi_mca_cp_backoff(mca, "stage temperature");
+	KUNIT_EXPECT_EQ(test, mca->cp_retry_ms, 10000);
+	mca_test_stage(test, f);
+	guard(mutex)(&mca->lock);
+	mca->cp_running_at = jiffies - 59 * HZ;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_cp_stop(mca, "stage temperature"), 0);
+	KUNIT_EXPECT_EQ(test, mca->cp_retry_ms, 20000);
+	mca->cp_psy = power_supply_get_by_name("mca-pm-test-cp");
+	mca->cp = MCA_CP_ON;
+	mca->cp_running_at = jiffies - 60 * HZ;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_cp_stop(mca, "stage temperature"), 0);
 	KUNIT_EXPECT_EQ(test, mca->cp_retry_ms, 10000);
 }
 

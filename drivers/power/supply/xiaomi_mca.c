@@ -666,6 +666,7 @@ struct xiaomi_mca {
 	const char *cp_last_exit;
 	const char *cp_stop_reason;
 	u32 cp_retry_ms;
+	unsigned long cp_running_at;
 	const char *hv_last_exit;
 	u32 cp_exits;
 	struct power_supply *cp_psy;	/* the stage, held while not MCA_CP_OFF */
@@ -2530,7 +2531,7 @@ static int xiaomi_mca_cp_set_buck(struct xiaomi_mca *mca, u32 icl_ma,
 
 static void xiaomi_mca_cp_backoff(struct xiaomi_mca *mca, const char *reason)
 {
-	if (mca->cp_last_exit && !strcmp(mca->cp_last_exit, reason))
+	if (mca->cp_retry_ms && mca->cp_last_exit && !strcmp(mca->cp_last_exit, reason))
 		mca->cp_retry_ms = min(2 * mca->cp_retry_ms, 300000U);
 	else
 		mca->cp_retry_ms = MCA_HV_RENEG_MS;
@@ -2546,6 +2547,8 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	if (!xiaomi_mca_cp_active(mca))
 		return 0;
 
+	if (mca->cp == MCA_CP_ON && time_after_eq(jiffies, mca->cp_running_at + 60 * HZ))
+		mca->cp_retry_ms = 0;
 	if (mca->cp != MCA_CP_STOPPING)
 		mca->cp_stop_reason = why;
 	ret = xiaomi_mca_cp_set_online(mca, false);
@@ -3290,9 +3293,12 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 				 mca->cp_mv, vbus_uv / 1000, ibus,
 				 vbat, ibat);
 			mca->cp = MCA_CP_ON;
+			mca->cp_running_at = jiffies;
 			mca->cp_polls = 0;
 		}
 	} else {
+		if (time_after_eq(jiffies, mca->cp_running_at + 60 * HZ))
+			mca->cp_retry_ms = 0;
 		if (ibus < MCA_CP_LOW_IBUS_MA) {
 			if (++mca->cp_low >= MCA_CP_LOW_POLLS) {
 				xiaomi_mca_cp_stop(mca, "bus current too low");
