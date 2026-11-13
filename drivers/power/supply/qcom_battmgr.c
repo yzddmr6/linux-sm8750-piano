@@ -546,6 +546,8 @@ struct qcom_battmgr {
 	unsigned int retry_evidence;
 	unsigned int retry_once;
 	unsigned int retry_pending;
+	bool retry_stopping;
+	unsigned long retry_deadline;
 	unsigned int serial_retries, ufcs_retries, pps_retries;
 	unsigned long serial_next, ufcs_next, pps_next;
 	bool tail_owned;
@@ -1684,6 +1686,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->tail_owned = false;
 		battmgr->stable_seen = false;
 		battmgr->missing_routes = battmgr->retry_pending = 0;
+		battmgr->retry_stopping = false;
 		battmgr->retry_once = battmgr->retry_evidence = 0;
 		battmgr->serial_retries = battmgr->ufcs_retries = battmgr->pps_retries = 0;
 		test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events);
@@ -1757,7 +1760,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	battmgr->retry_once |= battmgr->missing_routes & status.ready;
 	battmgr->missing_routes &= ~status.ready;
 	if (test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events) ||
-	    real_type == 9 /* Erhai ADSP USB_REAL_TYPE VOOC family */)
+	    (battmgr->pps_ops && battmgr->pps_ops->enabled() && real_type == 9) /* ADSP VOOC */)
 		battmgr->retry_evidence |= ERHAI_SERIAL;
 	if (test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events))
 		battmgr->retry_evidence |= ERHAI_UFCS;
@@ -1766,26 +1769,39 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->stable_seen = true;
 		battmgr->stable_since = jiffies;
 	}
-	if (!can_probe || tail)
+	if (!can_probe || tail) {
 		battmgr->retry_pending = 0;
-	else if (stable && !battmgr->retry_pending && !battmgr->serial_probe) {
+		battmgr->retry_stopping = false;
+	} else if (stable && !battmgr->retry_pending && !battmgr->serial_probe) {
 		battmgr->retry_pending = qcom_battmgr_retry_routes(battmgr, &status, ufcs_active);
 		if (battmgr->retry_pending) {
 			if (ufcs_active)
 				battmgr->retry_pending |= ERHAI_UFCS;
-			ret = qcom_battmgr_pps_stop(battmgr);
-			ret = ret ?: qcom_battmgr_pd_stop(battmgr, false, "qualified protocol retry");
+			battmgr->retry_stopping = true;
+			battmgr->retry_deadline = jiffies + msecs_to_jiffies(PD_CONFIG_TIMEOUT_MS);
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
-			if (ret) {
-				battmgr->retry_pending = 0;
-				return PD_POLL_MS;
-			}
 		}
+	}
+	if (battmgr->retry_stopping) {
+		ret = qcom_battmgr_pps_stop(battmgr);
+		ret = ret ?: qcom_battmgr_pd_stop(battmgr, false, "qualified protocol retry");
+		if (ret && time_before(jiffies, battmgr->retry_deadline))
+			return PD_POLL_MS;
+		battmgr->retry_stopping = false;
+		if (ret)
+			battmgr->retry_pending = 0;
 	}
 	probe_idle = !tail && can_probe && !battmgr->pd_restore && !battmgr->pd_restore_fcc &&
 		     !qcom_battmgr_pps_running(battmgr) &&
 		     !qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &vbus) &&
 		     vbus >= 4000000 && vbus <= 5500000;
+	/* Losing an ACK or a slow discharge is not another upward attempt.
+	 * Allow the existing PD transition deadline for 5 V readback before
+	 * taking D+/D-. On expiry resume normal fallback arbitration.
+	 */
+	if (battmgr->retry_pending && !battmgr->serial_probe && !probe_idle &&
+	    time_before(jiffies, battmgr->retry_deadline))
+		return PD_POLL_MS;
 	if (battmgr->pps_ops) {
 		/* A probe gets exclusive D+/D- ownership only on a dedicated
 		 * source at 5 V. Its decline/timeout releases the crossbar
@@ -1795,6 +1811,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		    (!battmgr->retry_pending || (battmgr->retry_pending & ERHAI_SERIAL)) &&
 		    (probe_idle || (!tail && can_probe && battmgr->serial_probe)) && !battmgr->serial_blocked &&
 		    ((battmgr->retry_pending & ERHAI_SERIAL) || !battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
+			battmgr->retry_once &= ~ERHAI_SERIAL;
 			ret = battmgr->pps_ops->serial_session(true);
 			if (!ret) {
 				battmgr->serial_probe = true;
@@ -1819,6 +1836,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		unsigned int delay;
 
 		battmgr->retry_pending = 0;
+		battmgr->retry_once &= ~ERHAI_UFCS;
 		delay = battmgr->pps_ops->ufcs_update(battmgr->pps_data);
 		if (battmgr->pps_ops->ufcs_active(battmgr->pps_data))
 			return delay ?: PD_POLL_MS;
