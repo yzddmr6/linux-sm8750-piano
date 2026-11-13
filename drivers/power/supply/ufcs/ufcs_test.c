@@ -180,7 +180,7 @@ static void timeout_and_reenter(struct kunit *test)
 	struct peer *p = test->priv;
 
 	p->silent = true;
-	KUNIT_ASSERT_LT(test, ufcs_handshake(p->dev), 0);
+	KUNIT_ASSERT_EQ(test, ufcs_handshake(p->dev), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, p->attempts, 1);
 	KUNIT_EXPECT_GT(test, p->disabled, 0);
 	p->silent = false;

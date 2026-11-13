@@ -27,6 +27,7 @@ struct erhai_probe_status {
 	unsigned int responded;
 	unsigned int protected;
 	unsigned int delivering;
+	bool first_ufcs_timeout;
 };
 
 /* All callbacks run under battmgr's charge_lock, including suspend/teardown. */

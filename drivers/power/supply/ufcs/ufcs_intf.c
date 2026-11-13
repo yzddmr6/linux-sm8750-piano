@@ -180,6 +180,7 @@ int ufcs_handshake(struct ufcs_dev *ufcs)
 	mutex_lock(&class->ext_req_lock);
 	mutex_lock(&class->pe_lock);
 	ufcs_event_reset(class);
+	ufcs->handshake_state = UFCS_HS_IDLE;
 	rc = ufcs->ops->enable(ufcs);
 	if (rc) {
 		ufcs->ops->disable(ufcs);
@@ -205,15 +206,13 @@ int ufcs_handshake(struct ufcs_dev *ufcs)
 	class->handshake_success = false;
 	mutex_unlock(&class->pe_lock);
 	wait_for_completion(&class->request_ack);
-	mutex_unlock(&class->handshake_lock);
+	if (READ_ONCE(class->handshake_success))
+		rc = 0;
+	else
+		rc = READ_ONCE(ufcs->handshake_state) == UFCS_HS_TIMEOUT ? -ETIMEDOUT : -EIO;
 	mutex_unlock(&class->ext_req_lock);
-
-	if (!READ_ONCE(class->handshake_success)) {
-		ufcs_err("handshake fail");
-		return -EIO;
-	}
-
-	return 0;
+	mutex_unlock(&class->handshake_lock);
+	return rc;
 }
 EXPORT_SYMBOL(ufcs_handshake);
 

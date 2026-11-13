@@ -41,6 +41,7 @@ enum ufcs_handshake_state {
 	UFCS_HS_WAIT,
 	UFCS_HS_SUCCESS,
 	UFCS_HS_FAIL,
+	UFCS_HS_TIMEOUT,
 };
 
 enum ufcs_err_type {

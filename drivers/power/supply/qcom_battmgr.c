@@ -550,6 +550,7 @@ struct qcom_battmgr {
 	bool serial_probe;
 	bool stable_seen;
 	unsigned long stable_since;
+	unsigned long fixed_stable_since;
 	unsigned int missing_routes;
 	unsigned int retry_evidence;
 	unsigned int retry_once;
@@ -1699,7 +1700,13 @@ static unsigned int qcom_battmgr_retry_routes(struct qcom_battmgr *b,
 
 	if (b->serial_retry_state.delivered)
 		eligible |= ERHAI_SERIAL;
-	if (b->ufcs_retry_state.delivered)
+	/* A missed first handshake earns one discovery slot after 30 s
+	 * of confirmed fixed 9 V power. Other failures supply no evidence.
+	 */
+	if (b->ufcs_retry_state.delivered ||
+	    (status->first_ufcs_timeout && !b->ufcs_retry_state.attempts &&
+	     b->pd_state == PD_ACTIVE &&
+	     time_after_eq(jiffies, b->fixed_stable_since + 30 * HZ)))
 		eligible |= ERHAI_UFCS;
 	eligible &= status->ready & ~status->protected;
 	if (eligible & b->restore_route)
@@ -2145,6 +2152,8 @@ fixed_contract:
 			battmgr->stable_seen = true;
 			battmgr->stable_since = jiffies;
 		}
+		if (battmgr->pd_state == PD_WAIT)
+			battmgr->fixed_stable_since = jiffies;
 		if (!qc)
 			qcom_battmgr_route_delivered(&battmgr->fixed_retry_state);
 		battmgr->pd_state = PD_ACTIVE;

@@ -318,6 +318,8 @@ re_recv:
 			ufcs_err("handshake timeout, retry\n");
 			goto retry;
 		}
+		if (event->type == UFCS_EVENT_TIMEOUT)
+			WRITE_ONCE(class->ufcs->handshake_state, UFCS_HS_TIMEOUT);
 		goto err;
 	case UFCS_EVENT_RECV_SOFT_RESET:
 		stop_handshake_timer(class);

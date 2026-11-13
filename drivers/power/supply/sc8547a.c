@@ -485,6 +485,8 @@ struct sc8547a_device {
 	int			auto_curve_idx;	/* current row (descends only) */
 	bool			auto_protection;
 	unsigned int responded;
+	bool ufcs_handshake_tried;
+	bool first_ufcs_timeout;
 	bool serial_quiesced;
 	bool monitor_pump_faults;
 	u8 pump_faults;
@@ -2630,6 +2632,7 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 		status->ready |= ERHAI_UFCS;
 #endif
 	status->responded = sc->responded;
+	status->first_ufcs_timeout = sc->first_ufcs_timeout;
 	if (sc->auto_state == SC_AUTO_DELIVER && sc->fastchg_deliver)
 		status->delivering = ERHAI_SERIAL;
 	if (sc->auto_protection)
@@ -2642,6 +2645,8 @@ void sc8547a_detached(void)
 	guard(mutex)(&sc8547_pps_lock);
 	if (sc8547_master_dev) {
 		sc8547_master_dev->responded = 0;
+		sc8547_master_dev->ufcs_handshake_tried = false;
+		sc8547_master_dev->first_ufcs_timeout = false;
 		sc8547_master_dev->auto_protection = false;
 		sc8547_master_dev->pump_faults = 0;
 	}
@@ -2888,10 +2893,15 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	if (ret)
 		goto out;
 	ret = ufcs_handshake(sc->ufcs);
+	scoped_guard(mutex, &sc8547_pps_lock) {
+		sc->first_ufcs_timeout = !sc->ufcs_handshake_tried && ret == -ETIMEDOUT &&
+			READ_ONCE(sc->ufcs->handshake_state) == UFCS_HS_TIMEOUT;
+		sc->ufcs_handshake_tried = true;
+		if (!ret)
+			sc->responded |= ERHAI_UFCS;
+	}
 	if (ret)
 		goto out;
-	scoped_guard(mutex, &sc8547_pps_lock)
-		sc->responded |= ERHAI_UFCS;
 	/* Stock sets the CP watchdog to 5 s after PHY handshake. The
 	 * source packet watchdog is a separate 3 s contract.
 	 */
