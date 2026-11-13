@@ -40,7 +40,7 @@ struct erhai_pps_ops {
 	void (*recharge)(void *data);
 	bool (*active)(void *data);
 	unsigned int (*update)(void *data, bool caps_changed);
-	int (*stop)(void *data);
+	int (*stop)(void *data, bool upgrading);
 	void (*detached)(void *data);
 };
 int erhai_pps_register(struct device *parent, const struct erhai_pps_ops *ops,

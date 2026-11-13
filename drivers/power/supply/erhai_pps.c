@@ -1439,13 +1439,17 @@ static bool erhai_pps_active(void *data)
 	return p->state != PPS_IDLE || p->cleanup || p->adc_held;
 }
 
-static int erhai_pps_stop(void *data)
+static int erhai_pps_stop(void *data, bool upgrading)
 {
 	struct erhai_pps *p = data;
+	bool restore_pps = upgrading && !p->ufcs && p->state != PPS_IDLE;
 
-	pps_exit(p, "policy stop");
+	pps_exit(p, upgrading ? "protocol upgrade" : "policy stop");
 	if (p->cleanup)
 		return -EIO;
+	/* The working APDO is the fallback if the higher protocol declines. */
+	if (restore_pps)
+		p->retry_at = jiffies;
 	p->next_poll = 0;
 
 	return 0;

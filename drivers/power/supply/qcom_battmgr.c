@@ -1240,12 +1240,12 @@ static bool qcom_battmgr_pps_running(struct qcom_battmgr *battmgr)
 	return battmgr->pps_ops && battmgr->pps_ops->active(battmgr->pps_data);
 }
 
-static int qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr)
+static int qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr, bool upgrading)
 {
 	if (!battmgr->pps_ops)
 		return 0;
 	return battmgr->pps_ops->serial_session(false) ?:
-		battmgr->pps_ops->stop(battmgr->pps_data);
+		battmgr->pps_ops->stop(battmgr->pps_data, upgrading);
 }
 
 /* Match only the Type-C supply belonging to this PMIC GLINK instance. */
@@ -1665,7 +1665,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	if (test_and_clear_bit(PD_EVENT_SERVICE_RESET, &battmgr->pd_events))
 		battmgr->pd_restore_fcc = false;
 	if (test_and_clear_bit(PD_EVENT_RESET, &battmgr->pd_events)) {
-		if (qcom_battmgr_pps_stop(battmgr) ||
+		if (qcom_battmgr_pps_stop(battmgr, false) ||
 		    qcom_battmgr_pd_stop(battmgr, false, "PD reset"))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
@@ -1675,11 +1675,11 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 
 	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 				      USB_ONLINE, &online)) {
-		qcom_battmgr_pps_stop(battmgr);
+		qcom_battmgr_pps_stop(battmgr, false);
 		return PD_POLL_MS;
 	}
 	if (test_and_clear_bit(PD_EVENT_DETACH, &battmgr->pd_events) || !online) {
-		ret = qcom_battmgr_pps_stop(battmgr);
+		ret = qcom_battmgr_pps_stop(battmgr, false);
 		if (battmgr->pps_ops)
 			battmgr->pps_ops->detached(battmgr->pps_data);
 		test_and_clear_bit(PD_EVENT_TAIL, &battmgr->pd_events);
@@ -1783,7 +1783,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		}
 	}
 	if (battmgr->retry_stopping) {
-		ret = qcom_battmgr_pps_stop(battmgr);
+		ret = qcom_battmgr_pps_stop(battmgr, true);
 		ret = ret ?: qcom_battmgr_pd_stop(battmgr, false, "qualified protocol retry");
 		if (ret && time_before(jiffies, battmgr->retry_deadline))
 			return PD_POLL_MS;
@@ -1845,7 +1845,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 	if (battmgr->pps_ops && battmgr->pps_ops->ufcs_active(battmgr->pps_data) &&
-	    qcom_battmgr_pps_stop(battmgr))
+	    qcom_battmgr_pps_stop(battmgr, false))
 		return PD_POLL_MS;
 	/* A failed 5 V readback or a disappearing PHY cancels this reservation. */
 	battmgr->retry_pending = 0;
@@ -1880,7 +1880,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 	if (qcom_battmgr_pps_running(battmgr)) {
-		if (qcom_battmgr_pps_stop(battmgr))
+		if (qcom_battmgr_pps_stop(battmgr, false))
 			return PD_POLL_MS;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
@@ -2153,7 +2153,7 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 
 	mutex_lock(&battmgr->charge_lock);
 	if (!battmgr->service_up) {
-		qcom_battmgr_pps_stop(battmgr);
+		qcom_battmgr_pps_stop(battmgr, false);
 		mutex_unlock(&battmgr->charge_lock);
 		return;
 	}
@@ -2237,7 +2237,7 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 			qcom_battmgr_charge_kick(battmgr);
 			return NOTIFY_BAD;
 		}
-		if (qcom_battmgr_pps_stop(battmgr)) {
+		if (qcom_battmgr_pps_stop(battmgr, false)) {
 			mutex_unlock(&battmgr->charge_lock);
 			WRITE_ONCE(battmgr->pps_suspended, false);
 			qcom_battmgr_charge_kick(battmgr);
@@ -3359,7 +3359,7 @@ static void qcom_battmgr_otg_worker(struct work_struct *work)
 	if (!battmgr->service_up || on == battmgr->otg_vbus)
 		return;
 
-	if (on && (qcom_battmgr_pps_stop(battmgr) ||
+	if (on && (qcom_battmgr_pps_stop(battmgr, false) ||
 		   qcom_battmgr_pd_stop(battmgr, false, "USB source role")))
 		return;
 
@@ -3523,7 +3523,7 @@ static void qcom_battmgr_cancel_work(void *data)
 	disable_delayed_work_sync(&battmgr->charge_work);
 	disable_work_sync(&battmgr->otg_work);
 	mutex_lock(&battmgr->charge_lock);
-	qcom_battmgr_pps_stop(battmgr);
+	qcom_battmgr_pps_stop(battmgr, false);
 	if (battmgr->service_up)
 		qcom_battmgr_pd_stop(battmgr, false, "driver stopped");
 	mutex_unlock(&battmgr->charge_lock);
@@ -3706,7 +3706,7 @@ void erhai_pps_unregister(struct device *parent)
 	struct qcom_battmgr *battmgr = dev_get_drvdata(parent);
 
 	guard(mutex)(&battmgr->charge_lock);
-	qcom_battmgr_pps_stop(battmgr);
+	qcom_battmgr_pps_stop(battmgr, false);
 	battmgr->pps_ops = NULL;
 	battmgr->pps_data = NULL;
 	set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
