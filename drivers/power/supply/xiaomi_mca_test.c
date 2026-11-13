@@ -2056,6 +2056,7 @@ static struct mca_policy_fixture *mca_full_charge_fixture(struct kunit *test)
 		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, psy);
 	}
 	f->mca.service_up = true;
+	f->pdos[0].max_ma = cpu_to_le32(3000);
 	f->term_readback = 5200;
 	kunit_add_action_or_reset(test, mca_full_charge_cleanup, NULL);
 	return f;
@@ -2649,6 +2650,11 @@ static void xiaomi_mca_test_ffc_conditions(struct kunit *test)
 	f->type = MCA_TYPE_FLOAT;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
+	f->type = MCA_TYPE_PD;
+	f->pdos[0].max_ma = cpu_to_le32(900);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
+	f->pdos[0].max_ma = cpu_to_le32(3000);
 	f->type = MCA_TYPE_SDP;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);

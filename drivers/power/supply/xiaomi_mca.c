@@ -2284,7 +2284,7 @@ static void xiaomi_mca_select_profile(struct xiaomi_mca *mca, int tcool, int twa
  * A source advertisement by itself is no evidence of usable charge current.
  */
 static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twarm,
-				      int vbat, int ibat)
+				      int vbat, int vmin, int ibat)
 {
 	u32 online, type, attached = READ_ONCE(mca->attach_generation);
 	int iterm = mca->ffc_warm ? 3164 : 2350;
@@ -2302,9 +2302,20 @@ static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twa
 	    type == MCA_TYPE_SDP || type == MCA_TYPE_CDP)
 		return false;
 
-	if ((type == MCA_TYPE_C || xiaomi_mca_probe_5v(type)) &&
-	    xiaomi_mca_5v_input(mca, type) <= MCA_POLICY_ICL_DEFAULT_MA)
-		return false;
+	/* The gauges average over several seconds. A sample can still
+	 * describe the previous source when the next one is already at 5 V.
+	 * Even at 100% efficiency the source must supply iterm at cell voltage.
+	 */
+	if (xiaomi_mca_is_pd(type) || type == MCA_TYPE_C || xiaomi_mca_probe_5v(type)) {
+		u32 vbus;
+
+		if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus) ||
+		    vbus < MCA_VBUS_ONLINE_UV)
+			return false;
+		if (vbus < MCA_HV_VBUS_5V_MAX_UV &&
+		    xiaomi_mca_5v_input(mca, type) * (vbus / 1000) <= iterm * vmin)
+			return false;
+	}
 	running = mca->ffc_active && mca->ffc_type == type && mca->ffc_attach == attached;
 	mca->ffc_type = type;
 	mca->ffc_attach = attached;
@@ -2359,7 +2370,7 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 		else if (tbat < MCA_TERM_COOL_DEGC)
 			mca->term_hot = false;
 		xiaomi_mca_update_zones(mca, tcool, tbat);
-		mca->ffc_active = !mca->term_hot && xiaomi_mca_ffc_conditions(mca, tcool, tbat, vbat, ibat);
+		mca->ffc_active = !mca->term_hot && xiaomi_mca_ffc_conditions(mca, tcool, tbat, vbat, vmin, ibat);
 	}
 	if (!ret)
 		xiaomi_mca_select_profile(mca, tcool, tbat);
