@@ -1920,8 +1920,12 @@ static u8 sc8547_adapter_cap(u8 model)
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(ratings); i++)
-		if (model >= ratings[i].first && model <= ratings[i].last)
-			return min_t(u8, ratings[i].watts * 10 / 11, SC8547_AUTO_CODE_CEILING);
+		if (model >= ratings[i].first && model <= ratings[i].last) {
+			/* 24924 explicitly specifies 11 V at 6.1 A for 67 W. */
+			if (ratings[i].watts >= 67)
+				return SC8547_AUTO_CODE_CEILING;
+			return ratings[i].watts * 10 / 11;
+		}
 	return 0;
 }
 

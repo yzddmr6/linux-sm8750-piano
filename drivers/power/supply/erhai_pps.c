@@ -32,20 +32,9 @@
  * Live-proven subset (2026-09-23, 100 W Anker): 49/34/35/5 -> VBUS 4.8->8.4 V,
  * pack 1.0->3.6 A when the ADSP is fresh; the battery-psy props are the
  * profile gate Android's engine also drives (the total handshake).  This
- * module automates the whole sequence behind a guarded state machine so a
- * failure always falls back to the ordinary 5 V contract.
- *
- * Design / safety:
- *  - engages ONLY for PD_PPS adapters (ADSP USB_REAL_TYPE == 8) with PPS
- *    support (USB_GET_PPS_TYPE == 1) and NO serial VOOC active
- *    (USB_VOOC_FAST_CHG_TYPE below pps_vooc_min AND sc8547a not delivering) —
- *    the genuine OnePlus brick keeps its existing serial-SVOOC path,
- *  - checks the serial owner and real adapter classification before entry,
- *  - steps VBUS up in pps_volt_step_mv increments (vendor order), servos the
- *    PPS current, hands off at the cell voltage limit and ALWAYS reverts to the 5 V
- *    contract on exit/detach/abnormal,
- *  - module params mirror the sc8547a driver style; every state crossing and
- *    exit reason is logged; counters/substates behind debugfs.
+ * module runs the sequence only with a live APDO and a free serial PHY.
+ * Battmgr selects the next source contract once the pumps have released
+ * the port and the 5 V transition has been confirmed.
  *
  * The battery manager supplies the freezable worker, policy lock and GLINK
  * transport. There is no independent battery supply or battery_charger client.
@@ -198,6 +187,7 @@ MODULE_PARM_DESC(pps_iclim_ma,
 		 "USB_INPUT_CURR_LIMIT written on PPS entry (mA); the ADSP honours 3000 when "
 		 "the battery demand is granted (validated 2026-09-24)");
 
+/* oplus-chg-erhai-common.dtsi: oplus_spec,vbat_uv_thr_mv. */
 static unsigned int pps_vbat_min_mv = 3300;
 module_param(pps_vbat_min_mv, uint, 0444);
 MODULE_PARM_DESC(pps_vbat_min_mv, "abort below this pack voltage (mV)");
@@ -206,11 +196,6 @@ static unsigned int pps_vbus_collapse_mv = 3800;
 module_param(pps_vbus_collapse_mv, uint, 0444);
 MODULE_PARM_DESC(pps_vbus_collapse_mv,
 		 "VBUS below this while targeting >5 V means a bad cable/adapter -> exit (mV)");
-
-static unsigned int pps_vooc_min = 2;
-module_param(pps_vooc_min, uint, 0444);
-MODULE_PARM_DESC(pps_vooc_min,
-		 "ADSP USB_VOOC_FAST_CHG_TYPE at or above this means serial VOOC owns the plug; never engage PPS");
 
 static unsigned int pps_stall_polls = 15;
 module_param(pps_stall_polls, uint, 0444);
@@ -522,27 +507,14 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 	return curve->steps[p->curve_idx].ma;
 }
 
-static bool pps_deployable(struct erhai_pps *p, bool *vooc_engaged)
+/* A fresh source APDO is checked by the caller. A stale firmware type
+ * can outlive a declined serial session, so use the actual PHY owner.
+ */
+static bool pps_deployable(struct erhai_pps *p)
 {
-	int pps_type, fct;
-
-	*vooc_engaged = false;
-
-	pps_type = pps_usb_get(PPS_PROP_USB_GET_PPS_TYPE);
-	fct = pps_usb_get(PPS_PROP_USB_VOOC_FAST_CHG_TYPE);
-
-	if (pps_type != 1 || fct < 0)
-		return false;
-	if (fct >= (int)pps_vooc_min || pps_sc_delivering() ||
-	    pps_sc_identifying()) {
-		*vooc_engaged = true;
-		return false;
-	}
-	if (pps_read_battery(p))
-		return false;
-	return pps_cell_limit(p, true) != 0;
+	return !pps_sc_delivering() && !pps_sc_identifying() &&
+	       !pps_read_battery(p) && pps_cell_limit(p, true);
 }
-
 
 /* Same pack table while the buck supplies the system or carries part
  * of the charge. The firmware reports its buck FCC rating in microamps.
@@ -989,14 +961,13 @@ static void pps_poll(struct erhai_pps *p)
 
 	switch (p->state) {
 	case PPS_IDLE: {
-		bool vooc;
 
 		if (online <= 0)
 			return;
 		if (p->pps_protection || time_before(jiffies, p->retry_at))
 			return;
 
-		if (!pps_deployable(p, &vooc))
+		if (!pps_deployable(p))
 			return;
 		/* The disabled serial poller no longer prewarms the ADC for us. */
 		if (pps_cp_enable && !p->adc_held) {
@@ -1387,12 +1358,11 @@ static bool erhai_pps_enabled(void)
 static bool erhai_pps_available(void *data)
 {
 	struct erhai_pps *p = data;
-	bool vooc;
 
 	if (p->state != PPS_IDLE || p->cleanup || p->adc_held)
 		return true;
 	return !p->pps_protection && !time_before(jiffies, p->retry_at) &&
-	       pps_deployable(p, &vooc) && pps_source_limit() > 0;
+	       pps_deployable(p) && pps_source_limit() > 0;
 }
 
 static bool erhai_pps_active(void *data)
