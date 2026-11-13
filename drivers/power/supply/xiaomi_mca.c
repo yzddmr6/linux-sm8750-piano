@@ -249,10 +249,7 @@ MODULE_PARM_DESC(charge_policy,
  * the ceiling below between 13 and 48 degC; this sets the charger-type value,
  * capped.  Temperature only ever moves the charge current, never the input
  * limit or the bus voltage, so the system keeps running from the source:
- * above MCA_FCC_DERATE_FROM the current steps down by MCA_FCC_DERATE_STEP_MA
- * per degree to the fallback value, and comes back one step at a time, once
- * the battery is a degree cooler than that step needs and at most every
- * MCA_FCC_RAISE_MS.  Below MCA_FCC_TBAT_MIN it is the fallback value.  The
+ * outside the normal cell window the buck uses the fallback current. The
  * ADSP's own JEITA window (0-55 degC) still applies.  Detach, unbind and
  * ADSP restarts put the fallback value back.
  */
@@ -260,9 +257,6 @@ MODULE_PARM_DESC(charge_policy,
 #define MCA_FCC_MAX_MA		3500	/* stock buck chg_pps; PD stays at 3000 */
 #define MCA_FCC_DEFAULT_MA	500
 #define MCA_FCC_TBAT_MIN	15
-#define MCA_FCC_DERATE_FROM	38
-#define MCA_FCC_DERATE_STEP_MA	300
-#define MCA_FCC_RAISE_MS	30000
 
 static bool charge_current;
 module_param(charge_current, bool, 0644);
@@ -347,7 +341,7 @@ MODULE_PARM_DESC(mipps_auth,
  * MCA_CP_TBAT_EXIT degC, and the buck charger does the rest.  The bus
  * budget follows the APDO and the 67 W source limit. DIV2 is limited to
  * 12 A on the battery side, not 5 A on the bus. Third-party PPS sources
- * are limited to 4100 mA total bus current. The target is lowered while the
+ * are limited to the 5 A USB PD cable ceiling. The target is lowered while the
  * stage is hot, see xiaomi_mca_cp_step().  Anything
  * unexpected (a read failure, the stage turning itself off, the bus out of
  * range, too little or too much current, detach, an ADSP restart, unbind)
@@ -371,17 +365,7 @@ MODULE_PARM_DESC(mipps_auth,
  */
 #define MCA_CP_TBAT_MIN		15
 #define MCA_CP_TBAT_FULL	18	/* MCA_CP_IBAT_REDUCED_MA below */
-#define MCA_CP_TBAT_WARM	40	/* MCA_CP_IBAT_REDUCED_MA from */
-#define MCA_CP_TBAT_EXIT	45
-#define MCA_CP_TBAT_HYS		2
-/*
- * The pack reading follows the current within seconds (40 to 37 degC in
- * 12 s after a step down): from MCA_CP_TBAT_WARM the limit is held
- * reduced this long, then comes back MCA_CP_TBAT_RAMP_MA at a time
- */
-#define MCA_CP_TBAT_HOLD_MS	30000
-#define MCA_CP_TBAT_RAMP_MA	500
-#define MCA_CP_TBAT_RAMP_MS	15000
+#define MCA_CP_TBAT_EXIT	MCA_TERM_HOT_DEGC /* warm cells hand off to 4060 mV buck */
 #define MCA_CP_IBAT_MAX_MA	12000	/* stock div_max_curr[DIV2], battery side */
 #define MCA_CP_MAX_POWER_MW	67000	/* stock max_power */
 #define MCA_CP_IBAT_REDUCED_MA	4500
@@ -430,7 +414,7 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_PAR_FCC_MA	2000
 #define MCA_CP_PAR_ICL_MA	1500
 #define MCA_CP_PPS_MAX_MA	6000	/* current limit asked of the source */
-#define MCA_CP_THIRD_IBUS_MA	4100
+#define MCA_CP_STD_PPS_MAX_MA	5000
 /* bus over-current protection of the stage, above the target */
 #define MCA_CP_BUSOCP_MARGIN_MA	1000
 #define MCA_CP_BUSOCP_MAX_MA	6000
@@ -675,8 +659,6 @@ struct xiaomi_mca {
 	u32 real_type;
 	int icl_set_ma;		/* last limit written by charge_policy, 0 if none */
 	int fcc_set_ma;		/* last current written by charge_current, 0 if none */
-	u32 fcc_full;		/* charger-type current fcc_set_ma was derived from */
-	unsigned long fcc_raise_at;	/* jiffies before which it is not raised */
 	enum xiaomi_mca_hv hv;
 	int hv_polls;
 	int hv_renegs;		/* times the source went back to 5 V on its own */
@@ -693,11 +675,9 @@ struct xiaomi_mca {
 	u32 cp_ibat_trip;	/* battery current limit the trip checks against */
 	/* jiffies when the limit was last that high, or the stage above target */
 	unsigned long cp_trip_at;
-	u32 cp_warm_ma;		/* battery limit as reduced for temperature */
 	enum xiaomi_mca_profile cp_profile; /* follows the current FFC conditions */
 	unsigned int cp_stage; /* monotonic while the selected table is unchanged */
 	u32 cp_target_ma; /* effective battery target after table/thermal limits */
-	unsigned long cp_warm_at;	/* jiffies when it last changed */
 	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
@@ -1514,27 +1494,20 @@ static u32 xiaomi_mca_policy_icl(u32 real_type)
 	return min(target, limits->input_current_ma);
 }
 
-/*
- * Current a PD source offers at 5 V: the lowest maximum among the PDOs and
- * APDOs whose range covers 5 V (some PPS sources list only a 5-11 V APDO),
- * or the default if there is none.
- */
+/* The buck's autonomous 5 V path uses a fixed PDO, never a PPS APDO. */
 static u32 xiaomi_mca_pd_5v_ma(struct xiaomi_mca *mca)
 {
 	struct xiaomi_mca_pdo pdos[MCA_PD_MAX_PDOS];
-	u32 ma = U32_MAX;
 	int i;
 
-	if (xiaomi_mca_read_blob(mca, MCA_PROP_PDOS, pdos, sizeof(pdos)))
-		return MCA_POLICY_ICL_DEFAULT_MA;
+	if (!xiaomi_mca_read_blob(mca, MCA_PROP_PDOS, pdos, sizeof(pdos)))
+		for (i = 0; i < MCA_PD_MAX_PDOS; i++)
+			if (le32_to_cpu(pdos[i].min_mv) == 5000 &&
+			    le32_to_cpu(pdos[i].max_mv) == 5000 &&
+			    le32_to_cpu(pdos[i].max_ma))
+				return le32_to_cpu(pdos[i].max_ma);
 
-	for (i = 0; i < MCA_PD_MAX_PDOS; i++) {
-		if (le32_to_cpu(pdos[i].min_mv) <= 5000 &&
-		    le32_to_cpu(pdos[i].max_mv) >= 5000)
-			ma = min(ma, le32_to_cpu(pdos[i].max_ma));
-	}
-
-	return ma && ma != U32_MAX ? ma : MCA_POLICY_ICL_DEFAULT_MA;
+	return MCA_POLICY_ICL_DEFAULT_MA;
 }
 
 /*
@@ -1579,32 +1552,17 @@ static u32 xiaomi_mca_policy_fcc(u32 real_type, bool hv)
 /* Charge current for @full at battery temperature @tbat */
 static u32 xiaomi_mca_fcc_thermal(u32 full, int tbat)
 {
-	u32 derate;
-
-	if (tbat < MCA_FCC_TBAT_MIN)
-		return MCA_FCC_DEFAULT_MA;
-	if (tbat <= MCA_FCC_DERATE_FROM || full <= MCA_FCC_DEFAULT_MA)
-		return full;
-
-	derate = (tbat - MCA_FCC_DERATE_FROM) * MCA_FCC_DERATE_STEP_MA;
-	return derate < full - MCA_FCC_DEFAULT_MA ? full - derate :
-						     MCA_FCC_DEFAULT_MA;
+	if (tbat < MCA_FCC_TBAT_MIN || tbat >= MCA_TERM_HOT_DEGC)
+		return min_t(u32, full, MCA_FCC_DEFAULT_MA);
+	return full;
 }
 
 static void xiaomi_mca_apply_fcc(struct xiaomi_mca *mca, int tbat)
 {
 	u32 full = min_t(u32, xiaomi_mca_policy_fcc(mca->real_type, mca->hv == MCA_HV_ON),
 			 MCA_FCC_MAX_MA);
-	u32 target = xiaomi_mca_fcc_thermal(full, tbat);
+	u32 target = xiaomi_mca_fcc_thermal(full, mca->term_hot ? MCA_TERM_HOT_DEGC : tbat);
 
-	/* Same charger, cooling down: one step at a time, with a degree spare */
-	if (mca->fcc_set_ma && full == mca->fcc_full &&
-	    target > mca->fcc_set_ma) {
-		if (time_before(jiffies, mca->fcc_raise_at))
-			return;
-		target = min3(target, xiaomi_mca_fcc_thermal(full, tbat + 1),
-			      (u32)mca->fcc_set_ma + MCA_FCC_DERATE_STEP_MA);
-	}
 	if (target == mca->fcc_set_ma)
 		return;
 
@@ -1616,8 +1574,6 @@ static void xiaomi_mca_apply_fcc(struct xiaomi_mca *mca, int tbat)
 	dev_info(mca->dev, "%s: charge current %u mA (battery %d degC)\n",
 		 xiaomi_mca_type_name(mca->real_type) ?: "Unknown", target, tbat);
 	mca->fcc_set_ma = target;
-	mca->fcc_full = full;
-	mca->fcc_raise_at = jiffies + msecs_to_jiffies(MCA_FCC_RAISE_MS);
 }
 
 static bool xiaomi_mca_is_pd(u32 real_type)
@@ -2101,7 +2057,7 @@ static int xiaomi_mca_cp_set_busocp(struct xiaomi_mca *mca, u32 ma)
 
 static u32 xiaomi_mca_cp_capability_ma(u32 apdo_ma, bool verified)
 {
-	return min_t(u32, apdo_ma, verified ? MCA_CP_PPS_MAX_MA : MCA_CP_THIRD_IBUS_MA);
+	return min_t(u32, apdo_ma, verified ? MCA_CP_PPS_MAX_MA : MCA_CP_STD_PPS_MAX_MA);
 }
 
 /* milliamp budget at the requested PPS voltage, before buck sharing. */
@@ -2463,10 +2419,10 @@ static bool xiaomi_mca_cp_after_auth(struct xiaomi_mca *mca)
 
 /*
  * Battery current limit (both cells) for the battery voltage and the
- * coolest and warmest temperature, see MCA_CP_TBAT_* and MCA_CP_VSTEP_*
+ * coolest cell temperature within the direct-charge window
  */
 static u32 xiaomi_mca_cp_ibat_limit(struct xiaomi_mca *mca, int vbat,
-				   int tcool, int twarm)
+				   int tcool)
 {
 	const struct xiaomi_mca_charge_step *steps;
 	u32 ma = cp_ibat_max ? clamp(cp_ibat_max, 1000U, (u32)MCA_CP_IBAT_MAX_MA) :
@@ -2481,20 +2437,6 @@ static u32 xiaomi_mca_cp_ibat_limit(struct xiaomi_mca *mca, int vbat,
 		mca->cp_stage++;
 	ma = min(ma, steps[mca->cp_stage].ma);
 
-	if (twarm >= MCA_CP_TBAT_WARM) {
-		mca->cp_warm_ma = MCA_CP_IBAT_REDUCED_MA;
-		mca->cp_warm_at = jiffies;
-	} else if (mca->cp_warm_ma < MCA_CP_IBAT_MAX_MA &&
-		   twarm <= MCA_CP_TBAT_WARM - MCA_CP_TBAT_HYS &&
-		   time_after(jiffies, mca->cp_warm_at +
-			      msecs_to_jiffies(mca->cp_warm_ma == MCA_CP_IBAT_REDUCED_MA ?
-					       MCA_CP_TBAT_HOLD_MS :
-					       MCA_CP_TBAT_RAMP_MS))) {
-		mca->cp_warm_ma = min(mca->cp_warm_ma + MCA_CP_TBAT_RAMP_MA,
-				      (u32)MCA_CP_IBAT_MAX_MA);
-		mca->cp_warm_at = jiffies;
-	}
-	ma = min(ma, mca->cp_warm_ma);
 	if (tcool < MCA_CP_TBAT_FULL)
 		ma = min_t(u32, ma, MCA_CP_IBAT_REDUCED_MA);
 	mca->cp_target_ma = ma;
@@ -2523,7 +2465,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	    vbat >= vbat_max - MCA_CP_VBAT_HYS_MV ||
 	    imax >= MCA_CP_CELL_OCP_MA ||
 	    min(tcool, tpack) < MCA_CP_TBAT_MIN ||
-	    max(tbat, tpack) >= MCA_CP_TBAT_WARM - MCA_CP_TBAT_HYS ||
+	    mca->term_hot || max(tbat, tpack) >= MCA_CP_TBAT_EXIT ||
 	    xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
 		return;
 	/* PD requests in the middle of the authentication break it */
@@ -2537,7 +2479,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	if (ma < MCA_CP_BUCK_MA + 1000)
 		return;
 
-	/* third_pps_ibus_max bounds the entire source, including the buck. */
+	/* The advertised current bounds both the buck and the pump. */
 	mca->cp_ma = xiaomi_mca_cp_capability_ma(ma, xiaomi_mca_adapter_verified(mca));
 	mca->cp_max_mv = max_mv;
 	mca->cp_mv = start_mv;
@@ -2572,7 +2514,6 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_buck_par = false;
 	mca->cp_stage = 0;
 	mca->cp_target_ma = 0;
-	mca->cp_warm_ma = MCA_CP_IBAT_MAX_MA;
 	mca->cp = MCA_CP_OPENING;
 	/* Confirm the new FV before asking the source to open this session. */
 	ret = xiaomi_mca_full_charge_poll(mca);
@@ -2619,7 +2560,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 
 	xiaomi_mca_select_profile(mca);
 	/* Never continue a high-current APDO after authentication is revoked. */
-	if (mca->cp_ma > MCA_CP_THIRD_IBUS_MA && !xiaomi_mca_adapter_verified(mca)) {
+	if (mca->cp_ma > MCA_CP_STD_PPS_MAX_MA && !xiaomi_mca_adapter_verified(mca)) {
 		xiaomi_mca_cp_stop(mca, "adapter authentication lost");
 		return;
 	}
@@ -2632,7 +2573,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		return;
 	}
 	if (min(tcool, tpack) < MCA_CP_TBAT_MIN ||
-	    max(tbat, tpack) >= MCA_CP_TBAT_EXIT) {
+	    max(tbat, tpack) >= MCA_CP_TBAT_EXIT || mca->term_hot) {
 		xiaomi_mca_cp_stop(mca, "battery temperature");
 		return;
 	}
@@ -2643,8 +2584,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		return;
 	}
 
-	ibat_max = xiaomi_mca_cp_ibat_limit(mca, vbat, min(tcool, tpack),
-					   max(tbat, tpack));
+	ibat_max = xiaomi_mca_cp_ibat_limit(mca, vbat, min(tcool, tpack));
 	/* a lowered limit is regulated down to before it trips */
 	if (ibat_max >= (int)mca->cp_ibat_trip) {
 		mca->cp_ibat_trip = ibat_max;
@@ -3426,7 +3366,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		if (xiaomi_mca_cp_stop(mca, "detached"))
 			return;
 		mca->cp = MCA_CP_OFF;
-		if (mca->icl_set_ma)
+		if (mca->icl_written)
 			xiaomi_mca_reset_icl(mca);
 		if (mca->fcc_written)
 			xiaomi_mca_reset_fcc(mca);
@@ -3491,7 +3431,6 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->icl_set_ma = 0;
 			mca->fcc_set_ma = 0;
 			mca->fcc_written = false;
-			mca->fcc_full = 0;
 			mca->auth_ok = false;
 			mca->mipps_attempted = false;
 			mca->auth_cleanup = false;
@@ -4050,8 +3989,8 @@ static void xiaomi_mca_unbind_restore(void *data)
 		xiaomi_mca_request_volt(mca, 5000);
 }
 
-/* Leave the autonomous buck charger at the source's 5 V policy limits. */
-static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca)
+/* Hand off the buck under a confirmed fixed contract. */
+static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca, u32 fixed_ma)
 {
 	u32 type, icl, fcc, tbat;
 	int ret;
@@ -4063,17 +4002,19 @@ static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca)
 	if (ret)
 		return ret;
 	icl = xiaomi_mca_policy_icl(type);
-	fcc = xiaomi_mca_policy_fcc(type, false);
+	fcc = xiaomi_mca_policy_fcc(type, fixed_ma != 0);
 	if (!icl || !fcc)
 		return -EOPNOTSUPP;
-	if (xiaomi_mca_is_pd(type))
+	if (fixed_ma)
+		icl = min(fixed_ma, xiaomi_mca_hv_icl(type));
+	else if (xiaomi_mca_is_pd(type))
 		icl = clamp(xiaomi_mca_pd_5v_ma(mca), MCA_ICL_MIN_MA, icl);
 
 	if (mca->fcc_written) {
 		ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tbat);
 		if (ret)
 			return ret;
-		fcc = xiaomi_mca_fcc_thermal(fcc, (s32)tbat);
+		fcc = xiaomi_mca_fcc_thermal(fcc, mca->term_hot ? MCA_TERM_HOT_DEGC : (s32)tbat);
 		ret = xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, fcc);
 		if (ret)
 			return ret;
@@ -4092,7 +4033,8 @@ static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca)
 /* Stop host-controlled charging before its suppliers can suspend. */
 static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 {
-	u32 vbus;
+	u32 vbus, fixed_ma = 0;
+	bool pps;
 	int ret;
 
 	ret = xiaomi_mca_pen_off(mca);
@@ -4121,20 +4063,47 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 			goto out;
 	}
 
-	ret = xiaomi_mca_sleep_currents(mca);
-	if (ret)
-		return ret;
+	/* Standard PD can maintain a fixed 9 V PDO without CPU keepalives.
+	 * Always name the fixed PDO explicitly, even if PPS already reads 9 V. */
+	if (hv_charge && mca->voltage_written && xiaomi_mca_is_pd(mca->real_type) &&
+	    !mca->charge_blocked) {
+		fixed_ma = xiaomi_mca_pd_9v_ma(mca, &pps);
+		if (fixed_ma && !pps) {
+			ret = xiaomi_mca_write_u32(mca, MCA_PROP_PD_FIXED_VOLT, MCA_HV_MV);
+			if (!ret) {
+				int read_ret;
 
-	ret = xiaomi_mca_restore_voltage(mca);
+				ret = read_poll_timeout(xiaomi_mca_read, read_ret,
+					read_ret || (vbus >= MCA_HV_VBUS_MIN_UV && vbus <= MCA_HV_VBUS_MAX_UV),
+					jiffies_to_usecs(MCA_POLL_INTERVAL),
+					jiffies_to_usecs(MCA_POLL_INTERVAL * MCA_HV_SETTLE_POLLS),
+					false, mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus);
+				ret = ret ?: read_ret;
+			}
+			if (ret)
+				fixed_ma = 0;
+		} else {
+			fixed_ma = 0;
+		}
+	}
+	if (!fixed_ma) {
+		/* Downrate before requesting 5 V. */
+		ret = xiaomi_mca_sleep_currents(mca, 0);
+		if (ret)
+			return ret;
+		ret = xiaomi_mca_restore_voltage(mca);
+	} else {
+		ret = xiaomi_mca_sleep_currents(mca, fixed_ma);
+	}
 	if (ret)
 		return ret;
 
 out:
 	mca->cp = MCA_CP_OFF;
-	mca->hv = MCA_HV_OFF;
-	mca->voltage_written = false;
+	mca->hv = fixed_ma ? MCA_HV_ON : MCA_HV_OFF;
+	mca->voltage_written = !!fixed_ma;
+	mca->hv_pps = false;
 	mca->hv_renegs = 0;
-	mca->fcc_full = 0;
 	mca->auth_ok = false;
 	mca->mipps_attempted = false;
 	mca->online = false;
@@ -4188,6 +4157,10 @@ static void xiaomi_mca_complete(struct device *dev)
 		if (!mca->sleeping)
 			return;
 		mca->sleeping = false;
+		/* Autonomous firmware owned the buck during sleep. Reapply even
+		 * when its pre-sleep setpoint equals the current policy target. */
+		mca->icl_set_ma = 0;
+		mca->fcc_set_ma = 0;
 		mca->pen_attempted = false;
 	}
 	enable_delayed_work(&mca->poll_work);
