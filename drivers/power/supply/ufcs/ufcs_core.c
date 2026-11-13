@@ -331,6 +331,10 @@ void ufcs_clean_process_info(struct ufcs_class *class)
 
 	memset(class->pwr_change_info, 0, sizeof(class->pwr_change_info));
 	class->power_changed = false;
+	class->test_mode = false;
+	class->vol_acc_test = false;
+	class->verify_pass = false;
+	WRITE_ONCE(class->test_request, 0);
 
 	class->src_info = 0;
 	class->cable_info = 0;

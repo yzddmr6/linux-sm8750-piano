@@ -85,24 +85,9 @@ void ufcs_pe_test_handle_work(struct work_struct *work)
 {
 	struct ufcs_class *class = container_of(work, struct ufcs_class, test_handle_work);
 	u16 request;
-	bool enable_test_mode, enable_vol_acc_test;
 	const char *cmd_name;
 
-	request = class->test_request;
-	enable_test_mode = (bool)UFCS_TEST_REQUEST_ENABLE_TEST_MODE(request);
-	enable_vol_acc_test = (bool)UFCS_TEST_REQUEST_ENABLE_VOL_ACC_TEST_MODE(request);
-
-	if (class->test_mode != enable_test_mode) {
-		class->test_mode = enable_test_mode;
-		ufcs_send_state(UFCS_NOTIFY_TEST_MODE_CHANGED, NULL);
-		ufcs_info("%s test mode\n", enable_test_mode ? "enable" : "disable");
-	}
-	if (class->vol_acc_test != enable_vol_acc_test) {
-		class->vol_acc_test = enable_vol_acc_test;
-		ufcs_send_state(UFCS_NOTIFY_VOL_ACC_TEST_MODE_CHANGED, NULL);
-		ufcs_info("%s voltage acc test mode\n", enable_vol_acc_test ? "enable" : "disable");
-	}
-
+	request = READ_ONCE(class->test_request);
 	if (UFCS_IS_TEST_CTRL_MSG(request))
 		return;
 	if (!class->test_mode)
@@ -142,11 +127,31 @@ void ufcs_pe_test_handle_work(struct work_struct *work)
 
 void ufcs_pe_test_request_handle(struct ufcs_class *class, u16 request)
 {
+	bool enable_test_mode, enable_vol_acc_test;
+
 	if (class == NULL) {
 		ufcs_err("class is NULL\n");
 		return;
 	}
 
-	class->test_request = request;
+	/* The mode belongs to this protocol session. Update it in the PE
+	 * while handling the frame; deferred I/O must not relatch an old
+	 * peer's mode after force-exit or a source reset.
+	 */
+	enable_test_mode = (bool)UFCS_TEST_REQUEST_ENABLE_TEST_MODE(request);
+	enable_vol_acc_test = (bool)UFCS_TEST_REQUEST_ENABLE_VOL_ACC_TEST_MODE(request);
+
+	if (class->test_mode != enable_test_mode) {
+		class->test_mode = enable_test_mode;
+		ufcs_send_state(UFCS_NOTIFY_TEST_MODE_CHANGED, NULL);
+		ufcs_info("%s test mode\n", enable_test_mode ? "enable" : "disable");
+	}
+	if (class->vol_acc_test != enable_vol_acc_test) {
+		class->vol_acc_test = enable_vol_acc_test;
+		ufcs_send_state(UFCS_NOTIFY_VOL_ACC_TEST_MODE_CHANGED, NULL);
+		ufcs_info("%s voltage acc test mode\n", enable_vol_acc_test ? "enable" : "disable");
+	}
+
+	WRITE_ONCE(class->test_request, request);
 	schedule_work(&class->test_handle_work);
 }

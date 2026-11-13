@@ -4,6 +4,7 @@
 #include <kunit/device.h>
 #include <linux/unaligned.h>
 #include "ufcs_class.h"
+#include "ufcs_core.h"
 
 struct peer {
 	struct kunit *test;
@@ -186,6 +187,24 @@ static void timeout_and_reenter(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ufcs_handshake(p->dev), 0);
 }
 
+static void leave_peer_test_mode(struct kunit *test)
+{
+	struct peer *p = test->priv;
+	u64 mode;
+
+	KUNIT_ASSERT_EQ(test, ufcs_handshake(p->dev), 0);
+	ufcs_pe_test_request_handle(p->dev->class, BIT(15) | BIT(14));
+	KUNIT_ASSERT_TRUE(test, ufcs_is_test_mode(p->dev));
+	KUNIT_ASSERT_TRUE(test, ufcs_is_vol_acc_test_mode(p->dev));
+	KUNIT_ASSERT_EQ(test, ufcs_force_exit(p->dev), 0);
+	flush_work(&p->dev->class->test_handle_work);
+	KUNIT_ASSERT_FALSE(test, ufcs_is_test_mode(p->dev));
+	KUNIT_ASSERT_FALSE(test, ufcs_is_vol_acc_test_mode(p->dev));
+	KUNIT_ASSERT_EQ(test, ufcs_handshake(p->dev), 0);
+	KUNIT_ASSERT_EQ(test, ufcs_intf_get_pdo_info(p->dev, &mode, 1), 1);
+	KUNIT_EXPECT_EQ(test, ufcs_intf_pdo_set(p->dev, 10000, 5000), 0);
+}
+
 static void malformed_capabilities(struct kunit *test)
 {
 	struct peer *p = test->priv;
@@ -200,6 +219,7 @@ static void malformed_capabilities(struct kunit *test)
 static struct kunit_case cases[] = {
 	KUNIT_CASE(negotiate),
 	KUNIT_CASE(timeout_and_reenter),
+	KUNIT_CASE(leave_peer_test_mode),
 	KUNIT_CASE(malformed_capabilities),
 	{}
 };
