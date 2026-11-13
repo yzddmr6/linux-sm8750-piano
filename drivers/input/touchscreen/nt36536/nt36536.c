@@ -724,6 +724,7 @@ static int32_t nvt_parse_dt(struct device *dev)
 	ts->int_trigger_type = INT_TRIGGER_TYPE;
 
 	ts->pen_support = device_property_read_bool(dev, "novatek,pen-support");
+	ts->pen_scan = ts->pen_support;
 	NVT_LOG("novatek,pen-support=%d\n", ts->pen_support);
 
 	SWRST_N8_ADDR = trim_id_table[0].hwinfo->hw_regs->swrst_sif_addr;
@@ -1289,13 +1290,8 @@ static int nvt_ext_cmd(u8 sub_cmd)
 }
 
 /*
- * The vendor stack sends the pen scan command only once a pen has connected
- * over Bluetooth, and turns it off again when the pen goes away, so the
- * firmware is not expected to report a pen before it.  Here the decision is
- * left to userspace through the pen_scan attribute, off by default so the
- * sensor does not spend power on a pen that is not there.  A downloaded
- * firmware starts with scanning off, so the setting is restored after each
- * download.  Called with ts->lock held.
+ * Downloaded firmware starts with scanning off. Restore the requested
+ * setting after every firmware download. Called with ts->lock held.
  */
 static int nvt_set_pen_scan(bool enable)
 {
