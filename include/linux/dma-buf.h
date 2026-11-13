@@ -277,6 +277,14 @@ struct dma_buf_ops {
 
 	int (*vmap)(struct dma_buf *dmabuf, struct iosys_map *map);
 	void (*vunmap)(struct dma_buf *dmabuf, struct iosys_map *map);
+
+	/**
+	 * @cacheable_sysram: All buffers exported with these ops use system
+	 * RAM with a normal write-back CPU mapping. An importer programming
+	 * its own device page tables can use this to select a snooping
+	 * mapping if its hardware supports cache-coherent access to RAM.
+	 */
+	bool cacheable_sysram;
 };
 
 /**

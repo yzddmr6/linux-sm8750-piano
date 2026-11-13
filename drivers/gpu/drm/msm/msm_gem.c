@@ -491,9 +491,11 @@ static struct drm_gpuva *get_vma_locked(struct drm_gem_object *obj,
 	return vma;
 }
 
-int msm_gem_prot(struct drm_gem_object *obj)
+int msm_gem_prot(struct drm_gem_object *obj, struct drm_gpuvm *vm)
 {
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
+	struct msm_drm_private *priv = obj->dev->dev_private;
+	struct msm_mmu *mmu = to_msm_vm(vm)->mmu;
 	int prot = IOMMU_READ;
 
 	if (!(msm_obj->flags & MSM_BO_GPU_READONLY))
@@ -505,13 +507,19 @@ int msm_gem_prot(struct drm_gem_object *obj)
 	if (msm_obj->flags & MSM_BO_CACHED_COHERENT)
 		prot |= IOMMU_CACHE;
 
+	/* Only the Adreno process page table has this coherency capability. */
+	if (obj->import_attach && priv->has_cached_coherent && mmu &&
+	    mmu->type == MSM_MMU_IOMMU_PAGETABLE &&
+	    obj->import_attach->dmabuf->ops->cacheable_sysram)
+		prot |= IOMMU_CACHE;
+
 	return prot;
 }
 
 int msm_gem_pin_vma_locked(struct drm_gem_object *obj, struct drm_gpuva *vma)
 {
 	struct msm_gem_object *msm_obj = to_msm_bo(obj);
-	int prot = msm_gem_prot(obj);
+	int prot = msm_gem_prot(obj, vma->vm);
 	int ret;
 
 	msm_gem_assert_locked(obj);

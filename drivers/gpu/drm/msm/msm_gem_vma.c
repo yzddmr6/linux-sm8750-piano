@@ -516,7 +516,7 @@ msm_gem_vm_sm_step_map(struct drm_gpuva_op *op, void *_arg)
 
 	if (obj) {
 		sgt = to_msm_bo(obj)->sgt;
-		prot = msm_gem_prot(obj);
+		prot = msm_gem_prot(obj, job->vm);
 	} else {
 		sgt = NULL;
 		prot = IOMMU_READ | IOMMU_WRITE;
