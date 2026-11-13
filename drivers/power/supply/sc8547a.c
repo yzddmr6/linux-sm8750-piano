@@ -492,6 +492,7 @@ struct sc8547a_device {
 	unsigned long		auto_identify_deadline;
 	const struct erhai_charge_curve *auto_curve;	/* selected CC/CV table */
 	int			auto_curve_idx;	/* current row (descends only) */
+	bool			auto_protection;
 	unsigned int		auto_taper_cnt;
 	int			auto_step_cnt;	/* advance debounce counter */
 	int			auto_reservo_cnt;	/* consecutive adapter-reset re-servos */
@@ -1862,18 +1863,27 @@ static u8 sc8547_adapter_cap(u8 model)
 /* Re-index on a change of bin. Within a bin use the AP VOOC PHY's
  * four consecutive voltage/current samples to descend the curve.
  */
+static int sc8547_cell_cv(int temp)
+{
+	/* oplus_spec,full_voltage: sustained (second) threshold per region. */
+	if (temp >= 440)
+		return 4130;
+	if (temp < 50)
+		return 4520;
+	if (temp >= 210 && temp < 350)
+		return 4550;
+	return 4545;
+}
+
 static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int temp,
 				     int mv, int ibus, bool entering)
 {
 	const struct erhai_charge_curve *curve;
 	const struct erhai_charge_step *step;
 
-	if (soc >= 90) /* current policy, oplus_spec,vooc_high_soc */
-		return false;
 	curve = erhai_curve_select(svooc_curves, soc, temp);
 	if (!curve || mv <= SC8547_CELL_MIN_VALID_MV ||
-	    mv >= (temp < 50 ? 4520 : temp >= 440 ? 4130 :
-		   temp >= 210 && temp < 350 ? 4550 : 4545))
+	    mv >= sc8547_cell_cv(temp))
 		return false;
 
 	if (entering || curve != sc->auto_curve) {
@@ -2196,6 +2206,18 @@ static void sc8547_attach_work(struct work_struct *work)
 	if (!sc->vooc_started)
 		return;
 
+	if (sc->auto_state == SC_AUTO_DONE || sc->auto_state == SC_AUTO_DECLINED) {
+		int soc, temp, mv;
+
+		if (sc8547_read_gauge(sc, &soc, &temp, &mv) ||
+		    !sc8547_auto_update_curve(sc, soc, temp, mv, 0, true))
+			goto reschedule;
+		sc->auto_state = SC_AUTO_IDENTIFY;
+		sc->fastchg_auto = true;
+		sc->auto_armed = false;
+		sc->auto_ident_retries = 0;
+		sc->auto_reservo_cnt = 0;
+	}
 	vbus = sc8547_get_vbus(sc);
 	if (!sc->auto_armed) {
 		sc8547_vooc_arm_hw(sc);
@@ -2230,8 +2252,13 @@ static void sc8547_attach_work(struct work_struct *work)
 		int cibus_total = cibus + slave_ma;
 		int margin = vbus - 2 * cpbat;
 		u8 r6 = 0, r7 = 0;
+		if (cpbat >= SC8547_CP_OVP_CEILING_MV || cibus >= 4500 ||
+		    slave_ma >= 4500 || cibus_total >= SC8547_IBUS_ABORT_MA) {
+			sc->auto_protection = true;
+			sc8547_auto_finish(sc, "pump overvoltage or overcurrent");
+			goto reschedule;
+		}
 		if (gret || cpbat <= 0 || vbus <= 0 || cibus < 0 || slave_ma < 0 ||
-		    cibus >= 4500 || slave_ma >= 4500 ||
 		    !sc8547_auto_update_curve(sc, gsoc, gtemp, cvbat, cibus_total, false)) {
 			sc8547_auto_finish(sc, "pack or pump outside delivery envelope");
 			goto reschedule;
@@ -2251,21 +2278,7 @@ static void sc8547_attach_work(struct work_struct *work)
 			goto reschedule;
 		}
 
-		if (cpbat >= SC8547_CP_OVP_CEILING_MV ||
-		    cibus_total >= SC8547_IBUS_ABORT_MA) {
-			/* Hard backstop: over-voltage / over-current -> latch off. */
-			sc8547_slave_cp_enable(sc, false);
-			sc8547_set_chg_enable(sc, false);
-			sc->cp_enabled = false;
-			sc->fastchg_deliver = false;
-			dev_warn(sc->dev,
-				 "fastchg backstop tripped (cell %d mV cp %d mV ibus %d mA total, master %d) — CP off, deliver disarmed\n",
-				 cvbat, cpbat, cibus_total, cibus);
-			if (sc->auto_state == SC_AUTO_DELIVER) {
-				sc8547_auto_finish(sc, "backstop (CV reached)");
-				goto reschedule;
-			}
-		} else if (!(r7 & SC8547_CHG_EN_MASK)) {
+		if (!(r7 & SC8547_CHG_EN_MASK)) {
 			/*
 			 * CHG_EN self-cleared in hardware (VBUS_ERRORLO / UCP
 			 * transient). Recover only when the Vbus margin is healthy
@@ -2362,6 +2375,14 @@ static void sc8547_attach_work(struct work_struct *work)
 	}
 
 reschedule:
+	if ((sc->auto_state == SC_AUTO_DONE || sc->auto_state == SC_AUTO_DECLINED) &&
+	    !sc->auto_protection && sc->adapter_type == SC_ADAPTER_SVOOC) {
+		/* A known brick can resume without unplugging. Keep the buck
+		 * in charge while CV/temperature or telemetry prevents entry.
+		 */
+		schedule_delayed_work(&sc->attach_work, msecs_to_jiffies(30000));
+		return;
+	}
 	if (sc->auto_state == SC_AUTO_IDENTIFY || sc->auto_state == SC_AUTO_DELIVER)
 		schedule_delayed_work(&sc->attach_work,
 				      msecs_to_jiffies(SC8547_ATTACH_POLL_MS));
@@ -2390,6 +2411,7 @@ int sc8547a_serial_session(bool enable)
 		sc->auto_ident_retries = 0;
 		sc->auto_reservo_cnt = 0;
 		sc->slave_low_cnt = 0;
+		sc->auto_protection = false;
 		sc->vooc_started = true;
 		mod_delayed_work(system_wq, &sc->attach_work,
 				 msecs_to_jiffies(SC8547_ATTACH_SETTLE_MS));
