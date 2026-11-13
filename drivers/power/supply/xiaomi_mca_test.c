@@ -842,6 +842,30 @@ static void xiaomi_mca_test_qc_voltage(struct kunit *test)
 	hv_charge = false;
 }
 
+static void xiaomi_mca_test_qc_pulses(struct kunit *test)
+{
+	static const struct { int type, delta, cmd; } cases[] = {
+		{ MCA_TYPE_HVDCP_3_B, 200, 0x20 }, { MCA_TYPE_HVDCP_3_B, -200, 0x10 },
+		{ MCA_TYPE_HVDCP_3P5, 20, 0x20 }, { MCA_TYPE_HVDCP_3P5, -20, 0x10 },
+	};
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	int i;
+
+	cp_charge = true;
+	f->mca.cp = MCA_CP_OPENING;
+	f->mca.cp_max_mv = 9500;
+	f->mca.vbus_uv = 8200000;
+	guard(mutex)(&f->mca.lock);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		f->mca.cp_type = f->type = cases[i].type;
+		KUNIT_ASSERT_EQ(test, xiaomi_mca_qc_adjust(&f->mca, 8200 + cases[i].delta), 0);
+		KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_QC_PULSE);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->last_data), cases[i].cmd);
+	}
+	f->type = MCA_TYPE_DCP;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_qc_adjust(&f->mca, 8400), -EPERM);
+}
+
 static void xiaomi_mca_test_hv_pps(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_policy_fixture(test);
@@ -2841,6 +2865,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_hv_fixed),
 	KUNIT_CASE(xiaomi_mca_test_hv_pps),
 	KUNIT_CASE(xiaomi_mca_test_qc_voltage),
+	KUNIT_CASE(xiaomi_mca_test_qc_pulses),
 	KUNIT_CASE(xiaomi_mca_test_policy_refusal),
 	KUNIT_CASE(xiaomi_mca_test_auth_read_only),
 	KUNIT_CASE(xiaomi_mca_test_temperature_follow),
