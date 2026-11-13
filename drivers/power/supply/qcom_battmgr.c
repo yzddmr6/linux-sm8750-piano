@@ -27,6 +27,7 @@
 #include <linux/usb/pd.h>
 #include <linux/workqueue.h>
 
+#include "erhai_cell_envelope.h"
 #include "erhai_otg_glink.h"
 
 #define BATTMGR_CHEMISTRY_LEN	4
@@ -190,7 +191,8 @@ enum qcom_battmgr_variant {
 /* Fixed PD limits from oplus-chg-erhai-common.dtsi and oplus-chg-24924.dtsi. */
 #define PD_FIXED_MV			9000
 #define PD_DEFAULT_MV			5000
-#define PD_INPUT_MAX_UA			2000000
+/* PM8550: top HAL usb_icl[] step, also used for the PPS buck path. */
+#define PD_INPUT_MAX_UA			3000000
 #define PD_TRANSITION_UA			500000
 #define PD_VBUS_RISEN_UV			7500000
 #define PD_VBUS_MAX_UV			11000000
@@ -1325,11 +1327,12 @@ static void qcom_battmgr_pd_log(struct qcom_battmgr *battmgr, u32 type)
 
 /* Erhai fixed-PD buck profile. FCC controls battery demand independently
  * of USB ICL. The firmware continues to own the CV and JEITA loops. Use
- * the qualified-pack PD row of oplus-chg-erhai-common.dtsi
- * (fccmax-ma-hv and batt-them-thr). BATT_TEMP is in centi-C. */
+ * the domestic cell envelope and the firmware-reported FCC rating.
+ * BATT_TEMP is in centi-C. */
 static int qcom_battmgr_pd_fcc(struct qcom_battmgr *b)
 {
-	u32 auth, hmac, temp, max_fcc, want, current_fcc;
+	const struct erhai_charge_step *step;
+	u32 auth, hmac, temp, soc, uv, max_fcc, want, current_fcc;
 	int ret;
 
 	ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM, &current_fcc);
@@ -1340,14 +1343,19 @@ static int qcom_battmgr_pd_fcc(struct qcom_battmgr *b)
 	want = b->pd_saved_fcc_ua;
 	if (!b->charge_inhibited && !b->charge_policy_hold && !b->charge_error &&
 	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, &temp) &&
-	    (s32)temp >= -1000 && (s32)temp < 5300 &&
+	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY, &soc) &&
+	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, &uv) &&
 	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_AUTH, &auth) &&
 	    auth == 1 &&
 	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_HMAC, &hmac) &&
 	    hmac == 1 &&
 	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM_MAX, &max_fcc) &&
-	    max_fcc > 0 && max_fcc <= INT_MAX)
-		want = min(max_fcc, (s32)temp < 0 ? 1761000U : 4400000U);
+	    max_fcc > 0 && max_fcc <= INT_MAX) {
+		step = erhai_cell_entry(soc / 100, (s32)temp < 0 ? -1 : temp / 10, uv / 1000);
+		/* Outside the direct-charge table the ADSP retains CV/JEITA. */
+		if (step)
+			want = min(max_fcc, step->ma * 2000U);
+	}
 	if (want == current_fcc)
 		return 0;
 	/* A timeout does not prove that the firmware ignored the write. */

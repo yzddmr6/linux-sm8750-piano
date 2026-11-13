@@ -46,7 +46,7 @@
 #include <linux/usb/wcd939x-usbss.h>
 
 #include "sc8547a.h"
-#include "erhai_svooc_curves.h"
+#include "erhai_cell_envelope.h"
 
 /*
  * Android parity for slow/noisy third-party (S)VOOC adapters.  The vendor
@@ -128,7 +128,7 @@ static const char * const sc8547_gauge_names[] = {
 
 #include "erhai_otg_glink.h"
 #include "sc8547a.h"
-#include "erhai_svooc_curves.h"
+#include "erhai_cell_envelope.h"
 
 /* ---- register map (charge-pump / VOOC-PHY function, I2C addr 0x6F) ---- */
 #define SC8547_REG_00			0x00	/* VBAT_OVP */
@@ -1908,18 +1908,6 @@ static u8 sc8547_adapter_cap(u8 model)
 /* Re-index on a change of bin. Within a bin use the AP VOOC PHY's
  * four consecutive voltage/current samples to descend the curve.
  */
-static int sc8547_cell_cv(int temp)
-{
-	/* oplus_spec,full_voltage: sustained (second) threshold per region. */
-	if (temp >= 440)
-		return 4130;
-	if (temp < 50)
-		return 4520;
-	if (temp >= 210 && temp < 350)
-		return 4550;
-	return 4545;
-}
-
 static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int temp,
 				     int mv, int ibus, bool entering)
 {
@@ -1928,8 +1916,8 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 
 	curve = erhai_curve_select(svooc_curves, soc, temp);
 	/* vooc_high_temp (entry) and over_high_temp (running). */
-	if (!curve || (entering && temp > 500) || mv <= SC8547_CELL_MIN_VALID_MV ||
-	    mv >= sc8547_cell_cv(temp))
+	if (!curve || mv <= SC8547_CELL_MIN_VALID_MV ||
+	    mv >= erhai_cell_cv(temp))
 		return false;
 
 	if (entering || curve != sc->auto_curve) {

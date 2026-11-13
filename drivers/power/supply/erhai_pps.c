@@ -63,8 +63,7 @@
 
 #include "erhai_otg_glink.h"
 #include "sc8547a.h"
-#include "erhai_pps_curves.h"
-#include "erhai_svooc_curves.h"
+#include "erhai_cell_envelope.h"
 
 #define CREATE_TRACE_POINTS
 #include "erhai_pps_trace.h"
@@ -203,10 +202,6 @@ module_param(pps_fcc_ma, uint, 0444);
 MODULE_PARM_DESC(pps_fcc_ma,
 		 "pack charge demand granted via BATT_CHG_CTRL_LIM (mA); Android draws ~4.4 A at 2 A/8.4 V in");
 
-static unsigned int pps_vbat_max_mv = 4490;
-module_param(pps_vbat_max_mv, uint, 0444);
-MODULE_PARM_DESC(pps_vbat_max_mv, "taper/exit at this pack voltage (mV)");
-
 static unsigned int pps_vbat_min_mv = 3300;
 module_param(pps_vbat_min_mv, uint, 0444);
 MODULE_PARM_DESC(pps_vbat_min_mv, "abort below this pack voltage (mV)");
@@ -281,7 +276,7 @@ MODULE_PARM_DESC(pps_cp_diff_max_mv,
 		 "never step VBUS up while vbus - 2*vbat at the chip is at or above this (mV; "
 		 "the pump drops at 700)");
 
-static unsigned int pps_cp_ibat_max_ma = 7400;
+static unsigned int pps_cp_ibat_max_ma = 13600;
 module_param(pps_cp_ibat_max_ma, uint, 0444);
 MODULE_PARM_DESC(pps_cp_ibat_max_ma, "pump ibus servo: step VBUS down while the pack takes more than this (mA)");
 
@@ -381,7 +376,6 @@ struct erhai_pps {
 	unsigned long		over_since;
 	unsigned int		pump_limit_ma;
 	unsigned long		ibat_over_since;
-	bool			hot_derate;
 
 	/* stats */
 	u64			sessions;
@@ -498,21 +492,17 @@ static int pps_read_vbus(struct erhai_pps *p)
  */
 static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 {
-	const struct erhai_charge_curve *curve, *cell;
+	const struct erhai_charge_curve *curve;
 	const struct erhai_charge_step *step;
-	unsigned int ma, idx;
 
-	curve = erhai_curve_select(pps_curves, p->soc, p->temp_ddc);
-	/* Stock admission keeps 1 C of headroom below the 51 C stop. */
-	if (!curve || (entering && p->temp_ddc >= 500) ||
-	    p->vbat_mv < (int)pps_vbat_min_mv ||
-	    p->vbat_mv >= min_t(unsigned int, pps_vbat_max_mv,
-				p->temp_ddc >= 440 ? 4130 : 4490))
+	curve = erhai_curve_select(svooc_curves, p->soc, p->temp_ddc);
+	if (!curve || p->vbat_mv < (int)pps_vbat_min_mv ||
+	    p->vbat_mv >= erhai_cell_cv(p->temp_ddc))
 		return 0;
 
 	if (entering || p->curve != curve) {
 		p->curve = curve;
-		p->curve_idx = erhai_curve_start(curve, p->vbat_mv, false);
+		p->curve_idx = erhai_curve_start(curve, p->vbat_mv, true);
 		p->over_since = 0;
 	} else {
 		step = &curve->steps[p->curve_idx];
@@ -528,27 +518,7 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 		}
 	}
 
-	ma = curve->steps[p->curve_idx].ma;
-	/* The full-rate PPS row is the 33 W profile limit. In the same
-	 * temperature/SOC/voltage bin the 2:1 SVOOC profile establishes
-	 * what the cell accepts. Keep explicit PPS taper rows and the
-	 * independent PPS battery overcurrent protection.
-	 */
-	cell = erhai_curve_select(svooc_curves, p->soc, p->temp_ddc);
-	idx = erhai_curve_start(cell, p->vbat_mv, true);
-	if (ma == 3000)
-		ma = cell->steps[idx].ma;
-	else
-		ma = min_t(unsigned int, ma, cell->steps[idx].ma);
-	if (entering || p->temp_ddc < 420 || p->temp_ddc >= 440)
-		p->hot_derate = false;
-	if (p->temp_ddc >= 430 && p->temp_ddc < 440)
-		p->hot_derate = true;
-	if (p->hot_derate)
-		ma = min(ma, 2000U);
-	else if (p->temp_ddc >= 410 && p->temp_ddc < 440)
-		ma = min(ma, 3000U);
-	return ma;
+	return curve->steps[p->curve_idx].ma;
 }
 
 static bool pps_deployable(struct erhai_pps *p, bool *vooc_engaged)
@@ -815,7 +785,7 @@ static int pps_cp_step(struct erhai_pps *p)
 		if (cibus > (int)(target + 500))
 			nv -= pps_cp_vstep_over_mv;
 		else if (cibus > (int)(target + pps_cp_ibus_band_ma) ||
-			 p->ibat_ma > (int)min(pps_cp_ibat_max_ma, 7400U))
+			 p->ibat_ma > (int)min(pps_cp_ibat_max_ma, 13600U))
 			nv -= pps_cp_vstep_mv;
 		else if (cibus < (int)target - (int)pps_cp_ibus_band_ma &&
 			 diff < (int)pps_cp_diff_max_mv)
@@ -939,7 +909,7 @@ static void pps_poll(struct erhai_pps *p)
 			if (taper != (p->state == PPS_TAPER))
 				pps_enter(p, taper ? PPS_TAPER : PPS_CHARGING, "cell curve");
 		}
-		if (p->ibat_ma > 7400) {
+		if (p->ibat_ma > 13600) {
 			if (!p->ibat_over_since)
 				p->ibat_over_since = jiffies | 1;
 			else if (time_after_eq(jiffies, p->ibat_over_since + 8 * HZ)) {

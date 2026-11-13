@@ -1,4 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#ifndef _ERHAI_CELL_ENVELOPE_H
+#define _ERHAI_CELL_ENVELOPE_H
 /* OnePlusOSS sm8750 cc463675855a, oplus-chg-erhai-common.dtsi, svooc_charge_strategy. */
 #include "erhai_charge_curve.h"
 
@@ -222,3 +224,29 @@ static const struct erhai_charge_curve svooc_curves[6][7] = {
 		ERHAI_CURVE(svooc_warm_soc75),
 	},
 };
+
+static inline int erhai_cell_cv(int temp)
+{
+	/* oplus_spec,full_voltage: sustained (second) threshold per region. */
+	if (temp >= 440)
+		return 4130;
+	if (temp < 50)
+		return 4520;
+	if (temp >= 210 && temp < 350)
+		return 4550;
+	return 4545;
+}
+
+/* The board table encodes 2:1 bus mA. Other converters apply the
+ * corresponding battery-side limit, regardless of negotiated voltage.
+ */
+static inline const struct erhai_charge_step *
+erhai_cell_entry(int soc, int temp, int mv)
+{
+	const struct erhai_charge_curve *curve = erhai_curve_select(svooc_curves, soc, temp);
+
+	if (!curve || mv <= 0 || mv >= erhai_cell_cv(temp))
+		return NULL;
+	return &curve->steps[erhai_curve_start(curve, mv, true)];
+}
+#endif
