@@ -64,6 +64,8 @@
 
 #include "erhai_otg_glink.h"
 #include "sc8547a.h"
+#include "erhai_pps_curves.h"
+#include "erhai_svooc_curves.h"
 
 #define CREATE_TRACE_POINTS
 #include "erhai_pps_trace.h"
@@ -223,14 +225,6 @@ module_param(pps_vbus_collapse_mv, uint, 0444);
 MODULE_PARM_DESC(pps_vbus_collapse_mv,
 		 "VBUS below this while targeting >5 V means a bad cable/adapter -> exit (mV)");
 
-static int pps_temp_min_c = 12;
-module_param(pps_temp_min_c, int, 0444);
-MODULE_PARM_DESC(pps_temp_min_c, "PPS pack temp floor (C)");
-
-static int pps_temp_max_c = 44;
-module_param(pps_temp_max_c, int, 0444);
-MODULE_PARM_DESC(pps_temp_max_c, "PPS pack temp ceiling (C)");
-
 static unsigned int pps_vooc_min = 2;
 module_param(pps_vooc_min, uint, 0444);
 MODULE_PARM_DESC(pps_vooc_min,
@@ -296,7 +290,7 @@ MODULE_PARM_DESC(pps_cp_diff_max_mv,
 		 "never step VBUS up while vbus - 2*vbat at the chip is at or above this (mV; "
 		 "the pump drops at 700)");
 
-static unsigned int pps_cp_ibat_max_ma = 9000;
+static unsigned int pps_cp_ibat_max_ma = 7400;
 module_param(pps_cp_ibat_max_ma, uint, 0444);
 MODULE_PARM_DESC(pps_cp_ibat_max_ma, "pump ibus servo: step VBUS down while the pack takes more than this (mA)");
 
@@ -392,7 +386,15 @@ struct erhai_pps {
 	int			ibat_ma;
 	int			pump_ibus_ma;
 	int			soc;
-	int			temp_c;
+	int			temp_ddc;
+	const struct erhai_charge_curve *curve;
+	unsigned int		curve_idx;
+	unsigned int		source_ma;
+	unsigned int		cell_ma;
+	unsigned long		over_since;
+	unsigned int		pump_limit_ma;
+	unsigned long		ibat_over_since;
+	bool			hot_derate;
 
 	/* stats */
 	u64			sessions;
@@ -483,10 +485,10 @@ static int pps_read_battery(struct erhai_pps *p)
 	if (ret)
 		goto out;
 	temp = val.intval;
-	p->temp_c = temp / 10;
+	p->temp_ddc = temp;
 	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_HEALTH, &val);
-	if (!ret && (val.intval != POWER_SUPPLY_HEALTH_GOOD ||
-		     temp < pps_temp_min_c * 10 || temp > pps_temp_max_c * 10))
+	if (!ret && val.intval != POWER_SUPPLY_HEALTH_GOOD &&
+	    val.intval != POWER_SUPPLY_HEALTH_COOL && val.intval != POWER_SUPPLY_HEALTH_WARM)
 		ret = -ERANGE;
 out:
 	power_supply_put(psy);
@@ -502,6 +504,63 @@ static int pps_read_vbus(struct erhai_pps *p)
 		return v;
 	p->vbus_mv = v / 1000;
 	return 0;
+}
+
+/* pps_ufcs_curve_v2: start strictly below the row voltage. During
+ * delivery, advance one row after 2500 ms continuously above target.
+ * A last gear still delivers its specified current up to its CV.
+ */
+static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
+{
+	const struct erhai_charge_curve *curve, *cell;
+	const struct erhai_charge_step *step;
+	unsigned int ma, idx;
+
+	curve = erhai_curve_select(pps_curves, p->soc, p->temp_ddc);
+	if (!curve || p->vbat_mv < pps_vbat_min_mv ||
+	    p->vbat_mv >= min_t(unsigned int, pps_vbat_max_mv,
+				p->temp_ddc >= 440 ? 4130 : 4490))
+		return 0;
+
+	if (entering || p->curve != curve) {
+		p->curve = curve;
+		p->curve_idx = erhai_curve_start(curve, p->vbat_mv, false);
+		p->over_since = 0;
+	} else {
+		step = &curve->steps[p->curve_idx];
+		if (!step->last && p->vbat_mv > step->mv) {
+			if (!p->over_since)
+				p->over_since = jiffies | 1;
+			else if (time_after(jiffies, p->over_since + msecs_to_jiffies(2500))) {
+				p->curve_idx++;
+				p->over_since = 0;
+			}
+		} else {
+			p->over_since = 0;
+		}
+	}
+
+	ma = curve->steps[p->curve_idx].ma;
+	/* The full-rate PPS row is the 33 W profile limit. In the same
+	 * temperature/SOC/voltage bin the 2:1 SVOOC profile establishes
+	 * what the cell accepts. Keep explicit PPS taper rows and the
+	 * independent PPS battery overcurrent protection.
+	 */
+	cell = erhai_curve_select(svooc_curves, p->soc, p->temp_ddc);
+	idx = erhai_curve_start(cell, p->vbat_mv, true);
+	if (ma == 3000)
+		ma = cell->steps[idx].ma;
+	else
+		ma = min_t(unsigned int, ma, cell->steps[idx].ma);
+	if (entering || p->temp_ddc < 420 || p->temp_ddc >= 440)
+		p->hot_derate = false;
+	if (p->temp_ddc >= 430 && p->temp_ddc < 440)
+		p->hot_derate = true;
+	if (p->hot_derate)
+		ma = min(ma, 2000U);
+	else if (p->temp_ddc >= 410 && p->temp_ddc < 440)
+		ma = min(ma, 3000U);
+	return ma;
 }
 
 static bool pps_deployable(struct erhai_pps *p, bool *vooc_engaged)
@@ -523,12 +582,7 @@ static bool pps_deployable(struct erhai_pps *p, bool *vooc_engaged)
 	}
 	if (pps_read_battery(p))
 		return false;
-	if (p->vbat_mv < (int)pps_vbat_min_mv ||
-	    p->vbat_mv >= (int)pps_vbat_max_mv)
-		return false;
-	if (p->temp_c < pps_temp_min_c || p->temp_c > pps_temp_max_c)
-		return false;
-	return true;
+	return pps_cell_limit(p, true) != 0;
 }
 
 
@@ -676,6 +730,7 @@ static int pps_cp_release(struct erhai_pps *p, const char *why, bool count)
 {
 	if (pps_cp_is_engaged() && pps_cp_drop())
 		return -EIO;
+	p->pump_limit_ma = 4000;
 	p->cp_lift_since = 0;
 	if (count) {
 		p->cp_rearms++;
@@ -700,7 +755,7 @@ static int pps_cp_step(struct erhai_pps *p)
 	const struct erhai_pps_sc_api *a = pps_sc_cp_get();
 	/* The single master has a board-programmed 4.5 A bus OCP.
 	 * Reserve the existing 500 mA servo overshoot margin. */
-	unsigned int target = min(p->target_curr_ma, 4000U);
+	unsigned int target = p->target_curr_ma;
 	int cvbus, cvbat, cibus, diff, rc, need = 0;
 	unsigned int nv;
 
@@ -713,7 +768,7 @@ static int pps_cp_step(struct erhai_pps *p)
 	}
 	if (a->snapshot(&cvbus, &cvbat, &cibus))
 		return -EIO;
-	if (cvbat < pps_vbat_min_mv || cvbat >= pps_vbat_max_mv ||
+	if (cvbat < pps_vbat_min_mv || cvbat >= 4800 /* loaded rail OVP backstop */ ||
 	    cvbus < pps_vbus_collapse_mv || cvbus > pps_cp_max_volt_mv)
 		return -ERANGE;
 
@@ -749,7 +804,7 @@ static int pps_cp_step(struct erhai_pps *p)
 		if (cibus > (int)(target + 500))
 			nv -= pps_cp_vstep_over_mv;
 		else if (cibus > (int)(target + pps_cp_ibus_band_ma) ||
-			 p->ibat_ma > (int)pps_cp_ibat_max_ma)
+			 p->ibat_ma > (int)min(pps_cp_ibat_max_ma, 7400U))
 			nv -= pps_cp_vstep_mv;
 		else if (cibus < (int)target - (int)pps_cp_ibus_band_ma &&
 			 diff < (int)pps_cp_diff_max_mv)
@@ -828,12 +883,13 @@ static int pps_source_limit(void)
 		return apdo;
 	if (ma <= 0)
 		ma = min(pps_cable_safe_ma, 3000U);
-	return min(min(pps_target_curr_ma, pps_max_curr_ma), (unsigned int)min(ma, apdo));
+	return min3(min(pps_target_curr_ma, pps_max_curr_ma), (unsigned int)min(ma, apdo), 5000U);
 }
 
 /* ---- the poll ---- */
 static void pps_poll(struct erhai_pps *p)
 {
+	unsigned int cell_ma = 0;
 	int online, rc;
 
 	if (!READ_ONCE(pps_enable)) {
@@ -855,10 +911,36 @@ static void pps_poll(struct erhai_pps *p)
 			pps_exit(p, "source, policy or battery unavailable");
 			return;
 		}
-		if (p->vbat_mv < (int)pps_vbat_min_mv ||
-		    p->vbat_mv >= (int)pps_vbat_max_mv) {
+		cell_ma = pps_cell_limit(p, p->state == PPS_NEGOTIATE);
+		if (!cell_ma) {
 			pps_exit(p, "battery limit");
 			return;
+		}
+		if (p->state == PPS_CHARGING || p->state == PPS_TAPER) {
+			bool taper = p->curve_idx || p->curve->steps[p->curve_idx].ma < 3000;
+
+			if (taper != (p->state == PPS_TAPER))
+				pps_enter(p, taper ? PPS_TAPER : PPS_CHARGING, "cell curve");
+		}
+		if (p->state != PPS_NEGOTIATE) {
+			if (p->ibat_ma > 7400) {
+				if (!p->ibat_over_since)
+					p->ibat_over_since = jiffies | 1;
+				else if (time_after_eq(jiffies, p->ibat_over_since + 8 * HZ)) {
+					p->failed = true;
+					pps_exit(p, "PPS battery overcurrent");
+					return;
+				}
+			} else {
+				p->ibat_over_since = 0;
+			}
+			p->cell_ma = cell_ma;
+			p->target_curr_ma = min3(p->source_ma, cell_ma, p->pump_limit_ma);
+			if (p->set_curr_ma > p->target_curr_ma &&
+			    pps_pdo_set(p, p->set_volt_mv, p->target_curr_ma)) {
+				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
+				return;
+			}
 		}
 		if (p->vbus_mv > (int)pps_cp_max_volt_mv ||
 		    (p->state != PPS_NEGOTIATE && p->vbus_mv < (int)pps_vbus_collapse_mv)) {
@@ -941,7 +1023,11 @@ static void pps_poll(struct erhai_pps *p)
 			pps_exit(p, "no usable PPS APDO");
 			return;
 		}
-		p->target_curr_ma = adapter_ma;
+		p->source_ma = adapter_ma;
+		p->cell_ma = cell_ma;
+		p->pump_limit_ma = 4000;
+		p->ibat_over_since = 0;
+		p->target_curr_ma = min3(p->source_ma, cell_ma, p->pump_limit_ma);
 		p->set_curr_ma = min(pps_start_curr_ma, p->target_curr_ma);
 		rc = erhai_otg_adsp_prop_get(PPS_BATT_OP_GET, PPS_PROP_BATT_CHG_CTRL_LIM);
 		if (rc < 0)
@@ -1077,10 +1163,6 @@ fail:
 			pps_exit(p, PPS_EXIT_REASON_VBAT_MIN);
 			return;
 		}
-		if (p->temp_c < pps_temp_min_c || p->temp_c > pps_temp_max_c) {
-			pps_exit(p, PPS_EXIT_REASON_TEMP);
-			return;
-		}
 		if (p->vbus_mv < (int)pps_vbus_collapse_mv) {
 			pps_exit(p, PPS_EXIT_REASON_COLLAPSE);
 			return;
@@ -1144,7 +1226,7 @@ fail:
 			pr_info("erhai_pps: %s vbus %d mV vbat %d mV ibat %d mA soc %d%% t %dC set %u mV curr %u mA cp %s buck %s\n",
 				charging ? "charging" : "taper",
 				p->vbus_mv, p->vbat_mv, p->ibat_ma, p->soc,
-				p->temp_c, p->set_volt_mv, p->set_curr_ma,
+				p->temp_ddc / 10, p->set_volt_mv, p->set_curr_ma,
 				pps_cp_is_engaged() ? "on" : "off",
 				p->buck_off ? "off" : "on");
 		return;
@@ -1193,7 +1275,7 @@ static void pps_trace_sample(struct erhai_pps *p)
 		.vbat_mv	= p->vbat_mv,
 		.ibat_ma	= p->ibat_ma,
 		.soc		= p->soc,
-		.temp_c		= p->temp_c,
+		.temp_c		= p->temp_ddc / 10,
 		.buck_off	= p->buck_off,
 		.chip_vbus_mv	= -1,
 		.chip_vbat_mv	= -1,
@@ -1229,7 +1311,7 @@ static unsigned int erhai_pps_update(void *data, bool caps_changed)
 			     p->state == PPS_TAPER)) {
 		int ma = pps_source_limit();
 
-		if (ma <= 0 || ma != p->target_curr_ma)
+		if (ma <= 0 || ma != p->source_ma)
 			pps_exit(p, "source capabilities changed");
 	}
 	if (time_before(jiffies, p->next_poll))
