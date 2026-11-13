@@ -675,7 +675,7 @@ struct xiaomi_mca {
 	unsigned int qc_stalls;
 	bool cp_die_hot;
 	bool cp_fault;
-	bool cp_recharge;
+	u32 cp_recharge_cv;	/* CV of the profile that tapered */
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
 	u32 cp_ibus_last;	/* stage and buck input current at the last step */
@@ -2647,8 +2647,7 @@ static u32 xiaomi_mca_cp_vbat_max(struct xiaomi_mca *mca)
 }
 
 /* The PPS APDO direct charging can use, 0 if none */
-static u32 xiaomi_mca_cp_apdo(struct xiaomi_mca *mca, u32 start_mv,
-			    u32 vbat_max, u32 *max_mv)
+static u32 xiaomi_mca_cp_apdo(struct xiaomi_mca *mca, u32 start_mv, u32 *max_mv)
 {
 	struct xiaomi_mca_pdo pdos[MCA_PD_MAX_PDOS];
 	u32 ma = 0;
@@ -2662,7 +2661,7 @@ static u32 xiaomi_mca_cp_apdo(struct xiaomi_mca *mca, u32 start_mv,
 		u32 hi_mv = le32_to_cpu(pdos[i].max_mv);
 
 		if (min_mv < hi_mv && min_mv <= start_mv &&
-		    hi_mv >= 2 * vbat_max + MCA_CP_DELTA_MV &&
+		    hi_mv >= start_mv &&
 		    le32_to_cpu(pdos[i].max_ma) > ma) {
 			ma = le32_to_cpu(pdos[i].max_ma);
 			*max_mv = hi_mv;
@@ -2748,7 +2747,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		xiaomi_mca_ffc_conditions(mca, min(tcool, tpack), max(tbat, tpack));
 	xiaomi_mca_select_profile(mca, min(tcool, tpack), max(tbat, tpack));
 	vbat_max = xiaomi_mca_cp_vbat_max(mca);
-	if ((mca->cp_recharge && vbat >= 4350) || vmin < MCA_CP_VBAT_MIN_MV ||
+	if ((mca->cp_recharge_cv >= vbat_max && vbat >= 4350) || vmin < MCA_CP_VBAT_MIN_MV ||
 	    vbat >= vbat_max - MCA_CP_VBAT_HYS_MV ||
 	    imax >= MCA_CP_CELL_OCP_MA ||
 	    min(tcool, tpack) < MCA_CP_TBAT_MIN ||
@@ -2765,7 +2764,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		max_mv = qc35 ? 10000 : 9500;
 		ma = qc35 ? 2100 : 2500;
 	} else {
-		ma = xiaomi_mca_cp_apdo(mca, start_mv, vbat_max, &max_mv);
+		ma = xiaomi_mca_cp_apdo(mca, start_mv, &max_mv);
 	}
 	if (ma < MCA_CP_BUCK_MA + 1000)
 		return;
@@ -2821,7 +2820,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_ibat_trip = 0;
 	mca->cp_stage = 0;
 	mca->cp_target_ma = 0;
-	mca->cp_recharge = false;
+	mca->cp_recharge_cv = 0;
 	mca->cp = MCA_CP_OPENING;
 	/* Confirm the new FV before asking the source to open this session. */
 	ret = xiaomi_mca_full_charge_poll(mca);
@@ -2919,7 +2918,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	taper = vbat >= cv - 9;	/* pps_taper_vol_hys */
 	if (vmin < MCA_CP_VBAT_MIN_MV || vbat > cv + (mca->ffc_active ? 0 : 4) ||
 	    (taper && (mca->cp != MCA_CP_ON || ibat <= 3000))) {
-		mca->cp_recharge = taper;
+		mca->cp_recharge_cv = taper ? cv : 0;
 		xiaomi_mca_cp_stop(mca, "battery voltage reached");
 		return;
 	}
@@ -2995,6 +2994,10 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	}
 	ibus = ibus_ua / 1000;
 	mca->cp_ibus_last = max(ibus + mca->ibus_ua / 1000, 0);
+	if (2 * vbat > mca->cp_max_mv) {
+		xiaomi_mca_cp_stop(mca, "source voltage range exhausted");
+		return;
+	}
 	if (vbus_uv / 1000 > 2 * vbat + MCA_CP_VBUS_MAX_DELTA_MV) {
 		mca->cp_fault = true;
 		xiaomi_mca_cp_stop(mca, "bus voltage too high");
@@ -3666,7 +3669,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		mca->cp_exits = 0;
 		mca->cp_last_exit = NULL;
 		mca->hv_last_exit = NULL;
-		mca->cp_recharge = false;
+		mca->cp_recharge_cv = 0;
 		mca->hv_retry = jiffies;
 		mca->policy_attach_generation = attachment;
 	}
@@ -3722,10 +3725,10 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 			mca->hv = MCA_HV_OFF;
 			mca->hv_pps = false;
 		}
-		if (mca->icl_written)
-			xiaomi_mca_reset_icl(mca);
-		if (mca->fcc_written)
-			xiaomi_mca_reset_fcc(mca);
+		if (mca->icl_written && xiaomi_mca_restore_icl(mca))
+			return;
+		if (mca->fcc_written && xiaomi_mca_reset_fcc(mca))
+			return;
 	}
 	mca->online = online;
 	mca->real_type = real_type;
@@ -3735,7 +3738,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		if (power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status) == MCA_UCSI_OFFLINE) {
 			mca->auth_lost = false;
 			mca->cp_fault = false;
-			mca->cp_recharge = false;
+			mca->cp_recharge_cv = 0;
 		}
 		if (!xiaomi_mca_auth_pending(mca) ||
 		    power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status) < MCA_UCSI_CONNECTED) {
@@ -3759,7 +3762,12 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		   (xiaomi_mca_cp_active(mca) &&
 		    (xiaomi_mca_is_qc_pump(mca->cp_type) ? real_type != mca->cp_type :
 							   !xiaomi_mca_is_pd(real_type)))) {
-		xiaomi_mca_cp_stop(mca, "unknown source");
+		if (xiaomi_mca_cp_stop(mca, "unknown source"))
+			return;
+		if (mca->icl_written && xiaomi_mca_restore_icl(mca))
+			return;
+		if (mca->fcc_written)
+			xiaomi_mca_reset_fcc(mca);
 	} else if (charge_policy && mipps_auth && !mca->auth_lost &&
 		   mca->adapter_svid == 0x2717 && mca->mipps_attempted &&
 		   !xiaomi_mca_authenticated(mca) && time_after_eq(jiffies, mca->auth_retry) &&

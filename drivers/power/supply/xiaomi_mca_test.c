@@ -2559,7 +2559,7 @@ static void xiaomi_mca_test_taper_handoff(struct kunit *test)
 	f->cells[0].current_ua = f->cells[1].current_ua = 1500000;
 	xiaomi_mca_cp_step(mca);
 	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
-	KUNIT_EXPECT_TRUE(test, mca->cp_recharge);
+	KUNIT_EXPECT_EQ(test, mca->cp_recharge_cv, 4540);
 	KUNIT_EXPECT_FALSE(test, mca->cp_fault);
 }
 
