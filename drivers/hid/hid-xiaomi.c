@@ -90,7 +90,8 @@ static int xiaomi_input_mapping(struct hid_device *hdev, struct hid_input *hi,
 
 	if (hdev->bus != BUS_BLUETOOTH ||
 	    hdev->vendor != BT_VENDOR_ID_XIAOMI_P81C ||
-	    hdev->product != BT_DEVICE_ID_XIAOMI_P81C ||
+	    (hdev->product != BT_DEVICE_ID_XIAOMI_P81C &&
+	     hdev->product != BT_DEVICE_ID_XIAOMI_M80P) ||
 	    report->type != HID_INPUT_REPORT)
 		return 0;
 
@@ -99,11 +100,15 @@ static int xiaomi_input_mapping(struct hid_device *hdev, struct hid_input *hi,
 	 * Preserve every other usage of this one-byte keyboard array.
 	 */
 	if (report->id == 2 && report->size == 8 && report->maxfield == 1 &&
-	    usage->hid == (HID_UP_KEYBOARD | 0x6e) &&
 	    field->report_size == 8 && field->report_count == 1 &&
 	    field->logical_minimum == 0x4b && field->logical_maximum == 0x6e &&
-	    field->flags == 0)
-		return -1;
+	    field->flags == 0) {
+		if (hdev->product == BT_DEVICE_ID_XIAOMI_M80P)
+			return (usage->hid == (HID_UP_KEYBOARD | 0x4b) ||
+				usage->hid == (HID_UP_KEYBOARD | 0x4e)) ? -1 : 0;
+		if (usage->hid == (HID_UP_KEYBOARD | 0x6e))
+			return -1;
+	}
 
 	if (report->id != 5 ||
 	    report->size != 112 || report->maxfield != 2 ||
@@ -133,7 +138,8 @@ static int xiaomi_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	 * exposed them; combining them would change libinput classification.
 	 */
 	if (hdev->vendor == BT_VENDOR_ID_XIAOMI_P81C &&
-	    hdev->product == BT_DEVICE_ID_XIAOMI_P81C)
+	    (hdev->product == BT_DEVICE_ID_XIAOMI_P81C ||
+	     hdev->product == BT_DEVICE_ID_XIAOMI_M80P))
 		hdev->quirks |= HID_QUIRK_INPUT_PER_APP;
 
 	ret = hid_parse(hdev);
@@ -144,6 +150,7 @@ static int xiaomi_probe(struct hid_device *hdev, const struct hid_device_id *id)
 
 static const struct hid_device_id xiaomi_devices[] = {
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_XIAOMI, USB_DEVICE_ID_MI_SILENT_MOUSE) },
+	{ HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_XIAOMI_P81C, BT_DEVICE_ID_XIAOMI_M80P) },
 	{ HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_XIAOMI_P81C, BT_DEVICE_ID_XIAOMI_P81C) },
 	{ }
 };
