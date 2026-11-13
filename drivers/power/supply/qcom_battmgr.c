@@ -532,6 +532,8 @@ struct qcom_battmgr {
 	bool pd_restore;
 	bool qc_contract;
 	bool serial_probe;
+	u32 charge_detected_type;
+	const char *fixed_exit;
 	unsigned long serial_retry;
 	unsigned long ufcs_retry;
 	bool ufcs_backoff;
@@ -1283,8 +1285,9 @@ static ssize_t charge_contract_show(struct device *dev, struct device_attribute 
 			 b->pd_state == PD_ACTIVE && !b->qc_contract ? PD_FIXED_MV : 0,
 			 b->pd_state == PD_ACTIVE ? b->pd_input_limit_ua : 0);
 
-	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d ",
-			     b->pd_state == PD_ACTIVE && b->qc_contract ? PD_FIXED_MV : 0, b->serial_probe);
+	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d detected_type=%u fixed_exit=%s ",
+			     b->pd_state == PD_ACTIVE && b->qc_contract ? PD_FIXED_MV : 0,
+			     b->serial_probe, b->charge_detected_type, b->fixed_exit ?: "none");
 	if (b->pps_ops)
 		return b->pps_ops->describe(b->pps_data, buf, len);
 	return len + sysfs_emit_at(buf, len, "state=idle\n");
@@ -1391,6 +1394,7 @@ static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 	if (!battmgr->pd_restore)
 		return fcc_err;
 
+	battmgr->fixed_exit = reason;
 	err = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
 					USB_INPUT_CURR_LIMIT,
 					min(battmgr->pd_input_limit_ua, PD_TRANSITION_UA));
@@ -1479,6 +1483,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		/* Optional classification must not disable ordinary fixed PD. */
 		real_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	}
+	battmgr->charge_detected_type = type;
 	/* Dedicated legacy supplies have no USB data role. A VOOC brick
 	 * can identify as DCP or Apple-style before its first serial frame.
 	 * Leave SDP, CDP, PD and OTG on their normal routes.
@@ -1873,6 +1878,10 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
 	case PM_POST_SUSPEND:
+		scoped_guard(mutex, &battmgr->charge_lock) {
+			if (battmgr->service_up && battmgr->pd_state == PD_ACTIVE)
+				qcom_battmgr_log_handoff(battmgr, "resume");
+		}
 		WRITE_ONCE(battmgr->pps_suspended, false);
 		qcom_battmgr_charge_kick(battmgr);
 		break;

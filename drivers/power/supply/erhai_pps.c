@@ -761,8 +761,7 @@ static int pps_cp_release(struct erhai_pps *p, const char *why, bool count)
 static int pps_cp_step(struct erhai_pps *p)
 {
 	const struct erhai_pps_sc_api *a = pps_sc_cp_get();
-	/* The single master has a board-programmed 4.5 A bus OCP.
-	 * Reserve the existing 500 mA servo overshoot margin. */
+	/* Board limit 4 A per leg, 4.5 A OCP. Inspect each ADC before raising VBUS. */
 	unsigned int target = p->target_curr_ma;
 	int slave_ma = 0;
 	int cvbus, cvbat, cibus, diff, rc, need = 0;
@@ -1424,7 +1423,8 @@ static ssize_t erhai_pps_describe(void *data, char *buf, ssize_t off)
 	struct erhai_pps *p = data;
 
 	return off + sysfs_emit_at(buf, off, "protocol=%s state=%s request_mv=%u request_ma=%u pump=%u pump_ibus_ma=%d exits=%u last_exit=%s\n",
-			  p->ufcs ? "ufcs" : p->state == PPS_IDLE ? "none" : "pps",
+			  pps_sc_delivering() ? "supervooc" : p->ufcs ? "ufcs" :
+			  p->state == PPS_IDLE ? "none" : "pps",
 			  pps_state_names[p->state], p->set_volt_mv, p->set_curr_ma,
 			  pps_cp_is_engaged(), pps_cp_is_engaged() ? p->pump_ibus_ma : 0, p->exits, p->last_reason ?: "none");
 }
