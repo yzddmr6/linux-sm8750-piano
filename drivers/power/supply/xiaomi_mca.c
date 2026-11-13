@@ -373,9 +373,9 @@ MODULE_PARM_DESC(mipps_auth,
  * to MCA_CP_TDIE_MIN_MA, and comes back a quarter as fast below
  * MCA_CP_TDIE_HOT - MCA_CP_TDIE_HYS; MCA_CP_TDIE_MAX leaves.
  */
-#define MCA_CP_TDIE_HOT		700
+#define MCA_CP_TDIE_HOT		1200
 #define MCA_CP_TDIE_HYS		50
-#define MCA_CP_TDIE_MAX		800
+#define MCA_CP_TDIE_MAX		1250	/* Piano die_temp_max */
 #define MCA_CP_TDIE_STEP_MA	200
 #define MCA_CP_TDIE_MIN_MA	1000
 #define MCA_CP_DELTA_MV		300	/* stock div_delta_volt */
@@ -687,6 +687,7 @@ struct xiaomi_mca {
 	unsigned int cp_stage; /* monotonic while the selected table is unchanged */
 	u32 cp_target_ma; /* effective battery target after table/thermal limits */
 	unsigned long cp_retry_at;
+	bool cp_die_hot;
 	bool cp_fault;
 	bool cp_recharge;
 	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
@@ -2580,6 +2581,18 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_psy = power_supply_get_by_name("sc8541");
 	if (!mca->cp_psy)
 		return;
+	if (mca->cp_die_hot) {
+		int tdie;
+
+		if (xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_TEMP, &tdie) ||
+		    tdie >= MCA_CP_TDIE_HOT) {
+			power_supply_put(mca->cp_psy);
+			mca->cp_psy = NULL;
+			xiaomi_mca_cp_backoff(mca);
+			return;
+		}
+		mca->cp_die_hot = false;
+	}
 	/* it must be off before the source is asked for anything */
 	if (xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &ret) || ret ||
 	    xiaomi_mca_cp_set_busocp(mca, min(mca->cp_ibus_ma + MCA_CP_BUSOCP_MARGIN_MA,
@@ -2624,6 +2637,17 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 
 	dev_info(mca->dev, "direct charging: %u mV %u mA (APDO to %u mV %u mA), battery %d mV %d degC, bus target %u mA\n",
 		 mca->cp_mv, mca->cp_ma, max_mv, ma, vbat, tbat, mca->cp_ibus_ma);
+}
+
+static u32 xiaomi_mca_die_limit(struct xiaomi_mca *mca, int tdie)
+{
+	if (tdie >= MCA_CP_TDIE_HOT)
+		return max_t(u32, mca->cp_ibus_hot - MCA_CP_TDIE_STEP_MA,
+					 min_t(u32, MCA_CP_TDIE_MIN_MA, mca->cp_ibus_ma));
+	if (tdie < MCA_CP_TDIE_HOT - MCA_CP_TDIE_HYS)
+		return min(mca->cp_ibus_hot + MCA_CP_TDIE_STEP_MA / 4,
+				       mca->cp_ibus_ma);
+	return mca->cp_ibus_hot;
 }
 
 /* One step of direct charging, every MCA_CP_POLL_MS */
@@ -2712,7 +2736,8 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_stop(mca, "bus voltage too high");
 		return;
 	}
-	if (tdie > MCA_CP_TDIE_MAX) {
+	if (tdie >= MCA_CP_TDIE_MAX) {
+		mca->cp_die_hot = true;
 		xiaomi_mca_cp_stop(mca, "stage temperature");
 		return;
 	}
@@ -2728,12 +2753,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	}
 
 	/* the stage warms about 1 degC/s at 4 A: back off before it trips */
-	if (tdie >= MCA_CP_TDIE_HOT)
-		mca->cp_ibus_hot = max_t(u32, mca->cp_ibus_hot - MCA_CP_TDIE_STEP_MA,
-					 min_t(u32, MCA_CP_TDIE_MIN_MA, mca->cp_ibus_ma));
-	else if (tdie < MCA_CP_TDIE_HOT - MCA_CP_TDIE_HYS)
-		mca->cp_ibus_hot = min(mca->cp_ibus_hot + MCA_CP_TDIE_STEP_MA / 4,
-				       mca->cp_ibus_ma);
+	mca->cp_ibus_hot = xiaomi_mca_die_limit(mca, tdie);
 	target = mca->cp_ibus_hot;
 
 	if (mca->cp == MCA_CP_OPENING) {

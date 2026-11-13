@@ -944,6 +944,11 @@ static void xiaomi_mca_test_profile_switch(struct kunit *test)
 	}
 	full_charge = false;
 	/* CN temperature rows and qualified FFC. */
+	mca->cp_ibus_ma = 4000;
+	mca->cp_ibus_hot = 3000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_die_limit(mca, 1149), 3050);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_die_limit(mca, 1199), 3000);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_die_limit(mca, 1200), 2800);
 	KUNIT_EXPECT_EQ(test, MCA_PROFILE_COUNT, 5);
 	xiaomi_mca_select_profile(mca, 25, 25);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000), 8000);
