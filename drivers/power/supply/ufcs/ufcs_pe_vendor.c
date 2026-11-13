@@ -16,9 +16,8 @@
 #include "ufcs_core.h"
 #include "ufcs_event.h"
 #include "ufcs_msg.h"
+#include "ufcs_intf.h"
 
-extern int ufcs_check_refuse_msg(struct ufcs_class *class, struct ufcs_msg *msg,
-	enum ufcs_msg_type type, u8 cmd);
 
 int ufcs_pe_oplus_get_emark_info(struct ufcs_class *class)
 {

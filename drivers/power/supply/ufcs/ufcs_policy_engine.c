@@ -265,8 +265,12 @@ static void ufcs_state_handshake_handle(struct ufcs_class *class, struct ufcs_ev
 	ufcs_free_event(class, &event);
 retry:
 	class->ufcs->handshake_state = UFCS_HS_WAIT;
-	class->ufcs->ops->handshake(class->ufcs);
-	start_handshake_timer(class);
+	if (start_handshake_timer(class))
+		goto reset;
+	if (class->ufcs->ops->handshake(class->ufcs)) {
+		stop_handshake_timer(class);
+		goto reset;
+	}
 re_recv:
 	event = ufcs_get_next_event(class);
 	if (event == NULL) {
@@ -284,7 +288,8 @@ re_recv:
 		stop_handshake_timer(class);
 		do {
 			ufcs_info("set baud rate to %d\n", baud_rate);
-			class->ufcs->ops->set_baud_rate(class->ufcs, baud_rate);
+			if (class->ufcs->ops->set_baud_rate(class->ufcs, baud_rate))
+				goto err;
 			rc = ufcs_send_ctrl_msg_ping(class);
 			if (rc < 0 && rc != -EBUSY) {
 				ufcs_err("ufcs ping error\n");
@@ -332,6 +337,7 @@ re_recv:
 
 err:
 	ufcs_free_event(class, &event);
+reset:
 	ufcs_source_hard_reset(class);
 }
 
@@ -509,7 +515,7 @@ re_recv:
 		goto re_recv;
 	case UFCS_EVENT_RECV_POWER_READY:
 		if (!wait_power_ready)
-			ufcs_err("The accept message is missing\n");
+			goto err;
 		stop_power_supply_timer(class);
 		complete(&class->request_ack);
 		break;
@@ -802,27 +808,6 @@ re_recv:
 		}
 		stop_sender_response_timer(class);
 		class->dev_info = msg->data_msg.dev_info.info;
-		if ((UFCS_DEVICE_INFO_DEV_VENDOR(class->dev_info) == UFCS_TEST_MODE_DEV_VND) &&
-		    (UFCS_DEVICE_INFO_IC_VENDOR(class->dev_info) == UFCS_TEST_MODE_IC_VND)) {
-			ufcs_info("enable test mode\n");
-			class->test_mode = true;
-			ufcs_send_state(UFCS_NOTIFY_TEST_MODE_CHANGED, NULL);
-			if (class->ufcs->ops->watchdog_config)
-				class->ufcs->ops->watchdog_config(class->ufcs, 0); /*disable wdt*/
-			if (class->ufcs->ops->baudrate_end_check_config)
-				class->ufcs->ops->baudrate_end_check_config(class->ufcs);
-#if IS_ENABLED(CONFIG_OPLUS_UFCS_CLASS_DEBUG)
-		} else if (class->debug.test_mode) {
-			ufcs_info("force enable test mode\n");
-			class->test_mode = true;
-			ufcs_send_state(UFCS_NOTIFY_TEST_MODE_CHANGED, NULL);
-			schedule_work(&class->debug.disable_wd_work);
-			if (class->ufcs->ops->watchdog_config)
-				class->ufcs->ops->watchdog_config(class->ufcs, 0); /*disable wdt*/
-			if (class->ufcs->ops->baudrate_end_check_config)
-				class->ufcs->ops->baudrate_end_check_config(class->ufcs);
-#endif /* CONFIG_OPLUS_UFCS_CLASS_DEBUG */
-		}
 		complete(&class->request_ack);
 		break;
 	case UFCS_EVENT_RECV_SOFT_RESET:
@@ -1178,6 +1163,8 @@ re_recv:
 		ufcs_free_event(class, &event);
 		goto re_recv;
 	case UFCS_EVENT_RECV_GET_DEVICE_INFO:
+		if (!wait_get_dev_info)
+			goto err;
 		stop_wait_msg_timer(class);
 		rc = ufcs_send_dev_info(class);
 		if (rc < 0) {
@@ -1190,6 +1177,8 @@ re_recv:
 		ufcs_free_event(class, &event);
 		goto re_recv;
 	case UFCS_EVENT_RECV_VERIFY_RESPONSE:
+		if (!wait_verify_response)
+			goto err;
 		msg = event->msg;
 		if (msg == NULL) {
 			ufcs_err("msg is NULL\n");
@@ -1240,8 +1229,14 @@ static void ufcs_state_power_change_handle(struct ufcs_class *class, struct ufcs
 		goto out;
 	}
 
-	for (i = 0; i < UFCS_OUTPUT_MODE_MAX; i++)
-		class->pwr_change_info[i] = msg->data_msg.power_change.data[i];
+	for (i = 0; i < msg->data_msg.length / 3; i++) {
+		u32 change = msg->data_msg.power_change.data[i];
+		int j;
+
+		for (j = 0; j < class->pdo.num; j++)
+			if (UFCS_OUTPUT_MODE_INDEX(class->pdo.data[j]) == UFCS_POWER_CHANGE_INDEX(change))
+				class->pwr_change_info[j] = change;
+	}
 	class->power_changed = true;
 	ufcs_send_state(UFCS_NOTIFY_POWER_CHANGE, NULL);
 out:
@@ -1368,7 +1363,9 @@ static int ufcs_sm_task(void *arg)
 #endif
 
 	while (!kthread_should_stop()) {
-		wait_event(class->sm_wq, class->sm_task_wakeup);
+		wait_event(class->sm_wq, class->sm_task_wakeup || kthread_should_stop());
+		if (kthread_should_stop())
+			break;
 		class->sm_task_wakeup = false;
 retry:
 		event = ufcs_get_next_event(class);
@@ -1378,8 +1375,6 @@ retry:
 				goto retry;
 			}
 			ufcs_exit_sm_work(class);
-			if (mutex_is_locked(&class->pe_lock))
-				mutex_unlock(&class->pe_lock);
 			continue;
 		}
 

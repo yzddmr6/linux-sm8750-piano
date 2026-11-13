@@ -1,13 +1,6 @@
-menuconfig OPLUS_UFCS_CLASS
-	tristate "oplus ufcs class"
-	default n
+config OPLUS_UFCS_CLASS
+	tristate "Oplus UFCS sink protocol and SC8547A PHY"
+	default CHARGER_SC8547A
 	help
-	  Say Y or M to enable oplus ufcs class
-
-config OPLUS_UFCS_CLASS_DEBUG
-	bool "oplus ufcs class debug feature"
-	depends on OPLUS_UFCS_CLASS
-	default n
-	help
-	  Say Y to enable oplus ufcs class debug feature
-
+	  Negotiate Universal Fast Charging Specification contracts over the
+	  SC8547A PHY on boards where the charger driver registers it.

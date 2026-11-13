@@ -83,7 +83,6 @@ struct ufcs_verify_info {
 struct ufcs_class {
 	struct ufcs_dev *ufcs;
 	struct kthread_worker *worker;
-	struct kthread_work event_work;
 	struct kthread_work msg_send_work;
 	struct kthread_work recv_work;
 	struct work_struct test_handle_work;
@@ -96,7 +95,6 @@ struct ufcs_class {
 	struct hrtimer timer[TIMER_MAX];
 	struct ufcs_event *timeout_event[TIMER_MAX];
 	struct ufcs_msg_sender sender;
-	struct ufcs_msg *recv_msg;
 
 	struct ufcs_pdo_info pdo;
 	struct ufcs_event_info event;

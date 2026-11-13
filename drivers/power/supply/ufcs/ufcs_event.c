@@ -5,6 +5,8 @@
 
 #define pr_fmt(fmt) "[EVENT]([%s][%d]): " fmt, __func__, __LINE__
 
+#include <linux/unaligned.h>
+#include <linux/bitfield.h>
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
@@ -224,14 +226,18 @@ struct ufcs_msg *ufcs_unpack_msg(struct ufcs_class *class, const u8 *buf, int le
 	}
 
 	msg->magic = UFCS_MSG_MAGIC;
-	head = be16_to_cpu(*((u16 *)buf));
+	head = get_unaligned_be16(buf);
 	msg->head.type = head & MSG_HEAD_TYPE_MASK;
-	msg->head.version = head & MSG_HEAD_VER_MASK;
-	msg->head.index = head & MSG_HEAD_INDEX_MASK;
-	msg->head.addr = head & MSG_HEAD_ADDR_MASK;
+	msg->head.version = FIELD_GET(MSG_HEAD_VER_MASK, head);
+	msg->head.index = FIELD_GET(MSG_HEAD_INDEX_MASK, head);
+	msg->head.addr = FIELD_GET(MSG_HEAD_ADDR_MASK, head);
+	if (msg->head.addr != UFCS_DEVICE_SINK || msg->head.version != UFCS_VER_CURR)
+		goto err;
 
 	switch (msg->head.type) {
 	case UFCS_CTRL_MSG:
+		if (len != msg_size)
+			goto err;
 		msg->ctrl_msg.command = buf[MSG_DATA_INDEX];
 		if (config->check_crc) {
 			msg->crc = buf[MSG_DATA_INDEX + 1];
@@ -239,18 +245,22 @@ struct ufcs_msg *ufcs_unpack_msg(struct ufcs_class *class, const u8 *buf, int le
 		}
 		break;
 	case UFCS_DATA_MSG:
+		if (len < msg_size + 1)
+			goto err;
 		msg->data_msg.command = buf[MSG_DATA_INDEX];
 		msg->data_msg.length = buf[MSG_DATA_INDEX + 1];
-		if (msg->data_msg.length + msg_size + 1 != len) {
+		if (msg->data_msg.length > sizeof(msg->data_msg.data) ||
+		    msg->data_msg.length + msg_size + 1 != len) {
 			ufcs_err("data message length invalid, len=%d, msg_size=%d, buf[%*ph]\n",
 				len, msg_size, len, buf);
 			goto err;
 		}
 		memcpy(msg->data_msg.data, &buf[MSG_DATA_INDEX + 2], msg->data_msg.length);
-		ufcs_data_msg_init(&msg->data_msg);
+		if (ufcs_data_msg_init(&msg->data_msg))
+			goto err;
 		if (config->check_crc) {
 			msg->crc = buf[MSG_DATA_INDEX + 2 + msg->data_msg.length];
-			crc = crc8_calculate(buf, MSG_DATA_INDEX + 1 + msg->data_msg.length);
+			crc = crc8_calculate(buf, MSG_DATA_INDEX + 2 + msg->data_msg.length);
 			if (msg->crc != crc) {
 				ufcs_err("data message crc error\n");
 				goto err;
@@ -268,7 +278,7 @@ struct ufcs_msg *ufcs_unpack_msg(struct ufcs_class *class, const u8 *buf, int le
 			msg_size = MSG_HEAD_SIZE + 3 + msg->vendor_msg.length + 1;
 		else
 			msg_size = MSG_HEAD_SIZE + 3 + msg->vendor_msg.length;
-		if (len != msg_size) {
+		if (len != msg_size || msg->vendor_msg.length > sizeof(msg->vendor_msg.data)) {
 			ufcs_err("vendor message length invalid, len=%d, msg_size=%d, buf[%*ph]\n",
 				len, msg_size, len, buf);
 			goto err;
@@ -279,7 +289,7 @@ struct ufcs_msg *ufcs_unpack_msg(struct ufcs_class *class, const u8 *buf, int le
 		ufcs_oplus_data_msg_init(&msg->vendor_msg);
 		if (config->check_crc) {
 			msg->crc = buf[MSG_DATA_INDEX + 3 + msg->vendor_msg.length];
-			crc = crc8_calculate(buf, MSG_DATA_INDEX + 2 + msg->vendor_msg.length);
+			crc = crc8_calculate(buf, MSG_DATA_INDEX + 3 + msg->vendor_msg.length);
 		}
 		break;
 	default:
@@ -330,7 +340,7 @@ static int ufcs_pack_msg(struct ufcs_class *class, struct ufcs_msg *msg, u8 *buf
 		buf[index++] = msg->ctrl_msg.command;
 		break;
 	case UFCS_DATA_MSG:
-		msg_size += 2 + msg->data_msg.length;
+		msg_size += 1 + msg->data_msg.length;
 		if (len < msg_size) {
 			ufcs_err("data message length too short\n");
 			return -EINVAL;
@@ -346,7 +356,7 @@ static int ufcs_pack_msg(struct ufcs_class *class, struct ufcs_msg *msg, u8 *buf
 			ufcs_err("not supported vendor msg, type=%d\n", msg->vendor_msg.vnd_msg.type);
 			return -ENOTSUPP;
 		}
-		msg_size += 3 + msg->vendor_msg.length;
+		msg_size += 2 + msg->vendor_msg.length;
 		if (len < msg_size) {
 			ufcs_err("vendor message length too short\n");
 			return -EINVAL;
@@ -657,6 +667,8 @@ err:
 	return -EINVAL;
 }
 
+static void ufcs_receive_message(struct ufcs_class *class, struct ufcs_msg *msg);
+
 static void ufcs_recv_work(struct kthread_work *work)
 {
 	struct ufcs_class *class = container_of(work, struct ufcs_class, recv_work);
@@ -664,7 +676,7 @@ static void ufcs_recv_work(struct kthread_work *work)
 	struct ufcs_msg *msg;
 	u8 buf[UFCS_MSG_SIZE_MAX];
 	int rc;
-	static unsigned int dev_err_flag = 0;
+	unsigned int dev_err_flag;
 
 recv:
 	rc = ufcs_get_error_flag(ufcs, &dev_err_flag);
@@ -680,6 +692,9 @@ recv:
 	if (rc != 0)
 		goto done;
 
+	if (dev_err_flag & (BIT(UFCS_COMM_ERR_CRC_ERR) | BIT(UFCS_COMM_ERR_RX_LEN_ERR) |
+			    BIT(UFCS_COMM_ERR_RX_OVERFLOW)))
+		goto done;
 	rc = ufcs->ops->read_msg(ufcs, buf, sizeof(buf));
 	if (rc < 0) {
 		ufcs_err("read ufcs msg error, rc=%d\n", rc);
@@ -719,13 +734,12 @@ recv:
 		 * non-ACK/NCK message to ensure that the message sending interval
 		 * meets the requirements.
 		 */
-		if (!mutex_is_locked(&class->sender.lock)) {
+		if (mutex_trylock(&class->sender.lock)) {
 			/*
 			 * This operation is only needed when the sender is
 			 * idle, because the sender will do the same operation
 			 * after sending the message.
 			 */
-			mutex_lock(&class->sender.lock);
 			class->sender.status = MSG_SEND_PENDIGN;
 			stop_msg_trans_delay_timer(class);
 			start_msg_trans_delay_timer(class);
@@ -734,8 +748,7 @@ recv:
 	}
 
 	usleep_range(T_ACK_TRANSMIT_US, T_ACK_TRANSMIT_US + 1);
-	class->recv_msg = msg;
-	kthread_queue_work(class->worker, &class->event_work);
+	ufcs_receive_message(class, msg);
 
 done:
 	spin_lock(&class->err_flag_lock);
@@ -847,8 +860,7 @@ static int ufcs_process_data_msg_event(struct ufcs_class *class, struct ufcs_eve
 		event->type = UFCS_EVENT_RECV_POWER_CHANGE;
 		break;
 	case DATA_MSG_TEST_REQUEST:
-		event->type = UFCS_EVENT_RECV_TEST_REQUEST;
-		break;
+		return -ENOTSUPP;
 	default:
 		return -ENOTSUPP;
 	}
@@ -943,19 +955,14 @@ static void ufcs_handle_unsupported_msg(struct ufcs_class *class, struct ufcs_ms
 		ufcs_err("send refuse msg error, rc=%d\n", rc);
 }
 
-static void ufcs_event_work(struct kthread_work *work)
+static void ufcs_receive_message(struct ufcs_class *class, struct ufcs_msg *msg)
 {
-	struct ufcs_class *class = container_of(work, struct ufcs_class, event_work);
 	struct ufcs_dev *ufcs = class->ufcs;
 	struct ufcs_event *event;
-	struct ufcs_msg *msg;
 	struct ufcs_config *config;
 	int rc;
 
 	config = &class->config;
-	msg = class->recv_msg;
-	if (msg == NULL)
-		return;
 
 	switch (msg->head.type) {
 	case UFCS_CTRL_MSG:
@@ -1115,11 +1122,9 @@ int ufcs_event_init(struct ufcs_class *class)
 		return -EINVAL;
 	}
 
-	kthread_init_work(&class->event_work, ufcs_event_work);
 	kthread_init_work(&class->msg_send_work, ufcs_msg_send_work);
 	kthread_init_work(&class->recv_work, ufcs_recv_work);
 	INIT_WORK(&class->fifo_overflow_work, ufcs_fifo_overflow_work);
-	class->recv_msg = NULL;
 
 	spin_lock_init(&class->event.event_list_lock);
 	INIT_LIST_HEAD(&class->event.event_list);
@@ -1138,7 +1143,6 @@ int ufcs_event_reset(struct ufcs_class *class)
 		return -EINVAL;
 	}
 
-	class->recv_msg = NULL;
 	class->event.exit = false;
 
 	ufcs_msg_sender_reset(&class->sender);
@@ -1156,11 +1160,11 @@ void ufcs_free_event(struct ufcs_class *class, struct ufcs_event **event)
 	}
 	tmp = *event;
 
-	spin_lock(&class->event.event_list_lock);
+	spin_lock_irq(&class->event.event_list_lock);
 	/* here to prevent the event has been released by ufcs_free_all_event */
 	if (!list_empty(&class->event.event_list) && !list_empty(&tmp->list))
 		list_del_init(&tmp->list);
-	spin_unlock(&class->event.event_list_lock);
+	spin_unlock_irq(&class->event.event_list_lock);
 	if (tmp->msg)
 		devm_kfree(&class->ufcs->dev, tmp->msg);
 	devm_kfree(&class->ufcs->dev, tmp);
@@ -1177,13 +1181,13 @@ void ufcs_free_all_event(struct ufcs_class *class)
 		return;
 	}
 
-	spin_lock(&class->event.event_list_lock);
+	spin_lock_irq(&class->event.event_list_lock);
 	if (list_empty(&class->event.event_list)) {
-		spin_unlock(&class->event.event_list_lock);
+		spin_unlock_irq(&class->event.event_list_lock);
 		return;
 	}
 	list_replace_init(&class->event.event_list, &tmp_list);
-	spin_unlock(&class->event.event_list_lock);
+	spin_unlock_irq(&class->event.event_list_lock);
 
 	list_for_each_entry_safe(event, tmp, &tmp_list, list) {
 		list_del_init(&event->list);
@@ -1206,22 +1210,26 @@ struct ufcs_event *ufcs_get_next_event(struct ufcs_class *class)
 	}
 
 recheck:
-	spin_lock(&class->event.event_list_lock);
+	spin_lock_irq(&class->event.event_list_lock);
 	if (list_empty(&class->event.event_list)) {
 		/*
 		 * completion must be re-initialized before exiting the atomic
 		 * range, so that events sent before waiting for completion can
 		 * be processed normally
 		 */
+		if (READ_ONCE(class->event.exit)) {
+			spin_unlock_irq(&class->event.event_list_lock);
+			return NULL;
+		}
 		reinit_completion(&class->event.ack);
-		spin_unlock(&class->event.event_list_lock);
+		spin_unlock_irq(&class->event.event_list_lock);
 		wait_for_completion(&class->event.ack);
 		if (class->event.exit)
 			return NULL;
 		goto recheck;
 	}
 	event = list_first_entry(&class->event.event_list, struct ufcs_event, list);
-	spin_unlock(&class->event.event_list_lock);
+	spin_unlock_irq(&class->event.event_list_lock);
 
 	ufcs_debug("get %s event\n", ufcs_get_event_name(event));
 

@@ -13,7 +13,7 @@
 #include <linux/power_supply.h>
 
 #include "ufcs_class.h"
-#include "ufcs_core.h"
+#include "ufcs_intf.h"
 
 int ufcs_msg_handler(struct ufcs_dev *ufcs)
 {
@@ -31,44 +31,45 @@ int ufcs_msg_handler(struct ufcs_dev *ufcs)
 }
 EXPORT_SYMBOL(ufcs_msg_handler);
 
-static int ufcs_pdo_select(struct ufcs_class *class, int vol_mv, int curr_ma)
+/* All limits are input-side mA. Choose the best advertised mode at this
+ * voltage and round current down on the charger's own step grid.
+ */
+static int ufcs_pdo_select(struct ufcs_class *class, int mv, int limit_ma,
+			   bool exact, int *selected_ma)
 {
+	int best_ma = 0, index = -ENODATA;
 	int i;
-	u64 pdo;
-	u32 max_curr;
 
 	if (class->test_mode)
-		return 1;
-
-	if (class->pdo.num == 0) {
-		ufcs_err("no pdo data\n");
-		return -ENODATA;
-	}
-
+		return -EBUSY;
 	for (i = 0; i < class->pdo.num; i++) {
-		pdo = class->pdo.data[i];
+		u64 pdo = class->pdo.data[i];
+		u32 change = class->pwr_change_info[i];
+		int min_mv = UFCS_OUTPUT_MODE_VOL_MIN(pdo);
+		int min_ma = UFCS_OUTPUT_MODE_CURR_MIN(pdo);
+		int ma = min_t(int, limit_ma, UFCS_OUTPUT_MODE_CURR_MAX(pdo));
 
-		if (vol_mv < UFCS_OUTPUT_MODE_VOL_MIN(pdo))
+		if (mv < min_mv || mv > UFCS_OUTPUT_MODE_VOL_MAX(pdo) ||
+		    (mv - min_mv) % UFCS_OUTPUT_MODE_VOL_STEP(pdo))
 			continue;
-		if (vol_mv > UFCS_OUTPUT_MODE_VOL_MAX(pdo))
+		if (change)
+			ma = min_t(int, ma, UFCS_POWER_CHANGE_CURR_MAX(change));
+		if (ma < min_ma || !UFCS_OUTPUT_MODE_INDEX(pdo))
 			continue;
-		if (curr_ma < UFCS_OUTPUT_MODE_CURR_MIN(pdo))
+		ma -= (ma - min_ma) % UFCS_OUTPUT_MODE_CURR_STEP(pdo);
+		if (ma <= best_ma || (exact && ma != limit_ma))
 			continue;
-		max_curr = 0;
-		if (class->power_changed)
-			max_curr = UFCS_POWER_CHANGE_CURR_MAX(class->pwr_change_info[i]);
-		if (max_curr == 0 || max_curr > UFCS_OUTPUT_MODE_CURR_MAX(pdo))
-			max_curr = UFCS_OUTPUT_MODE_CURR_MAX(pdo);
-		if (curr_ma > max_curr)
-			continue;
-		return ++i;
+		best_ma = ma;
+		index = UFCS_OUTPUT_MODE_INDEX(pdo);
 	}
-
-	return -ENODATA;
+	*selected_ma = best_ma;
+	return index;
 }
 
-static int __ufcs_pdo_set(struct ufcs_class *class, int index, int vol_mv, int curr_ma)
+static int ufcs_request(struct ufcs_class *class, int vol_mv, int limit_ma,
+			bool exact, int *applied_ma)
 {
+	int curr_ma;
 	int rc;
 	struct ufcs_data_msg_request *request;
 	struct ufcs_event *event;
@@ -86,7 +87,6 @@ static int __ufcs_pdo_set(struct ufcs_class *class, int index, int vol_mv, int c
 	event->msg = NULL;
 	event->type = UFCS_EVENT_SEND_REQUEST;
 	INIT_LIST_HEAD(&event->list);
-	request->request = UFCS_REQUEST_DATA(index, vol_mv, curr_ma);
 
 	mutex_lock(&class->ext_req_lock);
 	mutex_lock(&class->pe_lock);
@@ -96,6 +96,10 @@ static int __ufcs_pdo_set(struct ufcs_class *class, int index, int vol_mv, int c
 		rc = -EINVAL;
 		goto err;
 	}
+	rc = ufcs_pdo_select(class, vol_mv, limit_ma, exact, &curr_ma);
+	if (rc < 0)
+		goto err;
+	request->request = UFCS_REQUEST_DATA(rc, vol_mv, curr_ma);
 	rc = ufcs_push_event(class, event);
 	if (rc < 0) {
 		ufcs_err("push pdo request event error, rc=%d\n", rc);
@@ -111,6 +115,8 @@ static int __ufcs_pdo_set(struct ufcs_class *class, int index, int vol_mv, int c
 		return rc;
 	}
 
+	if (applied_ma)
+		*applied_ma = curr_ma;
 	return 0;
 
 err:
@@ -122,46 +128,25 @@ err:
 
 int ufcs_pdo_set(struct ufcs_class *class, int vol_mv, int curr_ma)
 {
-	int rc;
-
-	if (class == NULL) {
-		ufcs_err("ufcs class is NULL\n");
-		return -EINVAL;
-	}
-	if (!class->handshake_success) {
-		ufcs_err("ufcs no handshake\n");
-		return -EINVAL;
-	}
-
-	rc = ufcs_pdo_select(class, vol_mv, curr_ma);
-	if (rc < 0)
-		return rc;
-	rc = __ufcs_pdo_set(class, rc, vol_mv, curr_ma);
-
-	return rc;
+	return ufcs_request(class, vol_mv, curr_ma, true, NULL);
 }
+
+int ufcs_request_limited(struct ufcs_dev *ufcs, int mv, int cable_ma,
+			 int pumps_ma, int envelope_ma, int *applied_ma)
+{
+	if (!ufcs || !applied_ma || mv <= 0 || cable_ma <= 0 ||
+	    pumps_ma <= 0 || envelope_ma <= 0)
+		return -EINVAL;
+	return ufcs_request(ufcs->class, mv, min3(cable_ma, pumps_ma, envelope_ma),
+			    false, applied_ma);
+}
+EXPORT_SYMBOL_GPL(ufcs_request_limited);
 
 int ufcs_intf_pdo_set(struct ufcs_dev *ufcs, int vol_mv, int curr_ma)
 {
-	struct ufcs_class *class;
-	int rc;
-
-	if (ufcs == NULL) {
-		ufcs_err("ufcs is NULL\n");
+	if (!ufcs)
 		return -EINVAL;
-	}
-	class = ufcs->class;
-	if (!class->handshake_success) {
-		ufcs_err("ufcs no handshake\n");
-		return -EINVAL;
-	}
-
-	rc = ufcs_pdo_select(class, vol_mv, curr_ma);
-	if (rc < 0)
-		return rc;
-	rc = __ufcs_pdo_set(class, rc, vol_mv, curr_ma);
-
-	return rc;
+	return ufcs_pdo_set(ufcs->class, vol_mv, curr_ma);
 }
 EXPORT_SYMBOL(ufcs_intf_pdo_set);
 
@@ -191,14 +176,22 @@ int ufcs_handshake(struct ufcs_dev *ufcs)
 	event->type = UFCS_EVENT_HANDSHAKE;
 	INIT_LIST_HEAD(&event->list);
 
-	mutex_lock(&class->ext_req_lock);
 	mutex_lock(&class->handshake_lock);
+	mutex_lock(&class->ext_req_lock);
+	mutex_lock(&class->pe_lock);
 	ufcs_event_reset(class);
-	ufcs->ops->enable(ufcs);
+	rc = ufcs->ops->enable(ufcs);
+	if (rc) {
+		ufcs->ops->disable(ufcs);
+		mutex_unlock(&class->pe_lock);
+		mutex_unlock(&class->handshake_lock);
+		mutex_unlock(&class->ext_req_lock);
+		devm_kfree(&ufcs->dev, event);
+		return rc;
+	}
 	ufcs_clr_error_flag(ufcs);
 	class->sm_task_wakeup = true;
 	wake_up(&class->sm_wq);
-	mutex_lock(&class->pe_lock);
 	reinit_completion(&class->request_ack);
 	rc = ufcs_push_event(class, event);
 	if (rc < 0) {
@@ -211,12 +204,11 @@ int ufcs_handshake(struct ufcs_dev *ufcs)
 	}
 	class->handshake_success = false;
 	mutex_unlock(&class->pe_lock);
-	mutex_unlock(&class->handshake_lock);
 	wait_for_completion(&class->request_ack);
+	mutex_unlock(&class->handshake_lock);
 	mutex_unlock(&class->ext_req_lock);
 
 	if (!READ_ONCE(class->handshake_success)) {
-		ufcs->ops->disable(ufcs);
 		ufcs_err("handshake fail");
 		return -EIO;
 	}
@@ -227,36 +219,35 @@ EXPORT_SYMBOL(ufcs_handshake);
 
 int ufcs_source_hard_reset(struct ufcs_class *class)
 {
+	int rc;
+
 	if (class == NULL) {
 		ufcs_err("class is NULL\n");
 		return -EINVAL;
 	}
 
 	ufcs_err("send source hard reset\n");
-	ufcs_exit_sm_work(class);
-	ufcs_clean_process_info(class);
+
 	class->ufcs->ops->source_hard_reset(class->ufcs);
+	rc = class->ufcs->ops->disable(class->ufcs);
+	ufcs_clean_process_info(class);
+	ufcs_exit_sm_work(class);
 	ufcs_send_state(UFCS_NOTIFY_SOURCE_HW_RESET, NULL);
-	class->handshake_success = false;
-	return class->ufcs->ops->disable(class->ufcs);
+	return rc;
 }
 
 int ufcs_intf_source_hard_reset(struct ufcs_dev *ufcs)
 {
-	struct ufcs_class *class;
+	int rc;
 
-	if (ufcs == NULL) {
-		ufcs_err("ufcs is NULL\n");
+	if (!ufcs)
 		return -EINVAL;
-	}
-	class = ufcs->class;
-
-	ufcs_err("send source hard reset\n");
-	ufcs_exit_sm_work(class);
-	ufcs_clean_process_info(class);
-	class->ufcs->ops->source_hard_reset(class->ufcs);
-	class->handshake_success = false;
-	return class->ufcs->ops->disable(class->ufcs);
+	mutex_lock(&ufcs->class->ext_req_lock);
+	mutex_lock(&ufcs->class->pe_lock);
+	rc = ufcs_source_hard_reset(ufcs->class);
+	mutex_unlock(&ufcs->class->pe_lock);
+	mutex_unlock(&ufcs->class->ext_req_lock);
+	return rc;
 }
 EXPORT_SYMBOL(ufcs_intf_source_hard_reset);
 
@@ -353,54 +344,23 @@ err:
 int ufcs_force_exit(struct ufcs_dev *ufcs)
 {
 	struct ufcs_class *class;
-	struct power_supply *usb_psy;
-	union power_supply_propval pval = { 0 };
-	bool usb_online;
-	int rc;
+	int rc = 0;
 
-	if (ufcs == NULL) {
-		ufcs_err("ufcs is NULL\n");
+	if (!ufcs)
 		return -EINVAL;
-	}
 	class = ufcs->class;
-
-	ufcs_info("ufcs exit\n");
 	mutex_lock(&class->handshake_lock);
-	usb_psy = power_supply_get_by_name("usb");
-	if (!usb_psy) {
-		ufcs_err("usb psy not found\n");
-		usb_online = true;
-	} else {
-		rc = power_supply_get_property(usb_psy, POWER_SUPPLY_PROP_ONLINE, &pval);
-		if (rc < 0) {
-			ufcs_err("can't get usb online status, rc=%d\n", rc);
-			usb_online = true;
-		} else {
-			usb_online = !!pval.intval;
-		}
-		power_supply_put(usb_psy);
-	}
-
-	if (READ_ONCE(class->handshake_success) && usb_online) {
+	if (READ_ONCE(class->handshake_success))
 		rc = ufcs_send_exit_ufcs_mode(class);
-		if (rc < 0) {
-			ufcs_err("send exit ufcs mode error, send hard reset\n");
-			ufcs_source_hard_reset(class);
-		}
-	}
-
-	class->ufcs->ops->disable(class->ufcs);
-	class->event.exit = true;
-	class->test_mode = false;
-	class->sm_task_wakeup = false;
-	complete_all(&class->event.ack);
+	mutex_lock(&class->pe_lock);
+	if (rc)
+		rc = ufcs_source_hard_reset(class);
+	else
+		rc = ufcs->ops->disable(ufcs);
 	ufcs_clean_process_info(class);
-	ufcs_exit_sm_work(class);
-	if (mutex_is_locked(&class->pe_lock))
-		mutex_unlock(&class->pe_lock);
+	mutex_unlock(&class->pe_lock);
 	mutex_unlock(&class->handshake_lock);
-
-	return 0;
+	return rc;
 }
 EXPORT_SYMBOL(ufcs_force_exit);
 
@@ -492,8 +452,10 @@ void ufcs_clr_error_flag(struct ufcs_dev *ufcs)
 		return;
 	}
 
+	spin_lock(&ufcs->class->err_flag_lock);
 	ufcs->err_flag_save = 0;
 	kfifo_reset(&ufcs->err_flag_fifo);
+	spin_unlock(&ufcs->class->err_flag_lock);
 }
 EXPORT_SYMBOL(ufcs_clr_error_flag);
 
@@ -530,7 +492,9 @@ int ufcs_get_error_flag(struct ufcs_dev *ufcs, unsigned int *err_flag)
 		return -EINVAL;
 	}
 
+	spin_lock(&ufcs->class->err_flag_lock);
 	rc = kfifo_out(&ufcs->err_flag_fifo, err_flag, sizeof(*err_flag));
+	spin_unlock(&ufcs->class->err_flag_lock);
 	if (rc != sizeof(*err_flag)) {
 		ufcs_err("read err_flag_fifo error, rc=%d\n", rc);
 		return -EFAULT;
@@ -1002,7 +966,6 @@ int ufcs_verify_adapter(struct ufcs_class *class, u8 key_index, u8 *auth_data, u
 	int rc;
 	struct ufcs_event *event;
 	struct ufcs_data_msg_verify_request *verify_request;
-	int i;
 
 	if (class == NULL) {
 		ufcs_err("ufcs class is NULL\n");
@@ -1020,7 +983,6 @@ int ufcs_verify_adapter(struct ufcs_class *class, u8 key_index, u8 *auth_data, u
 		ufcs_err("data_len is not equal to %d\n", UFCS_VERIFY_AUTH_DATA_SIZE);
 		return -EINVAL;
 	}
-	memcpy(class->verify_info.auth_data, auth_data, UFCS_VERIFY_AUTH_DATA_SIZE);
 
 	event = devm_kzalloc(&class->ufcs->dev,
 		sizeof(struct ufcs_data_msg_verify_request) + sizeof(struct ufcs_event),
@@ -1036,11 +998,11 @@ int ufcs_verify_adapter(struct ufcs_class *class, u8 key_index, u8 *auth_data, u
 	event->type = UFCS_EVENT_SEND_VERIFY_REQUEST;
 	INIT_LIST_HEAD(&event->list);
 	verify_request->index = key_index;
-	for (i = 0; i < UFCS_VERIFY_RANDOM_DATA_SIZE; i++)
-		get_random_bytes(&verify_request->random_data[i], 1);
+	get_random_bytes(verify_request->random_data, sizeof(verify_request->random_data));
 
 	mutex_lock(&class->ext_req_lock);
 	mutex_lock(&class->pe_lock);
+	memcpy(class->verify_info.auth_data, auth_data, UFCS_VERIFY_AUTH_DATA_SIZE);
 	class->verify_pass = false;
 	reinit_completion(&class->request_ack);
 	if (!class->handshake_success) {
@@ -1056,6 +1018,9 @@ int ufcs_verify_adapter(struct ufcs_class *class, u8 key_index, u8 *auth_data, u
 	mutex_unlock(&class->pe_lock);
 	wait_for_completion(&class->request_ack);
 	rc = READ_ONCE(class->state.err);
+	if (!rc)
+		rc = class->verify_pass;
+	memzero_explicit(&class->verify_info, sizeof(class->verify_info));
 	mutex_unlock(&class->ext_req_lock);
 
 	if (rc < 0) {
@@ -1063,10 +1028,11 @@ int ufcs_verify_adapter(struct ufcs_class *class, u8 key_index, u8 *auth_data, u
 		return rc;
 	}
 
-	return class->verify_pass;
+	return rc;
 
 err:
 	mutex_unlock(&class->pe_lock);
+	memzero_explicit(&class->verify_info, sizeof(class->verify_info));
 	mutex_unlock(&class->ext_req_lock);
 	devm_kfree(&class->ufcs->dev, event);
 	return rc;

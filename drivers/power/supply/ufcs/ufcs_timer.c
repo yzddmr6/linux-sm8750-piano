@@ -260,28 +260,22 @@ static enum hrtimer_restart wait_msg_timeout(struct hrtimer *timer)
 
 int ufcs_timer_init(struct ufcs_class *class)
 {
+	static enum hrtimer_restart (* const handlers[TIMER_MAX])(struct hrtimer *) = {
+		[ACK_RECEIVE_TIMER] = ack_receive_timeout,
+		[SENDER_RESPONSE_TIMER] = sender_response_timeout,
+		[POWER_SUPPLY_TIMER] = power_supply_timeout,
+		[CABLE_INFO_TIMER] = cable_info_timeout,
+		[RESTART_TRANS_TIMER] = restart_trans_timeout,
+		[CABLE_TRANS_TIMER] = cable_trans_timeout,
+		[MSG_TRANS_DELAY_TIMER] = msg_trans_delay_timeout,
+		[HANDSHAKE_TIMER] = handshake_timeout,
+		[WAIT_MSG_TIMER] = wait_msg_timeout,
+		[EMARK_MSG_TIMER] = sender_emark_timeout,
+	};
 	int i;
 
-	if (class == NULL) {
-		ufcs_err("ufcs class is NULL\n");
-		return -EINVAL;
-	}
-
-	for (i = 0; i < TIMER_MAX; i++) {
-		hrtimer_init(&class->timer[i], CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-		class->timeout_event[i] = NULL;
-	}
-
-	class->timer[ACK_RECEIVE_TIMER].function = ack_receive_timeout;
-	class->timer[SENDER_RESPONSE_TIMER].function = sender_response_timeout;
-	class->timer[POWER_SUPPLY_TIMER].function = power_supply_timeout;
-	class->timer[CABLE_INFO_TIMER].function = cable_info_timeout;
-	class->timer[RESTART_TRANS_TIMER].function = restart_trans_timeout;
-	class->timer[CABLE_TRANS_TIMER].function = cable_trans_timeout;
-	class->timer[MSG_TRANS_DELAY_TIMER].function = msg_trans_delay_timeout;
-	class->timer[HANDSHAKE_TIMER].function = handshake_timeout;
-	class->timer[WAIT_MSG_TIMER].function = wait_msg_timeout;
-	class->timer[EMARK_MSG_TIMER].function = sender_emark_timeout;
+	for (i = 0; i < TIMER_MAX; i++)
+		hrtimer_setup(&class->timer[i], handlers[i], CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 
 	return 0;
 }
@@ -535,11 +529,11 @@ void stop_msg_trans_delay_timer(struct ufcs_class *class)
 	hrtimer_cancel(&class->timer[MSG_TRANS_DELAY_TIMER]);
 }
 
-void start_handshake_timer(struct ufcs_class *class)
+int start_handshake_timer(struct ufcs_class *class)
 {
 	if (class == NULL) {
 		ufcs_err("ufcs class is NULL\n");
-		return;
+		return -EINVAL;
 	}
 
 	if (class->timeout_event[HANDSHAKE_TIMER] == NULL) {
@@ -547,12 +541,13 @@ void start_handshake_timer(struct ufcs_class *class)
 			devm_kzalloc(&class->ufcs->dev, sizeof(struct ufcs_event), GFP_KERNEL);
 		if (class->timeout_event[HANDSHAKE_TIMER] == NULL) {
 			ufcs_err("alloc event buf error\n");
-			return;
+			return -ENOMEM;
 		}
 	}
 
 	hrtimer_start(&class->timer[HANDSHAKE_TIMER],
 		ms_to_ktime(T_HANDSHAKE_TIMEOUT_MS), HRTIMER_MODE_REL);
+	return 0;
 }
 
 void stop_handshake_timer(struct ufcs_class *class)

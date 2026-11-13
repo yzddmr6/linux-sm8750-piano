@@ -12,6 +12,8 @@
 
 struct ufcs_class;
 
+int ufcs_check_refuse_msg(struct ufcs_class *class, struct ufcs_msg *msg,
+	enum ufcs_msg_type type, u8 cmd);
 int ufcs_pdo_set(struct ufcs_class *class, int vol_mv, int curr_ma);
 int ufcs_config_watchdog(struct ufcs_class *class, u16 time_ms);
 int ufcs_get_device_info(struct ufcs_class *class, u64 *dev_info);

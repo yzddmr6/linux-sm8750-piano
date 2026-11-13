@@ -208,6 +208,8 @@ config BATTERY_PMU
 	  Say Y here to expose battery information on Apple machines
 	  through the generic battery class.
 
+source "drivers/power/supply/ufcs/Kconfig"
+
 config CHARGER_SC8547A
 	tristate "Southchip SC8547A charge pump / VOOC PHY"
 	depends on I2C && OF && BATTERY_QCOM_BATTMGR

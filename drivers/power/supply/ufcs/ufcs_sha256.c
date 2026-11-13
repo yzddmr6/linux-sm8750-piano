@@ -5,6 +5,8 @@
 
 #include <linux/types.h>
 #include <linux/kernel.h>
+#include <linux/string.h>
+#include "ufcs_sha256.h"
 
 #define UFCS_ENCRYPTION_BLOCK_SIZE 32
 #define UFCS_ENCRYPTION_HASH_A 0x6a09e667
@@ -16,16 +18,7 @@
 #define UFCS_ENCRYPTION_HASH_G 0x1f83d9ab
 #define UFCS_ENCRYPTION_HASH_H 0x5be0cd19
 
-static unsigned char ufcs_source_data[64] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x8d, 0x6a, 0x61, 0xd2, 0x06,
-	0x38, 0xb8, 0xe5, 0xc0, 0x26, 0x93, 0x0c, 0x3e, 0x60, 0x39, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x80,
-};
-
-static unsigned int ufcs_verify[64] = {
+static const unsigned int ufcs_verify[64] = {
 	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
 	0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
 	0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
@@ -53,6 +46,7 @@ int ufcs_get_encrypt_data(unsigned char random_a[16],
 			  unsigned char auth_msg[16],
 			  unsigned char encrypt_data[32])
 {
+	unsigned char ufcs_source_data[64] = { [48] = 0x80, [62] = 1, [63] = 0x80 };
 	unsigned char i, j;
 	unsigned int a, b, c, d, e, f, g, h, t1, t2, m[64];
 
@@ -69,7 +63,7 @@ int ufcs_get_encrypt_data(unsigned char random_a[16],
 	}
 
 	for (i = 0, j = 0; i < 16; ++i, j += 4) {
-		m[i] = (ufcs_source_data[j] << 24) |
+		m[i] = ((u32)ufcs_source_data[j] << 24) |
 		       (ufcs_source_data[j + 1] << 16) |
 		       (ufcs_source_data[j + 2] << 8) |
 		       (ufcs_source_data[j + 3]);
@@ -121,5 +115,7 @@ int ufcs_get_encrypt_data(unsigned char random_a[16],
 		encrypt_data[i + 28] = (h >> (24 - i * 8)) & 0x000000ff;
 	}
 
+	memzero_explicit(ufcs_source_data, sizeof(ufcs_source_data));
+	memzero_explicit(m, sizeof(m));
 	return 0;
 }

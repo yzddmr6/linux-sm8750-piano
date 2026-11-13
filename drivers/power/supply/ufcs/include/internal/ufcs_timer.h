@@ -60,7 +60,7 @@ void start_cable_trans_timer(struct ufcs_class *class);
 void stop_cable_trans_timer(struct ufcs_class *class);
 void start_msg_trans_delay_timer(struct ufcs_class *class);
 void stop_msg_trans_delay_timer(struct ufcs_class *class);
-void start_handshake_timer(struct ufcs_class *class);
+int start_handshake_timer(struct ufcs_class *class);
 void stop_handshake_timer(struct ufcs_class *class);
 void start_wait_msg_timer(struct ufcs_class *class);
 void stop_wait_msg_timer(struct ufcs_class *class);

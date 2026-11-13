@@ -769,8 +769,8 @@ static void ufcs_recv_data_msg_power_change(struct ufcs_data_msg_power_change *p
 	u8 *buf = (u8 *)power_change->data;
 	int i;
 
-	for (i = UFCS_OUTPUT_MODE_MAX - 1; i > 0; i--) {
-		data = (((u32)(buf[i])) << 16) + (((u32)(buf[i + 1])) << 8) + buf[i + 2];
+	for (i = UFCS_OUTPUT_MODE_MAX - 1; i >= 0; i--) {
+		data = (((u32)buf[3 * i]) << 16) | ((u32)buf[3 * i + 1] << 8) | buf[3 * i + 2];
 		power_change->data[i] = data;
 	}
 }
@@ -885,6 +885,8 @@ int ufcs_data_msg_init(struct ufcs_data_msg *msg)
 
 	switch (msg->command) {
 	case DATA_MSG_OUTPUT_CAPABILITIES:
+		if (!msg->length || msg->length % 8 || msg->length > sizeof(msg->output_cap))
+			return -EBADMSG;
 		ufcs_recv_data_msg_output_cap(&msg->output_cap);
 		break;
 	case DATA_MSG_REQUEST:
@@ -915,9 +917,13 @@ int ufcs_data_msg_init(struct ufcs_data_msg *msg)
 		ufcs_recv_or_pack_data_msg_verify_request(&msg->verify_request);
 		break;
 	case DATA_MSG_VERIFY_RESPONSE:
+		if (msg->length != sizeof(msg->verify_response))
+			return -EBADMSG;
 		ufcs_recv_or_pack_data_msg_verify_response(&msg->verify_response);
 		break;
 	case DATA_MSG_POWER_CHANGE:
+		if (!msg->length || msg->length % 3 || msg->length > 3 * UFCS_OUTPUT_MODE_MAX)
+			return -EBADMSG;
 		ufcs_recv_data_msg_power_change(&msg->power_change);
 		break;
 	case DATA_MSG_TEST_REQUEST:
@@ -969,6 +975,8 @@ int ufcs_data_msg_pack(struct ufcs_data_msg *msg)
 		ufcs_recv_or_pack_data_msg_verify_request(&msg->verify_request);
 		break;
 	case DATA_MSG_VERIFY_RESPONSE:
+		if (msg->length != sizeof(msg->verify_response))
+			return -EBADMSG;
 		ufcs_recv_or_pack_data_msg_verify_response(&msg->verify_response);
 		break;
 	case DATA_MSG_POWER_CHANGE:

@@ -370,8 +370,9 @@ ufcs_device_register(struct device *parent, struct ufcs_dev_ops *ops,
 		ufcs_err("drv_data is NULL\n");
 		return ERR_PTR(-EINVAL);
 	}
-	if (config == NULL) {
-		ufcs_err("config is NULL\n");
+	/* Only PHYs with hardware ACK support are wired on this platform. */
+	if (!config || config->reply_ack || config->check_crc) {
+		ufcs_err("unsupported PHY configuration\n");
 		return ERR_PTR(-EINVAL);
 	}
 
@@ -409,10 +410,6 @@ ufcs_device_register(struct device *parent, struct ufcs_dev_ops *ops,
 	if (rc)
 		goto free_ufcs;
 
-	rc = device_init_wakeup(&ufcs->dev, true);
-	if (rc)
-		goto free_ufcs;
-
 	rc = device_add(&ufcs->dev);
 	if (rc)
 		goto free_ufcs;
@@ -426,7 +423,7 @@ ufcs_device_register(struct device *parent, struct ufcs_dev_ops *ops,
 		}
 	}
 
-	class->worker = kthread_create_worker(0, "ufcs");
+	class->worker = kthread_run_worker(0, "ufcs");
 	if (IS_ERR(class->worker)) {
 		rc = PTR_ERR(class->worker);
 		goto del_device;
@@ -487,9 +484,17 @@ void ufcs_device_unregister(struct ufcs_dev *ufcs)
 
 	g_ufcs_dev = NULL;
 	class = ufcs->class;
+	WRITE_ONCE(class->event.exit, true);
+	spin_lock_irq(&class->event.event_list_lock);
 	complete_all(&class->event.ack);
+	spin_unlock_irq(&class->event.event_list_lock);
 	kthread_stop(class->sm_task);
+	kthread_flush_worker(class->worker);
+	for (int i = 0; i < TIMER_MAX; i++)
+		hrtimer_cancel(&class->timer[i]);
+	cancel_work_sync(&class->test_handle_work);
 	kthread_destroy_worker(class->worker);
+	cancel_work_sync(&class->fifo_overflow_work);
 	device_del(&ufcs->dev);
 	put_device(&ufcs->dev);
 }

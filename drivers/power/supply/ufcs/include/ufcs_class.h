@@ -117,6 +117,9 @@ void ufcs_device_unregister(struct ufcs_dev *ufcs);
 struct ufcs_dev *ufcs_get_ufcs_device(void);
 
 int ufcs_msg_handler(struct ufcs_dev *ufcs);
+/* Sleepable. Report input current only after ACCEPT and POWER_READY. */
+int ufcs_request_limited(struct ufcs_dev *ufcs, int mv, int cable_ma,
+			 int pumps_ma, int envelope_ma, int *applied_ma);
 int ufcs_intf_pdo_set(struct ufcs_dev *ufcs, int vol_mv, int curr_ma);
 int ufcs_handshake(struct ufcs_dev *ufcs);
 int ufcs_intf_source_hard_reset(struct ufcs_dev *ufcs);
