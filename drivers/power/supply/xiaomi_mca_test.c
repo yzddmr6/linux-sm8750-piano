@@ -2452,6 +2452,15 @@ static void xiaomi_mca_test_gauge_fallback(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, f->term_readback, n ? 5200 : 5480);
 		KUNIT_EXPECT_TRUE(test, f->mca.charge_blocked);
 	}
+	/* Temperature remains independently observable during the outage. */
+	f->tbat = 48;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), -ENODEV);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 4520);
+	f->tbat = 45;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), -ENODEV);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5200);
 	f->cells[0].error = 0;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);

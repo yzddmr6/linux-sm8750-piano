@@ -2429,8 +2429,12 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 		/* Hold the last vote for one missed observation. A measured
 		 * hot sensor always takes precedence over that grace period.
 		 */
-		if (max_t(int, (s32)tpack, tbat) < MCA_TERM_HOT_DEGC)
+		tbat = max_t(int, (s32)tpack, tbat);
+		if (tbat < MCA_TERM_HOT_DEGC) {
+			if (tbat < MCA_TERM_COOL_DEGC)
+				mca->term_hot = false;
 			return 0;
+		}
 		ret = -ENODATA;
 	}
 	if (ret) {
