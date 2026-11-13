@@ -627,6 +627,8 @@ struct xiaomi_mca {
 	bool term_written;	/* restore even after a lost write acknowledgment */
 	bool cp_normal_cv;
 	bool term_hot;		/* float-voltage thermal hysteresis */
+	bool fv_derated;
+	unsigned int gauge_failures;
 	bool ffc_done;
 	u32 ffc_type, ffc_attach;
 	bool ffc_active;		/* checked again every poll, never latched by auth */
@@ -2257,6 +2259,7 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 
 	ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
 	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax);
+	mca->fv_derated = !!ret;
 	if (ret) {
 		mca->ffc_active = false;
 		mca->term_hot = true;
@@ -2613,7 +2616,7 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 	}
 	ret = ret ?: xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
 	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax);
-	if (!ret) {
+	if (!ret && !(full_charge && charge_policy && mca->fv_derated)) {
 		tbat = max_t(s32, tbat, tpack);
 		tcool = min_t(s32, tcool, tpack);
 		mca->coolest_temp = tcool;
@@ -2627,7 +2630,37 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		else if (tcool >= -7)
 			mca->charge_cold = false;
 	}
-	mca->charge_blocked = ret || mca->charge_hold || mca->charge_hot || mca->charge_cold;
+	if (ret || (full_charge && charge_policy && mca->fv_derated)) {
+		int err = ret ?: -ENODATA;
+
+		mca->charge_blocked = true;
+		xiaomi_mca_charge_wake_poll(mca, false);
+		mca->gauge_failures = min(mca->gauge_failures + 1, 3U);
+		if (mca->charge_hold || mca->charge_hot || mca->charge_cold ||
+		    (end < 100 && mca->gauge_failures >= 3)) {
+			stop_ret = xiaomi_mca_charge_stop(mca);
+			return stop_ret ?: err;
+		}
+		/* Autonomous firmware retains its JEITA interlocks. Keep a
+		 * missing gauge from stranding an otherwise healthy pack.
+		 */
+		ret = xiaomi_mca_cp_stop(mca, "gauge unavailable");
+		if (!ret && !mca->term_hot && full_charge) {
+			mca->ffc_active = false;
+			mca->term_hot = true;
+			ret = xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, MCA_TERM_HOT_MV);
+		}
+		if (!ret && mca->fcc_set_ma != MCA_FCC_DEFAULT_MA) {
+			ret = xiaomi_mca_reset_fcc(mca);
+			if (!ret)
+				mca->fcc_set_ma = MCA_FCC_DEFAULT_MA;
+		}
+		if (!ret)
+			ret = xiaomi_mca_charge_enable(mca, true);
+		return ret ?: err;
+	}
+	mca->gauge_failures = 0;
+	mca->charge_blocked = mca->charge_hold || mca->charge_hot || mca->charge_cold;
 	if (mca->charge_blocked) {
 		stop_ret = xiaomi_mca_charge_stop(mca);
 		xiaomi_mca_charge_wake_poll(mca, false);

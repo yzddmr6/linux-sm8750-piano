@@ -2299,6 +2299,29 @@ static void xiaomi_mca_test_threshold_hysteresis(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->mca.charge_disabled);
 }
 
+static void xiaomi_mca_test_gauge_fallback(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	int n;
+
+	full_charge = charge_policy = true;
+	f->cells[0].error = -ENODEV;
+	f->mca.fcc_set_ma = 3500;
+	guard(mutex)(&f->mca.lock);
+	for (n = 0; n < 4; n++) {
+		KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), -ENODEV);
+		KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+		KUNIT_EXPECT_EQ(test, f->fcc, 500);
+		KUNIT_EXPECT_EQ(test, f->term_readback, 4520);
+		KUNIT_EXPECT_TRUE(test, f->mca.charge_blocked);
+	}
+	f->cells[0].error = 0;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
+	KUNIT_EXPECT_FALSE(test, f->mca.charge_blocked);
+}
+
 static void xiaomi_mca_test_threshold_thermal_release(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -2376,6 +2399,9 @@ static void xiaomi_mca_test_threshold_stop_failure_sleep(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
 	/* Invalid SOC cannot resume charging. */
 	f->cells[1].capacity = -1;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), -ENODATA);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), -ENODATA);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), -ENODATA);
 	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
 	/* Unplug after HV charging must still allow protected battery sleep. */
@@ -3031,6 +3057,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_threshold_wakeup_prepare),
 	KUNIT_CASE(xiaomi_mca_test_threshold_hysteresis),
 	KUNIT_CASE(xiaomi_mca_test_threshold_thermal_release),
+	KUNIT_CASE(xiaomi_mca_test_gauge_fallback),
 	KUNIT_CASE(xiaomi_mca_test_threshold_stop_failure_sleep),
 	KUNIT_CASE(xiaomi_mca_test_pm_refused),
 	KUNIT_CASE(xiaomi_mca_test_pm_no_source),
