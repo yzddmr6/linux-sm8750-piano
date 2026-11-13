@@ -669,6 +669,8 @@ struct xiaomi_mca {
 	unsigned long cp_retry_at;
 	bool auth_lost;
 	unsigned long auth_retry;
+	int qc_align_mv;
+	unsigned int qc_stalls;
 	bool cp_die_hot;
 	bool cp_fault;
 	bool cp_recharge;
@@ -2323,6 +2325,8 @@ static int xiaomi_mca_qc_adjust(struct xiaomi_mca *mca, u32 target)
 static int xiaomi_mca_cp_request(struct xiaomi_mca *mca, u32 mv)
 {
 	u32 ma;
+	int ret;
+
 	mv = clamp(rounddown(mv, 20), (u32)MCA_CP_PPS_MIN_MV,
 		   min_t(u32, mca->cp_max_mv, MCA_CP_PPS_MAX_MV));
 	if (xiaomi_mca_is_qc_pump(mca->cp_type)) {
@@ -2334,10 +2338,12 @@ static int xiaomi_mca_cp_request(struct xiaomi_mca *mca, u32 mv)
 	if (mv == mca->cp_mv && ma == mca->cp_request_ma)
 		return 0;
 
-	mca->cp_mv = mv;
-	mca->cp_request_ma = ma;
-	return xiaomi_mca_write_u32(mca, MCA_PROP_PPS_SELECT,
-				   xiaomi_mca_pps_word(mv, ma));
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_PPS_SELECT, xiaomi_mca_pps_word(mv, ma));
+	if (!ret) {
+		mca->cp_mv = mv;
+		mca->cp_request_ma = ma;
+	}
+	return ret;
 }
 
 /*
@@ -2796,6 +2802,8 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_mv = 0;
 	mca->cp_request_ma = 0;
 	mca->cp_polls = 0;
+	mca->qc_align_mv = 0;
+	mca->qc_stalls = 0;
 	mca->cp_low = 0;
 	mca->cp_ibus_hot = mca->cp_ibus_ma;
 	mca->cp_ibat_trip = 0;
@@ -2889,17 +2897,17 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 			return;
 		}
 	}
-	cv = xiaomi_mca_cp_vbat_max(mca);
-	taper = vbat >= cv - 9;	/* pps_taper_vol_hys */
-	if (vmin < MCA_CP_VBAT_MIN_MV || vbat > min_t(u32, cv + 4, mca->ffc_active ? MCA_TERM_FFC_MV : UINT_MAX) ||
-	    (taper && (mca->cp != MCA_CP_ON || ibat <= 3000))) {
-		mca->cp_recharge = taper;
-		xiaomi_mca_cp_stop(mca, "battery voltage reached");
-		return;
-	}
 	if (imax >= MCA_CP_CELL_OCP_MA) {
 		mca->cp_fault = true;
 		xiaomi_mca_cp_stop(mca, "cell current too high");
+		return;
+	}
+	cv = xiaomi_mca_cp_vbat_max(mca);
+	taper = vbat >= cv - 9;	/* pps_taper_vol_hys */
+	if (vmin < MCA_CP_VBAT_MIN_MV || vbat > cv + (mca->ffc_active ? 0 : 4) ||
+	    (taper && (mca->cp != MCA_CP_ON || ibat <= 3000))) {
+		mca->cp_recharge = taper;
+		xiaomi_mca_cp_stop(mca, "battery voltage reached");
 		return;
 	}
 	if (min(tcool, tpack) < MCA_CP_TBAT_MIN ||
@@ -2930,13 +2938,21 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 
 		/* Align the bus with the present cells before closing the switch. */
 		if (abs(bus - want) >= step) {
-			if (++mca->cp_polls > (MCA_HV_MV - 2 * MCA_CP_VBAT_MIN_MV) / step +
+			if (abs(bus - mca->qc_align_mv) >= step) {
+				mca->qc_align_mv = bus;
+				mca->qc_stalls = 0;
+			}
+			if (++mca->qc_stalls > MCA_CP_OPEN_TRIES ||
+			    ++mca->cp_polls > (MCA_HV_MV - 2 * MCA_CP_VBAT_MIN_MV) / step +
 					      MCA_CP_OPEN_TRIES ||
 			    xiaomi_mca_qc_adjust(mca, want))
 				xiaomi_mca_cp_stop(mca, "QC failed to reach opening voltage");
 			return;
 		}
-		mca->cp_polls = 0;
+		if (mca->qc_align_mv) {
+			mca->qc_align_mv = 0;
+			mca->cp_polls = 0;
+		}
 	}
 	if (mca->cp == MCA_CP_OPENING &&
 	    ++mca->cp_polls > MCA_CP_OPEN_TRIES) {
@@ -2944,6 +2960,9 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		return;
 	}
 	if (!on && mca->cp == MCA_CP_ON) {
+		/* A watchdog timeout is recoverable. Leave hardware protection
+		 * enabled on every new arm, including after a thermal trip.
+		 */
 		xiaomi_mca_cp_stop(mca, "stage turned itself off");
 		return;
 	}
@@ -2973,7 +2992,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_stop(mca, "stage temperature");
 		return;
 	}
-	if (ibus > (int)mca->cp_ibus_ma + MCA_CP_TRIP_IBUS_MA) {
+	if (ibus > MCA_CP_STAGE_IBUS_MA || ibus > (int)mca->cp_ibus_ma + MCA_CP_TRIP_IBUS_MA) {
 		mca->cp_fault = ibus > MCA_CP_STAGE_IBUS_MA;
 		xiaomi_mca_cp_stop(mca, "bus current too high");
 		return;

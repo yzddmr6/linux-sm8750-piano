@@ -534,6 +534,7 @@ struct mca_policy_fixture {
 	int ucsi_rp_ua, ucsi_mv;
 	u8 aicl_enabled;
 	unsigned int aicl_runs;
+	int stage_mv, stage_ma, stage_temp;
 	bool stage_on;
 	int stage_error;
 	unsigned int stage_stops;
@@ -1145,7 +1146,13 @@ static int mca_test_stage_get(struct power_supply *psy, enum power_supply_proper
 {
 	struct mca_policy_fixture *f = power_supply_get_drvdata(psy);
 
-	val->intval = f->stage_on;
+	switch (psp) {
+	case POWER_SUPPLY_PROP_ONLINE: val->intval = f->stage_on; break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW: val->intval = f->stage_mv * 1000; break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW: val->intval = f->stage_ma * 1000; break;
+	case POWER_SUPPLY_PROP_TEMP: val->intval = f->stage_temp; break;
+	default: return -EINVAL;
+	}
 	return 0;
 }
 
@@ -2501,6 +2508,7 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, vmin, 3449);
 	KUNIT_EXPECT_EQ(test, ibat, 6000);
 	KUNIT_EXPECT_EQ(test, imax, 7000);
+	f->cells[0].current_ua = 0;
 	mca_test_stage(test, f);
 	guard(mutex)(&f->mca.lock);
 	xiaomi_mca_cp_step(&f->mca);
@@ -2513,6 +2521,7 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	xiaomi_mca_cp_try_start(&f->mca);
 	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_OFF);
 	f->cells[0].voltage = 4400000;
+	f->cells[0].current_ua = 7000000;
 	f->mca.cp_psy = power_supply_get_by_name("mca-pm-test-cp");
 	f->mca.cp = MCA_CP_ON;
 	f->stage_on = true;
@@ -2520,6 +2529,34 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_COOLDOWN);
 	KUNIT_EXPECT_TRUE(test, f->mca.cp_fault);
 	KUNIT_EXPECT_FALSE(test, f->stage_on);
+}
+
+static void xiaomi_mca_test_taper_handoff(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	full_charge = hv_charge = cp_charge = true;
+	mca_test_stage(test, f);
+	mca->ffc_active = true;
+	mca->cp_max_mv = 11000;
+	mca->cp_mv = 9500;
+	mca->cp_ma = 5000;
+	mca->cp_ibus_ma = mca->cp_ibus_hot = 4000;
+	mca->icl_set_ma = mca->fcc_set_ma = 500;
+	f->stage_mv = 9400;
+	f->stage_ma = 2000;
+	f->cells[0].voltage = f->cells[1].voltage = 4540000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 2000000;
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_LT(test, mca->cp_mv, 9500);
+	f->cells[0].current_ua = f->cells[1].current_ua = 1500000;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
+	KUNIT_EXPECT_TRUE(test, mca->cp_recharge);
+	KUNIT_EXPECT_FALSE(test, mca->cp_fault);
 }
 
 static void xiaomi_mca_test_identity_edges(struct kunit *test)
@@ -2877,6 +2914,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_identity_edges),
 	KUNIT_CASE(xiaomi_mca_test_ffc_conditions),
 	KUNIT_CASE(xiaomi_mca_test_cp_cell_guards),
+	KUNIT_CASE(xiaomi_mca_test_taper_handoff),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_values),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_errors),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_refusal),
