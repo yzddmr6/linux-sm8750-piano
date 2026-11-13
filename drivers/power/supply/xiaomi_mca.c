@@ -240,7 +240,7 @@ static const char * const mca_real_type_names[MCA_TYPE_MAX] = {
 
 /* Input current limits (mA) set by charge_policy, from the stock tables */
 #define MCA_ICL_MIN_MA		100	/* also the ADSP power-on value */
-#define MCA_ICL_MAX_MA		1500
+#define MCA_ICL_5V_MAX_MA	3000	/* Piano ADSP fixed 5 V sink PDO */
 #define MCA_ICL_HV_MAX_MA	2500	/* at 9 V, see xiaomi_mca_hv_icl() */
 #define MCA_POLICY_ICL_DEFAULT_MA	500
 
@@ -1081,7 +1081,7 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 		       !memcmp(data, xiaomi_mca_piano_otg_cfg, len);
 	case MCA_PROP_INPUT_CURRENT_LIMIT:
 		return len == sizeof(u32) &&
-		       val >= MCA_ICL_MIN_MA && val <= MCA_ICL_HV_MAX_MA;
+		       val >= MCA_ICL_MIN_MA && val <= MCA_ICL_5V_MAX_MA;
 	case MCA_PROP_TERM_VOLT:
 		return len == sizeof(u32) &&
 		       (val == MCA_TERM_HOT_MV || val == MCA_TERM_DEFAULT_MV ||
@@ -1119,6 +1119,7 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 
 static bool xiaomi_mca_is_pd(u32 real_type);
 static u32 xiaomi_mca_5v_input(struct xiaomi_mca *mca, u32 type);
+static u32 xiaomi_mca_contract_ma(struct xiaomi_mca *mca, int mv, u32 fallback);
 
 /* All paths share the original checked transport and this refusal gate. */
 static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
@@ -1233,6 +1234,15 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		    vbus >= MCA_VBUS_ONLINE_UV && vbus < MCA_HV_VBUS_5V_MAX_UV &&
 		    (type == MCA_TYPE_C || xiaomi_mca_is_pd(type))) {
 			if (value > xiaomi_mca_5v_input(mca, type))
+				return -EINVAL;
+			ret = 0;
+		}
+		if (prop == MCA_PROP_INPUT_CURRENT_LIMIT && xiaomi_mca_is_pd(type) &&
+		    mca->cp != MCA_CP_ON && vbus >= MCA_HV_VBUS_MIN_UV &&
+		    vbus <= MCA_HV_VBUS_MAX_UV && !mca->hv_pps) {
+			u32 ma = xiaomi_mca_contract_ma(mca, MCA_HV_MV, 1600);
+
+			if (value > min_t(u32, ma, MCA_ICL_HV_MAX_MA))
 				return -EINVAL;
 			ret = 0;
 		}
@@ -1665,15 +1675,58 @@ enum xiaomi_mca_ucsi_state {
 	MCA_UCSI_PD_SINK,
 };
 
+struct xiaomi_mca_contract {
+	struct xiaomi_mca *mca;
+	int mv;
+};
+
+static bool xiaomi_mca_ucsi_peer(struct xiaomi_mca *mca, struct power_supply *psy)
+{
+	struct device *parent = psy->dev.parent;
+
+	return psy != mca->psy && parent && parent->parent == mca->dev->parent &&
+	       psy->desc->type == POWER_SUPPLY_TYPE_USB;
+}
+
+/* UCSI CURRENT_NOW is RDO operating current. A source PDO alone does not
+ * authorize drawing its advertised maximum. Check voltage, role and type.
+ */
+static int xiaomi_mca_pd_contract(struct power_supply *psy, void *data)
+{
+	struct xiaomi_mca_contract *want = data;
+	union power_supply_propval val;
+
+	if (!xiaomi_mca_ucsi_peer(want->mca, psy))
+		return 0;
+	guard(rwsem_read)(&psy->epc_sem);
+	if (psy->removing ||
+	    power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &val) ||
+	    val.intval != POWER_SUPPLY_STATUS_CHARGING ||
+	    power_supply_get_property(psy, POWER_SUPPLY_PROP_USB_TYPE, &val) ||
+	    val.intval != POWER_SUPPLY_USB_TYPE_PD ||
+	    power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &val) ||
+	    val.intval != want->mv * 1000 ||
+	    power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &val) ||
+	    val.intval < 100000 || val.intval > 5000000)
+		return 0;
+	return val.intval / 1000;
+}
+
+static u32 xiaomi_mca_contract_ma(struct xiaomi_mca *mca, int mv, u32 fallback)
+{
+	struct xiaomi_mca_contract want = { mca, mv };
+	int ma = power_supply_for_each_psy(&want, xiaomi_mca_pd_contract);
+
+	return ma > 0 ? ma : fallback;
+}
+
 /* The UCSI supply belongs to another child of this PMIC GLINK instance. */
 static int xiaomi_mca_ucsi_status(struct power_supply *psy, void *data)
 {
 	struct xiaomi_mca *mca = data;
-	struct device *parent = psy->dev.parent;
 	union power_supply_propval val;
 
-	if (psy == mca->psy || !parent || parent->parent != mca->dev->parent ||
-	    psy->desc->type != POWER_SUPPLY_TYPE_USB)
+	if (!xiaomi_mca_ucsi_peer(mca, psy))
 		return MCA_UCSI_UNAVAILABLE;
 	/* UCSI frees its connector data after unregistering this supply. */
 	guard(rwsem_read)(&psy->epc_sem);
@@ -1716,10 +1769,9 @@ static u32 xiaomi_mca_5v_input(struct xiaomi_mca *mca, u32 type)
 		else if (state == MCA_UCSI_RP_3000)
 			ma = 3000;
 	} else if (xiaomi_mca_is_pd(type)) {
-		ma = xiaomi_mca_pd_5v_ma(mca);
+		ma = min(xiaomi_mca_pd_5v_ma(mca), xiaomi_mca_contract_ma(mca, 5000, 1500));
 	}
-	/* Highest documented Piano buck ICL (in_pps). */
-	return min_t(u32, ma, MCA_ICL_HV_MAX_MA);
+	return min_t(u32, ma, MCA_ICL_5V_MAX_MA);
 }
 
 /* Remember disconnects even when a complete replug fits between two polls. */
@@ -1986,9 +2038,11 @@ static void xiaomi_mca_apply_policy(struct xiaomi_mca *mca)
 
 	hv_ma = xiaomi_mca_hv_step(mca);
 	
-	if (hv_ma)
-		target = clamp(hv_ma, MCA_ICL_MIN_MA,
-			       xiaomi_mca_hv_icl(mca->real_type));
+	if (hv_ma && xiaomi_mca_is_pd(mca->real_type) && !mca->hv_pps)
+		target = min3(hv_ma, xiaomi_mca_contract_ma(mca, MCA_HV_MV, 1600),
+			      (u32)MCA_ICL_HV_MAX_MA);
+	else if (hv_ma)
+		target = min(hv_ma, xiaomi_mca_hv_icl(mca->real_type));
 	else if (xiaomi_mca_is_qc(mca->real_type) && mca->hv == MCA_HV_REQUESTED)
 		target = min(target, xiaomi_mca_hv_icl(mca->real_type));
 	else if (mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV && mca->hv == MCA_HV_OFF)
@@ -4250,7 +4304,8 @@ static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca, u32 fixed_ma)
 	if (!icl || !fcc)
 		return -EOPNOTSUPP;
 	if (fixed_ma)
-		icl = min(fixed_ma, xiaomi_mca_hv_icl(type));
+		icl = min3(fixed_ma, xiaomi_mca_contract_ma(mca, MCA_HV_MV, 1600),
+			   (u32)MCA_ICL_HV_MAX_MA);
 	else if (xiaomi_mca_is_qc(type))
 		icl = min(icl, xiaomi_mca_hv_icl(type));
 	else if (xiaomi_mca_is_pd(type) || type == MCA_TYPE_C) {

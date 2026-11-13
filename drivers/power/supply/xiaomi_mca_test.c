@@ -531,7 +531,7 @@ struct mca_policy_fixture {
 	int error;
 	int write_error;
 	bool voltage_stuck;
-	int ucsi_rp_ua;
+	int ucsi_rp_ua, ucsi_mv;
 	bool stage_on;
 	int stage_error;
 	unsigned int stage_stops;
@@ -920,6 +920,7 @@ static void xiaomi_mca_test_policy_refusal(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_INPUT_CURRENT_LIMIT, 1600), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_INPUT_CURRENT_LIMIT, 1601), -EINVAL);
 	f->type = MCA_TYPE_PD_PPS;
+	mca->hv_pps = true;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2500), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3000), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3500), 0);
@@ -2653,6 +2654,9 @@ static int mca_ucsi_supply_get(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		val->intval = f->ucsi_type;
 		break;
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		val->intval = 1000 * f->ucsi_mv;
+		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		val->intval = f->ucsi_rp_ua;
 		break;
@@ -2669,7 +2673,7 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 {
 	static const enum power_supply_property props[] = {
 		POWER_SUPPLY_PROP_ONLINE, POWER_SUPPLY_PROP_USB_TYPE,
-		POWER_SUPPLY_PROP_STATUS, POWER_SUPPLY_PROP_CURRENT_NOW,
+		POWER_SUPPLY_PROP_STATUS, POWER_SUPPLY_PROP_CURRENT_NOW, POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	};
 	static const struct power_supply_desc desc = {
 		.name = "mca-test-ucsi", .type = POWER_SUPPLY_TYPE_USB,
@@ -2692,7 +2696,7 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 	f->ucsi_rp_ua = 1500000;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_5v_input(&f->mca, MCA_TYPE_C), 1500);
 	f->ucsi_rp_ua = 3000000;
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_5v_input(&f->mca, MCA_TYPE_C), 2500);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_5v_input(&f->mca, MCA_TYPE_C), 3000);
 	f->ucsi_status = POWER_SUPPLY_STATUS_DISCHARGING;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_5v_input(&f->mca, MCA_TYPE_C), 500);
 	f->ucsi_type = POWER_SUPPLY_USB_TYPE_PD;
@@ -2706,6 +2710,9 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 1500), 0);
 	f->vbus = 9000000;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 1600), 0);
+	f->ucsi_mv = 9000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2500), 0);
+	f->ucsi_rp_ua = 1600000;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2500),
 			-EINVAL);
 	f->ucsi_online = 0;
