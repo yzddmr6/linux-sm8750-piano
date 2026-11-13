@@ -26,7 +26,7 @@ struct erhai_probe_status {
 	unsigned int ready;
 	unsigned int responded;
 	unsigned int protected;
-	bool delivering;
+	unsigned int delivering;
 };
 
 /* All callbacks run under battmgr's charge_lock, including suspend/teardown. */
@@ -51,7 +51,7 @@ int erhai_pps_apdo_current(u32 min_mv, u32 max_mv, u32 *selected);
 int erhai_otg_adsp_usb_prop(u32 property);
 int erhai_otg_adsp_prop_get(u32 opcode, u32 property);
 int erhai_otg_adsp_prop_set(u32 opcode, u32 property, u32 value);
-void erhai_charge_tail_complete(void);
+void erhai_charge_tail_complete(unsigned int route);
 bool erhai_otg_charge_inhibited(void);
 struct pmic_glink_client *
 erhai_otg_glink_client_register_sibling(struct device *consumer, u32 id,

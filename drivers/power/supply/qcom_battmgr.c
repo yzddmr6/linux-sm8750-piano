@@ -226,6 +226,14 @@ enum qcom_battmgr_pd_event {
 	PD_EVENT_UFCS_RESPONSE,
 };
 
+/* Successful delivery and discovery attempts belong to this attachment. */
+struct erhai_route_retry {
+	bool delivered;
+	unsigned int attempts;
+	unsigned int recovery_step;
+	unsigned long next;
+};
+
 static DEFINE_MUTEX(erhai_bridge_lock);
 static struct qcom_battmgr *erhai_battmgr;
 
@@ -548,8 +556,11 @@ struct qcom_battmgr {
 	unsigned int retry_pending;
 	bool retry_stopping;
 	unsigned long retry_deadline;
-	unsigned int serial_retries, ufcs_retries, pps_retries, fixed_retries;
-	unsigned long serial_next, ufcs_next, pps_next, fixed_next;
+	struct erhai_route_retry serial_retry_state, ufcs_retry_state;
+	struct erhai_route_retry pps_retry_state, fixed_retry_state;
+	unsigned int restore_route;
+	unsigned int suspend_route;
+	unsigned int tail_route;
 	bool tail_owned;
 	unsigned int recharge_samples;
 	unsigned long recharge_at;
@@ -1556,6 +1567,38 @@ static int erhai_recharge_mv(int temp, unsigned int cycles, bool qualified)
 	return mv - (cycles >= 1200 ? 60 : cycles >= 800 ? 40 : cycles >= 400 ? 20 : 0);
 }
 
+static void qcom_battmgr_route_delivered(struct erhai_route_retry *retry)
+{
+	retry->delivered = true;
+	retry->recovery_step = 0;
+	retry->next = jiffies + msecs_to_jiffies(CHARGE_CTRL_POLL_MS);
+}
+
+static void qcom_battmgr_note_delivery(struct qcom_battmgr *b, unsigned int route)
+{
+	switch (route) {
+	case ERHAI_SERIAL:
+		qcom_battmgr_route_delivered(&b->serial_retry_state);
+		break;
+	case ERHAI_UFCS:
+		qcom_battmgr_route_delivered(&b->ufcs_retry_state);
+		break;
+	case ERHAI_PPS:
+		qcom_battmgr_route_delivered(&b->pps_retry_state);
+		break;
+	}
+}
+
+static void qcom_battmgr_restore_route(struct qcom_battmgr *b, unsigned int route)
+{
+	if (route) {
+		qcom_battmgr_note_delivery(b, route);
+		b->restore_route = route;
+	} else {
+		b->retry_once |= ERHAI_SERIAL | ERHAI_UFCS;
+	}
+}
+
 /* oplus_comm_check_rechg: six qualified samples, COUNT_TIMELIMIT 4 s.
  * Only a completed direct session arms this latch, never SOC at attach.
  */
@@ -1581,7 +1624,7 @@ static bool qcom_battmgr_tail_owned(struct qcom_battmgr *b)
 		b->recharge_samples = 0;
 	} else if (++b->recharge_samples >= 6) {
 		b->tail_owned = false;
-		b->retry_once |= ERHAI_SERIAL | ERHAI_UFCS;
+		qcom_battmgr_restore_route(b, READ_ONCE(b->tail_route));
 		if (b->pps_ops)
 			b->pps_ops->recharge(b->pps_data);
 		b->serial_backoff = b->ufcs_backoff = false;
@@ -1590,11 +1633,13 @@ static bool qcom_battmgr_tail_owned(struct qcom_battmgr *b)
 	return b->tail_owned;
 }
 
-void erhai_charge_tail_complete(void)
+void erhai_charge_tail_complete(unsigned int route)
 {
 	guard(mutex)(&erhai_bridge_lock);
-	if (erhai_battmgr)
+	if (erhai_battmgr) {
+		WRITE_ONCE(erhai_battmgr->tail_route, route);
 		set_bit(PD_EVENT_TAIL, &erhai_battmgr->pd_events);
+	}
 }
 EXPORT_SYMBOL_GPL(erhai_charge_tail_complete);
 
@@ -1614,21 +1659,31 @@ static unsigned long qcom_battmgr_probe_retry(unsigned int *failures)
 /* Absolute retry slots following stable power: 30 s, 120 s, 480 s.
  * If the evidence arrives late, keep the spacing between later slots.
  */
-static bool qcom_battmgr_retry_slot(unsigned int *attempts, unsigned long *next,
-				    unsigned long stable_since)
+static bool qcom_battmgr_retry_slot(struct erhai_route_retry *retry, unsigned long stable_since,
+				    bool restoring)
 {
 	static const unsigned int slots[] = { 30, 120, 480 };
-	unsigned int slot = *attempts;
+	unsigned int slot = retry->attempts;
 	unsigned long due;
 
+	if (retry->delivered) {
+		/* Recovery of a known contract has no attachment quota. If
+		 * recovery fails, space subsequent probes up to eight minutes.
+		 */
+		if (!restoring && time_before(jiffies, retry->next))
+			return false;
+		retry->next = jiffies + slots[retry->recovery_step] * HZ;
+		if (retry->recovery_step + 1 < ARRAY_SIZE(slots))
+			retry->recovery_step++;
+		return true;
+	}
 	if (slot >= ARRAY_SIZE(slots))
 		return false;
-	due = slot ? *next : stable_since + slots[0] * HZ;
+	due = slot ? retry->next : stable_since + slots[0] * HZ;
 	if (time_before(jiffies, due))
 		return false;
-	(*attempts)++;
-	if (*attempts < ARRAY_SIZE(slots))
-		*next = jiffies + (slots[*attempts] - slots[slot]) * HZ;
+	if (++retry->attempts < ARRAY_SIZE(slots))
+		retry->next = jiffies + (slots[slot + 1] - slots[slot]) * HZ;
 	return true;
 }
 
@@ -1639,15 +1694,27 @@ static unsigned int qcom_battmgr_retry_routes(struct qcom_battmgr *b,
 					      const struct erhai_probe_status *status,
 					      bool ufcs_active)
 {
-	unsigned int eligible = (b->retry_once | b->retry_evidence | status->responded) &
-				status->ready & ~status->protected;
+	unsigned int eligible = b->retry_once | b->retry_evidence | status->responded;
 	unsigned int routes = 0;
 
+	if (b->serial_retry_state.delivered)
+		eligible |= ERHAI_SERIAL;
+	if (b->ufcs_retry_state.delivered)
+		eligible |= ERHAI_UFCS;
+	eligible &= status->ready & ~status->protected;
+	if (eligible & b->restore_route)
+		eligible &= b->restore_route;
+	if (b->restore_route == ERHAI_PPS && (status->ready & ERHAI_PPS) &&
+	    b->pps_ops->available(b->pps_data))
+		return 0;
+
 	if ((eligible & ERHAI_SERIAL) && !b->serial_blocked &&
-	    qcom_battmgr_retry_slot(&b->serial_retries, &b->serial_next, b->stable_since))
+	    qcom_battmgr_retry_slot(&b->serial_retry_state, b->stable_since,
+				    b->restore_route == ERHAI_SERIAL))
 		routes |= ERHAI_SERIAL;
 	if ((eligible & ERHAI_UFCS) && !ufcs_active &&
-	    qcom_battmgr_retry_slot(&b->ufcs_retries, &b->ufcs_next, b->stable_since))
+	    qcom_battmgr_retry_slot(&b->ufcs_retry_state, b->stable_since,
+				    b->restore_route == ERHAI_UFCS))
 		routes |= ERHAI_UFCS;
 	b->retry_once &= ~routes;
 	return routes;
@@ -1688,8 +1755,12 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->missing_routes = battmgr->retry_pending = 0;
 		battmgr->retry_stopping = false;
 		battmgr->retry_once = battmgr->retry_evidence = 0;
-		battmgr->serial_retries = battmgr->ufcs_retries = 0;
-		battmgr->pps_retries = battmgr->fixed_retries = 0;
+		battmgr->serial_retry_state = (struct erhai_route_retry){};
+		battmgr->ufcs_retry_state = (struct erhai_route_retry){};
+		battmgr->pps_retry_state = (struct erhai_route_retry){};
+		battmgr->fixed_retry_state = (struct erhai_route_retry){};
+		battmgr->restore_route = battmgr->suspend_route = 0;
+		WRITE_ONCE(battmgr->tail_route, 0);
 		test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events);
 		test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events);
 		battmgr->serial_failures = battmgr->ufcs_failures = 0;
@@ -1755,6 +1826,9 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		    !battmgr->charge_policy_hold && !battmgr->charge_error;
 	if (battmgr->pps_ops)
 		battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
+	qcom_battmgr_note_delivery(battmgr, status.delivering);
+	if (status.delivering && status.delivering == battmgr->restore_route)
+		battmgr->restore_route = 0;
 	ufcs_active = battmgr->pps_ops && battmgr->pps_ops->ufcs_active(battmgr->pps_data);
 	if (dedicated)
 		battmgr->missing_routes |= (ERHAI_SERIAL | ERHAI_UFCS) & ~status.ready;
@@ -1813,6 +1887,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		    (probe_idle || (!tail && can_probe && battmgr->serial_probe)) && !battmgr->serial_blocked &&
 		    ((battmgr->retry_pending & ERHAI_SERIAL) || !battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
 			battmgr->retry_once &= ~ERHAI_SERIAL;
+			battmgr->restore_route &= ~ERHAI_SERIAL;
 			ret = battmgr->pps_ops->serial_session(true);
 			if (!ret) {
 				battmgr->serial_probe = true;
@@ -1838,6 +1913,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 
 		battmgr->retry_pending = 0;
 		battmgr->retry_once &= ~ERHAI_UFCS;
+		battmgr->restore_route &= ~ERHAI_UFCS;
 		delay = battmgr->pps_ops->ufcs_update(battmgr->pps_data);
 		if (battmgr->pps_ops->ufcs_active(battmgr->pps_data))
 			return delay ?: PD_POLL_MS;
@@ -1868,12 +1944,13 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			goto fixed_contract;
 		if (battmgr->pd_state == PD_ACTIVE &&
 		    (!(status.ready & ERHAI_PPS) ||
-		     !qcom_battmgr_retry_slot(&battmgr->pps_retries, &battmgr->pps_next,
-					     battmgr->stable_since)))
+		     !qcom_battmgr_retry_slot(&battmgr->pps_retry_state, battmgr->stable_since,
+					     battmgr->restore_route == ERHAI_PPS)))
 			goto fixed_contract;
 		if (qcom_battmgr_pd_stop(battmgr, false, "PPS handover"))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
+		battmgr->restore_route &= ~ERHAI_PPS;
 		delay = battmgr->pps_ops->update(battmgr->pps_data,
 				test_and_clear_bit(PD_EVENT_CAPS, &battmgr->pd_events));
 		if (qcom_battmgr_pps_running(battmgr))
@@ -1911,8 +1988,7 @@ fixed_contract:
 		if (battmgr->pd_state == PD_ACTIVE &&
 		    time_after_eq(jiffies, battmgr->fixed_retry) &&
 		    !qcom_battmgr_pd_current(battmgr, PD_FIXED_MV, &ua) && ua &&
-		    qcom_battmgr_retry_slot(&battmgr->fixed_retries, &battmgr->fixed_next,
-					    battmgr->stable_since)) {
+		    qcom_battmgr_retry_slot(&battmgr->fixed_retry_state, battmgr->stable_since, false)) {
 			battmgr->fixed_backoff = false;
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 		}
@@ -2069,6 +2145,8 @@ fixed_contract:
 			battmgr->stable_seen = true;
 			battmgr->stable_since = jiffies;
 		}
+		if (!qc)
+			qcom_battmgr_route_delivered(&battmgr->fixed_retry_state);
 		battmgr->pd_state = PD_ACTIVE;
 		qcom_battmgr_pd_log(battmgr, type);
 		return CHARGE_CTRL_POLL_MS;
@@ -2233,6 +2311,7 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 				  unsigned long action, void *data)
 {
 	struct qcom_battmgr *battmgr = container_of(nb, struct qcom_battmgr, pm_nb);
+	struct erhai_probe_status status = {};
 
 	switch (action) {
 	case PM_HIBERNATION_PREPARE:
@@ -2249,6 +2328,9 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 			qcom_battmgr_charge_kick(battmgr);
 			return NOTIFY_BAD;
 		}
+		if (battmgr->pps_ops)
+			battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
+		battmgr->suspend_route = status.delivering;
 		if (qcom_battmgr_pps_stop(battmgr, false)) {
 			mutex_unlock(&battmgr->charge_lock);
 			WRITE_ONCE(battmgr->pps_suspended, false);
@@ -2262,7 +2344,8 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 	case PM_POST_RESTORE:
 	case PM_POST_SUSPEND:
 		scoped_guard(mutex, &battmgr->charge_lock) {
-			battmgr->retry_once |= ERHAI_SERIAL | ERHAI_UFCS;
+			qcom_battmgr_restore_route(battmgr, battmgr->suspend_route);
+			battmgr->suspend_route = 0;
 			if (battmgr->service_up && battmgr->pd_state == PD_ACTIVE)
 				qcom_battmgr_log_handoff(battmgr, "resume");
 		}

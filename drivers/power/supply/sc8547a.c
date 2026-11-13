@@ -2486,7 +2486,7 @@ static void sc8547_attach_work(struct work_struct *work)
 			if (!gret && gtemp >= 0 && gtemp < 510 && gvbat > 0 &&
 			    (gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp)) ||
 			     sc->auto_taper_cnt >= SC8547_AUTO_STEP_DEBOUNCE))
-				erhai_charge_tail_complete();
+				erhai_charge_tail_complete(ERHAI_SERIAL);
 			sc8547_auto_finish(sc, "pack or pump outside delivery envelope");
 			goto reschedule;
 		}
@@ -2630,6 +2630,8 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 		status->ready |= ERHAI_UFCS;
 #endif
 	status->responded = sc->responded;
+	if (sc->auto_state == SC_AUTO_DELIVER && sc->fastchg_deliver)
+		status->delivering = ERHAI_SERIAL;
 	if (sc->auto_protection)
 		status->protected |= ERHAI_SERIAL;
 }

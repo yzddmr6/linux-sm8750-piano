@@ -979,7 +979,7 @@ static void pps_poll(struct erhai_pps *p)
 		if (!cell_ma) {
 			if (p->temp_ddc >= 0 && p->temp_ddc < 510 &&
 			    p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp)))
-				erhai_charge_tail_complete();
+				erhai_charge_tail_complete(p->ufcs ? ERHAI_UFCS : ERHAI_PPS);
 			pps_exit(p, "battery limit");
 			return;
 		}
@@ -1240,7 +1240,7 @@ fail:
 		}
 		if (rc) {
 			if (rc == -ENODATA)
-				erhai_charge_tail_complete();
+				erhai_charge_tail_complete(p->ufcs ? ERHAI_UFCS : ERHAI_PPS);
 			pps_exit(p, rc == -ENODATA ? "cell taper complete" : PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}
@@ -1499,7 +1499,9 @@ static void erhai_probe_status(void *data, struct erhai_probe_status *status)
 		status->protected |= ERHAI_UFCS;
 	if (!pps_cp_enable) /* Buck-only PPS does not require the pump. */
 		status->ready |= ERHAI_PPS;
-	status->delivering = p->state == PPS_CHARGING || p->state == PPS_TAPER;
+	if (p->state == PPS_CHARGING || p->state == PPS_TAPER ||
+	    (p->state == PPS_RAMP && p->vbus_mv > pps_start_volt_mv))
+		status->delivering = p->ufcs ? ERHAI_UFCS : ERHAI_PPS;
 }
 
 static const struct erhai_pps_ops erhai_pps_ops = {
