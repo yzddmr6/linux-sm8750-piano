@@ -2063,9 +2063,10 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 {
 	const struct erhai_charge_curve *curve;
 	const struct erhai_charge_step *step;
-
 	const struct erhai_charge_curve *raw;
 	unsigned int limit;
+	int last_temp = sc->curve_temp;
+	bool new_table;
 
 	raw = erhai_curve_select(svooc_curves, soc, temp);
 	sc->curve_temp = entering || !sc->auto_curve ? temp : erhai_curve_temp(sc->curve_temp, temp);
@@ -2075,7 +2076,9 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 	    mv >= min(erhai_cell_cv(temp), erhai_cell_cv(sc->curve_temp)))
 		return false;
 
-	if (entering || !sc->auto_curve || sc->auto_curve->steps != curve->steps) {
+	new_table = entering || !sc->auto_curve || sc->auto_curve->steps != curve->steps ||
+		    last_temp != sc->curve_temp;
+	if (new_table) {
 		sc->auto_curve = curve;
 		sc->auto_curve_idx = erhai_curve_start(curve, mv, true);
 		sc->auto_step_cnt = 0;
@@ -2104,7 +2107,7 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 	limit = curve->steps[sc->auto_curve_idx].ma;
 	if (raw->steps != curve->steps)
 		limit = min_t(unsigned int, limit, raw->steps[erhai_curve_start(raw, mv, true)].ma);
-	sc->curve_ma = entering || !sc->curve_ma ? limit : min(sc->curve_ma, limit);
+	sc->curve_ma = new_table ? limit : min(sc->curve_ma, limit);
 	sc->fastchg_curr_code = min_t(unsigned int, sc->curve_ma / 100, sc->adapter_cap);
 	return true;
 }

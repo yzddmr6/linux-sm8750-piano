@@ -485,9 +485,10 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 {
 	const struct erhai_charge_curve *curve;
 	const struct erhai_charge_step *step;
-
 	const struct erhai_charge_curve *raw;
 	unsigned int limit;
+	int last_temp = p->curve_temp;
+	bool new_table;
 
 	raw = erhai_curve_select(svooc_curves, p->soc, p->temp_ddc);
 	p->curve_temp = entering || !p->curve ? p->temp_ddc : erhai_curve_temp(p->curve_temp, p->temp_ddc);
@@ -496,7 +497,9 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 	    p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp)))
 		return 0;
 
-	if (entering || !p->curve || p->curve->steps != curve->steps) {
+	new_table = entering || !p->curve || p->curve->steps != curve->steps ||
+		    last_temp != p->curve_temp;
+	if (new_table) {
 		p->curve = curve;
 		p->curve_idx = erhai_curve_start(curve, p->vbat_mv, true);
 		p->over_since = 0;
@@ -517,7 +520,7 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 	limit = curve->steps[p->curve_idx].ma;
 	if (raw->steps != curve->steps)
 		limit = min_t(unsigned int, limit, raw->steps[erhai_curve_start(raw, p->vbat_mv, true)].ma);
-	p->curve_ma = entering || !p->curve_ma ? limit : min(p->curve_ma, limit);
+	p->curve_ma = new_table ? limit : min(p->curve_ma, limit);
 	return p->curve_ma;
 }
 
