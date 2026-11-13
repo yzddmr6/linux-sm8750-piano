@@ -177,12 +177,12 @@ static unsigned int pps_start_curr_ma = 1000;
 module_param(pps_start_curr_ma, uint, 0444);
 MODULE_PARM_DESC(pps_start_curr_ma, "PPS entry current (mA)");
 
-static unsigned int pps_target_curr_ma = 4000;
+static unsigned int pps_target_curr_ma = 5000;
 module_param(pps_target_curr_ma, uint, 0444);
 MODULE_PARM_DESC(pps_target_curr_ma,
 		 "PPS input current target (mA), capped by the adapter maximum at plug-in");
 
-static unsigned int pps_max_curr_ma = 4000;
+static unsigned int pps_max_curr_ma = 5000;
 module_param(pps_max_curr_ma, uint, 0444);
 MODULE_PARM_DESC(pps_max_curr_ma, "hard PPS input current ceiling (mA)");
 
@@ -739,6 +739,7 @@ static int pps_cp_step(struct erhai_pps *p)
 	/* The single master has a board-programmed 4.5 A bus OCP.
 	 * Reserve the existing 500 mA servo overshoot margin. */
 	unsigned int target = p->target_curr_ma;
+	int slave_ma = 0;
 	int cvbus, cvbat, cibus, diff, rc, need = 0;
 	unsigned int nv;
 
@@ -775,6 +776,26 @@ static int pps_cp_step(struct erhai_pps *p)
 				return pps_cp_release(p, "feed-window", true);
 			return rc;
 		}
+		rc = sc8547a_pps_share(cibus, diff, min(p->source_ma, p->cell_ma), &slave_ma);
+		if (rc == -ENOLINK)
+			return pps_cp_release(p, "slave unlatched", true);
+		if (rc)
+			return rc;
+		if (cibus >= 4500 || slave_ma >= 4500) {
+			p->protection = true;
+			return -ERANGE;
+		}
+		/* Until the ADC shows sharing, budget one pump. An unbalanced
+		 * pair can only increase by the headroom of its busiest leg.
+		 */
+		p->pump_limit_ma = min(4000 + min(cibus, slave_ma), 5000);
+		p->pump_ibus_ma = cibus + slave_ma;
+		target = min(target, p->pump_limit_ma);
+		if (p->set_curr_ma > target && pps_pdo_set(p, p->set_volt_mv, target))
+			return -EIO;
+		if (max(cibus, slave_ma) > 4000)
+			target = min_t(unsigned int, target, max(0, cibus + slave_ma - 500));
+		cibus += slave_ma;
 		p->cp_fed_at = jiffies;
 		/* switching but carrying nothing: with the buck suspended the
 		 * pack would sit idle (vendor: 4 results under 300 mA) */

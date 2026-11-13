@@ -872,15 +872,17 @@ static int sc8547_reset_voocphy(struct sc8547a_device *sc)
  * uses (svooc profile + REG_09 1000 ms watchdog + CHG_EN) and feeds the
  * watchdog every poll.  The serial ladder keeps first ownership of the CP:
  * whenever sc8547a_fastchg_delivering() is true this path refuses to run.
- * Gated on the master instance; slave stays idle (single-CP delivery).  The
+ * The slave shares high-current loads after its ADC confirms delivery. The
  * engine MUST call sc8547a_pps_cp_feed() more often than the 1000 ms watchdog
  * window or REG_07 self-clears and the CP drops out on its own (safety).
  */
+static bool pps_slave_engaged;
 static bool pps_cp_engaged;
 static bool pps_adc_hold;	/* keep the ADC on across drops (PPS session) */
 static bool sc8547_slave_is_on(void);	/* defined in the slave section below */
 
 static int sc8547_pps_disengage(void);
+static int sc8547_pps_slave_off(void);
 
 /* Snapshot the chip's own VBUS/VBAT/IBUS ADCs (V is upstream of the CP). */
 int sc8547a_pps_snapshot(int *vbus_mv, int *vbat_mv, int *ibus_ma)
@@ -1039,6 +1041,9 @@ static int sc8547_pps_disengage(void)
 	struct sc8547a_device *sc = sc8547_master_dev;
 	int ret;
 
+	ret = sc8547_pps_slave_off();
+	if (ret)
+		return ret;
 	if (!sc) {
 		pps_cp_engaged = false;
 		return 0;
@@ -1137,18 +1142,21 @@ static int sc8547_slave_hw_setting(struct sc8547a_device *master)
 	return 0;
 }
 
-static void sc8547_slave_cp_enable(struct sc8547a_device *master, bool on)
+static int sc8547_slave_cp_enable(struct sc8547a_device *master, bool on)
 {
 	struct sc8547a_device *sc = sc8547_slave_dev;
+	int ret;
 
 	if (!sc)
-		return;
+		return -ENODEV;
 	if (on) {
-		sc8547_write_byte(sc, SC8547_REG_09, 0x13);	/* WD 1000ms (as master) */
-		sc8547_write_byte(sc, SC8547_REG_11, 0x80);	/* ADC on (else ibus reads 0) */
+		ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+		ret = ret ?: sc8547_write_byte(sc, SC8547_REG_11, 0x80);
+		if (ret)
+			return ret;
 	}
-	sc8547_write_byte(sc, SC8547_REG_07,
-			  on ? SC8547_SLAVE_CP_ON : SC8547_SLAVE_CP_OFF);
+	return sc8547_write_byte(sc, SC8547_REG_07,
+				 on ? SC8547_SLAVE_CP_ON : SC8547_SLAVE_CP_OFF);
 }
 
 /*
@@ -1200,6 +1208,66 @@ static void sc8547_slave_reset(void)
 			   SC8547_WATCHDOG_DIS);
 	sc8547_write_byte(sc, SC8547_REG_11, 0x00);			/* ADC off */
 }
+
+/* Dual PPS sequence from TheMojoMan/oneplus-erhai-linux 110b27276c22.
+ * Keep both pumps under the PPS lock and surface every failed transfer.
+ * A latched enable alone cannot establish how the load is shared.
+ */
+static int sc8547_pps_slave_off(void)
+{
+	int ret;
+
+	if (!pps_slave_engaged)
+		return 0;
+	ret = sc8547_slave_cp_enable(sc8547_master_dev, false);
+	if (!ret)
+		ret = sc8547_set_adc_enable(sc8547_slave_dev, false);
+	if (!ret)
+		pps_slave_engaged = false;
+	return ret;
+}
+
+int sc8547a_pps_share(int master_ma, int margin_mv, unsigned int demand_ma,
+		      int *slave_ma)
+{
+	struct sc8547a_device *sc;
+	int ret;
+	u8 control;
+
+	guard(mutex)(&sc8547_pps_lock);
+	sc = sc8547_slave_dev;
+	*slave_ma = 0;
+	if (!sc || !pps_cp_engaged)
+		return 0;
+	if (demand_ma < 1600)
+		return sc8547_pps_slave_off();
+	if (!pps_slave_engaged) {
+		/* virtual_cp cp_open_curr_thr_ma / cp_close_curr_thr_ma. */
+		if (master_ma <= 1900 || margin_mv < 200)
+			return 0;
+		ret = sc8547_slave_hw_setting(sc8547_master_dev);
+		if (ret)
+			return ret;
+		pps_slave_engaged = true; /* a failed enable ACK can still have switched */
+		return sc8547_slave_cp_enable(sc8547_master_dev, true);
+	}
+
+	ret = sc8547_read_byte(sc, SC8547_REG_07, &control);
+	if (ret)
+		return ret;
+	if (!(control & SC8547_CHG_EN_MASK))
+		return sc8547_pps_slave_off() ?: -ENOLINK;
+	ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+	ret = ret ?: sc8547_set_adc_enable(sc, true);
+	if (ret)
+		return ret;
+	ret = sc8547_get_ibus(sc);
+	if (ret < 0)
+		return ret;
+	*slave_ma = ret;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(sc8547a_pps_share);
 
 /* ==================== VOOC protocol state machine ===================== *
  * Ported from the OnePlus vendor engine (oplus_ap_voocphy.c), reduced to the
@@ -2649,9 +2717,11 @@ static void sc8547a_remove(struct i2c_client *client)
 	debugfs_remove_recursive(sc->debug_root);
 	guard(mutex)(&sc8547_pps_lock);
 	sc8547_reset_voocphy(sc);
-	if (sc->is_slave)
+	if (sc->is_slave) {
+		pps_slave_engaged = false;
 		sc8547_slave_dev = NULL;
-	else {
+	} else {
+		sc8547_pps_slave_off();
 		sc8547_master_dev = NULL;
 		pps_cp_engaged = false;
 		pps_adc_hold = false;
@@ -2668,6 +2738,8 @@ static int sc8547a_suspend(struct device *dev)
 		return ret;
 	cancel_delayed_work_sync(&sc->attach_work);
 	guard(mutex)(&sc8547_pps_lock);
+	if (pps_slave_engaged && sc8547_pps_slave_off())
+		return -EIO;
 	if (!sc->is_slave) {
 		sc->auto_state = SC_AUTO_OFF;
 		sc->fastchg_deliver = false;

@@ -45,6 +45,7 @@ bool sc8547a_pps_cp_engaged(void);
 int sc8547a_pps_cp_engage(int *need_mv);
 int sc8547a_pps_cp_feed(int *vbus_mv, int *vbat_mv);
 int sc8547a_pps_cp_disengage(void);
+int sc8547a_pps_share(int master_ma, int margin_mv, unsigned int demand_ma, int *slave_ma);
 
 /* Keep the master ADC on for a whole PPS session (on) / release it (off). */
 int sc8547a_pps_adc_hold(bool on);
