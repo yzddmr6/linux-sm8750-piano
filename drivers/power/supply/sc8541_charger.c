@@ -47,6 +47,9 @@
 #define SC8541_TSHUT_DISABLE	BIT(7)
 #define SC8541_CTRL2		0x0f
 #define SC8541_CHG_EN		BIT(4)
+#define SC8541_CTRL3		0x10
+#define SC8541_WD_MASK		GENMASK(4, 2)
+#define SC8541_WD_ACTIVE	BIT(4)	/* WD_TIMEOUT=2, WD_TIMEOUT_DIS=0 */
 #define SC8541_EN_BYPASS	BIT(3)
 #define SC8541_DEVICE_INFO	0x22
 #define SC8541_DEVICE_ID	0x41
@@ -137,6 +140,8 @@ struct sc8541 {
 	struct mutex lock;		/* enabled, register sequences */
 	struct delayed_work watch;	/* kick timeout, or the check after a stop */
 	bool enabled;
+	bool wd_owned;
+	unsigned int wd_saved;
 	bool pen_owned;
 	u32 pen_gate_saved;
 	bool otg_owned;		/* excludes the forward charging policy */
@@ -249,6 +254,35 @@ static int sc8541_arm(struct sc8541 *sc)
 	return ret;
 }
 
+/* Restore the preceding mode's watchdog setting only after CHG_EN is clear. */
+static int sc8541_release_watchdog(struct sc8541 *sc)
+{
+	int ret;
+
+	if (!sc->wd_owned)
+		return 0;
+	ret = sc8541_write_check(sc, SC8541_CTRL3, SC8541_WD_MASK, sc->wd_saved);
+	if (!ret)
+		sc->wd_owned = false;
+	return ret;
+}
+
+static int sc8541_feed_watchdog(struct sc8541 *sc)
+{
+	unsigned int ctrl;
+	int ret;
+
+	if (!sc->wd_owned) {
+		ret = regmap_read(sc->regmap, SC8541_CTRL3, &ctrl);
+		if (ret)
+			return ret;
+		sc->wd_saved = ctrl & SC8541_WD_MASK;
+		sc->wd_owned = true;
+	}
+	/* Force a bus write on every MCA heartbeat, even for an unchanged value. */
+	return sc8541_write_check(sc, SC8541_CTRL3, SC8541_WD_MASK, SC8541_WD_ACTIVE);
+}
+
 static int sc8541_enable(struct sc8541 *sc)
 {
 	int ret = 0;
@@ -256,6 +290,11 @@ static int sc8541_enable(struct sc8541 *sc)
 	mutex_lock(&sc->lock);
 	if (sc->otg_owned || sc->pen_owned) {
 		ret = -EBUSY;
+		goto out;
+	}
+	ret = sc8541_feed_watchdog(sc);
+	if (ret) {
+		sc8541_disable_locked(sc);
 		goto out;
 	}
 	if (!sc->enabled) {
@@ -302,6 +341,7 @@ static int sc8541_disable_sync(struct sc8541 *sc)
 		dev_err(sc->dev, "still switching after stop\n");
 		ret = -EBUSY;
 	}
+	ret = ret ?: sc8541_release_watchdog(sc);
 	mutex_unlock(&sc->lock);
 	return ret;
 }
@@ -330,6 +370,8 @@ static void sc8541_watch(struct work_struct *work)
 		   (ctrl & SC8541_CHG_EN)) {
 		dev_warn(sc->dev, "still switching after stop, stopping again\n");
 		sc8541_disable_locked(sc);
+	} else if (sc8541_release_watchdog(sc)) {
+		mod_delayed_work(system_dfl_wq, &sc->watch, msecs_to_jiffies(SC8541_GUARD_MS));
 	}
 	mutex_unlock(&sc->lock);
 }
@@ -379,7 +421,7 @@ static int sc8541_otg_locked(struct sc8541 *sc, enum sc8541_otg_action action)
 
 	if (action == SC8541_OTG_PRESENT)
 		return 0;
-	if (sc->enabled)
+	if (sc->enabled || sc->wd_owned)
 		return -EBUSY;
 	if (action == SC8541_PEN_ISOLATE) {
 		if (sc->otg_owned)
