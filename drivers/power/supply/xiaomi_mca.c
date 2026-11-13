@@ -596,7 +596,14 @@ struct xiaomi_mca_notify_record {
 #define MCA_PROP_PEN_BOOST_ENABLE 0x200f
 #define MCA_PROP_PEN_BOOST_VOLTAGE 0x2010
 
+struct xiaomi_mca_cells {
+	int vmax, vmin, ibat, imax, cold, hot;
+	int status;
+};
+
 struct xiaomi_mca {
+	/* A policy tick uses one observation for FV, buck and pump control. */
+	const struct xiaomi_mca_cells *poll_cells;
 	struct device *dev;
 	struct pmic_glink_client *client;
 	struct power_supply *psy;
@@ -631,7 +638,7 @@ struct xiaomi_mca {
 	bool term_written;	/* restore even after a lost write acknowledgment */
 	bool cp_normal_cv;
 	bool term_hot;		/* float-voltage thermal hysteresis */
-	bool fv_derated;
+	bool fv_derated;	/* pack temperature unavailable */
 	unsigned int gauge_failures;
 	int cell_zone;		/* coldest sensor: 0, 8, 13 or 18 C row */
 	bool zone_valid, ffc_warm, cold_fv;
@@ -2195,38 +2202,55 @@ static char *xiaomi_mca_supplied_to[] = { "bq27z561-0", "bq27z561-1" };
  * current and largest absolute cell current. A low or overloaded cell
  * must not be hidden by the other cell's voltage or opposite current.
  */
-static int xiaomi_mca_gauges(int *vbat_mv, int *ibat_ma, int *tcool, int *tbat,
-			     int *vmin_mv, int *imax_ma)
+static void xiaomi_mca_sample_cells(struct xiaomi_mca_cells *cells)
 {
 	union power_supply_propval v, i, t;
 	struct power_supply *psy;
 	int n, ret;
 
-	*vbat_mv = 0;
-	*ibat_ma = 0;
-	*tbat = INT_MIN;
-	*tcool = INT_MAX;
-	*vmin_mv = INT_MAX;
-	*imax_ma = 0;
+	*cells = (struct xiaomi_mca_cells) { .cold = INT_MAX, .hot = INT_MIN, .vmin = INT_MAX };
 	for (n = 0; n < ARRAY_SIZE(xiaomi_mca_supplied_to); n++) {
 		psy = power_supply_get_by_name(xiaomi_mca_supplied_to[n]);
-		if (!psy)
-			return -ENODEV;
-		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &v);
+		if (!psy) {
+			cells->status = -ENODEV;
+			continue;
+		}
+		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &t);
+		if (!ret) {
+			cells->hot = max(cells->hot, t.intval / 10);
+			cells->cold = min(cells->cold, (t.intval < 0 ? t.intval - 9 : t.intval) / 10);
+		}
+		ret = ret ?: power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &v);
 		ret = ret ?: power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &i);
-		ret = ret ?: power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &t);
 		power_supply_put(psy);
-		if (ret)
-			return ret;
-		*vbat_mv = max(*vbat_mv, v.intval / 1000);
-		*vmin_mv = min(*vmin_mv, v.intval / 1000);
-		*ibat_ma += i.intval / 1000;
-		*imax_ma = max(*imax_ma, abs(i.intval / 1000));
-		*tbat = max(*tbat, t.intval / 10);
-		*tcool = min(*tcool, (t.intval < 0 ? (t.intval - 9) : t.intval) / 10);
+		if (ret) {
+			cells->status = ret;
+			continue;
+		}
+		cells->vmax = max(cells->vmax, v.intval / 1000);
+		cells->vmin = min(cells->vmin, v.intval / 1000);
+		cells->ibat += i.intval / 1000;
+		cells->imax = max(cells->imax, abs(i.intval / 1000));
 	}
+}
 
-	return 0;
+static int xiaomi_mca_gauges(struct xiaomi_mca *mca, int *vbat, int *ibat, int *cold,
+			     int *hot, int *vmin, int *imax)
+{
+	struct xiaomi_mca_cells local;
+	const struct xiaomi_mca_cells *cells = mca->poll_cells;
+
+	if (!cells) {
+		xiaomi_mca_sample_cells(&local);
+		cells = &local;
+	}
+	*vbat = cells->vmax;
+	*ibat = cells->ibat;
+	*cold = cells->cold;
+	*hot = cells->hot;
+	*vmin = cells->vmin;
+	*imax = cells->imax;
+	return cells->status;
 }
 
 static void xiaomi_mca_update_zones(struct xiaomi_mca *mca, int cold, int warm)
@@ -2369,8 +2393,15 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 	}
 
 	ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
-	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax);
 	mca->fv_derated = !!ret;
+	if (!ret && xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax)) {
+		/* Hold the last vote for one missed observation. A measured
+		 * hot sensor always takes precedence over that grace period.
+		 */
+		if (max_t(int, (s32)tpack, tbat) < MCA_TERM_HOT_DEGC)
+			return 0;
+		ret = -ENODATA;
+	}
 	if (ret) {
 		mca->ffc_active = false;
 		mca->term_hot = true;
@@ -2700,7 +2731,7 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 	union power_supply_propval val;
 	struct power_supply *psy;
 	unsigned int start, end;
-	int soc = 0, n, ret = 0, stop_ret;
+	int soc = 0, n, ret = 0, stop_ret, pack_ret, cell_ret;
 	int vbat, ibat, tcool, tbat, vmin, imax;
 	u32 tpack;
 
@@ -2743,22 +2774,28 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 				mca->charge_hold = false;
 		}
 	}
-	ret = ret ?: xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
-	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax);
+	pack_ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
+	cell_ret = xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax);
+	if (!pack_ret) {
+		tbat = max_t(int, tbat, (s32)tpack);
+		tcool = min_t(int, tcool, (s32)tpack);
+	}
+	/* A surviving thermometer can assert a hold. Clearing one requires
+	 * a complete sample.
+	 */
+	if (tbat >= 55)
+		mca->charge_hot = true;
+	if (tcool < -9)
+		mca->charge_cold = true;
+	ret = ret ?: pack_ret ?: cell_ret;
 	if (!ret && !(full_charge && charge_policy && mca->fv_derated)) {
-		tbat = max_t(s32, tbat, tpack);
-		tcool = min_t(s32, tcool, tpack);
 		mca->coolest_temp = tcool;
 		if (!full_charge)
 			xiaomi_mca_update_zones(mca, tcool, tbat);
 		/* Firmware JEITA remains enabled throughout. */
-		if (tbat >= 55)
-			mca->charge_hot = true;
-		else if (tbat < 53)
+		if (tbat < 53)
 			mca->charge_hot = false;
-		if (tcool < -9)
-			mca->charge_cold = true;
-		else if (tcool >= -7)
+		if (tcool >= -7)
 			mca->charge_cold = false;
 	}
 	if (ret || (full_charge && charge_policy && mca->fv_derated)) {
@@ -2767,19 +2804,36 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		mca->charge_blocked = true;
 		xiaomi_mca_charge_wake_poll(mca, false);
 		mca->gauge_failures = min(mca->gauge_failures + 1, 3U);
-		if (mca->charge_hold || mca->charge_hot || mca->charge_cold ||
-		    (end < 100 && mca->gauge_failures >= 3)) {
+		if (mca->charge_hold || mca->charge_hot || mca->charge_cold) {
 			stop_ret = xiaomi_mca_charge_stop(mca);
 			return stop_ret ?: err;
 		}
-		/* Autonomous firmware retains its JEITA interlocks. Keep a
-		 * missing gauge from stranding an otherwise healthy pack.
+		/* No new voltage/current or watchdog kick on a single miss.
+		 * The next tick uses a fresh pair of gauge readings.
 		 */
+		if (mca->gauge_failures < 2 && !pack_ret && !mca->fv_derated &&
+		    tbat < MCA_TERM_HOT_DEGC)
+			return err;
+
 		ret = xiaomi_mca_cp_stop(mca, "gauge unavailable");
-		if (!ret && !(full_charge && charge_policy && mca->fv_derated)) {
+		if (!ret) {
+			u32 target = mca->term_hot || tbat >= MCA_TERM_HOT_DEGC ||
+				     pack_ret || mca->fv_derated ? MCA_TERM_HOT_MV : MCA_TERM_DEFAULT_MV;
+			u32 readback;
+
 			mca->ffc_active = false;
-			mca->term_hot = true;
-			ret = xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, MCA_TERM_HOT_MV);
+			if (xiaomi_mca_read(mca, MCA_PROP_TERM_VOLT, &readback) ||
+			    readback != 2 * target - 3600)
+				ret = xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, target);
+			if (ret) {
+				xiaomi_mca_charge_enable(mca, false);
+				return ret;
+			}
+			mca->ffc_voted = false;
+		}
+		if (end < 100 && mca->gauge_failures >= 3) {
+			stop_ret = xiaomi_mca_charge_stop(mca);
+			return ret ?: stop_ret ?: err;
 		}
 		if (!ret && (mca->fcc_set_ma != MCA_FCC_DEFAULT_MA || mca->fcc_written)) {
 			ret = xiaomi_mca_reset_fcc(mca);
@@ -2966,7 +3020,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	     (!xiaomi_mca_is_pd(mca->real_type) || !xiaomi_mca_cp_after_auth(mca))))
 		return;
 
-	if (xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax))
+	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax))
 		return;
 	if (xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack))
 		return;
@@ -3134,7 +3188,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	bool taper;
 	u32 fcc, icl;
 
-	if (xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax) ||
+	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax) ||
 	    xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &on)) {
 		xiaomi_mca_cp_stop(mca, "read failed");
 		return;
@@ -4079,6 +4133,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 	struct xiaomi_mca *mca = container_of(to_delayed_work(work), struct xiaomi_mca,
 					      poll_work);
 	struct xiaomi_mca_state now;
+	struct xiaomi_mca_cells cells;
 	u32 generation;
 	bool changed = false;
 	int ret;
@@ -4125,6 +4180,10 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		if (xiaomi_mca_clear_auth(mca))
 			goto out;
 		xiaomi_mca_process_notifications(mca);
+		if (charge_policy || READ_ONCE(mca->charge_end) < 100 || mca->charge_disabled) {
+			xiaomi_mca_sample_cells(&cells);
+			mca->poll_cells = &cells;
+		}
 		ret = xiaomi_mca_full_charge_poll(mca);
 		if (ret) {
 			dev_warn_ratelimited(mca->dev, "failed to set float voltage: %d\n", ret);
@@ -4171,6 +4230,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		}
 
 out:
+		mca->poll_cells = NULL;
 		/* Identity discovery must also reach userspace while charging is held. */
 		changed |= xiaomi_mca_identity_changed(mca);
 		/* The uevent must not report what was cached before the change. */
