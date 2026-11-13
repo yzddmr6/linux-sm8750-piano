@@ -2741,6 +2741,13 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 	notification = le32_to_cpu(msg->notification);
 	if (!(battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD))
 		notification &= 0xff;
+	if ((battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS) &&
+	    (notification == NOTIF_OPLUS_PD_SVOOC || notification == NOTIF_OPLUS_UFCS_HANDSHAKE_OK)) {
+		set_bit(notification == NOTIF_OPLUS_PD_SVOOC ? PD_EVENT_SVOOC_RESPONSE :
+			PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events);
+		qcom_battmgr_usb_event(battmgr);
+		return;
+	}
 	switch (notification) {
 	case NOTIF_BAT_INFO:
 		battmgr->info.valid = false;
@@ -2780,14 +2787,6 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 			break;
 		}
 		fallthrough;
-	case NOTIF_OPLUS_PD_SVOOC:
-	case NOTIF_OPLUS_UFCS_HANDSHAKE_OK:
-		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS) {
-			set_bit(notification == NOTIF_OPLUS_PD_SVOOC ? PD_EVENT_SVOOC_RESPONSE :
-				PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events);
-			qcom_battmgr_usb_event(battmgr);
-		}
-		break;
 	case NOTIF_OPLUS_UFCS_DISABLE_MOS:
 	case NOTIF_OPLUS_POWER_ROLE:
 	case NOTIF_OPLUS_PD_HARD_RESET:
