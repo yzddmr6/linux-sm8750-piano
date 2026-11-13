@@ -2728,10 +2728,23 @@ static int sc8547_ufcs_authenticate(struct sc8547a_device *sc)
 	return ret == 1 ? INT_MAX : SC8547_UFCS_UNVERIFIED_MA;
 }
 
+/* Stock oplus_ufcs_get_emark_ability: UFCS_EMARK_POWER_DEFAULT
+ * is 4 A for an unidentified cable. An explicit cable rating wins.
+ * The default is used only inside our board's <=9.9 V operating range.
+ */
+static int sc8547_ufcs_cable_limit(int rc, u64 cable, unsigned int mv)
+{
+	if (rc < 0)
+		return 4000;
+	if (UFCS_CABLE_INFO_VOL_MAX(cable) < mv)
+		return 0;
+	return UFCS_CABLE_INFO_CURR_MAX(cable);
+}
+
 int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 {
-	u64 modes[UFCS_OUTPUT_MODE_MAX], cable;
-	int count, ret, i, source_ma, best = 0;
+	u64 modes[UFCS_OUTPUT_MODE_MAX], cable = 0;
+	int count, ret, i, cable_ma, source_ma, best = 0;
 	struct sc8547a_device *sc;
 
 	guard(mutex)(&sc8547_ufcs_lock);
@@ -2761,16 +2774,18 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	 * requires a successful cable information exchange.
 	 */
 	ret = ufcs_intf_get_cable_info(sc->ufcs, &cable);
-	if (ret < 0)
+	cable_ma = sc8547_ufcs_cable_limit(ret, cable, max_mv);
+	if (!cable_ma || !ufcs_handshake_success(sc->ufcs)) {
+		ret = -ENOLINK;
 		goto out;
+	}
 	source_ma = sc8547_ufcs_authenticate(sc);
 	if (source_ma < 0) {
 		ret = source_ma;
 		goto out;
 	}
 	for (i = 0; i < count; i++) {
-		int ma = min_t(int, UFCS_OUTPUT_MODE_CURR_MAX(modes[i]),
-			       UFCS_CABLE_INFO_CURR_MAX(cable));
+		int ma = min_t(int, UFCS_OUTPUT_MODE_CURR_MAX(modes[i]), cable_ma);
 
 		ma = min(ma, source_ma);
 		if (UFCS_OUTPUT_MODE_CURR_MIN(modes[i]) > ma)
@@ -2778,13 +2793,13 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 
 		if (UFCS_OUTPUT_MODE_VOL_MIN(modes[i]) > min_mv ||
 		    UFCS_OUTPUT_MODE_VOL_MAX(modes[i]) < max_mv ||
-		    UFCS_CABLE_INFO_VOL_MAX(cable) < max_mv || ma <= best)
+		    ma <= best)
 			continue;
 		sc->ufcs_mode = modes[i];
 		best = ma;
 	}
 	if (best) {
-		sc->ufcs_cable_ma = min_t(int, UFCS_CABLE_INFO_CURR_MAX(cable), source_ma);
+		sc->ufcs_cable_ma = min(cable_ma, source_ma);
 		sc->ufcs_granted_ma = 0;
 		sc->ufcs_packet_at = jiffies;
 		return best;
