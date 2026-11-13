@@ -137,6 +137,10 @@ static void sc8541_test_remove(struct kunit *test)
 	sc8541_stop(&f->sc);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
 	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -ENODEV);
+	f->stuck_enabled = true;
+	KUNIT_EXPECT_EQ(test, sc8541_quiesce(&f->sc), -EBUSY);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->sc.watch));
+	sc8541_cancel_watch(&f->sc);
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->sc.watch));
 }
 

@@ -715,6 +715,16 @@ static void sc8541_stop(void *data)
 		dev_err(sc->dev, "unable to confirm stop during removal\n");
 }
 
+/* An in-flight set_property(ONLINE=0) can schedule its final guard after
+ * stop(). The power-supply core drains callbacks during unregister.
+ */
+static void sc8541_cancel_watch(void *data)
+{
+	struct sc8541 *sc = data;
+
+	cancel_delayed_work_sync(&sc->watch);
+}
+
 static const struct regmap_config sc8541_regmap_config = {
 	.reg_bits = 8,
 	.val_bits = 8,
@@ -759,6 +769,10 @@ static int sc8541_probe(struct i2c_client *client)
 		if (ret)
 			return ret;
 	}
+
+	ret = devm_add_action_or_reset(dev, sc8541_cancel_watch, sc);
+	if (ret)
+		return ret;
 
 	cfg.drv_data = sc;
 	cfg.fwnode = dev_fwnode(dev);
