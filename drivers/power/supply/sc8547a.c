@@ -383,7 +383,7 @@ MODULE_PARM_DESC(slave_drop_ticks,
  * inflated by the delivery IR drop.  See the backstop comment above.
  */
 #define SC8547_AUTO_CODE_CEILING	0x49	/* full curve: code 73 = 7300 mA bus */
-#define SC8547_MAX_SOC_DEFAULT		80	/* stop fast-charge at this SoC % (longevity) */
+#define SC8547_MAX_SOC_DEFAULT		90	/* stock oplus_spec,vooc_high_soc */
 
 #define SC8547_AUTO_IDENTIFY_MS		4000	/* window to see adapter_check_ok */
 #define SC8547_AUTO_TEMP_MIN_DDC	150	/* 15.0 C: below -> normal charge */
@@ -501,7 +501,7 @@ struct sc8547a_device {
 
 	/* --- auto charge-manager (fastchg_auto) --- */
 	bool			fastchg_auto;	/* one-shot master arm (kill-switch) */
-	int			max_soc;	/* stop fast-charge at this SoC % (default 80) */
+	int			max_soc;	/* stop fast-charge at this SoC % (default 90) */
 	enum sc8547_auto_state	auto_state;
 	unsigned long		auto_identify_deadline;
 	const struct sc8547_curve_row *auto_curve;	/* selected CC/CV table */
