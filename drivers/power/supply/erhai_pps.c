@@ -40,8 +40,7 @@
  *    support (USB_GET_PPS_TYPE == 1) and NO serial VOOC active
  *    (USB_VOOC_FAST_CHG_TYPE below pps_vooc_min AND sc8547a not delivering) —
  *    the genuine OnePlus brick keeps its existing serial-SVOOC path,
- *  - starts PPS only after a debounce long enough for the serial ladder to
- *    decline (pps_identify_ms), so a slow-starting genuine brick wins,
+ *  - checks the serial owner and real adapter classification before entry,
  *  - steps VBUS up in pps_volt_step_mv increments (vendor order), servos the
  *    PPS current, hands off at the cell voltage limit and ALWAYS reverts to the 5 V
  *    contract on exit/detach/abnormal,
@@ -153,14 +152,6 @@ MODULE_PARM_DESC(pps_enable, "master kill switch for the PPS fast-charge engine"
 static unsigned int pps_poll_ms = 2000;
 module_param(pps_poll_ms, uint, 0444);
 MODULE_PARM_DESC(pps_poll_ms, "engine poll period (ms)");
-
-static unsigned int pps_identify_ms = 10000;
-static unsigned int pps_reprobe_ms = 15000;
-module_param(pps_reprobe_ms, uint, 0444);
-MODULE_PARM_DESC(pps_reprobe_ms, "re-probe interval while the adapter reads as undeployable (ADSP slow start)");
-module_param(pps_identify_ms, uint, 0444);
-MODULE_PARM_DESC(pps_identify_ms,
-		 "wait for the serial-VOOC ladder to decline before PPS engages (ms)");
 
 static unsigned int pps_start_volt_mv = 5500;
 module_param(pps_start_volt_mv, uint, 0444);
@@ -329,7 +320,6 @@ MODULE_PARM_DESC(pps_voocphy_enable,
 /* ---- state machine ---- */
 enum pps_state {
 	PPS_IDLE = 0,		/* nothing attached / not a PPS adapter */
-	PPS_ARMED,		/* PD_PPS seen; waiting for serial ladder to decline */
 	PPS_NEGOTIATE,		/* writing profile gate + PPS props */
 	PPS_RAMP,		/* stepping VBUS up toward the target */
 	PPS_CHARGING,		/* servoing PPS current within cell limits */
@@ -340,7 +330,6 @@ enum pps_state {
 
 static const char *const pps_state_names[PPS_LAST_STATE] = {
 	[PPS_IDLE]	= "idle",
-	[PPS_ARMED]	= "armed",
 	[PPS_NEGOTIATE]	= "negotiate",
 	[PPS_RAMP]	= "ramp",
 	[PPS_CHARGING]	= "charging",
@@ -372,11 +361,8 @@ struct erhai_pps {
 	enum pps_state		state;
 	const char		*last_reason;
 	unsigned long		state_since;	/* jiffies state was entered */
-	unsigned long		armed_since;
 	unsigned long		ramp_since;
 	unsigned int		stall_count;
-	bool			plug_logged;
-	unsigned long		last_reprobe;	/* adapter line printed for this plug */
 
 	/* what we last commanded / observed */
 	unsigned int		set_volt_mv;
@@ -633,7 +619,6 @@ static int pps_revert(struct erhai_pps *p)
 	p->stall_count = 0;
 	p->buck_off = false;
 	p->cp_lift_since = 0;
-	p->plug_logged = false;
 	return 0;
 }
 
@@ -646,8 +631,6 @@ static void pps_enter(struct erhai_pps *p, enum pps_state st, const char *why)
 			why ? " (" : "", why ?: "", why ? ")" : "");
 	p->state = st;
 	p->state_since = jiffies;
-	if (st == PPS_ARMED)
-		p->armed_since = jiffies;
 	if (st == PPS_RAMP)
 		p->ramp_since = jiffies;
 }
@@ -909,7 +892,7 @@ static void pps_poll(struct erhai_pps *p)
 	if (pps_read_vbus(p) < 0)
 		online = -EINVAL;	/* ADSP not up yet -> treat as offline */
 
-	if (p->state >= PPS_NEGOTIATE && p->state < PPS_EXIT) {
+	if (p->state > PPS_NEGOTIATE && p->state < PPS_EXIT) {
 		if (online <= 0 || erhai_otg_charge_inhibited() || pps_read_battery(p)) {
 
 			pps_exit(p, "source, policy or battery unavailable");
@@ -959,68 +942,32 @@ static void pps_poll(struct erhai_pps *p)
 		bool vooc;
 
 		if (online <= 0) {
-			p->plug_logged = false;
 
 			return;
 		}
 		if (p->protection || time_before(jiffies, p->retry_at))
 			return;
-		p->plug_logged = true;
 
-		/*
-		 * Early after boot the ADSP property service may still be
-		 * coming up: the first read returns garbage (real_type 6,
-		 * pps_type 0) and the glink queue then stalls behind the
-		 * audio graph start, so the state never changes on its own.
-		 * Re-read every pps_reprobe_ms until the adapter reports as
-		 * deployable instead of waiting forever for a property event.
-		 */
-		if (!pps_deployable(p, &vooc)) {
-			if (!p->plug_logged ||
-			    time_before(jiffies, p->last_reprobe +
-					msecs_to_jiffies(pps_reprobe_ms)))
-				return;
-			p->last_reprobe = jiffies;
-			p->plug_logged = false;	/* force a fresh probe log */
+		if (!pps_deployable(p, &vooc))
 			return;
-		}
 		/* The disabled serial poller no longer prewarms the ADC for us. */
 		if (pps_cp_enable && !p->adc_held) {
 			if (pps_sc_adc_hold(true))
 				return;
 			p->adc_held = true;
 		}
-		pps_enter(p, PPS_ARMED, "PD_PPS adapter");
-		return;
-	}
-	case PPS_ARMED: {
-		bool vooc;
-
-		if (online <= 0) {
-			pps_exit(p, PPS_EXIT_REASON_DETACH);
-			return;
-		}
-		if (pps_deployable(p, &vooc) && !vooc) {
-			if (time_after_eq(jiffies, p->armed_since +
-					  msecs_to_jiffies(pps_identify_ms)))
-				pps_enter(p, PPS_NEGOTIATE, NULL);
-			return;
-		}
-		if (vooc) {
-			/* serial VOOC won: stand down for this plug */
-			pps_exit(p, PPS_EXIT_REASON_VOOC_ENGAGED);
-			return;
-		}
-		/* adapter vanished or no longer deployable -> back to idle.
-		 * Go through pps_enter() like every other transition: the bare
-		 * assignment skipped the transition log, left last_reason
-		 * stale and never refreshed state_since, so the debugfs view
-		 * disagreed with the engine's actual state. */
-		pps_exit(p, PPS_EXIT_REASON_NOT_PPS);
-		return;
+		pps_enter(p, PPS_NEGOTIATE, "PD_PPS adapter");
+		fallthrough;
 	}
 	case PPS_NEGOTIATE: {
 		int adapter_ma;
+
+		/* IDLE falls through after classifying a confirmed PD/PPS sink. */
+		cell_ma = pps_cell_limit(p, true);
+		if (!cell_ma) {
+			pps_exit(p, "battery limit");
+			return;
+		}
 
 		adapter_ma = pps_source_limit();
 		if (adapter_ma <= 0) {
