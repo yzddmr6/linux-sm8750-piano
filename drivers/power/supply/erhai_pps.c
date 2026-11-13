@@ -339,6 +339,8 @@ struct erhai_pps {
 	unsigned long slave_retry_at;
 	bool ufcs_protection;
 	bool pps_protection;
+	u32 session_apdo, exhausted_apdo;
+	unsigned int exhausted_ma, entry_failures;
 	unsigned long retry_at;
 	unsigned long next_poll;
 
@@ -876,6 +878,7 @@ static int pps_cp_step(struct erhai_pps *p)
 		p->cp_fed_at = jiffies;
 		p->cp_low_cnt = 0;
 		p->cp_engages++;
+		p->entry_failures = 0;
 		pr_info("erhai_pps: CP 2:1 ENGAGED (chip vbus %d mV vbat %d mV diff %d mV ibus %d mA set %u mV)\n",
 			cvbus, cvbat, diff, cibus, p->set_volt_mv);
 		trace_erhai_pps_cp_event("engage", 0, cvbus, cvbat, cibus,
@@ -904,6 +907,10 @@ static int pps_cp_step(struct erhai_pps *p)
 			  msecs_to_jiffies(pps_cp_lift_ms))) {
 		pr_info("erhai_pps: CP entry timed out (diff %d mV, engage rc=%d)\n",
 			diff, rc);
+		if (!p->ufcs && ++p->entry_failures >= pps_cp_rearm_max) {
+			p->exhausted_apdo = p->session_apdo;
+			p->exhausted_ma = p->source_ma;
+		}
 		return pps_cp_release(p, "entry-timeout", true);
 	}
 	return 0;
@@ -911,10 +918,10 @@ static int pps_cp_step(struct erhai_pps *p)
 
 
 /* The maximum scalar alone does not identify the APDO's voltage range. */
-static int pps_source_limit(void)
+static int pps_source_limit(u32 *selected)
 {
 	int ma = pps_usb_get(PPS_PROP_USB_GET_PPS_MAX_CURR);
-	int apdo = erhai_pps_apdo_current(pps_target_volt_mv, pps_cp_max_volt_mv);
+	int apdo = erhai_pps_apdo_current(pps_target_volt_mv, pps_cp_max_volt_mv, selected);
 
 	if (apdo <= 0)
 		return apdo;
@@ -1035,7 +1042,7 @@ static void pps_poll(struct erhai_pps *p)
 			return;
 		}
 
-		adapter_ma = pps_source_limit();
+		adapter_ma = pps_source_limit(&p->session_apdo);
 		if (adapter_ma <= 0) {
 			pps_exit(p, "no usable PPS APDO");
 			return;
@@ -1108,6 +1115,7 @@ static void pps_poll(struct erhai_pps *p)
 		p->cp_lift_since = 0;
 		p->cp_holdoff_until = jiffies;
 		p->cp_rearms = 0;
+		p->entry_failures = 0;
 		p->sessions++;
 		p->entries++;
 		pps_enter(p, PPS_RAMP, NULL);
@@ -1322,9 +1330,10 @@ static unsigned int erhai_pps_update(void *data, bool caps_changed)
 
 	if (!p->ufcs && caps_changed && (p->state == PPS_RAMP || p->state == PPS_CHARGING ||
 			     p->state == PPS_TAPER)) {
-		int ma = pps_source_limit();
+		u32 apdo;
+		int ma = pps_source_limit(&apdo);
 
-		if (ma <= 0 || ma != p->source_ma)
+		if (ma <= 0 || ma != p->source_ma || apdo != p->session_apdo)
 			pps_exit(p, "source capabilities changed");
 	}
 	if (p->state != PPS_IDLE && time_before(jiffies, p->next_poll))
@@ -1410,10 +1419,17 @@ static bool erhai_pps_available(void *data)
 {
 	struct erhai_pps *p = data;
 
+	u32 apdo;
+	int ma;
+
 	if (p->state != PPS_IDLE || p->cleanup || p->adc_held)
 		return true;
-	return !p->pps_protection && !time_before(jiffies, p->retry_at) &&
-	       pps_deployable(p) && pps_source_limit() > 0;
+	if (p->pps_protection || time_before(jiffies, p->retry_at) || !pps_deployable(p))
+		return false;
+	ma = pps_source_limit(&apdo);
+	if (ma >= 0 && (apdo != p->exhausted_apdo || ma != p->exhausted_ma))
+		p->exhausted_apdo = 0;
+	return ma > 0 && !p->exhausted_apdo;
 }
 
 static bool erhai_pps_active(void *data)
@@ -1435,12 +1451,21 @@ static int erhai_pps_stop(void *data)
 	return 0;
 }
 
+static void erhai_pps_recharge(void *data)
+{
+	struct erhai_pps *p = data;
+
+	p->exhausted_apdo = 0;
+	p->entry_failures = 0;
+	p->retry_at = jiffies;
+}
+
 static void erhai_pps_detached(void *data)
 {
 	struct erhai_pps *p = data;
 
 	p->pps_protection = p->ufcs_protection = false;
-	p->retry_at = jiffies;
+	erhai_pps_recharge(p);
 	sc8547a_detached();
 }
 
@@ -1461,7 +1486,7 @@ static const struct erhai_pps_ops erhai_pps_ops = {
 	.serial_session = sc8547a_serial_session,
 	.active = erhai_pps_active,
 	.available = erhai_pps_available,
-	.source_limit = pps_source_limit,
+	.recharge = erhai_pps_recharge,
 	.ufcs_active = erhai_ufcs_active,
 	.ufcs_update = erhai_ufcs_update,
 	.update = erhai_pps_update,

@@ -537,8 +537,6 @@ struct qcom_battmgr {
 	bool qc_contract;
 	bool serial_probe;
 	bool tail_owned;
-	int pps_offer;
-	bool pps_declined;
 	unsigned int recharge_samples;
 	unsigned long recharge_at;
 	u32 charge_detected_type;
@@ -1567,7 +1565,8 @@ static bool qcom_battmgr_tail_owned(struct qcom_battmgr *b)
 		b->recharge_samples = 0;
 	} else if (++b->recharge_samples >= 6) {
 		b->tail_owned = false;
-		b->pps_declined = false;
+		if (b->pps_ops)
+			b->pps_ops->recharge(b->pps_data);
 		b->serial_backoff = b->ufcs_backoff = false;
 		b->serial_failures = b->ufcs_failures = 0;
 	}
@@ -1598,7 +1597,7 @@ static unsigned long qcom_battmgr_probe_retry(unsigned int *failures)
 static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
-	bool fixed_working, tail, probe_idle, prefer_pps, dedicated, can_probe, qc, try_qc, caps_changed, current_changed = false;
+	bool tail, probe_idle, prefer_pps, dedicated, can_probe, qc, try_qc, caps_changed, current_changed = false;
 	u32 online, type, health, vbat, vbus, ua, real_type;
 	int ret;
 
@@ -1624,7 +1623,6 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			battmgr->pps_ops->detached(battmgr->pps_data);
 		test_and_clear_bit(PD_EVENT_TAIL, &battmgr->pd_events);
 		battmgr->tail_owned = false;
-		battmgr->pps_declined = false;
 		battmgr->serial_failures = battmgr->ufcs_failures = 0;
 		battmgr->serial_backoff = false;
 		battmgr->serial_blocked = false;
@@ -1728,25 +1726,13 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	/* The Type-C partner's PD capabilities are stronger evidence than
 	 * an incomplete BC1.2 classification. PPS also checks its APDO.
 	 */
-	fixed_working = battmgr->pd_state == PD_ACTIVE || battmgr->pd_state == PD_WAIT;
-	if (!fixed_working && !qcom_battmgr_pps_running(battmgr))
-		battmgr->pps_declined = false;
-	if (battmgr->pps_ops && battmgr->pps_declined && fixed_working &&
-	    test_bit(PD_EVENT_CAPS, &battmgr->pd_events)) {
-		int offer = battmgr->pps_ops->source_limit();
-
-		if (offer >= 0 && offer != battmgr->pps_offer)
-			battmgr->pps_declined = false;
-	}
-	prefer_pps = !battmgr->pps_declined && !tail && !test_bit(PD_EVENT_TAIL, &battmgr->pd_events) && !READ_ONCE(battmgr->pps_suspended) &&
+	prefer_pps = !tail && !test_bit(PD_EVENT_TAIL, &battmgr->pd_events) && !READ_ONCE(battmgr->pps_suspended) &&
 		     battmgr->pps_ops && battmgr->pps_ops->enabled() &&
 		     src.sink && !READ_ONCE(battmgr->otg_request);
 	if (prefer_pps && !battmgr->charge_inhibited && !battmgr->charge_policy_hold &&
 	    !battmgr->charge_error && battmgr->pps_ops->available(battmgr->pps_data)) {
 		unsigned int delay;
 
-		if (!qcom_battmgr_pps_running(battmgr))
-			battmgr->pps_offer = battmgr->pps_ops->source_limit();
 		if (qcom_battmgr_pd_stop(battmgr, false, "PPS handover"))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
@@ -1754,8 +1740,6 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 				test_and_clear_bit(PD_EVENT_CAPS, &battmgr->pd_events));
 		if (qcom_battmgr_pps_running(battmgr))
 			return delay;
-		/* Keep the fallback if this same APDO already failed. */
-		battmgr->pps_declined = true;
 		/* Cleanup completed. Re-read a fixed PDO in this same poll. */
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
@@ -3424,12 +3408,13 @@ static void qcom_battmgr_unregister_pm_notifier(void *data)
 
 /* PD sources qualify their advertised current against the cable identity.
  * Use one live PPS APDO covering the complete voltage regulation window. */
-int erhai_pps_apdo_current(u32 min_mv, u32 max_mv)
+int erhai_pps_apdo_current(u32 min_mv, u32 max_mv, u32 *selected)
 {
 	struct qcom_battmgr *b;
 	unsigned int i;
 	int ret, ma = 0;
 
+	*selected = 0;
 	guard(mutex)(&erhai_bridge_lock);
 	b = erhai_battmgr;
 	if (!b || !b->service_up)
@@ -3443,8 +3428,11 @@ int erhai_pps_apdo_current(u32 min_mv, u32 max_mv)
 
 		if (pdo_type(pdo) == PDO_TYPE_APDO && pdo_apdo_type(pdo) == APDO_TYPE_PPS &&
 		    pdo_pps_apdo_min_voltage(pdo) <= min_mv &&
-		    pdo_pps_apdo_max_voltage(pdo) >= max_mv)
-			ma = max_t(int, ma, pdo_pps_apdo_max_current(pdo));
+		    pdo_pps_apdo_max_voltage(pdo) >= max_mv &&
+		    pdo_pps_apdo_max_current(pdo) > ma) {
+			ma = pdo_pps_apdo_max_current(pdo);
+			*selected = pdo;
+		}
 	}
 	return min(ma, 5000);
 }
