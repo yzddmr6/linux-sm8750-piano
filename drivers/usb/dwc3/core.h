@@ -1000,7 +1000,8 @@ struct dwc3_scratchpad_array {
 /**
  * struct dwc3_glue_ops - The ops indicate the notifications that
  *				need to be passed on to glue layer
- * @pre_set_role: Notify glue of role switch notifications
+ * @pre_set_role: Notify glue of role switch notifications, called from
+ *		  drd_work so that it does not run during system sleep
  * @pre_run_stop: Notify run stop enable/disable information to glue
  */
 struct dwc3_glue_ops {
@@ -1058,6 +1059,8 @@ struct dwc3_glue_ops {
  * @dr_mode: requested mode of operation
  * @current_dr_role: current role of operation when in dual-role mode
  * @desired_dr_role: desired role of operation when in dual-role mode
+ * @requested_role: role requested
+ * @requested_role_pending: @requested_role is yet to be passed to the glue
  * @edev: extcon handle
  * @edev_nb: extcon notifier
  * @hsphy_mode: UTMI phy mode, one of following:
@@ -1261,6 +1264,8 @@ struct dwc3 {
 	enum usb_dr_mode	dr_mode;
 	u32			current_dr_role;
 	u32			desired_dr_role;
+	enum usb_role		requested_role;
+	bool			requested_role_pending;
 	struct extcon_dev	*edev;
 	struct notifier_block	edev_nb;
 	enum usb_phy_interface	hsphy_mode;
@@ -1614,6 +1619,7 @@ struct dwc3_gadget_ep_cmd_params {
 /* prototypes */
 void dwc3_set_prtcap(struct dwc3 *dwc, u32 mode, bool ignore_susphy);
 void dwc3_set_mode(struct dwc3 *dwc, u32 mode);
+void dwc3_set_role(struct dwc3 *dwc, u32 mode, enum usb_role role);
 u32 dwc3_core_fifo_space(struct dwc3_ep *dep, u8 type);
 
 #define DWC3_IP_IS(_ip)							\

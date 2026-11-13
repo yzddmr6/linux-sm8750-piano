@@ -1055,6 +1055,7 @@ struct ath12k_base {
 	atomic_t reset_count;
 	atomic_t recovery_count;
 	bool is_reset;
+	bool resuming;
 	struct completion reset_complete;
 	/* continuous recovery fail count */
 	atomic_t fail_cont_count;

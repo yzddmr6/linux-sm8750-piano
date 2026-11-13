@@ -224,6 +224,7 @@ int ath12k_core_resume_early(struct ath12k_base *ab)
 		return ret;
 
 	reinit_completion(&ab->restart_completed);
+	WRITE_ONCE(ab->resuming, true);
 	ret = ath12k_hif_power_up(ab);
 	if (ret)
 		ath12k_warn(ab, "failed to power up hif during resume: %d\n", ret);
@@ -243,6 +244,7 @@ int ath12k_core_resume(struct ath12k_base *ab)
 
 	time_left = wait_for_completion_timeout(&ab->restart_completed,
 						ATH12K_RESET_TIMEOUT_HZ);
+	WRITE_ONCE(ab->resuming, false);
 	if (time_left == 0) {
 		ath12k_warn(ab, "timeout while waiting for restart complete");
 		return -ETIMEDOUT;
@@ -1734,6 +1736,10 @@ static void ath12k_core_reset(struct work_struct *work)
 	struct ath12k_hw_group *ag = ab->ag;
 	int reset_count, fail_cont_count, i;
 	long time_left;
+
+	/* The new MHI devices are probed only after the system resume */
+	if (READ_ONCE(ab->resuming))
+		complete(&ab->restart_completed);
 
 	if (!(test_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE, &ab->dev_flags))) {
 		ath12k_warn(ab, "ignore reset dev flags 0x%lx\n", ab->dev_flags);
