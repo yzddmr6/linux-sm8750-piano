@@ -142,3 +142,4 @@ obj-$(CONFIG_CHARGER_SC8547A)	+= sc8547a.o
 obj-$(CONFIG_CHARGER_CPS8601)	+= cps8601.o
 obj-$(CONFIG_CHARGER_ERHAI_PPS)	+= erhai_pps.o
 CFLAGS_erhai_pps.o		:= -I$(src)
+obj-$(CONFIG_OPLUS_UFCS_CLASS) += ufcs/

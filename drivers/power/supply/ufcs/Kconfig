@@ -1,0 +1,13 @@
+config OPLUS_UFCS_CLASS
+	tristate "Oplus UFCS sink protocol and SC8547A PHY"
+	select REGMAP
+	default CHARGER_SC8547A
+	help
+	  Negotiate Universal Fast Charging Specification contracts over the
+	  SC8547A PHY on boards where the charger driver registers it.
+
+config OPLUS_UFCS_KUNIT_TEST
+	bool "UFCS sink protocol test" if !KUNIT_ALL_TESTS
+	depends on KUNIT && OPLUS_UFCS_CLASS=y
+	select CRYPTO_LIB_SHA256
+	default KUNIT_ALL_TESTS
