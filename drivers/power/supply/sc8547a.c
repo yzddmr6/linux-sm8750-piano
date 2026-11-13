@@ -535,11 +535,27 @@ bool sc8547a_fastchg_identifying(void)
 }
 EXPORT_SYMBOL_GPL(sc8547a_fastchg_identifying);
 
+/* A failed pump-off transfer can have taken effect. Leave both chips
+ * completely untouched for a full REG09 (1 s) watchdog period. Even a
+ * register read can service this watchdog (vendor CP_WATCHDOG_RESET).
+ */
+static bool pump_stopping;
+static unsigned long pump_off_at;
+
+static bool sc8547_waiting_for_off(void)
+{
+	return READ_ONCE(pump_stopping) && time_before(jiffies, READ_ONCE(pump_off_at));
+}
+
 /* ------------------------- register accessors ------------------------- */
 
 static int sc8547_read_byte(struct sc8547a_device *sc, u8 reg, u8 *val)
 {
-	int ret = i2c_smbus_read_byte_data(sc->client, reg);
+	int ret;
+
+	if (sc8547_waiting_for_off())
+		return -EAGAIN;
+	ret = i2c_smbus_read_byte_data(sc->client, reg);
 
 	if (ret < 0) {
 		dev_err(sc->dev, "read reg 0x%02x failed: %d\n", reg, ret);
@@ -551,7 +567,11 @@ static int sc8547_read_byte(struct sc8547a_device *sc, u8 reg, u8 *val)
 
 static int sc8547_write_byte(struct sc8547a_device *sc, u8 reg, u8 val)
 {
-	int ret = i2c_smbus_write_byte_data(sc->client, reg, val);
+	int ret;
+
+	if (sc8547_waiting_for_off())
+		return -EAGAIN;
+	ret = i2c_smbus_write_byte_data(sc->client, reg, val);
 
 	if (ret < 0)
 		dev_err(sc->dev, "write 0x%02x to reg 0x%02x failed: %d\n",
@@ -577,7 +597,11 @@ out:
 
 static int sc8547_read_word(struct sc8547a_device *sc, u8 reg)
 {
-	int ret = i2c_smbus_read_word_data(sc->client, reg);
+	int ret;
+
+	if (sc8547_waiting_for_off())
+		return -EAGAIN;
+	ret = i2c_smbus_read_word_data(sc->client, reg);
 
 	if (ret < 0)
 		dev_err(sc->dev, "read word reg 0x%02x failed: %d\n", reg, ret);
@@ -586,7 +610,11 @@ static int sc8547_read_word(struct sc8547a_device *sc, u8 reg)
 
 static int sc8547_write_word(struct sc8547a_device *sc, u8 reg, u16 val)
 {
-	int ret = i2c_smbus_write_word_data(sc->client, reg, val);
+	int ret;
+
+	if (sc8547_waiting_for_off())
+		return -EAGAIN;
+	ret = i2c_smbus_write_word_data(sc->client, reg, val);
 
 	if (ret < 0)
 		dev_err(sc->dev, "write word 0x%04x to reg 0x%02x failed: %d\n",
@@ -625,7 +653,11 @@ static int sc8547_set_adc_enable(struct sc8547a_device *sc, bool enable)
 static int sc8547_get_vbus(struct sc8547a_device *sc)
 {
 	u8 buf[2];
-	int ret = i2c_smbus_read_i2c_block_data(sc->client, SC8547_REG_15, 2, buf);
+	int ret;
+
+	if (sc8547_waiting_for_off())
+		return -EAGAIN;
+	ret = i2c_smbus_read_i2c_block_data(sc->client, SC8547_REG_15, 2, buf);
 
 	if (ret != sizeof(buf))
 		return ret < 0 ? ret : -EIO;
@@ -637,7 +669,11 @@ static int sc8547_get_vbus(struct sc8547a_device *sc)
 static int sc8547_get_ibus(struct sc8547a_device *sc)
 {
 	u8 buf[2];
-	int ret = i2c_smbus_read_i2c_block_data(sc->client, SC8547_REG_13, 2, buf);
+	int ret;
+
+	if (sc8547_waiting_for_off())
+		return -EAGAIN;
+	ret = i2c_smbus_read_i2c_block_data(sc->client, SC8547_REG_13, 2, buf);
 
 	if (ret != sizeof(buf))
 		return ret < 0 ? ret : -EIO;
@@ -649,7 +685,11 @@ static int sc8547_get_ibus(struct sc8547a_device *sc)
 static int sc8547_get_vbat(struct sc8547a_device *sc)
 {
 	u8 buf[2];
-	int ret = i2c_smbus_read_i2c_block_data(sc->client, SC8547_REG_1B, 2, buf);
+	int ret;
+
+	if (sc8547_waiting_for_off())
+		return -EAGAIN;
+	ret = i2c_smbus_read_i2c_block_data(sc->client, SC8547_REG_1B, 2, buf);
 
 	if (ret != sizeof(buf))
 		return ret < 0 ? ret : -EIO;
@@ -1008,8 +1048,10 @@ int sc8547a_pps_cp_engage(int *need_mv)
 	ret = sc8547_svooc_hw_setting(sc);
 	if (!ret)
 		ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
-	if (!ret)
+	if (!ret) {
+		pps_cp_engaged = true; /* an enable with a lost ACK may have switched */
 		ret = sc8547_set_chg_enable(sc, true);
+	}
 	if (ret) {
 		sc8547_pps_disengage();
 		return ret;
@@ -1074,21 +1116,27 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_cp_feed);
 static int sc8547_pps_disengage(void)
 {
 	struct sc8547a_device *sc = sc8547_master_dev;
-	int ret;
+	int master = 0, slave;
 
-	ret = sc8547_pps_slave_off();
-	if (ret)
-		return ret;
-	if (!sc) {
-		pps_cp_engaged = false;
+	if (pump_stopping) {
+		if (sc8547_waiting_for_off())
+			return -EAGAIN;
+		/* No register access since the failed stop. Both enables
+		 * were preceded by a successful REG09=1s watchdog write.
+		 */
+		pump_stopping = false;
+		pps_cp_engaged = pps_slave_engaged = false;
 		return 0;
 	}
-	ret = sc->ufcs_owner ? sc8547_set_chg_enable(sc, false) : sc8547_reset_voocphy(sc);
-	if (ret)
-		return ret;
+	if (sc && pps_cp_engaged)
+		master = sc8547_set_chg_enable(sc, false);
+	slave = sc8547_pps_slave_off();
+	if (master || slave) {
+		WRITE_ONCE(pump_off_at, jiffies + HZ + 1);
+		WRITE_ONCE(pump_stopping, true);
+		return -EAGAIN;
+	}
 	pps_cp_engaged = false;
-	if (pps_adc_hold)
-		return sc8547_set_adc_enable(sc, true);
 	return 0;
 }
 
@@ -2615,8 +2663,7 @@ static int sc8547_ufcs_end(struct sc8547a_device *sc)
 	if (!sc || !sc->ufcs_owner)
 		return 0;
 	scoped_guard(mutex, &sc8547_pps_lock) {
-		ret = sc8547_pps_slave_off();
-		ret = ret ?: sc8547_set_chg_enable(sc, false);
+		ret = sc8547_pps_disengage();
 		if (ret)
 			return ret;
 		pps_cp_engaged = false;
@@ -2823,6 +2870,8 @@ static irqreturn_t sc8547_irq_handler(int irq, void *data)
 
 	/* When the PHY is armed, an IRQ is an adapter VOOC frame. */
 	guard(mutex)(&sc8547_pps_lock);
+	if (sc8547_waiting_for_off())
+		return IRQ_HANDLED;
 	sc8547_collect_faults(sc);
 #if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
 	if (sc->ufcs_owner) {

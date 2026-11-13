@@ -558,8 +558,15 @@ static int pps_revert(struct erhai_pps *p)
 	int rc, err = 0, vbus, online;
 
 #define PPS_RESTORE(call) do { rc = (call); if (rc && !err) err = rc; } while (0)
-	PPS_RESTORE(pps_sc_adc_hold(false));
-	PPS_RESTORE(pps_cp_drop());
+	rc = pps_cp_drop();
+	if (rc) {
+		p->cleanup = true;
+		return rc;
+	}
+	/* ADC power is diagnostic. Once both converters are off, a failed
+	 * ADC disable cannot prevent handoff to the independent PMIC buck.
+	 */
+	pps_sc_adc_hold(false);
 	if (p->ufcs) {
 		PPS_RESTORE(sc8547a_ufcs_stop());
 	} else {
