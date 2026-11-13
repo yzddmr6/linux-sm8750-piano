@@ -679,6 +679,7 @@ struct xiaomi_mca {
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
 	u32 cp_ibus_last;	/* stage and buck input current at the last step */
+	unsigned long cp_cap_retry;
 	u32 cp_ibus_cap;	/* learned from a source dropping out, 0 if none */
 	unsigned long cp_off_at;	/* jiffies when the source went away */
 	unsigned long cp_on_at;		/* jiffies when it came */
@@ -2629,11 +2630,27 @@ static void xiaomi_mca_cp_learn_drop(struct xiaomi_mca *mca)
 		return;
 
 	mca->cp_ibus_cap = mca->cp_ibus_last - MCA_CP_DROP_BACKOFF_MA;
-	dev_warn(mca->dev, "source dropped out at %u mA, %u mA from now on\n",
+	mca->cp_cap_retry = jiffies + msecs_to_jiffies(MCA_HV_RETRY_MS);
+	dev_warn(mca->dev, "source dropped out at %u mA, retrying from %u mA\n",
 		 mca->cp_ibus_last, mca->cp_ibus_cap);
 }
 
-/* What the source gives: its APDO current, less once it dropped out */
+/* Re-test a learned limit on the running stage only after the source has
+ * carried that load. A new drop updates the ceiling and restarts backoff.
+ */
+static void xiaomi_mca_cp_recover_current(struct xiaomi_mca *mca)
+{
+	u32 cap = mca->cp_ibus_cap;
+
+	if (!cap || mca->cp != MCA_CP_ON || time_before(jiffies, mca->cp_cap_retry) ||
+	    mca->cp_ibus_last + MCA_CP_DROP_BACKOFF_MA < cap)
+		return;
+	cap += MCA_CP_DROP_BACKOFF_MA;
+	mca->cp_ibus_cap = cap < mca->cp_ma ? cap : 0;
+	mca->cp_cap_retry = jiffies + msecs_to_jiffies(MCA_HV_RETRY_MS);
+}
+
+/* What the source gives: its APDO current, less while recovering from dropout. */
 static u32 xiaomi_mca_cp_src_ma(struct xiaomi_mca *mca)
 {
 	u32 ma = mca->cp_ibus_cap ? min(mca->cp_ma, mca->cp_ibus_cap) : mca->cp_ma;
@@ -2778,10 +2795,18 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_ma = xiaomi_mca_cp_capability_ma(ma, xiaomi_mca_adapter_verified(mca));
 	mca->cp_max_mv = max_mv;
 	mca->cp_mv = start_mv;
-	src_ma = xiaomi_mca_cp_src_ma(mca);
+	/* Size hardware protection for the present contract. The live
+	 * regulator separately applies the learned ceiling on every step.
+	 */
+	src_ma = xiaomi_mca_cp_power_limit(mca->cp_ma, start_mv);
 	src_ma -= min_t(u32, src_ma, MCA_CP_BUCK_MA + 200);
 	mca->cp_ibus_ma = min_t(u32, MCA_CP_STAGE_IBUS_MA, src_ma);
-	if (mca->cp_ibus_ma < 2 * MCA_CP_OPEN_IBUS_MA) {
+	if (xiaomi_mca_cp_src_ma(mca) < MCA_CP_BUCK_MA + 200 + 2 * MCA_CP_OPEN_IBUS_MA) {
+		/* A learned limit below the opening current cannot be tested
+		 * from a running pump. Retry from the normal opening ramp.
+		 */
+		if (mca->cp_ibus_cap && time_after_eq(jiffies, mca->cp_cap_retry))
+			mca->cp_ibus_cap = 0;
 		xiaomi_mca_cp_backoff(mca);
 		return;
 	}
@@ -3024,6 +3049,8 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		return;
 	}
 
+	if (!taper && tdie < MCA_CP_TDIE_HOT)
+		xiaomi_mca_cp_recover_current(mca);
 	/* the stage warms about 1 degC/s at 4 A: back off before it trips */
 	mca->cp_ibus_hot = xiaomi_mca_die_limit(mca, tdie);
 	target = mca->cp_ibus_hot;

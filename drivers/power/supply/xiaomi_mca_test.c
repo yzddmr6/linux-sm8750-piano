@@ -1090,6 +1090,31 @@ static void xiaomi_mca_test_source_limits(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000), 8000);
 }
 
+static void xiaomi_mca_test_recover_learned_limit(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	mca->cp = MCA_CP_ON;
+	mca->cp_ma = 3000;
+	mca->cp_ibus_last = 2500;
+	xiaomi_mca_cp_learn_drop(mca);
+	KUNIT_ASSERT_EQ(test, mca->cp_ibus_cap, 2000);
+	xiaomi_mca_cp_recover_current(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp_ibus_cap, 2000);
+	mca->cp_cap_retry = jiffies;
+	mca->cp_ibus_last = 1000;
+	xiaomi_mca_cp_recover_current(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp_ibus_cap, 2000);
+	mca->cp_ibus_last = 1900;
+	xiaomi_mca_cp_recover_current(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp_ibus_cap, 2500);
+	mca->cp_cap_retry = jiffies;
+	mca->cp_ibus_last = 2400;
+	xiaomi_mca_cp_recover_current(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp_ibus_cap, 0);
+}
+
 static void xiaomi_mca_test_cp_limits(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_policy_fixture(test);
@@ -2952,6 +2977,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_auth_read_only),
 	KUNIT_CASE(xiaomi_mca_test_temperature_follow),
 	KUNIT_CASE(xiaomi_mca_test_cp_limits),
+	KUNIT_CASE(xiaomi_mca_test_recover_learned_limit),
 	KUNIT_CASE(xiaomi_mca_test_fcc_ack_without_readback),
 	KUNIT_CASE(xiaomi_mca_test_fcc_request_failure),
 	KUNIT_CASE(xiaomi_mca_test_pm_gate),
