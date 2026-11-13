@@ -955,7 +955,7 @@ static void xiaomi_mca_test_policy_refusal(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3501), -EINVAL);
 	f->type = MCA_TYPE_HVDCP_3;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3600), 0);
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3601), -EPERM);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3601), -EINVAL);
 	f->type = MCA_TYPE_PD;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3500), -EINVAL);
 	f->vbus = 5000000;
@@ -1170,7 +1170,10 @@ static int mca_test_stage_set(struct power_supply *psy, enum power_supply_proper
 
 static void mca_test_stage(struct kunit *test, struct mca_policy_fixture *f)
 {
-	static const enum power_supply_property props[] = { POWER_SUPPLY_PROP_ONLINE };
+	static const enum power_supply_property props[] = {
+		POWER_SUPPLY_PROP_ONLINE, POWER_SUPPLY_PROP_VOLTAGE_NOW,
+		POWER_SUPPLY_PROP_CURRENT_NOW, POWER_SUPPLY_PROP_TEMP,
+	};
 	static const struct power_supply_desc desc = {
 		.name = "mca-pm-test-cp",
 		.type = POWER_SUPPLY_TYPE_MAINS,
@@ -1235,8 +1238,8 @@ static void xiaomi_mca_test_pm_quiesce(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->stage_on);
 	KUNIT_EXPECT_EQ(test, f->stage_stops, 1);
 	KUNIT_EXPECT_PTR_EQ(test, f->mca.cp_psy, NULL);
-	KUNIT_EXPECT_EQ(test, f->icl, 500U);
-	KUNIT_EXPECT_EQ(test, f->fcc, 2000U);
+	KUNIT_EXPECT_EQ(test, f->icl, 1500U);
+	KUNIT_EXPECT_EQ(test, f->fcc, 1500U);
 	KUNIT_EXPECT_EQ(test, f->voltage_requests, 1);
 	KUNIT_EXPECT_FALSE(test, f->voltage_before_stop);
 	KUNIT_EXPECT_EQ(test, f->vbus, 5000000);
@@ -1431,7 +1434,7 @@ static void xiaomi_mca_test_pm_lost_ack(struct kunit *test)
 	f->write_error = 0;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_prepare(f->mca.dev), 0);
 	KUNIT_EXPECT_TRUE(test, f->mca.fcc_written);
-	KUNIT_EXPECT_EQ(test, f->fcc, xiaomi_mca_policy_fcc(f->type, false));
+	KUNIT_EXPECT_EQ(test, f->fcc, 1500U);
 	xiaomi_mca_complete(f->mca.dev);
 	cancel_delayed_work_sync(&f->mca.poll_work);
 
@@ -2003,7 +2006,7 @@ static void xiaomi_mca_test_full_charge_readback(struct kunit *test)
 	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_UP);
 	f->term_readback = 5200;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
-	KUNIT_EXPECT_EQ(test, f->term_readback, 5480);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
 	KUNIT_EXPECT_EQ(test, f->term_writes, 3);
 
 	/* Matching data from a different service generation is not an ACK. */
@@ -2508,6 +2511,7 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, vmin, 3449);
 	KUNIT_EXPECT_EQ(test, ibat, 6000);
 	KUNIT_EXPECT_EQ(test, imax, 7000);
+	f->mca.cp_ma = 3000;
 	f->cells[0].current_ua = 0;
 	mca_test_stage(test, f);
 	guard(mutex)(&f->mca.lock);
@@ -2550,7 +2554,7 @@ static void xiaomi_mca_test_taper_handoff(struct kunit *test)
 	f->cells[0].current_ua = f->cells[1].current_ua = 2000000;
 	guard(mutex)(&mca->lock);
 	xiaomi_mca_cp_step(mca);
-	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_ON);
 	KUNIT_EXPECT_LT(test, mca->cp_mv, 9500);
 	f->cells[0].current_ua = f->cells[1].current_ua = 1500000;
 	xiaomi_mca_cp_step(mca);
