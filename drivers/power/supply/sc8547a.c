@@ -958,13 +958,15 @@ static int sc8547_take_faults(void)
 
 	ret = sc8547_collect_faults(master);
 	if (master) {
-		flags = master->pump_faults;
+		if (master->monitor_pump_faults)
+			flags = master->pump_faults;
 		master->pump_faults = 0;
 	}
 	if (slave) {
 		/* A missing slave sample cannot erase a real master fault. */
 		sc8547_collect_faults(slave);
-		flags |= slave->pump_faults;
+		if (slave->monitor_pump_faults)
+			flags |= slave->pump_faults;
 		slave->pump_faults = 0;
 	}
 	return flags ?: ret;
