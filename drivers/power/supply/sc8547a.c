@@ -484,7 +484,9 @@ struct sc8547a_device {
 	unsigned int curve_ma;	/* selected CC/CV table */
 	int			auto_curve_idx;	/* current row (descends only) */
 	bool			auto_protection;
+	bool serial_quiesced;
 	u8 pump_faults;
+	unsigned int adc_over_count;
 	unsigned int		auto_taper_cnt;
 	int			auto_step_cnt;	/* advance debounce counter */
 	int			auto_reservo_cnt;	/* consecutive adapter-reset re-servos */
@@ -1117,6 +1119,12 @@ drop:
 }
 EXPORT_SYMBOL_GPL(sc8547a_pps_cp_feed);
 
+static void sc8547_wait_for_watchdog(void)
+{
+	WRITE_ONCE(pump_off_at, jiffies + HZ + 1);
+	WRITE_ONCE(pump_stopping, true);
+}
+
 static int sc8547_pps_disengage(void)
 {
 	struct sc8547a_device *sc = sc8547_master_dev;
@@ -1136,8 +1144,7 @@ static int sc8547_pps_disengage(void)
 		master = sc8547_set_chg_enable(sc, false);
 	slave = sc8547_pps_slave_off();
 	if (master || slave) {
-		WRITE_ONCE(pump_off_at, jiffies + HZ + 1);
-		WRITE_ONCE(pump_stopping, true);
+		sc8547_wait_for_watchdog();
 		return -EAGAIN;
 	}
 	pps_cp_engaged = false;
@@ -1296,6 +1303,29 @@ static int sc8547_slave_reset(void)
 		return ret;
 	return sc8547_update_bits(sc, SC8547_REG_09, SC8547_WATCHDOG_MASK,
 				  SC8547_WATCHDOG_DIS) ?: sc8547_set_adc_enable(sc, false);
+}
+
+/* Serial CHG_EN writes also arm REG09 before either leg can start. */
+static int sc8547_serial_off(struct sc8547a_device *sc)
+{
+	int master, slave;
+
+	if (sc->serial_quiesced)
+		return 0;
+	if (pump_stopping) {
+		if (sc8547_pps_disengage())
+			return -EAGAIN;
+		sc->serial_quiesced = true;
+		return 0;
+	}
+	master = sc8547_set_chg_enable(sc, false);
+	slave = sc8547_slave_reset();
+	if (master || slave) {
+		sc8547_wait_for_watchdog();
+		return -EAGAIN;
+	}
+	sc->serial_quiesced = true;
+	return 0;
 }
 
 /* Dual PPS sequence from TheMojoMan/oneplus-erhai-linux 110b27276c22.
@@ -2164,11 +2194,10 @@ static void sc8547_auto_decline(struct sc8547a_device *sc, const char *why)
  */
 static void sc8547_auto_finish(struct sc8547a_device *sc, const char *why)
 {
-	sc8547_slave_reset();		/* drop parallel CP first */
-	sc8547_set_chg_enable(sc, false);
-	sc8547_reset_voocphy(sc);
-	wcd939x_usbss_dpdm_switch_fast_charge(false);
-	sc8547_set_adc_enable(sc, true);
+	if (!sc8547_serial_off(sc)) {
+		sc8547_reset_voocphy(sc);
+		wcd939x_usbss_dpdm_switch_fast_charge(false);
+	}
 	sc->fastchg_enable = false;
 	sc->fastchg_deliver = false;
 	sc->cp_enabled = false;
@@ -2408,8 +2437,12 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc8547_auto_finish(sc, "SC8547A OVP/OCP");
 			goto reschedule;
 		}
-		if (faults < 0 || (!gret && ibat > 13600) || cpbat >= SC8547_CP_OVP_CEILING_MV || cibus >= 4500 ||
-		    slave_ma >= 4500 || cibus_total >= SC8547_IBUS_ABORT_MA) {
+		if (cpbat >= SC8547_CP_OVP_CEILING_MV || cibus >= 4500 ||
+		    slave_ma >= 4500 || cibus_total >= SC8547_IBUS_ABORT_MA || (!gret && ibat > 13600))
+			sc->adc_over_count++;
+		else
+			sc->adc_over_count = 0;
+		if (faults < 0 || sc->adc_over_count > 1) {
 			sc8547_auto_finish(sc, "ADC limit or status unavailable");
 			goto reschedule;
 		}
@@ -2428,6 +2461,8 @@ static void sc8547_attach_work(struct work_struct *work)
 		 */
 		sc->fastchg_curr_code = min_t(unsigned int, sc->fastchg_curr_code,
 					     (4000 + min(cibus, slave_ma)) / 100);
+		if (sc->adc_over_count)
+			sc->fastchg_curr_code = max_t(int, SC8547_CURR_CODE_MIN, sc->fastchg_curr_code - 1);
 		if (!sc->cp_enabled)
 			goto reschedule;
 
@@ -2575,6 +2610,8 @@ int sc8547a_serial_session(bool enable)
 			return -EAGAIN;
 		sc->auto_state = SC_AUTO_IDENTIFY;
 		sc->fastchg_auto = true;
+		sc->serial_quiesced = false;
+		sc->adc_over_count = 0;
 		sc->auto_armed = false;
 		sc->auto_ident_retries = 0;
 		sc->auto_reservo_cnt = 0;
@@ -2590,10 +2627,10 @@ int sc8547a_serial_session(bool enable)
 	sc->fastchg_enable = false;
 	sc->fastchg_deliver = false;
 	sc->cp_enabled = false;
-	ret = sc8547_slave_reset();
-	ret = ret ?: sc8547_reset_voocphy(sc);
+	ret = sc8547_serial_off(sc);
 	if (ret)
 		return ret;
+	sc8547_reset_voocphy(sc);
 	route = wcd939x_usbss_dpdm_switch_fast_charge(false);
 	if (!ret && !route)
 		sc->vooc_started = false;
