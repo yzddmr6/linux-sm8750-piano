@@ -390,6 +390,7 @@ struct erhai_pps {
 	int			vbus_mv;
 	int			vbat_mv;
 	int			ibat_ma;
+	int			pump_ibus_ma;
 	int			soc;
 	int			temp_c;
 
@@ -716,6 +717,7 @@ static int pps_cp_step(struct erhai_pps *p)
 	    cvbus < pps_vbus_collapse_mv || cvbus > pps_cp_max_volt_mv)
 		return -ERANGE;
 
+	p->pump_ibus_ma = cibus;
 	diff = cvbus - cvbat * 2;
 
 	if (a->cp_engaged()) {
@@ -1270,7 +1272,17 @@ static int erhai_pps_stop(void *data)
 	return 0;
 }
 
+static ssize_t erhai_pps_describe(void *data, char *buf, ssize_t off)
+{
+	struct erhai_pps *p = data;
+
+	return off + sysfs_emit_at(buf, off, "state=%s request_mv=%u request_ma=%u pump=%u pump_ibus_ma=%d exits=%u last_exit=%s\n",
+			  pps_state_names[p->state], p->set_volt_mv, p->set_curr_ma,
+			  pps_cp_is_engaged(), pps_cp_is_engaged() ? p->pump_ibus_ma : 0, p->exits, p->last_reason ?: "none");
+}
+
 static const struct erhai_pps_ops erhai_pps_ops = {
+	.describe = erhai_pps_describe,
 	.enabled = erhai_pps_enabled,
 	.active = erhai_pps_active,
 	.update = erhai_pps_update,

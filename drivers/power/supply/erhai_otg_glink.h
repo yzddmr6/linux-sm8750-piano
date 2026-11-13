@@ -20,6 +20,7 @@ struct pmic_glink_client;
 
 /* All callbacks run under battmgr's charge_lock, including suspend/teardown. */
 struct erhai_pps_ops {
+	ssize_t (*describe)(void *data, char *buf, ssize_t off);
 	bool (*enabled)(void);
 	bool (*active)(void *data);
 	unsigned int (*update)(void *data, bool caps_changed);
