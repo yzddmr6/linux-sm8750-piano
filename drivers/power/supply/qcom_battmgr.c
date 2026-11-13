@@ -1325,8 +1325,8 @@ static void qcom_battmgr_pd_log(struct qcom_battmgr *battmgr, u32 type)
 
 /* Erhai fixed-PD buck profile. FCC controls battery demand independently
  * of USB ICL. The firmware continues to own the CV and JEITA loops. Use
- * the normal PD row only for a qualified pack in the normal temperature
- * window. Preserve the autonomous profile everywhere else. */
+ * the qualified-pack PD row of oplus-chg-erhai-common.dtsi
+ * (fccmax-ma-hv and batt-them-thr). BATT_TEMP is in centi-C. */
 static int qcom_battmgr_pd_fcc(struct qcom_battmgr *b)
 {
 	u32 auth, hmac, temp, max_fcc, want, current_fcc;
@@ -1340,14 +1340,14 @@ static int qcom_battmgr_pd_fcc(struct qcom_battmgr *b)
 	want = b->pd_saved_fcc_ua;
 	if (!b->charge_inhibited && !b->charge_policy_hold && !b->charge_error &&
 	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, &temp) &&
-	    (s32)temp >= 1200 && (s32)temp < 4400 &&
+	    (s32)temp >= -1000 && (s32)temp < 5300 &&
 	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_AUTH, &auth) &&
 	    auth == 1 &&
 	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_HMAC, &hmac) &&
 	    hmac == 1 &&
 	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM_MAX, &max_fcc) &&
 	    max_fcc > 0 && max_fcc <= INT_MAX)
-		want = min(max_fcc, 4400000U);
+		want = min(max_fcc, (s32)temp < 0 ? 1761000U : 4400000U);
 	if (want == current_fcc)
 		return 0;
 	/* A timeout does not prove that the firmware ignored the write. */
@@ -1533,7 +1533,8 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	    qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, &vbat))
 		return CHARGE_CTRL_POLL_MS;
 	if (battmgr->charge_inhibited || battmgr->charge_policy_hold || battmgr->charge_error ||
-	    health != POWER_SUPPLY_HEALTH_GOOD ||
+	    (health != POWER_SUPPLY_HEALTH_GOOD && health != POWER_SUPPLY_HEALTH_COOL &&
+	     health != POWER_SUPPLY_HEALTH_WARM) ||
 	    vbat >= (battmgr->pd_restore ? PD_VBAT_STOP_UV : PD_VBAT_START_UV)) {
 		qcom_battmgr_pd_stop(battmgr, false, "battery limit");
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
