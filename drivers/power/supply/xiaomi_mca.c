@@ -1753,6 +1753,8 @@ static int xiaomi_mca_pd_contract(struct power_supply *psy, void *data)
 		return 0;
 	guard(rwsem_read)(&psy->epc_sem);
 	if (psy->removing ||
+	    power_supply_get_property_direct(psy, POWER_SUPPLY_PROP_ONLINE, &val) ||
+	    val.intval != 1 ||
 	    power_supply_get_property_direct(psy, POWER_SUPPLY_PROP_STATUS, &val) ||
 	    val.intval != POWER_SUPPLY_STATUS_CHARGING ||
 	    power_supply_get_property_direct(psy, POWER_SUPPLY_PROP_USB_TYPE, &val) ||

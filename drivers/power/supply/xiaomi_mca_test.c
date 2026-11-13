@@ -2973,7 +2973,15 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 	f->vbus = 9000000;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 1600), 0);
 	f->ucsi_mv = 9000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_contract_ma(&f->mca, 9000, 1600), 3000);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2500), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2501), -EINVAL);
+	f->ucsi_rp_ua = 2000000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2000), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2001), -EINVAL);
+	f->ucsi_online = 0;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_contract_ma(&f->mca, 9000, 1600), 1600);
+	f->ucsi_online = 1;
 	f->ucsi_rp_ua = 1600000;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2500),
 			-EINVAL);
