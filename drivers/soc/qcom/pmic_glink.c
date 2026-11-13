@@ -15,7 +15,6 @@
 #include <linux/soc/qcom/pdr.h>
 #include <linux/soc/qcom/pmic_glink.h>
 #include <linux/spinlock.h>
-#include <linux/string.h>
 #include <linux/suspend.h>
 #include <linux/workqueue.h>
 
@@ -178,6 +177,9 @@ void pmic_glink_client_neuter(struct pmic_glink_client *client)
 	/* The dispatch path reads these three fields under pg->client_lock,
 	 * so the teardown has to take the same lock or the two race. */
 	spin_lock_irqsave(&pg->client_lock, flags);
+	pmic_glink_client_relax(client);
+	client->dev = NULL;
+	client->wakeup_filter = NULL;
 	client->cb = pmic_glink_noop_cb;
 	client->pdr_notify = pmic_glink_noop_pdr;
 	client->priv = NULL;
@@ -250,7 +252,7 @@ EXPORT_SYMBOL_GPL(pmic_glink_send);
 static bool pmic_glink_is_wakeup_event(struct pmic_glink_client *client,
 				       const void *data, size_t len)
 {
-	if (!device_may_wakeup(client->dev))
+	if (!client->dev || !device_may_wakeup(client->dev))
 		return false;
 
 	return !client->wakeup_filter || client->wakeup_filter(data, len, client->priv);
@@ -283,14 +285,7 @@ static bool pmic_glink_defer(struct pmic_glink *pg, const void *data, size_t len
 	if (!pg->defer)
 		return false;
 
-	/* An identical notification brings nothing new, keep the latest copy */
-	list_for_each_entry(msg, &pg->deferred, node) {
-		if (msg->len == len && !memcmp(msg->data, data, len)) {
-			list_move_tail(&msg->node, &pg->deferred);
-			return true;
-		}
-	}
-
+	/* Vendor notifications can be ordered commands, including identical ones. */
 	if (pg->num_deferred == PMIC_GLINK_MAX_DEFERRED) {
 		msg = list_first_entry(&pg->deferred, struct pmic_glink_deferred_msg, node);
 		list_del(&msg->node);
@@ -343,7 +338,7 @@ static int pmic_glink_rpmsg_callback(struct rpmsg_device *rpdev, void *data,
 	hdr = data;
 
 	/* The sender of a request is waiting for the response */
-	notification = le32_to_cpu(hdr->type) != PMIC_GLINK_REQ_RESP;
+	notification = le32_to_cpu(hdr->type) == PMIC_GLINK_NOTIFY;
 
 	/* Defer under client_lock, to set stay_awake before it is delivered */
 	spin_lock_irqsave(&pg->client_lock, flags);
@@ -414,7 +409,7 @@ static bool pmic_glink_deferring(struct pmic_glink *pg)
 	return pg->defer;
 }
 
-static void pmic_glink_state_notify_clients(struct pmic_glink *pg)
+static void pmic_glink_state_notify_clients(struct pmic_glink *pg, bool replay)
 {
 	struct pmic_glink_client *client;
 	unsigned int new_state = pg->client_state;
@@ -423,7 +418,7 @@ static void pmic_glink_state_notify_clients(struct pmic_glink *pg)
 	if (pg->client_state != SERVREG_SERVICE_STATE_UP) {
 		/* On UP the clients use the remote, hold that back as well */
 		if (pg->pdr_state == SERVREG_SERVICE_STATE_UP && pg->ept &&
-		    !pmic_glink_deferring(pg))
+		    (replay || !pmic_glink_deferring(pg)))
 			new_state = SERVREG_SERVICE_STATE_UP;
 	} else {
 		if (pg->pdr_state == SERVREG_SERVICE_STATE_DOWN || !pg->ept)
@@ -452,6 +447,9 @@ static void pmic_glink_deliver_work(struct work_struct *work)
 
 	guard(mutex)(&pg->state_lock);
 
+	/* Publish the new service generation before delivering its notifications. */
+	pmic_glink_state_notify_clients(pg, true);
+
 	for (;;) {
 		spin_lock_irqsave(&pg->defer_lock, flags);
 		msg = list_first_entry_or_null(&pg->deferred, struct pmic_glink_deferred_msg, node);
@@ -477,8 +475,6 @@ static void pmic_glink_deliver_work(struct work_struct *work)
 		pmic_glink_client_relax(client);
 	spin_unlock_irqrestore(&pg->client_lock, flags);
 
-	pmic_glink_state_notify_clients(pg);
-
 	if (dropped)
 		dev_warn(pg->dev, "%u notifications lost during system sleep\n", dropped);
 }
@@ -490,7 +486,7 @@ static void pmic_glink_pdr_callback(int state, char *svc_path, void *priv)
 	guard(mutex)(&pg->state_lock);
 	pg->pdr_state = state;
 
-	pmic_glink_state_notify_clients(pg);
+	pmic_glink_state_notify_clients(pg, false);
 }
 
 static int pmic_glink_rpmsg_probe(struct rpmsg_device *rpdev)
@@ -510,7 +506,7 @@ static int pmic_glink_rpmsg_probe(struct rpmsg_device *rpdev)
 	pg->ept = rpdev->ept;
 	if (!pg->pdr_available)
 		pg->pdr_state = SERVREG_SERVICE_STATE_UP;
-	pmic_glink_state_notify_clients(pg);
+	pmic_glink_state_notify_clients(pg, false);
 
 	return 0;
 }
@@ -528,7 +524,7 @@ static void pmic_glink_rpmsg_remove(struct rpmsg_device *rpdev)
 	pg->ept = NULL;
 	if (!pg->pdr_available)
 		pg->pdr_state = SERVREG_SERVICE_STATE_DOWN;
-	pmic_glink_state_notify_clients(pg);
+	pmic_glink_state_notify_clients(pg, false);
 }
 
 static const struct rpmsg_device_id pmic_glink_rpmsg_id_match[] = {

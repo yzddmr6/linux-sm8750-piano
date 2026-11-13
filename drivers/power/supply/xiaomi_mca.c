@@ -3174,6 +3174,13 @@ static void xiaomi_mca_process_notifications(struct xiaomi_mca *mca)
 	}
 }
 
+static bool xiaomi_mca_usb_notification(const void *data, size_t len, void *priv)
+{
+	const struct xiaomi_mca_notification *msg = data;
+
+	return len == sizeof(*msg) && le32_to_cpu(msg->id) == MCA_NOTIFY_TYPE_CHANGE;
+}
+
 static void xiaomi_mca_callback(const void *data, size_t len, void *priv)
 {
 	const struct pmic_glink_hdr *hdr = data;
@@ -4314,6 +4321,10 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 	 * Allocated first, so that devres releases it last: the power supply
 	 * and debugfs readers send requests through it until they are gone.
 	 */
+	ret = devm_device_init_wakeup(dev);
+	if (ret)
+		return ret;
+
 	mca->client = devm_pmic_glink_client_alloc(dev, PMIC_GLINK_OWNER_BATTMGR,
 						   xiaomi_mca_callback,
 						   xiaomi_mca_pdr_notify, mca);
@@ -4371,6 +4382,7 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 
 	scoped_guard(spinlock_irqsave, &mca->rx_lock)
 		mca->poll_ready = true;
+	pmic_glink_client_set_wakeup_filter(mca->client, xiaomi_mca_usb_notification);
 	pmic_glink_client_register(mca->client);
 	schedule_delayed_work(&mca->poll_work, 0);
 
