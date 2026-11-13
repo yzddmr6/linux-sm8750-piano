@@ -184,12 +184,12 @@ static unsigned int pps_start_curr_ma = 1000;
 module_param(pps_start_curr_ma, uint, 0444);
 MODULE_PARM_DESC(pps_start_curr_ma, "PPS entry current (mA)");
 
-static unsigned int pps_target_curr_ma = 5000;
+static unsigned int pps_target_curr_ma = 4000;
 module_param(pps_target_curr_ma, uint, 0444);
 MODULE_PARM_DESC(pps_target_curr_ma,
 		 "PPS input current target (mA), capped by the adapter maximum at plug-in");
 
-static unsigned int pps_max_curr_ma = 5000;
+static unsigned int pps_max_curr_ma = 4000;
 module_param(pps_max_curr_ma, uint, 0444);
 MODULE_PARM_DESC(pps_max_curr_ma, "hard PPS input current ceiling (mA)");
 
