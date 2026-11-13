@@ -870,12 +870,12 @@ static void xiaomi_mca_test_aicl(struct kunit *test)
 		f->aicl_enabled = 0;
 		f->mca.fcc_set_ma = f->mca.icl_set_ma = 0;
 		KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT,
-						      3000), i ? -EINVAL : -EAGAIN);
+						      3000), -EAGAIN);
 		xiaomi_mca_apply_policy(&f->mca);
 		KUNIT_EXPECT_EQ(test, f->aicl_enabled, 1);
 		KUNIT_EXPECT_EQ(test, f->aicl_runs, i + 1);
-		KUNIT_EXPECT_EQ(test, f->icl, i ? 500 : 3000);
-		KUNIT_EXPECT_EQ(test, f->fcc, i ? 500 : 3000);
+		KUNIT_EXPECT_EQ(test, f->icl, 3000);
+		KUNIT_EXPECT_EQ(test, f->fcc, 3000);
 		xiaomi_mca_apply_policy(&f->mca);
 		KUNIT_EXPECT_EQ(test, f->aicl_runs, i + 1);
 	}
@@ -2659,9 +2659,11 @@ static void xiaomi_mca_test_ffc_conditions(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, f->mca.cp_profile, MCA_PROFILE_FFC);
 	}
 	f->type = MCA_TYPE_FLOAT;
+	f->cells[0].current_ua = 0;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
 	f->type = MCA_TYPE_PD;
+	f->cells[0].current_ua = 2000000;
 	f->pdos[0].max_ma = cpu_to_le32(900);
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
@@ -3081,7 +3083,7 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 	f->ucsi_rp_ua = 3000000;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_5v_input(&f->mca, MCA_TYPE_C), 3000);
 	f->ucsi_rp_ua = 500000;
-	f->ucsi_charge_type = POWER_SUPPLY_CHARGE_TYPE_STANDARD;
+	f->ucsi_charge_type = POWER_SUPPLY_CHARGE_TYPE_UNKNOWN;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_5v_input(&f->mca, MCA_TYPE_UNKNOWN), 3000);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_5v_input(&f->mca, MCA_TYPE_FLOAT), 3000);
 	f->ucsi_rp_ua = 3000000;

@@ -1731,7 +1731,6 @@ enum xiaomi_mca_ucsi_state {
 	MCA_UCSI_UNAVAILABLE,
 	MCA_UCSI_OFFLINE,
 	MCA_UCSI_CONNECTED,
-	MCA_UCSI_NOMINAL_SINK,
 	MCA_UCSI_RP_1500,
 	MCA_UCSI_RP_3000,
 	MCA_UCSI_PD_SINK,
@@ -1811,9 +1810,6 @@ static int xiaomi_mca_ucsi_status(struct power_supply *psy, void *data)
 			return MCA_UCSI_RP_3000;
 		if (val.intval == 1500000)
 			return MCA_UCSI_RP_1500;
-		if (!power_supply_get_property_direct(psy, POWER_SUPPLY_PROP_CHARGE_TYPE, &val) &&
-		    val.intval == POWER_SUPPLY_CHARGE_TYPE_STANDARD)
-			return MCA_UCSI_NOMINAL_SINK;
 		return MCA_UCSI_CONNECTED;
 	}
 	if (val.intval != POWER_SUPPLY_USB_TYPE_PD && val.intval != POWER_SUPPLY_USB_TYPE_PD_PPS)
@@ -1841,9 +1837,6 @@ static u32 xiaomi_mca_5v_input(struct xiaomi_mca *mca, u32 type)
 			ma = 1500;
 		else if (state == MCA_UCSI_RP_3000)
 			ma = 3000;
-		else if ((type == MCA_TYPE_UNKNOWN || type == MCA_TYPE_FLOAT) &&
-			 state != MCA_UCSI_NOMINAL_SINK)
-			ma = MCA_POLICY_ICL_DEFAULT_MA;
 	} else if (xiaomi_mca_is_pd(type)) {
 		ma = xiaomi_mca_pd_5v_ma(mca);
 		ma = min(ma, xiaomi_mca_contract_ma(mca, 5000, min(ma, 3000U)));
