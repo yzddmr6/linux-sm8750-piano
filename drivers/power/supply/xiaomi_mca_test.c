@@ -3181,6 +3181,14 @@ static void xiaomi_mca_test_ffc_handoff(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
 	f->ucsi_online = 0;
+	f->pdos[1].min_mv = cpu_to_le32(5000);
+	f->pdos[1].max_mv = cpu_to_le32(11000);
+	mca->hv = MCA_HV_ON;
+	mca->hv_pps = true;
+	mca->hv_pps_ma = 3000;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
+	mca->hv = MCA_HV_OFF;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 	KUNIT_EXPECT_FALSE(test, mca->ffc_active);
 

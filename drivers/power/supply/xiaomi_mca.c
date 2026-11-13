@@ -2377,8 +2377,11 @@ static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twa
 			if (vbus < MCA_HV_VBUS_MIN_UV || vbus > MCA_HV_VBUS_MAX_UV)
 				return settling;
 			offered = xiaomi_mca_pd_9v_ma(mca, &pps);
-			rdo = xiaomi_mca_contract_ma(mca, MCA_HV_MV, 0);
-			if (!rdo || !offered || pps)
+			if (pps && mca->hv == MCA_HV_ON && mca->hv_pps)
+				rdo = mca->hv_pps_ma;
+			else
+				rdo = xiaomi_mca_contract_ma(mca, MCA_HV_MV, 0);
+			if (!rdo || !offered)
 				return settling;
 			ma = min3(offered, rdo, (u32)MCA_ICL_HV_MAX_MA);
 		}
