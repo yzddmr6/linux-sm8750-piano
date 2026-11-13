@@ -129,6 +129,9 @@ enum qcom_battmgr_variant {
 #define BATT_CHG_CTRL_START_THR		25
 #define BATT_CHG_CTRL_END_THR		26
 /* OPLUS firmware: set to 0 to stop charging, the system keeps running on input */
+/* Charger firmware gauge qualification properties (oplus_hal_adsp.h). */
+#define BATT_OPLUS_AUTH			30
+#define BATT_OPLUS_HMAC			40
 #define BATT_OPLUS_CHG_EN		24
 /* Fixed PDO voltage in mV, written with BATTMGR_BAT_PROPERTY_SET */
 #define BATT_OPLUS_SET_PDO		25
@@ -207,6 +210,7 @@ enum qcom_battmgr_pd_state {
 enum qcom_battmgr_pd_event {
 	PD_EVENT_CAPS,
 	PD_EVENT_RESET,
+	PD_EVENT_SERVICE_RESET,
 };
 
 static DEFINE_MUTEX(erhai_bridge_lock);
@@ -523,6 +527,8 @@ struct qcom_battmgr {
 	bool pd_restore;
 	bool pd_logged;
 	u32 pd_input_limit_ua;
+	u32 pd_saved_fcc_ua;
+	bool pd_restore_fcc;
 	u32 pd_saved_limit_ua;
 };
 
@@ -1291,15 +1297,54 @@ static void qcom_battmgr_pd_log(struct qcom_battmgr *battmgr, u32 type)
 	battmgr->pd_logged = true;
 }
 
+/* Erhai fixed-PD buck profile. FCC controls battery demand independently
+ * of USB ICL. The firmware continues to own the CV and JEITA loops. Use
+ * the normal PD row only for a qualified pack in the normal temperature
+ * window. Preserve the autonomous profile everywhere else. */
+static int qcom_battmgr_pd_fcc(struct qcom_battmgr *b)
+{
+	u32 auth, hmac, temp, max_fcc, want, current_fcc;
+	int ret;
+
+	ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM, &current_fcc);
+	if (ret)
+		return ret;
+	if (!b->pd_restore_fcc)
+		b->pd_saved_fcc_ua = current_fcc;
+	want = b->pd_saved_fcc_ua;
+	if (!b->charge_inhibited && !b->charge_policy_hold && !b->charge_error &&
+	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, &temp) &&
+	    (s32)temp >= 1200 && (s32)temp < 4400 &&
+	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_AUTH, &auth) &&
+	    auth == 1 &&
+	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_HMAC, &hmac) &&
+	    hmac == 1 &&
+	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM_MAX, &max_fcc) &&
+	    max_fcc > 0 && max_fcc <= INT_MAX)
+		want = min(max_fcc, 4400000U);
+	if (want == current_fcc)
+		return 0;
+	/* A timeout does not prove that the firmware ignored the write. */
+	b->pd_restore_fcc = true;
+	return qcom_battmgr_set_property(b, BATTMGR_BAT_PROPERTY_SET, BATT_CHG_CTRL_LIM, want);
+}
+
 /* Restore the host's previous ICL only after asking the firmware for 5 V. */
 static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 			      const char *reason)
 {
 	u32 vbus;
-	int ret, err;
+	int ret, err, fcc_err = 0;
 
+	if (battmgr->pd_restore_fcc) {
+		ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+						BATT_CHG_CTRL_LIM, battmgr->pd_saved_fcc_ua);
+		fcc_err = ret;
+		if (!ret)
+			battmgr->pd_restore_fcc = false;
+	}
 	if (!battmgr->pd_restore)
-		return 0;
+		return fcc_err;
 
 	err = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
 					USB_INPUT_CURR_LIMIT,
@@ -1319,8 +1364,8 @@ static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 		if (!err || offline)
 			battmgr->pd_restore = false;
 	}
-	err = ret ?: err;
-	battmgr->pd_state = battmgr->pd_restore ? PD_FAILED : PD_IDLE;
+	err = fcc_err ?: ret ?: err;
+	battmgr->pd_state = battmgr->pd_restore || battmgr->pd_restore_fcc ? PD_FAILED : PD_IDLE;
 	battmgr->pd_logged = false;
 	if (err)
 		dev_warn(battmgr->dev, "PD: restore 5 V (%s) failed: %d\n", reason, err);
@@ -1337,6 +1382,8 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	u32 online, type, health, vbat, vbus, ua, real_type;
 	int ret;
 
+	if (test_and_clear_bit(PD_EVENT_SERVICE_RESET, &battmgr->pd_events))
+		battmgr->pd_restore_fcc = false;
 	if (test_and_clear_bit(PD_EVENT_RESET, &battmgr->pd_events)) {
 		qcom_battmgr_pps_stop(battmgr);
 		battmgr->pd_state = PD_IDLE;
@@ -1354,7 +1401,9 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		ret = qcom_battmgr_pps_stop(battmgr);
 		if (ret)
 			return PD_POLL_MS;
-		qcom_battmgr_pd_stop(battmgr, true, "charger removed");
+		if (qcom_battmgr_pd_stop(battmgr, true, "charger removed") &&
+		    battmgr->pd_restore_fcc)
+			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
 		battmgr->pd_logged = false;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
@@ -1392,7 +1441,8 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			qcom_battmgr_pps_stop(battmgr);
 			return PD_POLL_MS;
 		}
-		return battmgr->pps_ops->update(battmgr->pps_data);
+		return battmgr->pps_ops->update(battmgr->pps_data,
+				test_and_clear_bit(PD_EVENT_CAPS, &battmgr->pd_events));
 	}
 	if (qcom_battmgr_pps_running(battmgr)) {
 		if (qcom_battmgr_pps_stop(battmgr))
@@ -1418,6 +1468,11 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	}
 
 	if (battmgr->pd_state == PD_FAILED) {
+		if (battmgr->pd_restore_fcc || battmgr->pd_restore) {
+			if (qcom_battmgr_pd_stop(battmgr, false, "pending restore"))
+				return PD_POLL_MS;
+			battmgr->pd_state = PD_FAILED;
+		}
 		qcom_battmgr_pd_log(battmgr, type);
 		return 0;
 	}
@@ -1425,7 +1480,8 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	if (qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_HEALTH, &health) ||
 	    qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, &vbat))
 		return CHARGE_CTRL_POLL_MS;
-	if (battmgr->charge_inhibited || health != POWER_SUPPLY_HEALTH_GOOD ||
+	if (battmgr->charge_inhibited || battmgr->charge_policy_hold || battmgr->charge_error ||
+	    health != POWER_SUPPLY_HEALTH_GOOD ||
 	    vbat >= (battmgr->pd_restore ? PD_VBAT_STOP_UV : PD_VBAT_START_UV)) {
 		qcom_battmgr_pd_stop(battmgr, false, "battery limit");
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
@@ -1497,6 +1553,9 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			if (ret)
 				goto failed;
 		}
+		ret = qcom_battmgr_pd_fcc(battmgr);
+		if (ret)
+			goto failed;
 		battmgr->pd_state = PD_ACTIVE;
 		qcom_battmgr_pd_log(battmgr, type);
 		return CHARGE_CTRL_POLL_MS;
@@ -1509,7 +1568,7 @@ failed:
 	qcom_battmgr_pd_stop(battmgr, false, "request failed");
 	battmgr->pd_state = PD_FAILED;
 	qcom_battmgr_pd_log(battmgr, type);
-	return 0;
+	return battmgr->pd_restore || battmgr->pd_restore_fcc ? PD_POLL_MS : 0;
 }
 
 /* Finish the existing fixed-PD transition before the charge worker freezes. */
@@ -1540,7 +1599,7 @@ static void qcom_battmgr_pd_suspend(struct qcom_battmgr *battmgr)
 	 * raise its input limit after cleanup succeeded and VBUS is at 5 V.
 	 * Missing capabilities or a failed read leave the firmware fallback.
 	 */
-	if (battmgr->pd_restore || READ_ONCE(battmgr->otg_request))
+	if (battmgr->pd_restore || battmgr->pd_restore_fcc || READ_ONCE(battmgr->otg_request))
 		return;
 	power_supply_for_each_psy(&src, qcom_battmgr_pd_source_match);
 	if (!src.sink || qcom_battmgr_pd_current(battmgr, PD_DEFAULT_MV, &ua) || !ua)
@@ -2484,6 +2543,9 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->info.charge_ctrl_end = le32_to_cpu(resp->intval.value);
 			break;
 		case BATT_CHG_CTRL_LIM:
+		case BATT_CHG_CTRL_LIM_MAX:
+		case BATT_OPLUS_AUTH:
+		case BATT_OPLUS_HMAC:
 			/* Only read through qcom_battmgr_get_property() */
 			break;
 		default:
@@ -2803,6 +2865,7 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		/* ... and starts with the boost off and without a PPS contract */
 		battmgr->otg_request = false;
 		battmgr->otg_vbus = false;
+		set_bit(PD_EVENT_SERVICE_RESET, &battmgr->pd_events);
 		set_bit(PD_EVENT_RESET, &battmgr->pd_events);
 		qcom_battmgr_charge_kick(battmgr);
 	}
@@ -2932,6 +2995,34 @@ static void qcom_battmgr_unregister_pm_notifier(void *data)
 
 	unregister_pm_notifier(&battmgr->pm_nb);
 }
+
+/* PD sources qualify their advertised current against the cable identity.
+ * Use one live PPS APDO covering the complete voltage regulation window. */
+int erhai_pps_apdo_current(u32 min_mv, u32 max_mv)
+{
+	struct qcom_battmgr *b;
+	unsigned int i;
+	int ret, ma = 0;
+
+	guard(mutex)(&erhai_bridge_lock);
+	b = erhai_battmgr;
+	if (!b || !b->service_up)
+		return -ENODEV;
+	guard(mutex)(&b->lock);
+	ret = qcom_battmgr_read_pdos_locked(b);
+	if (ret)
+		return ret;
+	for (i = 0; i < b->num_src_pdos; i++) {
+		u32 pdo = b->src_pdos[i];
+
+		if (pdo_type(pdo) == PDO_TYPE_APDO && pdo_apdo_type(pdo) == APDO_TYPE_PPS &&
+		    pdo_pps_apdo_min_voltage(pdo) <= min_mv &&
+		    pdo_pps_apdo_max_voltage(pdo) >= max_mv)
+			ma = max_t(int, ma, pdo_pps_apdo_max_current(pdo));
+	}
+	return min(ma, 5000);
+}
+EXPORT_SYMBOL_GPL(erhai_pps_apdo_current);
 
 /* Property traffic from PPS uses the existing serialized request channel. */
 int erhai_otg_adsp_prop_get(u32 opcode, u32 property)

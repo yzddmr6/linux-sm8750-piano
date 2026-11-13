@@ -1039,13 +1039,14 @@ int sc8547a_pps_cp_feed(int *vbus_mv, int *vbat_mv)
 {
 	guard(mutex)(&sc8547_pps_lock);
 	struct sc8547a_device *sc = sc8547_master_dev;
-	int vbus, vbat, diff;
+	int vbus, vbat, diff, ret;
+	bool window = false;
 	u8 control;
 
 	if (!sc || !pps_cp_engaged)
 		return -ENODEV;
-	if (sc8547_read_byte(sc, SC8547_REG_07, &control) ||
-	    !(control & SC8547_CHG_EN_MASK))
+	ret = sc8547_read_byte(sc, SC8547_REG_07, &control);
+	if (ret)
 		goto drop;
 	vbus = sc8547_get_vbus(sc);
 	vbat = sc8547_get_vbat(sc);
@@ -1057,15 +1058,23 @@ int sc8547a_pps_cp_feed(int *vbus_mv, int *vbat_mv)
 		*vbat_mv = vbat;
 	diff = vbus - vbat * 2;
 	if (diff < SC8547_CP_RESTART_MARGIN_MV ||
-	    diff > SC8547_CP_RESTART_MARGIN_CEIL_MV)
+	    diff > SC8547_CP_RESTART_MARGIN_CEIL_MV) {
+		window = true;
 		goto drop;
-	if (sc8547_write_byte(sc, SC8547_REG_09, 0x13) ||
-	    sc8547_set_chg_enable(sc, true))
+	}
+	if (!(control & SC8547_CHG_EN_MASK))
 		goto drop;
-	return 0;
+	ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+	if (!ret)
+		ret = sc8547_set_chg_enable(sc, true);
+	if (!ret)
+		return 0;
 drop:
-	sc8547_pps_disengage();
-	return -EAGAIN;
+	/* Reserve EAGAIN for an observed window excursion. I2C adapters can
+	 * also return EAGAIN for arbitration loss. */
+	if (sc8547_pps_disengage())
+		return -EIO;
+	return window ? -EAGAIN : -EIO;
 }
 EXPORT_SYMBOL_GPL(sc8547a_pps_cp_feed);
 

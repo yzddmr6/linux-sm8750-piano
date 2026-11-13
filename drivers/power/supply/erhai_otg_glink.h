@@ -22,12 +22,13 @@ struct pmic_glink_client;
 struct erhai_pps_ops {
 	bool (*enabled)(void);
 	bool (*active)(void *data);
-	unsigned int (*update)(void *data);
+	unsigned int (*update)(void *data, bool caps_changed);
 	int (*stop)(void *data);
 };
 int erhai_pps_register(struct device *parent, const struct erhai_pps_ops *ops,
 		       void *data);
 void erhai_pps_unregister(struct device *parent);
+int erhai_pps_apdo_current(u32 min_mv, u32 max_mv);
 int erhai_otg_adsp_usb_prop(u32 property);
 int erhai_otg_adsp_prop_get(u32 opcode, u32 property);
 int erhai_otg_adsp_prop_set(u32 opcode, u32 property, u32 value);
