@@ -182,9 +182,7 @@
 	clock-frequency = <1000000>;
 
 	cam_wide_vcm: vcm@c {
-		/* Stock uses GT9764BA; its register protocol is unverified. */
-		status = "disabled";
-		compatible = "giantec,gt9769";
+		compatible = "giantec,gt9764";
 		reg = <0x0c>;
 		vin-supply = <&vreg_l6b_1p8>;
 		vdd-supply = <&vreg_l7b_2p8>;
@@ -196,6 +194,7 @@
 		led-names = "privacy";
 		privacy-led-brightness = <4 255>;
 		flash-leds = <&piano_camera_flash>;
+		lens-focus = <&cam_wide_vcm>;
 		reg = <0x10>;
 		power-domains = <&camcc CAM_CC_TITAN_TOP_GDSC>;
 		clocks = <&cambistmclkcc CAM_BIST_MCLK_CC_MCLK1_CLK>;
