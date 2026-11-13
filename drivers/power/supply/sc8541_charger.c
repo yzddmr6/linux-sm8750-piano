@@ -43,8 +43,13 @@
 #define SC8541_BUSOVP		0x06	/* 7000 + 50 mV * [7:0] */
 #define SC8541_BUSOVP_ALM	0x07
 #define SC8541_BUSOCP		0x08	/* bit7 disable, 1000 + 250 mA * [4:0] */
+#define SC8541_TEMP_CTRL	0x0a
+#define SC8541_TSHUT_DISABLE	BIT(7)
 #define SC8541_CTRL2		0x0f
 #define SC8541_CHG_EN		BIT(4)
+#define SC8541_CTRL3		0x10
+#define SC8541_WD_MASK		GENMASK(4, 2)
+#define SC8541_WD_ACTIVE	BIT(4)	/* WD_TIMEOUT=2, WD_TIMEOUT_DIS=0 */
 #define SC8541_EN_BYPASS	BIT(3)
 #define SC8541_DEVICE_INFO	0x22
 #define SC8541_DEVICE_ID	0x41
@@ -135,6 +140,9 @@ struct sc8541 {
 	struct mutex lock;		/* enabled, register sequences */
 	struct delayed_work watch;	/* kick timeout, or the check after a stop */
 	bool enabled;
+	bool removing;
+	bool wd_owned;
+	unsigned int wd_saved;
 	bool pen_owned;
 	u32 pen_gate_saved;
 	bool otg_owned;		/* excludes the forward charging policy */
@@ -232,6 +240,13 @@ static int sc8541_arm(struct sc8541 *sc)
 	ret = ret ?: sc8541_write_check(sc, SC8541_BUSOCP, 0x9f,
 				(sc->busocp_ma - SC8541_BUSOCP_OFFSET_MA) /
 				SC8541_BUSOCP_STEP_MA);
+	/* Reverse mode may leave IBAT_OCP disabled. SC8541 is rated
+	 * for 8 A output. Southchip's SC8541_IBAT_OCP converter for REG02
+	 * starts at zero in 100 mA steps; REG11 selects the sense resistor.
+	 * Preserve the board setting. The gauges independently limit pack current.
+	 */
+	ret = ret ?: sc8541_write_check(sc, SC8541_BATOCP, 0xff, 8000 / 100);
+	ret = ret ?: sc8541_write_check(sc, SC8541_TEMP_CTRL, SC8541_TSHUT_DISABLE, 0);
 	/* 2:1, not bypass */
 	ret = ret ?: sc8541_write_check(sc, SC8541_CTRL2, SC8541_EN_BYPASS, 0);
 	/* all channels, continuous conversion */
@@ -242,13 +257,51 @@ static int sc8541_arm(struct sc8541 *sc)
 	return ret;
 }
 
+/* Restore the preceding mode's watchdog setting only after CHG_EN is clear. */
+static int sc8541_release_watchdog(struct sc8541 *sc)
+{
+	int ret;
+
+	if (!sc->wd_owned)
+		return 0;
+	ret = sc8541_write_check(sc, SC8541_CTRL3, SC8541_WD_MASK, sc->wd_saved);
+	if (!ret)
+		sc->wd_owned = false;
+	return ret;
+}
+
+static int sc8541_feed_watchdog(struct sc8541 *sc)
+{
+	unsigned int ctrl;
+	int ret;
+
+	if (!sc->wd_owned) {
+		ret = regmap_read(sc->regmap, SC8541_CTRL3, &ctrl);
+		if (ret)
+			return ret;
+		sc->wd_saved = ctrl & SC8541_WD_MASK;
+		sc->wd_owned = true;
+	}
+	/* Force a bus write on every MCA heartbeat, even for an unchanged value. */
+	return sc8541_write_check(sc, SC8541_CTRL3, SC8541_WD_MASK, SC8541_WD_ACTIVE);
+}
+
 static int sc8541_enable(struct sc8541 *sc)
 {
 	int ret = 0;
 
 	mutex_lock(&sc->lock);
+	if (sc->removing) {
+		ret = -ENODEV;
+		goto out;
+	}
 	if (sc->otg_owned || sc->pen_owned) {
 		ret = -EBUSY;
+		goto out;
+	}
+	ret = sc8541_feed_watchdog(sc);
+	if (ret) {
+		sc8541_disable_locked(sc);
 		goto out;
 	}
 	if (!sc->enabled) {
@@ -295,6 +348,7 @@ static int sc8541_disable_sync(struct sc8541 *sc)
 		dev_err(sc->dev, "still switching after stop\n");
 		ret = -EBUSY;
 	}
+	ret = ret ?: sc8541_release_watchdog(sc);
 	mutex_unlock(&sc->lock);
 	return ret;
 }
@@ -323,6 +377,8 @@ static void sc8541_watch(struct work_struct *work)
 		   (ctrl & SC8541_CHG_EN)) {
 		dev_warn(sc->dev, "still switching after stop, stopping again\n");
 		sc8541_disable_locked(sc);
+	} else if (sc8541_release_watchdog(sc)) {
+		mod_delayed_work(system_dfl_wq, &sc->watch, msecs_to_jiffies(SC8541_GUARD_MS));
 	}
 	mutex_unlock(&sc->lock);
 }
@@ -372,7 +428,9 @@ static int sc8541_otg_locked(struct sc8541 *sc, enum sc8541_otg_action action)
 
 	if (action == SC8541_OTG_PRESENT)
 		return 0;
-	if (sc->enabled)
+	if (sc->removing)
+		return -ENODEV;
+	if (sc->enabled || sc->wd_owned)
 		return -EBUSY;
 	if (action == SC8541_PEN_ISOLATE) {
 		if (sc->otg_owned)
@@ -650,8 +708,21 @@ static void sc8541_stop(void *data)
 {
 	struct sc8541 *sc = data;
 
+	scoped_guard(mutex, &sc->lock)
+		sc->removing = true;
 	debugfs_remove_recursive(sc->dbg);
-	sc8541_disable_sync(sc);
+	if (sc8541_disable_sync(sc))
+		dev_err(sc->dev, "unable to confirm stop during removal\n");
+}
+
+/* An in-flight set_property(ONLINE=0) can schedule its final guard after
+ * stop(). The power-supply core drains callbacks during unregister.
+ */
+static void sc8541_cancel_watch(void *data)
+{
+	struct sc8541 *sc = data;
+
+	cancel_delayed_work_sync(&sc->watch);
 }
 
 static const struct regmap_config sc8541_regmap_config = {
@@ -699,8 +770,7 @@ static int sc8541_probe(struct i2c_client *client)
 			return ret;
 	}
 
-	/* Runs after the power supply is gone, so nothing turns it back on */
-	ret = devm_add_action_or_reset(dev, sc8541_stop, sc);
+	ret = devm_add_action_or_reset(dev, sc8541_cancel_watch, sc);
 	if (ret)
 		return ret;
 
@@ -714,6 +784,11 @@ static int sc8541_probe(struct i2c_client *client)
 	sc->dbg = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("regs", 0400, sc->dbg, sc, &sc8541_dbg_regs_fops);
 	debugfs_create_file("adc", 0600, sc->dbg, sc, &sc8541_dbg_adc_fops);
+
+	/* Drain the stage before devres unregisters the power supply. */
+	ret = devm_add_action_or_reset(dev, sc8541_stop, sc);
+	if (ret)
+		return ret;
 
 	i2c_set_clientdata(client, sc);
 	dev_info(dev, "SC8541 (ctrl 0x%02x)\n", ctrl);

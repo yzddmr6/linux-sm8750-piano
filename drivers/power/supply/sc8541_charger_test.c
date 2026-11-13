@@ -76,7 +76,11 @@ static void sc8541_test_protections(struct kunit *test)
 {
 	struct sc8541_test *f = sc8541_test_init(test);
 
+	f->regs[SC8541_BATOCP] = 0xd0;
+	f->regs[SC8541_TEMP_CTRL] = SC8541_TSHUT_DISABLE;
 	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOCP], 80);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_TEMP_CTRL] & SC8541_TSHUT_DISABLE, 0);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOVP], 76);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOVP_ALM], 71);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BUSOVP], 80);
@@ -91,6 +95,30 @@ static void sc8541_test_protections(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
 }
 
+static void sc8541_test_hw_watchdog(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+	unsigned int writes;
+
+	f->regs[SC8541_CTRL3] = 0xa4;
+	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL3], 0xb0);
+	writes = f->writes;
+	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	KUNIT_ASSERT_EQ(test, f->writes, writes + 1);
+	KUNIT_EXPECT_EQ(test, f->write_regs[writes], SC8541_CTRL3);
+	f->fail_reg = SC8541_CTRL3;
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -EIO);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+	f->fail_reg = -1;
+	f->stuck_enabled = true;
+	KUNIT_EXPECT_EQ(test, sc8541_quiesce(&f->sc), -EBUSY);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL3], 0xb0);
+	f->stuck_enabled = false;
+	KUNIT_ASSERT_EQ(test, sc8541_quiesce(&f->sc), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL3], 0xa4);
+}
+
 static void sc8541_test_failed_arm(struct kunit *test)
 {
 	struct sc8541_test *f = sc8541_test_init(test);
@@ -99,6 +127,21 @@ static void sc8541_test_failed_arm(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -EIO);
 	KUNIT_EXPECT_FALSE(test, f->sc.enabled);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+}
+
+static void sc8541_test_remove(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+
+	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	sc8541_stop(&f->sc);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_CTRL2] & SC8541_CHG_EN, 0);
+	KUNIT_EXPECT_EQ(test, sc8541_enable(&f->sc), -ENODEV);
+	f->stuck_enabled = true;
+	KUNIT_EXPECT_EQ(test, sc8541_quiesce(&f->sc), -EBUSY);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&f->sc.watch));
+	sc8541_cancel_watch(&f->sc);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&f->sc.watch));
 }
 
 static void sc8541_test_adc(struct kunit *test)
@@ -260,6 +303,8 @@ static struct kunit_case sc8541_test_cases[] = {
 	KUNIT_CASE(sc8541_test_otg_sequence),
 	KUNIT_CASE(sc8541_test_protections),
 	KUNIT_CASE(sc8541_test_failed_arm),
+	KUNIT_CASE(sc8541_test_hw_watchdog),
+	KUNIT_CASE(sc8541_test_remove),
 	KUNIT_CASE(sc8541_test_adc),
 	KUNIT_CASE(sc8541_test_suspend_write_failure),
 	KUNIT_CASE(sc8541_test_suspend_read_failure),
