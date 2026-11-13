@@ -271,7 +271,7 @@ MODULE_PARM_DESC(charge_current,
  */
 #define MCA_TERM_DEFAULT_MV	4400
 #define MCA_TERM_FULL_MV	4480
-#define MCA_TERM_FFC_MV		4550	/* CN jeita_para_ffc; pump tapers at 4540 */
+#define MCA_TERM_FFC_MV		4540	/* batt_para_lwn final fast-charge step */
 #define MCA_TERM_HOT_MV		4060
 #define MCA_TERM_HOT_DEGC	48
 #define MCA_TERM_COOL_DEGC	46
@@ -2061,33 +2061,15 @@ static void xiaomi_mca_select_profile(struct xiaomi_mca *mca, int tcool, int twa
 	}
 }
 
+/* FFC describes the cells. Adapter identity limits the source current. */
 static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twarm)
 {
-	union power_supply_propval soc;
-	struct power_supply *psy;
-	int n, ret;
+	u32 type;
 
-	/* Stock buck ffc_temp_low/high and allow_start_ffc_batt_soc_thr. */
-	if (!full_charge || !mipps_auth || !xiaomi_mca_authenticated(mca) ||
-	    mca->policy_generation != READ_ONCE(mca->service_generation) ||
-	    tcool < 18 || twarm >= 48 ||
-	    xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE) != 1 ||
-	    xiaomi_mca_read_u32(mca, MCA_PROP_USB_REAL_TYPE) != MCA_TYPE_PD_VERIFY ||
-	    xiaomi_mca_read_u32(mca, MCA_PROP_PD_VERIFIED) != 1 ||
-	    xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
-		return false;
-
-	for (n = 0; n < ARRAY_SIZE(xiaomi_mca_supplied_to); n++) {
-		psy = power_supply_get_by_name(xiaomi_mca_supplied_to[n]);
-		if (!psy)
-			return false;
-		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &soc);
-		power_supply_put(psy);
-		if (ret || soc.intval < 0 || soc.intval > 100 ||
-		    (!mca->ffc_active && soc.intval >= 95))
-			return false;
-	}
-	return true;
+	return full_charge && tcool >= 18 && twarm < MCA_TERM_HOT_DEGC &&
+	       mca->policy_generation == READ_ONCE(mca->service_generation) &&
+	       xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE) == 1 &&
+	       !xiaomi_mca_read_type(mca, &type) && xiaomi_mca_limits(type);
 }
 
 static int xiaomi_mca_restore_term_volt(struct xiaomi_mca *mca)
@@ -2750,7 +2732,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	}
 	cv = xiaomi_mca_cp_vbat_max(mca);
 	taper = vbat >= cv - 9;	/* pps_taper_vol_hys */
-	if (vmin < MCA_CP_VBAT_MIN_MV || vbat > cv + 4 ||
+	if (vmin < MCA_CP_VBAT_MIN_MV || vbat > min_t(u32, cv + 4, mca->ffc_active ? MCA_TERM_FFC_MV : UINT_MAX) ||
 	    (taper && (mca->cp != MCA_CP_ON || ibat <= 3000))) {
 		mca->cp_recharge = taper;
 		xiaomi_mca_cp_stop(mca, "battery voltage reached");
