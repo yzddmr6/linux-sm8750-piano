@@ -890,6 +890,11 @@ static void xiaomi_mca_test_qc_pulses(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_QC_PULSE);
 		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->last_data), cases[i].cmd);
 	}
+	/* A hold at a non-PPS-aligned ADC measurement sends no QC pulse. */
+	f->mca.vbus_uv = 8217000;
+	f->writes = 0;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_request(&f->mca, 8217), 0);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
 	f->type = MCA_TYPE_DCP;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_qc_adjust(&f->mca, 8400), -EPERM);
 }

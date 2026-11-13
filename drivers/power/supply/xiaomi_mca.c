@@ -1005,18 +1005,12 @@ static int xiaomi_mca_write(struct xiaomi_mca *mca, u32 property, u32 value)
  */
 static int xiaomi_mca_restore_icl(struct xiaomi_mca *mca)
 {
-	u32 real_type;
 	int ret;
 
 	lockdep_assert_held(&mca->lock);
 
 	if (!mca->icl_written)
 		return 0;
-
-	/* Unknown also forbids automatic writes; wait for a recognized source. */
-	ret = xiaomi_mca_read_type(mca, &real_type);
-	if (ret || !xiaomi_mca_limits(real_type))
-		return ret ?: -EOPNOTSUPP;
 
 	ret = xiaomi_mca_write(mca, MCA_PROP_INPUT_CURRENT_LIMIT, MCA_ICL_DEFAULT_MA);
 	if (ret) {
@@ -1205,8 +1199,18 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	ret = xiaomi_mca_read_type(mca, &type);
 	if (ret)
 		return ret;
-	if (!xiaomi_mca_limits(type))
+	if (!xiaomi_mca_limits(type)) {
+		if (prop == MCA_PROP_INPUT_CURRENT_LIMIT && mca->icl_written &&
+		    get_unaligned_le32(data) == MCA_ICL_DEFAULT_MA) {
+			memcpy(buf, data, len);
+			ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
+			ret = ret ?: xiaomi_mca_read(mca, prop, &readback);
+			if (ret)
+				return ret;
+			return readback == MCA_ICL_DEFAULT_MA ? 0 : -EIO;
+		}
 		return -EOPNOTSUPP;
+	}
 	if (prop == MCA_PROP_QC_PULSE &&
 	    (!xiaomi_mca_is_qc_pump(type) || type != mca->cp_type ||
 	     (mca->cp != MCA_CP_OPENING && mca->cp != MCA_CP_ON)))
@@ -2338,13 +2342,14 @@ static int xiaomi_mca_cp_request(struct xiaomi_mca *mca, u32 mv)
 	u32 ma;
 	int ret;
 
-	mv = clamp(rounddown(mv, 20), (u32)MCA_CP_PPS_MIN_MV,
+	mv = clamp(mv, (u32)MCA_CP_PPS_MIN_MV,
 		   min_t(u32, mca->cp_max_mv, MCA_CP_PPS_MAX_MV));
 	if (xiaomi_mca_is_qc_pump(mca->cp_type)) {
 		mca->cp_request_ma = mca->cp_ma;
 		mca->cp_mv = mca->vbus_uv / 1000;
 		return xiaomi_mca_qc_adjust(mca, mv);
 	}
+	mv = rounddown(mv, 20);
 	ma = rounddown(xiaomi_mca_cp_power_limit(mca->cp_ma, mv), 50);
 	if (mv == mca->cp_mv && ma == mca->cp_request_ma)
 		return 0;
@@ -3762,12 +3767,8 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		   (xiaomi_mca_cp_active(mca) &&
 		    (xiaomi_mca_is_qc_pump(mca->cp_type) ? real_type != mca->cp_type :
 							   !xiaomi_mca_is_pd(real_type)))) {
-		if (xiaomi_mca_cp_stop(mca, "unknown source"))
-			return;
-		if (mca->icl_written && xiaomi_mca_restore_icl(mca))
-			return;
-		if (mca->fcc_written)
-			xiaomi_mca_reset_fcc(mca);
+		if (!xiaomi_mca_cp_stop(mca, "unknown source") && mca->icl_written)
+			xiaomi_mca_restore_icl(mca);
 	} else if (charge_policy && mipps_auth && !mca->auth_lost &&
 		   mca->adapter_svid == 0x2717 && mca->mipps_attempted &&
 		   !xiaomi_mca_authenticated(mca) && time_after_eq(jiffies, mca->auth_retry) &&
