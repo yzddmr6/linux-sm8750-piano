@@ -1681,14 +1681,14 @@ static u32 xiaomi_mca_policy_fcc(u32 real_type, bool hv)
 }
 
 /* Charge current for @full at battery temperature @tbat */
-static u32 xiaomi_mca_fcc_thermal(u32 full, int tbat)
+static u32 xiaomi_mca_fcc_thermal(struct xiaomi_mca *mca, u32 full, int tbat)
 {
 	/* CN mca_buckchg_jeita. Firmware and charge_limit_poll own stop. */
 	if (tbat < -9 || tbat >= 55)
 		return min_t(u32, full, MCA_FCC_DEFAULT_MA);
 	if (tbat < 3)
 		return min_t(u32, full, 880);
-	if (tbat < 8)
+	if (tbat < 8 || (mca->zone_valid && mca->cell_zone < 8))
 		return min_t(u32, full, 1768);
 	/* All other active JEITA rows allow >= 4520 mA, above buck max. */
 	return full;
@@ -1705,7 +1705,7 @@ static void xiaomi_mca_apply_fcc(struct xiaomi_mca *mca, int tbat, u32 icl)
 		full = icl;
 	else if (xiaomi_mca_is_pd(mca->real_type) && mca->hv == MCA_HV_ON)
 		full = min(2 * icl, (u32)MCA_CP_PAR_FCC_MAX_MA);
-	target = xiaomi_mca_fcc_thermal(full, tbat);
+	target = xiaomi_mca_fcc_thermal(mca, full, tbat);
 
 	if (target == mca->fcc_set_ma)
 		return;
@@ -2724,6 +2724,8 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		tbat = max_t(s32, tbat, tpack);
 		tcool = min_t(s32, tcool, tpack);
 		mca->coolest_temp = tcool;
+		if (!full_charge)
+			xiaomi_mca_update_zones(mca, tcool, tbat);
 		/* Firmware JEITA remains enabled throughout. */
 		if (tbat >= 55)
 			mca->charge_hot = true;
@@ -4673,7 +4675,7 @@ static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca, u32 fixed_ma)
 		ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tbat);
 		if (ret)
 			return ret;
-		fcc = xiaomi_mca_fcc_thermal(fcc, min((s32)tbat, mca->coolest_temp));
+		fcc = xiaomi_mca_fcc_thermal(mca, fcc, min((s32)tbat, mca->coolest_temp));
 		ret = xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, fcc);
 		if (ret)
 			return ret;

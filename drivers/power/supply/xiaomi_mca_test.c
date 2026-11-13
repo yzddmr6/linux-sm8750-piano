@@ -1038,6 +1038,11 @@ static void xiaomi_mca_test_jeita_hysteresis(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, mca->ffc_warm);
 	xiaomi_mca_update_zones(mca, 25, 33);
 	KUNIT_EXPECT_FALSE(test, mca->ffc_warm);
+	xiaomi_mca_update_zones(mca, 7, 25);
+	xiaomi_mca_update_zones(mca, 9, 25);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_fcc_thermal(mca, 3000, 9), 1768);
+	xiaomi_mca_update_zones(mca, 10, 25);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_fcc_thermal(mca, 3000, 10), 3000);
 }
 
 static void xiaomi_mca_test_profile_switch(struct kunit *test)
@@ -1379,7 +1384,7 @@ static void xiaomi_mca_test_pm_source_currents(struct kunit *test)
 	/* The 5 V handoff retains the existing warm-battery derating. */
 	f->tbat = 48;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_prepare(f->mca.dev), 0);
-	KUNIT_EXPECT_EQ(test, f->fcc, xiaomi_mca_fcc_thermal(900, 48));
+	KUNIT_EXPECT_EQ(test, f->fcc, xiaomi_mca_fcc_thermal(&f->mca, 900, 48));
 }
 
 static void xiaomi_mca_test_sleep_fixed_pd(struct kunit *test)
