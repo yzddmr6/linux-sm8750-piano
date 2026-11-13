@@ -624,17 +624,31 @@ static int csot_xn242_unprepare(struct drm_panel *panel)
 	return 0;
 }
 
-static const struct drm_display_mode csot_xn242_mode = {
-	.clock = (1696 + 50 + 32 + 64) * 2 * (2400 + 26 + 2 + 230) * 120 / 1000,
-	.hdisplay = 1696 * 2,
-	.hsync_start = (1696 + 50) * 2,
-	.hsync_end = (1696 + 50 + 32) * 2,
-	.htotal = (1696 + 50 + 32 + 64) * 2,
-	.vdisplay = 2400,
-	.vsync_start = 2400 + 26,
-	.vsync_end = 2400 + 26 + 2,
-	.vtotal = 2400 + 26 + 2 + 230,
-	.type = DRM_MODE_TYPE_DRIVER,
+static const struct drm_display_mode csot_xn242_modes[] = {
+	{
+		.clock = (1696 + 50 + 32 + 64) * 2 * (2400 + 26 + 2 + 230) * 120 / 1000,
+		.hdisplay = 1696 * 2,
+		.hsync_start = (1696 + 50) * 2,
+		.hsync_end = (1696 + 50 + 32) * 2,
+		.htotal = (1696 + 50 + 32 + 64) * 2,
+		.vdisplay = 2400,
+		.vsync_start = 2400 + 26,
+		.vsync_end = 2400 + 26 + 2,
+		.vtotal = 2400 + 26 + 2 + 230,
+		.type = DRM_MODE_TYPE_DRIVER,
+	},
+	{
+		.clock = (1696 + 210 + 80 + 160) * 2 * (2400 + 26 + 2 + 52) * 90 / 1000,
+		.hdisplay = 1696 * 2,
+		.hsync_start = (1696 + 210) * 2,
+		.hsync_end = (1696 + 210 + 80) * 2,
+		.htotal = (1696 + 210 + 80 + 160) * 2,
+		.vdisplay = 2400,
+		.vsync_start = 2400 + 26,
+		.vsync_end = 2400 + 26 + 2,
+		.vtotal = 2400 + 26 + 2 + 52,
+		.type = DRM_MODE_TYPE_DRIVER,
+	},
 };
 
 static const struct drm_panel_funcs csot_xn242_panel_funcs = {
@@ -774,8 +788,8 @@ static const struct panel_desc csot_xn242_desc = {
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_LPM |
 		      MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT,
 	.dsc_cfg = &csot_xn242_dsc_cfg,
-	.modes = &csot_xn242_mode,
-	.num_modes = 1,
+	.modes = csot_xn242_modes,
+	.num_modes = ARRAY_SIZE(csot_xn242_modes),
 	.is_dual_dsi = true,
 	.reset_initially_deasserted = true,
 	.panel_funcs = &csot_xn242_panel_funcs,
