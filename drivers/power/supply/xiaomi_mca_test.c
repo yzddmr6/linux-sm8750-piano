@@ -532,6 +532,8 @@ struct mca_policy_fixture {
 	int write_error;
 	bool voltage_stuck;
 	int ucsi_rp_ua, ucsi_mv;
+	u8 aicl_enabled;
+	unsigned int aicl_runs;
 	bool stage_on;
 	int stage_error;
 	unsigned int stage_stops;
@@ -547,6 +549,17 @@ static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 
 	if (f->error)
 		return f->error;
+	if (prop == MCA_PROP_AICL_ENABLE || prop == MCA_PROP_RERUN_AICL) {
+		if (len != 1)
+			return -EINVAL;
+		if (op == MCA_OPCODE_READ)
+			*(u8 *)data = f->aicl_enabled;
+		else if (prop == MCA_PROP_AICL_ENABLE)
+			f->aicl_enabled = *(u8 *)data;
+		else
+			f->aicl_runs++;
+		return 0;
+	}
 	if (op == MCA_OPCODE_WRITE) {
 		f->writes++;
 		if (prop == MCA_PROP_TERM_VOLT)
@@ -840,6 +853,20 @@ static void xiaomi_mca_test_qc_voltage(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_request_volt(mca, MCA_HV_MV), -EOPNOTSUPP);
 	mutex_unlock(&mca->lock);
 	hv_charge = false;
+}
+
+static void xiaomi_mca_test_aicl(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+
+	f->mca.real_type = f->type = MCA_TYPE_FLOAT;
+	guard(mutex)(&f->mca.lock);
+	xiaomi_mca_apply_policy(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->aicl_enabled, 1);
+	KUNIT_EXPECT_EQ(test, f->aicl_runs, 1);
+	KUNIT_EXPECT_EQ(test, f->icl, 1000);
+	xiaomi_mca_apply_policy(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->aicl_runs, 1);
 }
 
 static void xiaomi_mca_test_qc_pulses(struct kunit *test)
@@ -2873,6 +2900,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_hv_pps),
 	KUNIT_CASE(xiaomi_mca_test_qc_voltage),
 	KUNIT_CASE(xiaomi_mca_test_qc_pulses),
+	KUNIT_CASE(xiaomi_mca_test_aicl),
 	KUNIT_CASE(xiaomi_mca_test_policy_refusal),
 	KUNIT_CASE(xiaomi_mca_test_auth_read_only),
 	KUNIT_CASE(xiaomi_mca_test_temperature_follow),

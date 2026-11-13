@@ -149,6 +149,8 @@ static const __le32 xiaomi_mca_piano_otg_cfg[] = {
 /* Piano mca_qc_quick_charge_regulation and qcom_subpmic_set_qc_volt_cmd.
  * This firmware uses 0x20/0x10, unlike the Onyx enum (1/2).
  */
+#define MCA_PROP_AICL_ENABLE	0x2012	/* u8 */
+#define MCA_PROP_RERUN_AICL	0x2013	/* u8 */
 #define MCA_PROP_QC_PULSE	0x201d
 #define MCA_QC_UP		0x20
 #define MCA_QC_DOWN		0x10
@@ -1090,6 +1092,9 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	case MCA_PROP_CHARGE_CURRENT:
 		return len == sizeof(u32) &&
 		       val >= MCA_FCC_MIN_MA && val <= MCA_CP_PAR_FCC_MAX_MA;
+	case MCA_PROP_AICL_ENABLE:
+	case MCA_PROP_RERUN_AICL:
+		return len == 1 && *(const u8 *)data == 1;
 	case MCA_PROP_QC_PULSE:
 		return cp_charge && len == sizeof(u32) && (val == MCA_QC_UP || val == MCA_QC_DOWN);
 	case MCA_PROP_QC_VOLT:
@@ -1539,7 +1544,7 @@ static u32 xiaomi_mca_policy_icl(u32 real_type)
 
 	if (!limits)
 		return 0;
-	/* Preserve the community policy's lower Type-C/FLOAT fallback. */
+	/* Initial ceilings before checking Rp or an explicit contract. */
 	switch (real_type) {
 	case MCA_TYPE_FLOAT:
 		target = 1000;
@@ -1762,7 +1767,7 @@ static u32 xiaomi_mca_5v_input(struct xiaomi_mca *mca, u32 type)
 	u32 ma = xiaomi_mca_policy_icl(type);
 	int state;
 
-	if (type == MCA_TYPE_C) {
+	if (type == MCA_TYPE_C || type == MCA_TYPE_FLOAT) {
 		state = power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status);
 		if (state == MCA_UCSI_RP_1500)
 			ma = 1500;
@@ -1824,10 +1829,19 @@ static int xiaomi_mca_read_type(struct xiaomi_mca *mca, u32 *type)
 	if (ret)
 		return ret;
 	*type = le32_to_cpu(val);
-	if (*type != MCA_TYPE_UNKNOWN)
+	if (*type == MCA_TYPE_UNKNOWN || *type == MCA_TYPE_FLOAT || *type == MCA_TYPE_C ||
+	    *type == MCA_TYPE_DCP) {
+		int state = power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status);
+
+		if (state == MCA_UCSI_RP_1500 || state == MCA_UCSI_RP_3000) {
+			*type = MCA_TYPE_C;
+			return 0;
+		}
+		if (state != MCA_UCSI_PD_SINK)
+			return 0;
+	} else {
 		return 0;
-	if (power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status) != MCA_UCSI_PD_SINK)
-		return 0;
+	}
 
 	ret = xiaomi_mca_read_blob(mca, MCA_PROP_PD_STATE, &val, sizeof(val));
 	if (ret || le32_to_cpu(val) != MCA_PD_SNK_READY)
@@ -2019,6 +2033,20 @@ static u32 xiaomi_mca_hv_icl(u32 real_type)
 	return limits ? limits->input_current_ma : 0;
 }
 
+/* Piano's sub-PMIC has its own VBUS/AICL loop. Turn it on before
+ * raising the input vote, then trigger a scan for the new ceiling.
+ */
+static int xiaomi_mca_aicl(struct xiaomi_mca *mca, bool rerun)
+{
+	u8 enabled = 1, value;
+
+	if (rerun)
+		return xiaomi_mca_write_blob(mca, MCA_PROP_RERUN_AICL, &enabled, sizeof(enabled));
+	if (!xiaomi_mca_read_blob(mca, MCA_PROP_AICL_ENABLE, &value, sizeof(value)) && value == 1)
+		return 0;
+	return xiaomi_mca_write_blob(mca, MCA_PROP_AICL_ENABLE, &enabled, sizeof(enabled));
+}
+
 /*
  * charge_policy: raise the input current limit to what the detected charger
  * type allows, never above what a PD source advertises at the voltage in
@@ -2031,6 +2059,7 @@ static void xiaomi_mca_apply_policy(struct xiaomi_mca *mca)
 	u32 target = xiaomi_mca_policy_icl(mca->real_type);
 	int tbat = (s32)xiaomi_mca_read_u32(mca, MCA_PROP_PACK_TBAT);
 	u32 hv_ma;
+	bool aicl;
 	int ret;
 
 	if (!target)
@@ -2059,7 +2088,14 @@ static void xiaomi_mca_apply_policy(struct xiaomi_mca *mca)
 	if (target == mca->icl_set_ma)
 		return;
 
+	aicl = mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV && mca->hv == MCA_HV_OFF &&
+	       (mca->real_type == MCA_TYPE_FLOAT || mca->real_type == MCA_TYPE_C ||
+		xiaomi_mca_is_pd(mca->real_type));
+	if (aicl && xiaomi_mca_aicl(mca, false))
+		return;
 	ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, target);
+	if (!ret && aicl)
+		ret = xiaomi_mca_aicl(mca, true);
 	if (ret) {
 		dev_warn(mca->dev, "failed to set input limit %u mA: %d\n",
 			 target, ret);
