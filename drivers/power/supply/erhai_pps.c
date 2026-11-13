@@ -1284,6 +1284,7 @@ static ssize_t erhai_pps_describe(void *data, char *buf, ssize_t off)
 static const struct erhai_pps_ops erhai_pps_ops = {
 	.describe = erhai_pps_describe,
 	.enabled = erhai_pps_enabled,
+	.serial_session = sc8547a_serial_session,
 	.active = erhai_pps_active,
 	.update = erhai_pps_update,
 	.stop = erhai_pps_stop,

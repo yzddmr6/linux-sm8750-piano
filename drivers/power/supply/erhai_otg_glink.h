@@ -22,6 +22,7 @@ struct pmic_glink_client;
 struct erhai_pps_ops {
 	ssize_t (*describe)(void *data, char *buf, ssize_t off);
 	bool (*enabled)(void);
+	int (*serial_session)(bool enable);
 	bool (*active)(void *data);
 	unsigned int (*update)(void *data, bool caps_changed);
 	int (*stop)(void *data);

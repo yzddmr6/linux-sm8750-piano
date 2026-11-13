@@ -213,7 +213,7 @@ config CHARGER_SC8547A
 	depends on I2C && OF && BATTERY_QCOM_BATTMGR
 	help
 	  Southchip SC8547A charge pump and PPS hardware interface.
-	  The experimental proprietary serial charging path is disabled by default.
+	  The battery manager selects serial SUPERVOOC for dedicated chargers.
 	  Each I2C instance binds one pump; the PPS engine controls the primary.
 	  Telemetry and hardware protections remain available without serial mode.
 

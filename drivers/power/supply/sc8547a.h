@@ -22,6 +22,7 @@
  * genuine serial-SVOOC path keeps ownership of the plug.
  */
 bool sc8547a_fastchg_delivering(void);
+int sc8547a_serial_session(bool enable);
 
 /*
  * Is the serial VOOC ladder in the identify or deliver phase (see sc8547a.c)?

@@ -182,6 +182,10 @@ struct cps8601 {
 	u16			chip_id;
 	int			pen_soc;
 	bool			present;
+	u64			pen_addr;
+	u64			frame_addr;
+	u32			frame_check;
+	bool			have_check;
 	bool			ready;
 	bool			removing;	/* unbound: init/ready must not reschedule */
 
@@ -773,6 +777,44 @@ out:
 	release_firmware(fw);
 }
 
+/* ASK address encoding from TheMojoMan/oneplus-erhai-linux 110b27276c22,
+ * drivers/power/supply/oplus_cps8601.c (Oplus, GPL-2.0-only).
+ * The check frame and both address fragments belong to one docking.
+ */
+static void cps8601_forget_pen(struct cps8601 *chip)
+{
+	chip->frame_addr = 0;
+	chip->have_check = false;
+	if (xchg(&chip->pen_addr, 0))
+		kobject_uevent(&chip->dev->kobj, KOBJ_CHANGE);
+}
+
+static void cps8601_pen_address(struct cps8601 *chip, const u8 *frame)
+{
+	u64 addr = 0;
+	unsigned int i;
+
+	if (frame[1] == 0xc1) {
+		chip->frame_check = frame[2] | frame[3] << 8 | frame[4] << 16;
+		chip->have_check = true;
+	} else if (frame[1] == 0xb6 && frame[5] == 0x48 && frame[6] == 0xb7) {
+		for (i = 0; i < 3; i++) {
+			u8 a = frame[2 + i], b = frame[7 + i];
+
+			addr |= (u64)(u8)((a << 4) | (b >> 4)) << (8 * i);
+			addr |= (u64)(u8)((b << 4) | (a >> 4)) << (24 + 8 * i);
+		}
+		chip->frame_addr = addr;
+	} else {
+		return;
+	}
+	addr = chip->frame_addr;
+	if (chip->present && addr && addr != GENMASK_ULL(47, 0) && chip->have_check &&
+	    (((addr >> 24) ^ addr) & 0xffffff) == chip->frame_check &&
+	    xchg(&chip->pen_addr, addr) != addr)
+		kobject_uevent(&chip->dev->kobj, KOBJ_CHANGE);
+}
+
 static void cps8601_handle_rx_frame(struct cps8601 *chip)
 {
 	u8 frame[11];
@@ -792,8 +834,8 @@ static void cps8601_handle_rx_frame(struct cps8601 *chip)
 			dev_info(chip->dev, "pen full\n");
 		else
 			dev_info(chip->dev, "pen soc %d%%\n", chip->pen_soc);
-	} else if (frame[0] == 0x48 && (frame[1] == 0xb6 || frame[1] == 0xc1)) {
-		dev_dbg(chip->dev, "mac frame %*ph\n", 11, frame);
+	} else if (frame[0] == 0x48) {
+		cps8601_pen_address(chip, frame);
 	}
 }
 
@@ -829,12 +871,14 @@ static irqreturn_t cps8601_irq(int irq, void *data)
 		u16 width = 0;
 
 		cps8601_read16(chip, CPS8601_REG_PING_WIDTH, &width);
+		cps8601_forget_pen(chip);
 		chip->present = true;
 		schedule_work(&chip->attach_work);
 		dev_info(chip->dev, "pen attached (ping width %d)\n", width);
 	}
 	if (active & CPS8601_IRQ_RX_DETACH) {
 		chip->present = false;
+		cps8601_forget_pen(chip);
 		chip->pen_soc = -1;
 		dev_info(chip->dev, "pen removed\n");
 	}
@@ -993,6 +1037,17 @@ static ssize_t present_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(present);
 
+static ssize_t pen_address_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct cps8601 *chip = dev_get_drvdata(dev);
+	u64 addr = READ_ONCE(chip->pen_addr);
+
+	return sysfs_emit(buf, "%012llX\n", addr);
+}
+static DEVICE_ATTR_RO(pen_address);
+
+
 static ssize_t pen_soc_show(struct device *dev,
 			    struct device_attribute *attr, char *buf)
 {
@@ -1121,6 +1176,7 @@ static DEVICE_ATTR_WO(fsk);
 
 static struct attribute *cps8601_attrs[] = {
 	&dev_attr_present.attr,
+	&dev_attr_pen_address.attr,
 	&dev_attr_pen_soc.attr,
 	&dev_attr_fw_version.attr,
 	&dev_attr_tx_voltage.attr,
@@ -1164,6 +1220,7 @@ static int cps8601_quiesce(struct cps8601 *chip)
 	cps8601_power_off(chip);
 	chip->ready = false;
 	chip->present = false;
+	cps8601_forget_pen(chip);
 	chip->pen_soc = -1;
 	active = chip->hboost_active;
 	ret = cps8601_hboost_req(chip, 0);
