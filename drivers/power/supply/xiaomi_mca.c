@@ -2871,20 +2871,26 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 				mca->fcc_set_ma = MCA_FCC_DEFAULT_MA;
 		}
 		if (!ret && xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE) == 1) {
-			u32 icl, type;
+			u32 icl, type, input;
 
 			ret = xiaomi_mca_read_type(mca, &type);
-			ret = ret ?: xiaomi_mca_read(mca, MCA_PROP_INPUT_CURRENT_LIMIT, &icl);
-			if (!ret && icl != MCA_FCC_DEFAULT_MA &&
-			    (xiaomi_mca_limits(type) || (type == MCA_TYPE_UNKNOWN &&
-							 mca->real_type == type))) {
+			if (ret)
+				return ret;
+			input = MCA_FCC_DEFAULT_MA;
+			if ((type == MCA_TYPE_FLOAT || type == MCA_TYPE_UNKNOWN) &&
+			    xiaomi_mca_read_u32(mca, MCA_PROP_USB_VOLTAGE_NOW) < MCA_HV_VBUS_5V_MAX_UV)
+				input = MCA_FLOAT_ICL_MA;
+			ret = xiaomi_mca_read(mca, MCA_PROP_INPUT_CURRENT_LIMIT, &icl);
+			if (!ret && icl != input && (xiaomi_mca_limits(type) || type == MCA_TYPE_UNKNOWN)) {
+				/* The write gate rechecks type, voltage and sink online. */
+				if (type == MCA_TYPE_UNKNOWN)
+					mca->real_type = type;
 				/* Replace both the 100 mA boot vote and a stale
 				 * high-current vote inherited from a previous source.
 				 */
-				ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT,
-							   MCA_FCC_DEFAULT_MA);
+				ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, input);
 				if (!ret)
-					mca->icl_set_ma = MCA_FCC_DEFAULT_MA;
+					mca->icl_set_ma = input;
 			}
 		}
 		if (!ret)
