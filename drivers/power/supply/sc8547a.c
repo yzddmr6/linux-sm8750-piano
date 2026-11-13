@@ -46,6 +46,7 @@
 #include <linux/usb/wcd939x-usbss.h>
 
 #include "sc8547a.h"
+#include "erhai_svooc_curves.h"
 
 /*
  * Android parity for slow/noisy third-party (S)VOOC adapters.  The vendor
@@ -127,6 +128,7 @@ static const char * const sc8547_gauge_names[] = {
 
 #include "erhai_otg_glink.h"
 #include "sc8547a.h"
+#include "erhai_svooc_curves.h"
 
 /* ---- register map (charge-pump / VOOC-PHY function, I2C addr 0x6F) ---- */
 #define SC8547_REG_00			0x00	/* VBAT_OVP */
@@ -319,13 +321,11 @@ static const char * const sc8547_gauge_names[] = {
  * over-voltage guard, set well above any legitimate loaded reading (the highest
  * seen is ~4.49 V).
  */
-#define SC8547_VBAT_CV_CEILING_MV	4500	/* cell (gauge) CV end */
 #define SC8547_CP_OVP_CEILING_MV	4800	/* CP-side hard guard: cell CV (4.5 V)
 						 * plus the measured ~0.3 V IR drop
 						 * at 8 A; a wilder reading than this
 						 * is a genuine over-voltage. */
 #define SC8547_IBUS_ABORT_MA		8000	/* total-bus (master+slave) hard abort; > code-73 7300 mA */
-#define SC8547_TEMP_ABORT_DDC		450	/* pack temp 45.0 C -> stop (0.1 C) */
 #define SC8547_CP_RESTART_MARGIN_MV	110	/* min vbus-2*vbat to re-enable CP */
 #define SC8547_CP_RESTART_MARGIN_CEIL_MV 700	/* refuse re-enable into an over-volted bus (runaway) */
 #define SC8547_CELL_MIN_VALID_MV	2500	/* below this the gauge reading is used only as a fallback */
@@ -382,16 +382,10 @@ MODULE_PARM_DESC(slave_drop_ticks,
  * i.e. the gauge reading — NOT the charge pump's own Vbat ADC, which is
  * inflated by the delivery IR drop.  See the backstop comment above.
  */
-#define SC8547_AUTO_CODE_CEILING	0x49	/* full curve: code 73 = 7300 mA bus */
-#define SC8547_MAX_SOC_DEFAULT		90	/* stock oplus_spec,vooc_high_soc */
+#define SC8547_AUTO_CODE_CEILING	61	/* 24926 (24924 table): 6100 mA */
 
 #define SC8547_AUTO_IDENTIFY_MS		4000	/* window to see adapter_check_ok */
-#define SC8547_AUTO_TEMP_MIN_DDC	150	/* 15.0 C: below -> normal charge */
-#define SC8547_AUTO_TEMP_MAX_DDC	440	/* 44.0 C: above -> normal charge */
-#define SC8547_AUTO_TEMP_NL_NH_DDC	350	/* <350 -> normal_low col, else _high */
 #define SC8547_AUTO_STEP_DEBOUNCE	4	/* consecutive ticks (~1 s) to advance */
-#define SC8547_AUTO_STEP_I_HYST_MA	200	/* ibus below setpoint by this -> step */
-#define SC8547_AUTO_STEP_V_HYST_MV	10	/* vbat over target by this -> step */
 /*
  * A genuine SVOOC adapter periodically resets its VOOC link (drops output and
  * waits for a fresh handshake) after tens of seconds of CC. That is not an
@@ -444,13 +438,6 @@ enum sc8547_auto_state {
 	SC_AUTO_DONE,		/* curve exit reached; handed back to normal charge */
 };
 
-/* One host CC/CV curve row: {target_vbat mV, ask-current code, exit}. */
-struct sc8547_curve_row {
-	u16	target_vbat;
-	u8	code;		/* bus-side ibus / 100 mA */
-	u8	exit;
-};
-
 struct sc8547a_device {
 	struct i2c_client	*client;
 	struct device		*dev;
@@ -501,12 +488,11 @@ struct sc8547a_device {
 
 	/* --- auto charge-manager (fastchg_auto) --- */
 	bool			fastchg_auto;	/* one-shot master arm (kill-switch) */
-	int			max_soc;	/* stop fast-charge at this SoC % (default 90) */
 	enum sc8547_auto_state	auto_state;
 	unsigned long		auto_identify_deadline;
-	const struct sc8547_curve_row *auto_curve;	/* selected CC/CV table */
-	int			auto_curve_len;
+	const struct erhai_charge_curve *auto_curve;	/* selected CC/CV table */
 	int			auto_curve_idx;	/* current row (descends only) */
+	unsigned int		auto_taper_cnt;
 	int			auto_step_cnt;	/* advance debounce counter */
 	int			auto_reservo_cnt;	/* consecutive adapter-reset re-servos */
 	int			auto_ident_retries;	/* identify re-arms on this plug */
@@ -1738,51 +1724,6 @@ static void vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 
 /* Reset the ladder-tracking state for a fresh plug. */
 /*
- * Host-side SVOOC CC/CV curves, transcribed from the erhai Android device tree
- * (oplus,sc8547a@6F/svooc_charge_strategy). Rows are {target_vbat, ask-current
- * code, exit}, ordered big->small current. The policy picks the first row whose
- * target_vbat >= the live vbat, then descends as vbat rises / current tapers;
- * the terminal exit row hands charging back to the normal (battmgr) path. Only
- * the normal-temperature columns are carried — any other temperature range
- * declines auto fast-charge and lets normal charging run. Codes above the auto
- * ceiling are clamped at use, so several leading high-code rows collapse to the
- * same clamped setpoint (harmless; stepping still tracks vbat).
- */
-static const struct sc8547_curve_row sc_curve_soc0_50_nl[] = {
-	{ 4050, 73, 0 }, { 4230, 61, 0 }, { 4230, 50, 0 }, { 4230, 40, 0 },
-	{ 4380, 39, 0 }, { 4380, 35, 0 }, { 4380, 30, 0 }, { 4535, 29, 0 },
-	{ 4535, 25, 0 }, { 4535, 20, 0 }, { 4535, 15, 0 }, { 4545, 10, 1 },
-};
-static const struct sc8547_curve_row sc_curve_soc0_50_nh[] = {
-	{ 4200, 61, 0 }, { 4200, 60, 0 }, { 4200, 50, 0 }, { 4230, 48, 0 },
-	{ 4230, 45, 0 }, { 4230, 40, 0 }, { 4380, 39, 0 }, { 4380, 35, 0 },
-	{ 4380, 30, 0 }, { 4535, 29, 0 }, { 4535, 25, 0 }, { 4535, 20, 0 },
-	{ 4535, 15, 0 }, { 4545, 14, 1 },
-};
-static const struct sc8547_curve_row sc_curve_soc50_75_nl[] = {
-	{ 4380, 30, 0 }, { 4535, 29, 0 }, { 4535, 25, 0 }, { 4535, 20, 0 },
-	{ 4535, 15, 0 }, { 4545, 10, 1 },
-};
-static const struct sc8547_curve_row sc_curve_soc50_75_nh[] = {
-	{ 4380, 35, 0 }, { 4380, 30, 0 }, { 4535, 29, 0 }, { 4535, 25, 0 },
-	{ 4535, 20, 0 }, { 4535, 15, 0 }, { 4545, 14, 1 },
-};
-static const struct sc8547_curve_row sc_curve_soc75_85_nl[] = {
-	{ 4535, 29, 0 }, { 4535, 25, 0 }, { 4535, 20, 0 }, { 4535, 15, 0 },
-	{ 4545, 10, 1 },
-};
-static const struct sc8547_curve_row sc_curve_soc75_85_nh[] = {
-	{ 4380, 30, 0 }, { 4535, 29, 0 }, { 4535, 25, 0 }, { 4535, 20, 0 },
-	{ 4535, 15, 0 }, { 4545, 14, 1 },
-};
-static const struct sc8547_curve_row sc_curve_soc85_90_nl[] = {
-	{ 4535, 20, 0 }, { 4535, 15, 0 }, { 4545, 10, 1 },
-};
-static const struct sc8547_curve_row sc_curve_soc85_90_nh[] = {
-	{ 4535, 25, 0 }, { 4535, 20, 0 }, { 4535, 15, 0 }, { 4545, 10, 1 },
-};
-
-/*
  * Read pack SOC (%), temperature (0.1 C) and cell voltage (mV) from ONE named
  * gauge power-supply.  Returns -ENODEV when that psy is not registered yet.
  */
@@ -1866,52 +1807,6 @@ static int sc8547_read_gauge(struct sc8547a_device *sc, int *soc, int *temp_ddc,
 	return last;
 }
 
-/*
- * Select the CC/CV curve for the current SOC + temperature. Returns 0 and fills
- * curve/len on success, or -ERANGE if this SOC/temp is outside the auto
- * envelope (SOC > 90, or temperature outside the normal window) — the caller
- * then declines auto fast-charge and leaves normal charging running.
- */
-static int sc8547_auto_select_curve(int soc, int temp_ddc,
-				    const struct sc8547_curve_row **curve, int *len)
-{
-	bool nh = temp_ddc >= SC8547_AUTO_TEMP_NL_NH_DDC;
-
-	if (temp_ddc < SC8547_AUTO_TEMP_MIN_DDC ||
-	    temp_ddc > SC8547_AUTO_TEMP_MAX_DDC)
-		return -ERANGE;
-
-	if (soc <= 50)
-		nh ? (*curve = sc_curve_soc0_50_nh, *len = ARRAY_SIZE(sc_curve_soc0_50_nh))
-		   : (*curve = sc_curve_soc0_50_nl, *len = ARRAY_SIZE(sc_curve_soc0_50_nl));
-	else if (soc <= 75)
-		nh ? (*curve = sc_curve_soc50_75_nh, *len = ARRAY_SIZE(sc_curve_soc50_75_nh))
-		   : (*curve = sc_curve_soc50_75_nl, *len = ARRAY_SIZE(sc_curve_soc50_75_nl));
-	else if (soc <= 85)
-		nh ? (*curve = sc_curve_soc75_85_nh, *len = ARRAY_SIZE(sc_curve_soc75_85_nh))
-		   : (*curve = sc_curve_soc75_85_nl, *len = ARRAY_SIZE(sc_curve_soc75_85_nl));
-	else if (soc <= 90)
-		nh ? (*curve = sc_curve_soc85_90_nh, *len = ARRAY_SIZE(sc_curve_soc85_90_nh))
-		   : (*curve = sc_curve_soc85_90_nl, *len = ARRAY_SIZE(sc_curve_soc85_90_nl));
-	else
-		return -ERANGE;			/* SOC > 90: no fast-charge */
-
-	return 0;
-}
-
-/* First curve row whose target_vbat >= vbat (else the last, terminal row). */
-static int sc8547_auto_init_idx(const struct sc8547_curve_row *curve, int len,
-				int vbat)
-{
-	int i;
-
-	for (i = 0; i < len; i++)
-		if (vbat <= curve[i].target_vbat)
-			return i;
-	return len - 1;
-}
-
-/* Clamp an Android curve code to the auto ceiling. */
 /* SUPERVOOC model IDs and rated watts from OnePlusOSS sm8750,
  * cc463675855a, oplus_chg_vooc.c adapter_id_table (GPL-2.0-only).
  * Use the 11 V SUPERVOOC rating
@@ -1964,45 +1859,51 @@ static u8 sc8547_adapter_cap(u8 model)
 	return 0;
 }
 
-/*
- * Advance the CC/CV curve one row when the pack has moved past the current row:
- * vbat has climbed over target (voltage step) or, at the CV plateau, the bus
- * current has tapered below the clamped setpoint (current step). Debounced so a
- * single noisy sample can't step. Returns true once the terminal exit row is
- * reached (caller stops fast-charge and hands back to normal charging).
+/* Re-index on a change of bin. Within a bin use the AP VOOC PHY's
+ * four consecutive voltage/current samples to descend the curve.
  */
-static bool sc8547_auto_step(struct sc8547a_device *sc, int vbat, int ibus)
+static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int temp,
+				     int mv, int ibus, bool entering)
 {
-	const struct sc8547_curve_row *row = &sc->auto_curve[sc->auto_curve_idx];
-	u8 clamped = min(row->code, sc->adapter_cap);
-	bool advance;
+	const struct erhai_charge_curve *curve;
+	const struct erhai_charge_step *step;
 
-	if (row->exit) {
-		sc->fastchg_curr_code = clamped;
-		return true;
-	}
+	if (soc >= 90) /* current policy, oplus_spec,vooc_high_soc */
+		return false;
+	curve = erhai_curve_select(svooc_curves, soc, temp);
+	if (!curve || mv <= SC8547_CELL_MIN_VALID_MV ||
+	    mv >= (temp < 50 ? 4520 : temp >= 440 ? 4130 :
+		   temp >= 210 && temp < 350 ? 4550 : 4545))
+		return false;
 
-	advance = (vbat > row->target_vbat + SC8547_AUTO_STEP_V_HYST_MV) ||
-		  (vbat >= row->target_vbat &&
-		   ibus < clamped * 100 - SC8547_AUTO_STEP_I_HYST_MA);
-
-	if (advance && sc->auto_curve_idx < sc->auto_curve_len - 1) {
-		if (++sc->auto_step_cnt >= SC8547_AUTO_STEP_DEBOUNCE) {
-			sc->auto_curve_idx++;
-			sc->auto_step_cnt = 0;
-			row = &sc->auto_curve[sc->auto_curve_idx];
-			clamped = min(row->code, sc->adapter_cap);
-			dev_info(sc->dev,
-				 "auto: step to curve[%d] target_vbat %d code %u (clamped %u)%s\n",
-				 sc->auto_curve_idx, row->target_vbat, row->code,
-				 clamped, row->exit ? " EXIT" : "");
-		}
-	} else {
+	if (entering || curve != sc->auto_curve) {
+		sc->auto_curve = curve;
+		sc->auto_curve_idx = erhai_curve_start(curve, mv, true);
 		sc->auto_step_cnt = 0;
+		sc->auto_taper_cnt = 0;
+	} else {
+		step = &curve->steps[sc->auto_curve_idx];
+		if (!step->last && mv > step->mv && ibus < step->ma + 1000) {
+			if (++sc->auto_step_cnt >= SC8547_AUTO_STEP_DEBOUNCE) {
+				sc->auto_curve_idx++;
+				sc->auto_step_cnt = 0;
+			}
+		} else {
+			sc->auto_step_cnt = 0;
+		}
 	}
-
-	sc->fastchg_curr_code = clamped;
-	return sc->auto_curve[sc->auto_curve_idx].exit;
+	step = &curve->steps[sc->auto_curve_idx];
+	/* Let even a one-row high-SOC curve deliver. Only a measured
+	 * low-current tail on a running pump hands the cell to the buck.
+	 */
+	if (!entering && sc->cp_enabled && step->last && ibus < 300) {
+		if (++sc->auto_taper_cnt >= SC8547_AUTO_STEP_DEBOUNCE)
+			return false;
+	} else {
+		sc->auto_taper_cnt = 0;
+	}
+	sc->fastchg_curr_code = min_t(unsigned int, step->ma / 100, sc->adapter_cap);
+	return true;
 }
 
 static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
@@ -2231,8 +2132,7 @@ static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
  */
 static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 {
-	const struct sc8547_curve_row *curve;
-	int soc, temp_ddc, vbat, cell_mv = -1, vref, len, idx, ret, ua;
+	int soc, temp_ddc, cell_mv, ret, ua;
 
 	if (!sc->adapter_check_ok || !sc->model_received) {
 		if (time_before(jiffies, sc->auto_identify_deadline))
@@ -2257,57 +2157,21 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 		return;
 	}
 
-	if (soc >= sc->max_soc) {
-		sc8547_auto_decline(sc, "SoC already at limit");
-		return;
-	}
 
 	/*
 	 * Gate and index the curve on the CELL voltage (gauge). The CP's own
 	 * reading is inflated by the delivery IR drop and would make a half-full
 	 * pack look like it is already at CV.
 	 */
-	vbat = sc8547_get_vbat(sc);
-	vref = (cell_mv > SC8547_CELL_MIN_VALID_MV) ? cell_mv : vbat;
-	/* A failed CP ADC read leaves vref negative; indexing the curve with
-	 * that errno would pick the highest-current row (index 0) and engage
-	 * the pump flat out.  Skip the tick instead: one bad sample is not a
-	 * reason to abandon fast charging for the rest of the plug, and a
-	 * persistently unreadable ADC still ends in a decline when the
-	 * identify window runs out — which restores the normal charge route
-	 * rather than leaving the crossbar armed. */
-	if (vref <= 0) {
-		if (time_before(jiffies, sc->auto_identify_deadline))
-			return;
-		sc8547_auto_decline(sc, "CP voltage unreadable");
+	if (!sc8547_auto_update_curve(sc, soc, temp_ddc, cell_mv, 0, true)) {
+		sc8547_auto_decline(sc, "outside cell curve");
 		return;
 	}
-	if (vref >= SC8547_VBAT_CV_CEILING_MV) {
-		sc8547_auto_decline(sc, "vbat at CV already");
-		return;
-	}
-
-	if (sc8547_auto_select_curve(soc, temp_ddc, &curve, &len)) {
-		sc8547_auto_decline(sc, "SOC/temp outside auto envelope");
-		return;
-	}
-
-	idx = sc8547_auto_init_idx(curve, len, vref);
-	if (curve[idx].exit) {
-		sc8547_auto_decline(sc, "already at curve exit");
-		return;
-	}
-
-	/* Escalate to delivery. One-shot: consume the master arm now. */
-	sc->auto_curve = curve;
-	sc->auto_curve_len = len;
-	sc->auto_curve_idx = idx;
-	sc->auto_step_cnt = 0;
-	sc->fastchg_curr_code = min(curve[idx].code, sc->adapter_cap);
 	if (!sc->hw_profile_set) {		/* normally pre-applied at arm */
 		sc8547_svooc_hw_setting(sc);
 		sc->hw_profile_set = true;
 	}
+	sc->fastchg_curr_code = min_t(u8, sc->fastchg_curr_code, 40);
 	sc->fastchg_enable = true;
 	sc->fastchg_deliver = true;
 	sc->fastchg_auto = false;	/* one-shot per arm consumed */
@@ -2315,7 +2179,7 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 	sc->auto_deliver_since = jiffies;	/* for re-servo sustained-CC refill */
 	dev_info(sc->dev,
 		 "auto fast-charge: SVOOC identified (soc %d%% temp %d.%d C cell %d mV cp %d mV) — deliver curve[%d] code %u\n",
-		 soc, temp_ddc / 10, temp_ddc % 10, vref, vbat, idx,
+		 soc, temp_ddc / 10, temp_ddc % 10, cell_mv, sc8547_get_vbat(sc), sc->auto_curve_idx,
 		 sc->fastchg_curr_code);
 }
 
@@ -2353,17 +2217,10 @@ static void sc8547_attach_work(struct work_struct *work)
 		int cibus = sc8547_get_ibus(sc);
 		int gsoc = -1, gtemp = 0, gvbat = -1;
 		int gret;
-		int cvbat;				/* the reference for CC/CV */
+		int cvbat;
 
 		gret = sc8547_read_gauge(sc, &gsoc, &gtemp, &gvbat);
-		/*
-		 * CC/CV reference = the CELL voltage (gauge) while it is readable;
-		 * the CP's own reading only as the fallback.  See the backstop
-		 * comment above: on the loaded CP reading a half-full pack looks
-		 * like it is already at CV and every session dies in ~20 s.
-		 */
-		cvbat = (gret == 0 && gvbat > SC8547_CELL_MIN_VALID_MV) ? gvbat
-								       : cpbat;
+		cvbat = gvbat;
 		/*
 		 * Under dual-CP the master REG_13 reads only its half of the bus
 		 * current; the CC taper compare and the over-current backstop both
@@ -2373,24 +2230,20 @@ static void sc8547_attach_work(struct work_struct *work)
 		int cibus_total = cibus + slave_ma;
 		int margin = vbus - 2 * cpbat;
 		u8 r6 = 0, r7 = 0;
-		if (gret || gvbat <= SC8547_CELL_MIN_VALID_MV || cpbat <= 0 ||
-		    vbus <= 0 || cibus < 0 || slave_ma < 0 || gtemp < SC8547_AUTO_TEMP_MIN_DDC ||
-		    gtemp > SC8547_AUTO_TEMP_MAX_DDC || gsoc >= sc->max_soc) {
+		if (gret || cpbat <= 0 || vbus <= 0 || cibus < 0 || slave_ma < 0 ||
+		    cibus >= 4500 || slave_ma >= 4500 ||
+		    !sc8547_auto_update_curve(sc, gsoc, gtemp, cvbat, cibus_total, false)) {
 			sc8547_auto_finish(sc, "pack or pump outside delivery envelope");
 			goto reschedule;
 		}
+		/* Until both ADCs show load, limit to the board's 4 A per
+		 * pump rating. On an uneven split use the weaker leg's
+		 * measured contribution, leaving the other leg its reserve.
+		 */
+		sc->fastchg_curr_code = min_t(unsigned int, sc->fastchg_curr_code,
+					     (4000 + min(cibus, slave_ma)) / 100);
 		if (!sc->cp_enabled)
 			goto reschedule;
-
-		/*
-		 * Auto CC/CV: step the ask-current code down the curve as vbat
-		 * rises / current tapers. The terminal exit row ends fast-charge
-		 * and hands back to normal charging.
-		 */
-		if (sc8547_auto_step(sc, cvbat, cibus_total)) {
-			sc8547_auto_finish(sc, "curve exit");
-			goto reschedule;
-		}
 
 		if (sc8547_read_byte(sc, SC8547_REG_06, &r6) ||
 		    sc8547_read_byte(sc, SC8547_REG_07, &r7)) {
@@ -2398,8 +2251,7 @@ static void sc8547_attach_work(struct work_struct *work)
 			goto reschedule;
 		}
 
-		if (cvbat >= SC8547_VBAT_CV_CEILING_MV ||
-		    cpbat >= SC8547_CP_OVP_CEILING_MV ||
+		if (cpbat >= SC8547_CP_OVP_CEILING_MV ||
 		    cibus_total >= SC8547_IBUS_ABORT_MA) {
 			/* Hard backstop: over-voltage / over-current -> latch off. */
 			sc8547_slave_cp_enable(sc, false);
@@ -2421,8 +2273,7 @@ static void sc8547_attach_work(struct work_struct *work)
 			 * rather than fake a live CP or oscillate into a fault.
 			 */
 			if (margin >= SC8547_CP_RESTART_MARGIN_MV &&
-			    margin <= SC8547_CP_RESTART_MARGIN_CEIL_MV &&
-			    cvbat < SC8547_VBAT_CV_CEILING_MV) {
+			    margin <= SC8547_CP_RESTART_MARGIN_CEIL_MV) {
 				sc8547_write_byte(sc, SC8547_REG_09, 0x13);
 				sc8547_set_chg_enable(sc, true);
 				dev_warn(sc->dev,
@@ -2656,9 +2507,9 @@ static int sc8547_state_show(struct seq_file *m, void *unused)
 		"off", "identify", "deliver", "declined", "done",
 	};
 
-	seq_printf(m, "auto_armed %d state %s code %u max_soc %d%% reservo %d/%d ident_retry %d/%u vbus %d mV vbat %d mV ibus %d mA (master %d slave %d) cp %s\n",
+	seq_printf(m, "auto_armed %d state %s code %u reservo %d/%d ident_retry %d/%u vbus %d mV vbat %d mV ibus %d mA (master %d slave %d) cp %s\n",
 		   sc->fastchg_auto, names[sc->auto_state], sc->fastchg_curr_code,
-		   sc->max_soc, sc->auto_reservo_cnt, SC8547_AUTO_RESERVO_MAX,
+		   sc->auto_reservo_cnt, SC8547_AUTO_RESERVO_MAX,
 		   sc->auto_ident_retries, identify_retries,
 		   sc8547_get_vbus(sc), sc8547_get_vbat(sc),
 		   sc8547_get_ibus(sc) + sc8547_slave_ibus(),
@@ -2666,9 +2517,9 @@ static int sc8547_state_show(struct seq_file *m, void *unused)
 		   sc8547_slave_dev ? "dual" : "single");
 	if (sc->auto_state == SC_AUTO_DELIVER && sc->auto_curve)
 		seq_printf(m, "curve idx %d/%d target_vbat %d code %u\n",
-			   sc->auto_curve_idx, sc->auto_curve_len - 1,
-			   sc->auto_curve[sc->auto_curve_idx].target_vbat,
-			   sc->auto_curve[sc->auto_curve_idx].code);
+			   sc->auto_curve_idx, sc->auto_curve->count - 1,
+			   sc->auto_curve->steps[sc->auto_curve_idx].mv,
+			   sc->auto_curve->steps[sc->auto_curve_idx].ma / 100);
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(sc8547_state);
@@ -2709,7 +2560,6 @@ static int sc8547a_probe(struct i2c_client *client)
 	sc->is_slave = device_property_read_bool(sc->dev, "southchip,secondary") ||
 		       device_property_read_bool(sc->dev, "oplus,slave");
 	sc->fastchg_curr_code = SC8547_CURR_CODE_MIN;
-	sc->max_soc = SC8547_MAX_SOC_DEFAULT;
 	sc->ovp_reg = SC8547_DEFAULT_OVP_REG;
 	sc->ocp_reg = SC8547_DEFAULT_OCP_REG;
 	device_property_read_u8(sc->dev, "sc,vbat-ovp-reg", &sc->ovp_reg);
