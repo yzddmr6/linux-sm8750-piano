@@ -335,6 +335,8 @@ struct erhai_pps {
 	u32 applied_fcc_ua;
 	bool protection;
 	unsigned int high_bus_samples;
+	unsigned int slave_failures;
+	unsigned long slave_retry_at;
 	bool ufcs_protection;
 	bool pps_protection;
 	unsigned long retry_at;
@@ -772,11 +774,20 @@ static int pps_cp_step(struct erhai_pps *p)
 				return pps_cp_release(p, "feed-window", true);
 			return rc;
 		}
-		rc = sc8547a_pps_share(cibus, diff, min(p->source_ma, p->cell_ma), &slave_ma);
-		if (rc == -ENOLINK)
-			return pps_cp_release(p, "slave unlatched", true);
-		if (rc)
-			return rc;
+		if (!p->slave_failures || time_after_eq(jiffies, p->slave_retry_at)) {
+			rc = sc8547a_pps_share(cibus, diff, min(p->source_ma, p->cell_ma), &slave_ma);
+			if (rc) {
+				/* Remove any uncertain enable (including a lost ACK).
+				 * Stop feeding the slave. Its REG09 watchdog is 1 s.
+				 */
+				sc8547a_pps_share(cibus, diff, 0, &slave_ma);
+				slave_ma = 0;
+				p->slave_retry_at = jiffies + (HZ << min(p->slave_failures, 5U));
+				p->slave_failures = min(p->slave_failures + 1, 6U);
+			} else {
+				p->slave_failures = 0;
+			}
+		}
 
 		/* Until the ADC shows sharing, budget one pump. An unbalanced
 		 * pair can only increase by the headroom of its busiest leg.
@@ -1011,6 +1022,7 @@ static void pps_poll(struct erhai_pps *p)
 		p->source_ma = adapter_ma;
 		p->cell_ma = cell_ma;
 		p->pump_limit_ma = 4000;
+		p->slave_failures = 0;
 		p->ibat_over_since = 0;
 		p->target_curr_ma = min3(p->source_ma, cell_ma, p->pump_limit_ma);
 		p->set_curr_ma = min(pps_start_curr_ma, p->target_curr_ma);
@@ -1348,6 +1360,7 @@ static unsigned int erhai_ufcs_update(void *data)
 	}
 	p->ufcs = p->cleanup = true;
 	p->source_ma = min_t(unsigned int, ma, 2 * 4000);
+	p->slave_failures = 0;
 	p->pump_limit_ma = 4000;
 	p->target_curr_ma = min3(p->cell_ma, p->source_ma, p->pump_limit_ma);
 	p->cp_rearms = 0;
