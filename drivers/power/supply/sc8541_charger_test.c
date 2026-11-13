@@ -76,7 +76,11 @@ static void sc8541_test_protections(struct kunit *test)
 {
 	struct sc8541_test *f = sc8541_test_init(test);
 
+	f->regs[SC8541_BATOCP] = 0xd0;
+	f->regs[SC8541_TEMP_CTRL] = SC8541_TSHUT_DISABLE;
 	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOCP], 80);
+	KUNIT_EXPECT_EQ(test, f->regs[SC8541_TEMP_CTRL] & SC8541_TSHUT_DISABLE, 0);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOVP], 76);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BATOVP_ALM], 71);
 	KUNIT_EXPECT_EQ(test, f->regs[SC8541_BUSOVP], 80);

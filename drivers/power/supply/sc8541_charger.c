@@ -43,6 +43,8 @@
 #define SC8541_BUSOVP		0x06	/* 7000 + 50 mV * [7:0] */
 #define SC8541_BUSOVP_ALM	0x07
 #define SC8541_BUSOCP		0x08	/* bit7 disable, 1000 + 250 mA * [4:0] */
+#define SC8541_TEMP_CTRL	0x0a
+#define SC8541_TSHUT_DISABLE	BIT(7)
 #define SC8541_CTRL2		0x0f
 #define SC8541_CHG_EN		BIT(4)
 #define SC8541_EN_BYPASS	BIT(3)
@@ -232,6 +234,11 @@ static int sc8541_arm(struct sc8541 *sc)
 	ret = ret ?: sc8541_write_check(sc, SC8541_BUSOCP, 0x9f,
 				(sc->busocp_ma - SC8541_BUSOCP_OFFSET_MA) /
 				SC8541_BUSOCP_STEP_MA);
+	/* Reverse mode may leave IBAT_OCP disabled. SC8541 is rated
+	 * for 8 A output; REG02 programs it in 100 mA steps.
+	 */
+	ret = ret ?: sc8541_write_check(sc, SC8541_BATOCP, 0xff, 8000 / 100);
+	ret = ret ?: sc8541_write_check(sc, SC8541_TEMP_CTRL, SC8541_TSHUT_DISABLE, 0);
 	/* 2:1, not bypass */
 	ret = ret ?: sc8541_write_check(sc, SC8541_CTRL2, SC8541_EN_BYPASS, 0);
 	/* all channels, continuous conversion */
