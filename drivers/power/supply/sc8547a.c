@@ -2304,6 +2304,10 @@ static void sc8547_attach_work(struct work_struct *work)
 		}
 		if (gret || cpbat <= 0 || vbus <= 0 || cibus < 0 || slave_ma < 0 ||
 		    !sc8547_auto_update_curve(sc, gsoc, gtemp, cvbat, cibus_total, false)) {
+			if (!gret && gtemp >= 0 && gtemp < 510 && gvbat > 0 &&
+			    (gvbat >= erhai_cell_cv(gtemp) ||
+			     sc->auto_taper_cnt >= SC8547_AUTO_STEP_DEBOUNCE))
+				erhai_charge_tail_complete();
 			sc8547_auto_finish(sc, "pack or pump outside delivery envelope");
 			goto reschedule;
 		}

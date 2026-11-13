@@ -925,6 +925,9 @@ static void pps_poll(struct erhai_pps *p)
 		}
 		cell_ma = pps_cell_limit(p, false);
 		if (!cell_ma) {
+			if (p->temp_ddc >= 0 && p->temp_ddc < 510 &&
+			    p->vbat_mv >= erhai_cell_cv(p->temp_ddc))
+				erhai_charge_tail_complete();
 			pps_exit(p, "battery limit");
 			return;
 		}
@@ -1183,6 +1186,8 @@ fail:
 			rc = pps_cp_release(p, "disabled", false);
 		}
 		if (rc) {
+			if (rc == -ENODATA)
+				erhai_charge_tail_complete();
 			pps_exit(p, rc == -ENODATA ? "cell taper complete" : PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}

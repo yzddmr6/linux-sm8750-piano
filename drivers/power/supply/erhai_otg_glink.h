@@ -37,6 +37,7 @@ int erhai_pps_apdo_current(u32 min_mv, u32 max_mv);
 int erhai_otg_adsp_usb_prop(u32 property);
 int erhai_otg_adsp_prop_get(u32 opcode, u32 property);
 int erhai_otg_adsp_prop_set(u32 opcode, u32 property, u32 value);
+void erhai_charge_tail_complete(void);
 bool erhai_otg_charge_inhibited(void);
 struct pmic_glink_client *
 erhai_otg_glink_client_register_sibling(struct device *consumer, u32 id,
