@@ -251,7 +251,7 @@ MODULE_PARM_DESC(pps_cp_rearm_ms, "hold-off after a pump drop or a failed entry 
 
 static unsigned int pps_cp_rearm_max = 5;
 module_param(pps_cp_rearm_max, uint, 0444);
-MODULE_PARM_DESC(pps_cp_rearm_max, "pump attempts per plug-in; then buck path for the rest of it");
+MODULE_PARM_DESC(pps_cp_rearm_max, "pump retries per PPS session before returning to fixed PD and backing off");
 
 static unsigned int pps_cp_vstep_mv = 40;
 module_param(pps_cp_vstep_mv, uint, 0444);
@@ -487,7 +487,7 @@ static int pps_read_vbus(struct erhai_pps *p)
 	return 0;
 }
 
-/* pps_ufcs_curve_v2: start strictly below the row voltage. During
+/* The cell table accepts equality at entry. During
  * delivery, advance one row after 2500 ms continuously above target.
  * A last gear still delivers its specified current up to its CV.
  */
@@ -1345,7 +1345,7 @@ static unsigned int erhai_ufcs_update(void *data)
 	}
 	if (p->ufcs_protection)
 		return 0;
-	if (p->state != PPS_IDLE || p->cleanup || !pps_cp_enable ||
+	if (p->state != PPS_IDLE || p->cleanup || !pps_enable || !pps_cp_enable ||
 	    erhai_otg_charge_inhibited() || pps_read_battery(p))
 		return 0;
 	p->cell_ma = pps_cell_limit(p, true);

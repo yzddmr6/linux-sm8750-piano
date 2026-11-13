@@ -1188,16 +1188,18 @@ static bool sc8547_slave_is_on(void)
 }
 
 /* Drop the slave CP + ADC on teardown / hand-back. */
-static void sc8547_slave_reset(void)
+static int sc8547_slave_reset(void)
 {
 	struct sc8547a_device *sc = sc8547_slave_dev;
+	int ret;
 
 	if (!sc)
-		return;
-	sc8547_write_byte(sc, SC8547_REG_07, SC8547_SLAVE_CP_OFF);	/* CP off */
-	sc8547_update_bits(sc, SC8547_REG_09, SC8547_WATCHDOG_MASK,
-			   SC8547_WATCHDOG_DIS);
-	sc8547_write_byte(sc, SC8547_REG_11, 0x00);			/* ADC off */
+		return 0;
+	ret = sc8547_write_byte(sc, SC8547_REG_07, SC8547_SLAVE_CP_OFF);
+	if (ret)
+		return ret;
+	return sc8547_update_bits(sc, SC8547_REG_09, SC8547_WATCHDOG_MASK,
+				  SC8547_WATCHDOG_DIS) ?: sc8547_set_adc_enable(sc, false);
 }
 
 /* Dual PPS sequence from TheMojoMan/oneplus-erhai-linux 110b27276c22.
@@ -2026,10 +2028,8 @@ static void sc8547_vooc_arm_hw(struct sc8547a_device *sc)
 
 /*
  * Auto path: decline fast-charge for this plug and restore the normal USB/PD
- * charge route. Called when no (S)VOOC adapter identified, or a battery
- * precondition (SOC/temp/vbat) is outside the auto envelope. The charger stays
- * plugged and charges over the normal battmgr path; auto stays declined until
- * the adapter is physically removed.
+ * charge route. Battmgr can retry after backoff when the adapter or
+ * battery conditions recover.
  */
 static void sc8547_auto_decline(struct sc8547a_device *sc, const char *why)
 {
@@ -2466,8 +2466,10 @@ int sc8547a_serial_session(bool enable)
 	sc->fastchg_enable = false;
 	sc->fastchg_deliver = false;
 	sc->cp_enabled = false;
-	sc8547_slave_reset();
-	ret = sc8547_reset_voocphy(sc);
+	ret = sc8547_slave_reset();
+	ret = ret ?: sc8547_reset_voocphy(sc);
+	if (ret)
+		return ret;
 	route = wcd939x_usbss_dpdm_switch_fast_charge(false);
 	if (!ret && !route)
 		sc->vooc_started = false;

@@ -25,6 +25,7 @@
 #include <linux/suspend.h>
 #include <linux/units.h>
 #include <linux/usb/pd.h>
+#include <linux/usb/role.h>
 #include <linux/workqueue.h>
 
 #include "erhai_cell_envelope.h"
@@ -216,6 +217,7 @@ enum qcom_battmgr_pd_event {
 	PD_EVENT_CAPS,
 	PD_EVENT_RESET,
 	PD_EVENT_SERVICE_RESET,
+	PD_EVENT_PARTNER,
 };
 
 static DEFINE_MUTEX(erhai_bridge_lock);
@@ -537,6 +539,11 @@ struct qcom_battmgr {
 	unsigned long serial_retry;
 	unsigned long ufcs_retry;
 	bool ufcs_backoff;
+	bool pd_charge_only;
+	bool pd_partner_checked;
+	bool fixed_backoff;
+	unsigned long fixed_retry;
+	unsigned long pd_classified_at;
 	bool qc_probed;
 	unsigned long qc_probe_at;
 	bool serial_backoff;
@@ -1252,6 +1259,38 @@ static int qcom_battmgr_pd_source_match(struct power_supply *psy, void *data)
 	return src->sink;
 }
 
+/* On a PD charger the mandatory first fixed PDO describes whether the
+ * partner supports USB communication. Reserve those data pins for USB.
+ */
+static bool qcom_battmgr_pd_charge_only(struct qcom_battmgr *b)
+{
+	guard(mutex)(&b->lock);
+	return !qcom_battmgr_read_pdos_locked(b) && !(b->src_pdos[0] & PDO_FIXED_USB_COMM);
+}
+
+/* A missing BC1.2 result can describe either a brick or a data port.
+ * Use the connector's UCSI-controlled role switch before claiming D+/D-.
+ */
+static bool qcom_battmgr_usb_idle(struct qcom_battmgr *b)
+{
+	struct fwnode_handle *node;
+	struct usb_role_switch *sw;
+	bool idle;
+
+	device_for_each_child_node(b->dev->parent, node) {
+		if (!fwnode_device_is_compatible(node, "usb-c-connector"))
+			continue;
+		sw = fwnode_usb_role_switch_get(node);
+		fwnode_handle_put(node);
+		if (IS_ERR_OR_NULL(sw))
+			return false;
+		idle = usb_role_switch_get_role(sw) == USB_ROLE_NONE;
+		usb_role_switch_put(sw);
+		return idle;
+	}
+	return false;
+}
+
 /* Read fresh capabilities; never infer a fixed PDO from an APDO range. */
 static int qcom_battmgr_pd_current(struct qcom_battmgr *battmgr, u32 mv, u32 *ua)
 {
@@ -1427,11 +1466,27 @@ static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 	return err;
 }
 
+/* Every D+/D- acquisition starts with the preceding converter off and
+ * VBUS back inside the 5 V range. A late firmware ACK can precede decay.
+ */
+static int qcom_battmgr_prepare_probe(struct qcom_battmgr *b)
+{
+	u32 uv;
+	int ret;
+
+	ret = b->pps_ops->stop(b->pps_data);
+	ret = ret ?: qcom_battmgr_pd_stop(b, false, "protocol handover");
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &uv);
+	if (ret)
+		return ret;
+	return uv >= 4000000 && uv <= 5500000 ? 0 : -EAGAIN;
+}
+
 /* Fixed PDOs and PPS share a worker and never write the contract concurrently. */
 static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
-	bool prefer_pps, dedicated, can_probe, qc, caps_changed, current_changed = false;
+	bool prefer_pps, dedicated, can_probe, qc, try_qc, caps_changed, current_changed = false;
 	u32 online, type, health, vbat, vbus, ua, real_type;
 	int ret;
 
@@ -1458,6 +1513,9 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->aicl_done = false;
 		battmgr->ufcs_backoff = false;
 		battmgr->qc_probed = false;
+		battmgr->fixed_backoff = false;
+		battmgr->pd_partner_checked = false;
+		battmgr->pd_charge_only = false;
 		ret = qcom_battmgr_pps_stop(battmgr);
 		if (ret)
 			return PD_POLL_MS;
@@ -1471,31 +1529,35 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	}
 
 	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-				      USB_ADAP_TYPE, &type)) {
-		qcom_battmgr_pps_stop(battmgr);
-		return PD_POLL_MS;
-	}
+				      USB_ADAP_TYPE, &type))
+		type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 
 	power_supply_for_each_psy(&src, qcom_battmgr_pd_source_match);
 	real_type = type;
 	if (battmgr->pps_ops && battmgr->pps_ops->enabled() &&
 	    qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 				      USB_REAL_TYPE, &real_type)) {
-		if (qcom_battmgr_pps_running(battmgr)) {
-			qcom_battmgr_pps_stop(battmgr);
-			return PD_POLL_MS;
-		}
-		/* Optional classification must not disable ordinary fixed PD. */
+		/* Classification is optional. The power contract has its own readback. */
 		real_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	}
 	battmgr->charge_detected_type = type;
-	/* Dedicated legacy supplies have no USB data role. A VOOC brick
-	 * can identify as DCP or Apple-style before its first serial frame.
-	 * Leave SDP, CDP, PD and OTG on their normal routes.
-	 */
+	if (!src.sink) {
+		battmgr->pd_charge_only = false;
+		battmgr->pd_partner_checked = false;
+	} else if (test_and_clear_bit(PD_EVENT_PARTNER, &battmgr->pd_events) ||
+		   !battmgr->pd_partner_checked ||
+		   (!battmgr->pd_charge_only && !qcom_battmgr_pps_running(battmgr) &&
+		    time_after_eq(jiffies, battmgr->pd_classified_at + msecs_to_jiffies(CHARGE_CTRL_POLL_MS)))) {
+		battmgr->pd_charge_only = qcom_battmgr_pd_charge_only(battmgr);
+		battmgr->pd_partner_checked = true;
+		battmgr->pd_classified_at = jiffies;
+	}
 	qc = (type >= 0x80 && type <= 0x82) || (real_type >= 0x80 && real_type <= 0x82);
-	dedicated = !src.sink && (qc || type == POWER_SUPPLY_USB_TYPE_DCP ||
-				  type == OPLUS_USB_TYPE_APPLE_BRICK_ID);
+	dedicated = src.sink ? battmgr->pd_charge_only :
+		    (qc || type == POWER_SUPPLY_USB_TYPE_DCP ||
+		     type == OPLUS_USB_TYPE_APPLE_BRICK_ID ||
+		     ((type == POWER_SUPPLY_USB_TYPE_UNKNOWN || type == POWER_SUPPLY_USB_TYPE_C) &&
+		      qcom_battmgr_usb_idle(battmgr)));
 	can_probe = dedicated && !READ_ONCE(battmgr->pps_suspended) &&
 		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
 		    !battmgr->charge_policy_hold && !battmgr->charge_error;
@@ -1504,12 +1566,11 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		 * source at 5 V. Its decline/timeout releases the crossbar
 		 * before the next protocol (including firmware QC) can act.
 		 */
-		if (can_probe && !battmgr->serial_blocked && !battmgr->pps_ops->ufcs_active(battmgr->pps_data) &&
+		if (can_probe && !battmgr->serial_blocked &&
 		    (!battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
-			if (battmgr->pps_ops->stop(battmgr->pps_data) ||
-			    qcom_battmgr_pd_stop(battmgr, false, "serial probe"))
-				return PD_POLL_MS;
-			ret = battmgr->pps_ops->serial_session(true);
+			ret = battmgr->serial_probe ? 0 : qcom_battmgr_prepare_probe(battmgr);
+			if (!ret)
+				ret = battmgr->pps_ops->serial_session(true);
 			if (!ret) {
 				battmgr->serial_probe = true;
 				return PD_POLL_MS;
@@ -1527,9 +1588,9 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	    (!battmgr->ufcs_backoff || time_after_eq(jiffies, battmgr->ufcs_retry))) {
 		unsigned int delay;
 
-		if (qcom_battmgr_pd_stop(battmgr, false, "UFCS probe"))
-			return PD_POLL_MS;
-		delay = battmgr->pps_ops->ufcs_update(battmgr->pps_data);
+		delay = 0;
+		if (battmgr->pps_ops->ufcs_active(battmgr->pps_data) || !qcom_battmgr_prepare_probe(battmgr))
+			delay = battmgr->pps_ops->ufcs_update(battmgr->pps_data);
 		if (battmgr->pps_ops->ufcs_active(battmgr->pps_data))
 			return delay ?: PD_POLL_MS;
 		battmgr->ufcs_backoff = true;
@@ -1574,12 +1635,26 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->pps_input_used = false;
 	}
 
-	qc = qc && !src.sink;
+	/* Charge-only PD sources may also implement HVDCP. Try their
+	 * fixed PDO first; after a refusal or an absent 9 V PDO let QC
+	 * negotiate, and revisit the fixed PDO after its normal timeout.
+	 */
+	if (battmgr->fixed_backoff && time_after_eq(jiffies, battmgr->fixed_retry)) {
+		battmgr->fixed_backoff = false;
+		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+	}
+	if (src.sink && dedicated && !battmgr->fixed_backoff && battmgr->pd_state != PD_ACTIVE &&
+	    battmgr->pd_state != PD_WAIT && !qcom_battmgr_pd_current(battmgr, PD_FIXED_MV, &ua) && !ua) {
+		battmgr->fixed_backoff = true;
+		battmgr->fixed_retry = jiffies + msecs_to_jiffies(PD_CONFIG_TIMEOUT_MS);
+	}
+	try_qc = !src.sink || (dedicated && battmgr->fixed_backoff);
+	qc = qc && try_qc;
 	/* A DCP classification can precede HVDCP detection. Ask firmware
 	 * to negotiate identification (BATT_SET_QC=0), never raise VBUS
 	 * without its positive HVDCP response. Data ports keep D+/D-.
 	 */
-	if (can_probe && !qc && !battmgr->pd_restore && (!battmgr->qc_probed ||
+	if (can_probe && try_qc && !qc && !battmgr->pd_restore && (!battmgr->qc_probed ||
 	    time_after_eq(jiffies, battmgr->qc_probe_at + msecs_to_jiffies(CHARGE_CTRL_POLL_MS)))) {
 		battmgr->qc_probed = true;
 		battmgr->qc_probe_at = jiffies;
@@ -1589,7 +1664,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			return PD_POLL_MS;
 		}
 	}
-	if ((!src.sink && !qc) || READ_ONCE(battmgr->otg_request)) {
+	if ((try_qc && !qc) || READ_ONCE(battmgr->otg_request)) {
 		if (qcom_battmgr_pd_stop(battmgr, false, "no high-voltage sink"))
 			return PD_POLL_MS;
 		qcom_battmgr_pd_log(battmgr, type);
@@ -1724,6 +1799,10 @@ failed:
 	dev_warn(battmgr->dev, "PD: 9 V request failed: %d\n", ret);
 	qcom_battmgr_pd_stop(battmgr, false, "request failed");
 	battmgr->pd_since = jiffies;
+	if (!qc && dedicated) {
+		battmgr->fixed_backoff = true;
+		battmgr->fixed_retry = jiffies + msecs_to_jiffies(PD_CONFIG_TIMEOUT_MS);
+	}
 	battmgr->pd_state = PD_FAILED;
 	qcom_battmgr_pd_log(battmgr, type);
 	return PD_POLL_MS;
@@ -2409,6 +2488,7 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 	case NOTIF_OPLUS_PLUGIN:
 	case NOTIF_OPLUS_APSD_DONE:
 		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE) {
+			set_bit(PD_EVENT_PARTNER, &battmgr->pd_events);
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 			power_supply_changed(battmgr->usb_psy);
 			qcom_battmgr_usb_event(battmgr);
