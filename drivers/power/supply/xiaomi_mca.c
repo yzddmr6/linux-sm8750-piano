@@ -659,6 +659,7 @@ struct xiaomi_mca {
 	u32 cp_type;	/* protocol at stage entry */
 	enum xiaomi_mca_cp cp;
 	const char *cp_last_exit;
+	const char *cp_stop_reason;
 	u32 cp_retry_ms;
 	const char *hv_last_exit;
 	u32 cp_exits;
@@ -2460,7 +2461,14 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	if (!xiaomi_mca_cp_active(mca))
 		return 0;
 
+	if (mca->cp != MCA_CP_STOPPING)
+		mca->cp_stop_reason = why;
 	ret = xiaomi_mca_cp_set_online(mca, false);
+	if (ret == -ENODEV) {
+		guard(rwsem_read)(&mca->cp_psy->epc_sem);
+		if (mca->cp_psy->removing)
+			ret = 0;
+	}
 	if (ret) {
 		mca->cp = MCA_CP_STOPPING;
 		dev_err(mca->dev, "failed to stop the switched-capacitor stage: %d\n", ret);
@@ -2469,6 +2477,8 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	power_supply_put(mca->cp_psy);
 	mca->cp_psy = NULL;
 	mca->cp_exits++;
+	why = mca->cp_stop_reason ?: why;
+	mca->cp_stop_reason = NULL;
 	dev_info(mca->dev, "direct charging stopped: %s\n", why);
 
 	xiaomi_mca_cp_backoff(mca, why);

@@ -1428,6 +1428,27 @@ static void xiaomi_mca_test_cp_stop_failure(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, f->mca.cp_psy, NULL);
 }
 
+static void xiaomi_mca_test_stage_removed(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct power_supply *psy;
+
+	mca_test_stage(test, f);
+	psy = f->mca.cp_psy;
+	f->stage_error = -ENODEV;
+	guard(mutex)(&f->mca.lock);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_stop(&f->mca, "stage read failed"), -ENODEV);
+	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_STOPPING);
+	scoped_guard(rwsem_write, &psy->epc_sem)
+		psy->removing = true;
+	xiaomi_mca_policy_poll(&f->mca);
+	KUNIT_EXPECT_PTR_EQ(test, f->mca.cp_psy, NULL);
+	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_COOLDOWN);
+	KUNIT_EXPECT_STREQ(test, f->mca.cp_last_exit, "stage read failed");
+	scoped_guard(rwsem_write, &psy->epc_sem)
+		psy->removing = false;
+}
+
 static void xiaomi_mca_test_pm_refused(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_policy_fixture(test);
@@ -3096,6 +3117,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_threshold_thermal_release),
 	KUNIT_CASE(xiaomi_mca_test_gauge_fallback),
 	KUNIT_CASE(xiaomi_mca_test_threshold_stop_failure_sleep),
+	KUNIT_CASE(xiaomi_mca_test_stage_removed),
 	KUNIT_CASE(xiaomi_mca_test_pm_refused),
 	KUNIT_CASE(xiaomi_mca_test_pm_no_source),
 	KUNIT_CASE_SLOW(xiaomi_mca_test_pm_voltage_timeout),

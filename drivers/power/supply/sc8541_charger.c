@@ -140,6 +140,7 @@ struct sc8541 {
 	struct mutex lock;		/* enabled, register sequences */
 	struct delayed_work watch;	/* kick timeout, or the check after a stop */
 	bool enabled;
+	bool removing;
 	bool wd_owned;
 	unsigned int wd_saved;
 	bool pen_owned;
@@ -288,6 +289,10 @@ static int sc8541_enable(struct sc8541 *sc)
 	int ret = 0;
 
 	mutex_lock(&sc->lock);
+	if (sc->removing) {
+		ret = -ENODEV;
+		goto out;
+	}
 	if (sc->otg_owned || sc->pen_owned) {
 		ret = -EBUSY;
 		goto out;
@@ -421,6 +426,8 @@ static int sc8541_otg_locked(struct sc8541 *sc, enum sc8541_otg_action action)
 
 	if (action == SC8541_OTG_PRESENT)
 		return 0;
+	if (sc->removing)
+		return -ENODEV;
 	if (sc->enabled || sc->wd_owned)
 		return -EBUSY;
 	if (action == SC8541_PEN_ISOLATE) {
@@ -699,8 +706,11 @@ static void sc8541_stop(void *data)
 {
 	struct sc8541 *sc = data;
 
+	scoped_guard(mutex, &sc->lock)
+		sc->removing = true;
 	debugfs_remove_recursive(sc->dbg);
-	sc8541_disable_sync(sc);
+	if (sc8541_disable_sync(sc))
+		dev_err(sc->dev, "unable to confirm stop during removal\n");
 }
 
 static const struct regmap_config sc8541_regmap_config = {
@@ -748,11 +758,6 @@ static int sc8541_probe(struct i2c_client *client)
 			return ret;
 	}
 
-	/* Runs after the power supply is gone, so nothing turns it back on */
-	ret = devm_add_action_or_reset(dev, sc8541_stop, sc);
-	if (ret)
-		return ret;
-
 	cfg.drv_data = sc;
 	cfg.fwnode = dev_fwnode(dev);
 	sc->psy = devm_power_supply_register(dev, &sc8541_desc, &cfg);
@@ -763,6 +768,11 @@ static int sc8541_probe(struct i2c_client *client)
 	sc->dbg = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("regs", 0400, sc->dbg, sc, &sc8541_dbg_regs_fops);
 	debugfs_create_file("adc", 0600, sc->dbg, sc, &sc8541_dbg_adc_fops);
+
+	/* Drain the stage before devres unregisters the power supply. */
+	ret = devm_add_action_or_reset(dev, sc8541_stop, sc);
+	if (ret)
+		return ret;
 
 	i2c_set_clientdata(client, sc);
 	dev_info(dev, "SC8541 (ctrl 0x%02x)\n", ctrl);
