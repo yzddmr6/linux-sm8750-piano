@@ -1482,7 +1482,9 @@ void ath12k_pci_power_down(struct ath12k_base *ab, bool is_suspend)
 {
 	struct ath12k_pci *ab_pci = ath12k_pci_priv(ab);
 
-	if (!test_bit(ATH12K_PCI_FLAG_INIT_DONE, &ab_pci->flags))
+	/* Calibration powers up MHI before mission-mode CE setup. */
+	if (!test_bit(ATH12K_PCI_FLAG_INIT_DONE, &ab_pci->flags) &&
+	    !test_bit(ATH12K_MHI_POWER_ON, &ab_pci->mhi_state))
 		return;
 
 	/* restore aspm in case firmware bootup fails */

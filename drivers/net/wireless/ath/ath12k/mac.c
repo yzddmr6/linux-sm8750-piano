@@ -7,6 +7,7 @@
 #include <net/mac80211.h>
 #include <net/cfg80211.h>
 #include <linux/etherdevice.h>
+#include <linux/of.h>
 
 #include "mac.h"
 #include "core.h"
@@ -1044,24 +1045,6 @@ static void ath12k_pdev_caps_update(struct ath12k *ar)
 	ar->txpower_scale = WMI_HOST_TP_SCALE_MAX;
 }
 
-/* Encode a TXPOWER_LIMIT2G/5G value. Hardware that declares the vendor host
- * driver's platform limit gets the lower of the two, sent with the SAR reason
- * as that driver does, so that a later write cannot lift the platform limit
- * whichever reason the firmware keeps.
- */
-static u32 ath12k_mac_txpower_limit_param(struct ath12k *ar, u32 txpower)
-{
-	u8 limit = ar->ab->hw_params->pdev_txpower_sar_limit;
-
-	if (!limit)
-		return txpower;
-
-	return u32_encode_bits(min_t(u32, txpower, limit),
-			       WMI_PDEV_PARAM_TXPOWER_VALUE) |
-	       u32_encode_bits(WMI_PDEV_PARAM_TXPOWER_REASON_SAR,
-			       WMI_PDEV_PARAM_TXPOWER_REASON);
-}
-
 static int ath12k_mac_txpower_recalc(struct ath12k *ar)
 {
 	struct ath12k_pdev *pdev = ar->pdev;
@@ -1091,7 +1074,10 @@ static int ath12k_mac_txpower_recalc(struct ath12k *ar)
 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "txpower to set in hw %d\n",
 		   txpower / 2);
 
-	txpower = ath12k_mac_txpower_limit_param(ar, txpower);
+	/* Limit this board to the target firmware's measured HE80 envelope. */
+	if (ar->ab->hw_rev == ATH12K_HW_WCN7860_HW20 &&
+	    of_machine_is_compatible("xiaomi,piano"))
+		txpower = min(txpower, 44);
 
 	if ((pdev->cap.supported_bands & WMI_HOST_WLAN_2GHZ_CAP) &&
 	    ar->txpower_limit_2g != txpower) {

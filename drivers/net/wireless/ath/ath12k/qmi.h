@@ -29,6 +29,7 @@
 
 #define QMI_WLFW_REQUEST_MEM_IND_V01		0x0035
 #define QMI_WLFW_FW_MEM_READY_IND_V01		0x0037
+#define QMI_WLFW_CAL_DONE_IND_V01		0x003e
 #define QMI_WLFW_FW_READY_IND_V01		0x0038
 
 #define QMI_WLANFW_MAX_DATA_SIZE_V01		6144
@@ -65,6 +66,7 @@ enum ath12k_qmi_event_type {
 	ATH12K_QMI_EVENT_POWER_UP,
 	ATH12K_QMI_EVENT_POWER_DOWN,
 	ATH12K_QMI_EVENT_HOST_CAP,
+	ATH12K_QMI_EVENT_CAL_DONE,
 	ATH12K_QMI_EVENT_MAX,
 };
 
@@ -145,6 +147,7 @@ struct ath12k_qmi {
 	u32 mem_seg_count;
 	u32 target_mem_mode;
 	bool target_mem_delayed;
+	bool cal_running;
 	u8 cal_done;
 
 	/* protected with struct ath12k_qmi::event_lock */
@@ -635,6 +638,7 @@ enum ath12k_qmi_firmware_mode {
 
 	/* firmware offline; values 2-3 reserved by firmware ABI */
 	ATH12K_QMI_FIRMWARE_MODE_OFF = 4,
+	ATH12K_QMI_FIRMWARE_MODE_CALIBRATION = 7,
 };
 
 static inline void ath12k_qmi_set_event_block(struct ath12k_qmi *qmi, bool block)

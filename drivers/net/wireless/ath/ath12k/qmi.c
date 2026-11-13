@@ -9,6 +9,7 @@
 #include "qmi.h"
 #include "core.h"
 #include "debug.h"
+#include "hif.h"
 #include <linux/of.h>
 #include <linux/firmware.h>
 #include <linux/of_address.h>
@@ -4162,7 +4163,26 @@ static void ath12k_qmi_msg_fw_ready_cb(struct qmi_handle *qmi_hdl,
 	ath12k_qmi_driver_event_post(qmi, ATH12K_QMI_EVENT_FW_READY, NULL);
 }
 
+/* WLFW CAL_DONE_IND, shared with cnss2 and WCN7750. The optional
+ * upload length only applies to hosts persisting a calibration file.
+ */
+static void ath12k_qmi_msg_cal_done_cb(struct qmi_handle *handle,
+				       struct sockaddr_qrtr *sq,
+				       struct qmi_txn *txn, const void *data)
+{
+	struct ath12k_qmi *qmi = container_of(handle, struct ath12k_qmi, handle);
+
+	ath12k_qmi_driver_event_post(qmi, ATH12K_QMI_EVENT_CAL_DONE, NULL);
+}
+
 static const struct qmi_msg_handler ath12k_qmi_msg_handlers[] = {
+	{
+		.type = QMI_INDICATION,
+		.msg_id = QMI_WLFW_CAL_DONE_IND_V01,
+		.ei = qmi_wlanfw_fw_ready_ind_msg_v01_ei,
+		.decoded_size = sizeof(struct qmi_wlanfw_fw_ready_ind_msg_v01),
+		.fn = ath12k_qmi_msg_cal_done_cb,
+	},
 	{
 		.type = QMI_INDICATION,
 		.msg_id = QMI_WLFW_REQUEST_MEM_IND_V01,
@@ -4285,7 +4305,33 @@ static void ath12k_qmi_driver_event_work(struct work_struct *work)
 			if (ret < 0)
 				set_bit(ATH12K_FLAG_QMI_FAIL, &ab->dev_flags);
 			break;
+		case ATH12K_QMI_EVENT_CAL_DONE:
+			if (!qmi->cal_running)
+				break;
+			ath12k_dbg(ab, ATH12K_DBG_QMI, "cold boot calibration completed\n");
+			ret = ath12k_qmi_wlanfw_mode_send(ab, ATH12K_QMI_FIRMWARE_MODE_OFF);
+			if (ret < 0)
+				goto cal_error;
+			qmi->cal_running = false;
+			qmi->cal_done = 1;
+			ath12k_hif_power_down(ab, false);
+			ret = ath12k_hif_power_up(ab);
+			if (ret < 0)
+				goto cal_error;
+			break;
 		case ATH12K_QMI_EVENT_FW_READY:
+			if (!qmi->cal_done && ab->hw_rev == ATH12K_HW_WCN7860_HW20 &&
+			    of_machine_is_compatible("xiaomi,piano")) {
+				if (!qmi->cal_running) {
+					qmi->cal_running = true;
+					ath12k_dbg(ab, ATH12K_DBG_QMI, "requesting cold boot calibration\n");
+					ret = ath12k_qmi_wlanfw_mode_send(ab,
+						ATH12K_QMI_FIRMWARE_MODE_CALIBRATION);
+					if (ret < 0)
+						goto cal_error;
+				}
+				break;
+			}
 			clear_bit(ATH12K_FLAG_QMI_FAIL, &ab->dev_flags);
 			if (test_bit(ATH12K_FLAG_QMI_FW_READY_COMPLETE, &ab->dev_flags)) {
 				if (ab->is_reset)
@@ -4313,7 +4359,10 @@ static void ath12k_qmi_driver_event_work(struct work_struct *work)
 			ath12k_warn(ab, "invalid event type: %d\n", event->type);
 			break;
 		}
-
+		goto skip;
+cal_error:
+		ath12k_warn(ab, "cold boot calibration transition failed: %d\n", ret);
+		set_bit(ATH12K_FLAG_QMI_FAIL, &ab->dev_flags);
 skip:
 		kfree(event);
 		spin_lock(&qmi->event_lock);
