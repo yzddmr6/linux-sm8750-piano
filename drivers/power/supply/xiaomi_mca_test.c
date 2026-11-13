@@ -2908,6 +2908,36 @@ static void xiaomi_mca_test_mipps_lost_ack(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->verify, 0);
 }
 
+static void xiaomi_mca_test_auth_retry_contract(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_auth_fixture(test);
+	int n;
+
+	charge_policy = hv_charge = true;
+	f->mca.mipps_attempted = true;
+	f->mca.auth_retry = jiffies - 300 * HZ;
+	f->mca.adapter_svid = 0x2717;
+	f->mca.hv = MCA_HV_ON;
+	f->vbus = 9000000;
+	guard(mutex)(&f->mca.lock);
+	for (n = 0; n < 3; n++) {
+		xiaomi_mca_policy_poll(&f->mca);
+		KUNIT_EXPECT_EQ(test, f->mca.hv, MCA_HV_ON);
+		KUNIT_EXPECT_TRUE(test, f->mca.mipps_attempted);
+		KUNIT_EXPECT_EQ(test, f->voltage_requests, 0);
+	}
+	f->vbus = 5000000;
+	f->mca.hv = MCA_HV_OFF;
+	xiaomi_mca_policy_poll(&f->mca);
+	KUNIT_EXPECT_FALSE(test, f->mca.mipps_attempted);
+	f->fail_verify = true;
+	xiaomi_mca_mipps_authenticate(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->mca.auth_retry_ms, 60000);
+	f->mca.mipps_attempted = false;
+	xiaomi_mca_mipps_authenticate(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->mca.auth_retry_ms, 120000);
+}
+
 static void xiaomi_mca_test_mipps_restart(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_auth_fixture(test);
@@ -3156,6 +3186,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_mipps_bad_digest),
 	KUNIT_CASE(xiaomi_mca_test_mipps_lost_ack),
 	KUNIT_CASE(xiaomi_mca_test_mipps_restart),
+	KUNIT_CASE(xiaomi_mca_test_auth_retry_contract),
 	KUNIT_CASE(xiaomi_mca_test_mipps_detach),
 	KUNIT_CASE(xiaomi_mca_test_identity_edges),
 	KUNIT_CASE(xiaomi_mca_test_ffc_conditions),

@@ -684,6 +684,7 @@ struct xiaomi_mca {
 	unsigned long cp_retry_at;
 	bool auth_lost;
 	unsigned long auth_retry;
+	u32 auth_retry_ms;
 	int qc_align_mv;
 	unsigned int qc_stalls;
 	bool cp_die_hot;
@@ -1559,7 +1560,9 @@ static void xiaomi_mca_mipps_authenticate(struct xiaomi_mca *mca)
 		mca->auth_tried = false;
 	}
 finish:
-	mca->auth_retry = jiffies + msecs_to_jiffies(MCA_HV_RETRY_MS);
+	mca->auth_retry_ms = !ret ? 0 : mca->auth_retry_ms ?
+		min(2 * mca->auth_retry_ms, 300000U) : MCA_HV_RETRY_MS;
+	mca->auth_retry = jiffies + msecs_to_jiffies(mca->auth_retry_ms);
 	if (generation == READ_ONCE(mca->service_generation)) {
 		if (ret && discovered) {
 			xiaomi_mca_write_u32(mca, MCA_PROP_PD_VERIFIED, 0);
@@ -3883,6 +3886,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		mca->cp_fault = false;
 		mca->cp_exits = 0;
 		mca->cp_last_exit = NULL;
+		mca->auth_retry_ms = 0;
 		mca->hv_last_exit = NULL;
 		mca->cp_recharge_cv = 0;
 		mca->hv_retry = jiffies;
@@ -3990,13 +3994,9 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 	} else if (charge_policy && mipps_auth && !mca->auth_lost &&
 		   mca->adapter_svid == 0x2717 && mca->mipps_attempted &&
 		   !xiaomi_mca_authenticated(mca) && time_after_eq(jiffies, mca->auth_retry) &&
-		   xiaomi_mca_is_pd(real_type)) {
-		mca->auth_retry = jiffies + msecs_to_jiffies(MCA_HV_RETRY_MS);
-		if (xiaomi_mca_cp_stop(mca, "retry adapter authentication") ||
-		    xiaomi_mca_restore_voltage(mca))
-			return;
-		mca->hv = MCA_HV_OFF;
-		mca->cp = MCA_CP_OFF;
+		   mca->cp == MCA_CP_OFF && mca->hv == MCA_HV_OFF &&
+		   mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV && xiaomi_mca_is_pd(real_type)) {
+		/* Re-enter from 5 V without dismantling a working fallback. */
 		mca->mipps_attempted = false;
 	} else if (charge_policy && xiaomi_mca_cp_active(mca)) {
 		xiaomi_mca_cp_step(mca);
