@@ -1428,15 +1428,15 @@ static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
-	bool prefer_pps, dedicated, qc, caps_changed, current_changed = false;
+	bool prefer_pps, dedicated, can_probe, qc, caps_changed, current_changed = false;
 	u32 online, type, health, vbat, vbus, ua, real_type;
 	int ret;
 
 	if (test_and_clear_bit(PD_EVENT_SERVICE_RESET, &battmgr->pd_events))
 		battmgr->pd_restore_fcc = false;
 	if (test_and_clear_bit(PD_EVENT_RESET, &battmgr->pd_events)) {
-		qcom_battmgr_pps_stop(battmgr);
-		if (qcom_battmgr_pd_stop(battmgr, false, "PD reset"))
+		if (qcom_battmgr_pps_stop(battmgr) ||
+		    qcom_battmgr_pd_stop(battmgr, false, "PD reset"))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
 		battmgr->pd_logged = false;
@@ -1491,14 +1491,15 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	qc = (type >= 0x80 && type <= 0x82) || (real_type >= 0x80 && real_type <= 0x82);
 	dedicated = !src.sink && (qc || type == POWER_SUPPLY_USB_TYPE_DCP ||
 				  type == OPLUS_USB_TYPE_APPLE_BRICK_ID);
+	can_probe = dedicated && !READ_ONCE(battmgr->pps_suspended) &&
+		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
+		    !battmgr->charge_policy_hold && !battmgr->charge_error;
 	if (battmgr->pps_ops) {
 		/* A probe gets exclusive D+/D- ownership only on a dedicated
 		 * source at 5 V. Its decline/timeout releases the crossbar
 		 * before the next protocol (including firmware QC) can act.
 		 */
-		if (!battmgr->pps_ops->ufcs_active(battmgr->pps_data) && dedicated && !READ_ONCE(battmgr->pps_suspended) &&
-		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
-		    !battmgr->charge_policy_hold && !battmgr->charge_error &&
+		if (can_probe && !battmgr->pps_ops->ufcs_active(battmgr->pps_data) &&
 		    (!battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
 			if (battmgr->pps_ops->stop(battmgr->pps_data) ||
 			    qcom_battmgr_pd_stop(battmgr, false, "serial probe"))
@@ -1516,9 +1517,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			return PD_POLL_MS;
 		battmgr->serial_probe = false;
 	}
-	if (IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS) && dedicated && battmgr->pps_ops &&
-	    !battmgr->pps_suspended && !battmgr->otg_request && !battmgr->charge_inhibited &&
-	    !battmgr->charge_policy_hold && !battmgr->charge_error &&
+	if (IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS) && can_probe && battmgr->pps_ops &&
 	    (!battmgr->ufcs_backoff || time_after_eq(jiffies, battmgr->ufcs_retry))) {
 		unsigned int delay;
 

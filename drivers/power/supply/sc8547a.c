@@ -42,6 +42,7 @@
 #include <linux/random.h>
 #if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
 #include <linux/regmap.h>
+#include <linux/firmware.h>
 #include "ufcs/sc8547a_ufcs.h"
 #include "ufcs/include/internal/ufcs_msg.h"
 #endif
@@ -420,6 +421,7 @@ struct sc8547a_device {
 	struct sc8547a_ufcs_phy ufcs_phy;
 	struct ufcs_dev *ufcs;
 	u64 ufcs_mode;
+	unsigned int ufcs_cable_ma;
 	unsigned long ufcs_packet_at;
 #endif
 	bool ufcs_owner;
@@ -2585,6 +2587,32 @@ int sc8547a_ufcs_stop(void)
 	return sc8547_ufcs_end(sc8547_master_dev);
 }
 
+/* Stock obtains the 16 authentication bytes from userspace. Keep this
+ * device-local input out of the driver and reject failed authentication.
+ */
+static int sc8547_ufcs_authenticate(struct sc8547a_device *sc)
+{
+	const struct firmware *key;
+	u64 info;
+	int ret;
+
+	ret = ufcs_intf_get_device_info(sc->ufcs, &info);
+	if (ret)
+		return ret;
+	if (UFCS_DEVICE_INFO_IC_VENDOR(info) ||
+	    UFCS_DEVICE_INFO_DEV_VENDOR(info) != UFCS_OPLUS_DEV_ID)
+		return 0;
+	ret = request_firmware_direct(&key, "oneplus/erhai/ufcs-auth.bin", sc->dev);
+	if (ret)
+		return ret;
+	if (key->size == UFCS_VERIFY_AUTH_DATA_SIZE)
+		ret = ufcs_intf_verify_adapter(sc->ufcs, 1, (u8 *)key->data, key->size);
+	else
+		ret = -EINVAL;
+	release_firmware(key);
+	return ret == 1 ? 0 : ret < 0 ? ret : -EKEYREJECTED;
+}
+
 int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 {
 	u64 modes[UFCS_OUTPUT_MODE_MAX], cable;
@@ -2604,6 +2632,9 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	if (ret)
 		goto out;
 	ret = ufcs_handshake(sc->ufcs);
+	if (ret)
+		goto out;
+	ret = sc8547_ufcs_authenticate(sc);
 	if (ret)
 		goto out;
 	ret = ufcs_intf_config_watchdog(sc->ufcs, 3000);
@@ -2631,6 +2662,7 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 		best = ma;
 	}
 	if (best) {
+		sc->ufcs_cable_ma = UFCS_CABLE_INFO_CURR_MAX(cable);
 		sc->ufcs_packet_at = jiffies;
 		return best;
 	}
@@ -2644,6 +2676,7 @@ int sc8547a_ufcs_request(unsigned int *mv, unsigned int *ma)
 	struct sc8547a_device *sc;
 	u64 mode;
 	unsigned int base_mv, base_ma;
+	int applied, ret;
 
 	guard(mutex)(&sc8547_ufcs_lock);
 	sc = sc8547_master_dev;
@@ -2655,9 +2688,11 @@ int sc8547a_ufcs_request(unsigned int *mv, unsigned int *ma)
 	if (*mv < base_mv || *ma < base_ma)
 		return -ERANGE;
 	*mv -= (*mv - base_mv) % UFCS_OUTPUT_MODE_VOL_STEP(mode);
-	*ma -= (*ma - base_ma) % UFCS_OUTPUT_MODE_CURR_STEP(mode);
-	if (ufcs_intf_pdo_set(sc->ufcs, *mv, *ma))
-		return -EIO;
+	ret = ufcs_request_limited(sc->ufcs, *mv, sc->ufcs_cable_ma,
+				   8000, *ma, &applied);
+	if (ret)
+		return ret;
+	*ma = applied;
 	sc->ufcs_packet_at = jiffies;
 	return 0;
 }
