@@ -548,8 +548,8 @@ struct qcom_battmgr {
 	unsigned int retry_pending;
 	bool retry_stopping;
 	unsigned long retry_deadline;
-	unsigned int serial_retries, ufcs_retries, pps_retries;
-	unsigned long serial_next, ufcs_next, pps_next;
+	unsigned int serial_retries, ufcs_retries, pps_retries, fixed_retries;
+	unsigned long serial_next, ufcs_next, pps_next, fixed_next;
 	bool tail_owned;
 	unsigned int recharge_samples;
 	unsigned long recharge_at;
@@ -1688,7 +1688,8 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->missing_routes = battmgr->retry_pending = 0;
 		battmgr->retry_stopping = false;
 		battmgr->retry_once = battmgr->retry_evidence = 0;
-		battmgr->serial_retries = battmgr->ufcs_retries = battmgr->pps_retries = 0;
+		battmgr->serial_retries = battmgr->ufcs_retries = 0;
+		battmgr->pps_retries = battmgr->fixed_retries = 0;
 		test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events);
 		test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events);
 		battmgr->serial_failures = battmgr->ufcs_failures = 0;
@@ -1900,13 +1901,23 @@ fixed_contract:
 	 * fixed PDO first; after a refusal or an absent 9 V PDO let QC
 	 * negotiate, and revisit the fixed PDO after its normal timeout.
 	 */
-	if (battmgr->fixed_backoff && time_after_eq(jiffies, battmgr->fixed_retry)) {
-		/* Check the PDO without releasing a live QC contract. */
-		if (!battmgr->qc_contract || !battmgr->pd_restore ||
-		    (!qcom_battmgr_pd_current(battmgr, PD_FIXED_MV, &ua) && ua))
+	if (src.sink && dedicated && qc && battmgr->qc_contract && battmgr->pd_restore) {
+		/* A fixed 9 V PDO can appear while QC is delivering. Use
+		 * read-only PDO evidence before spending a disruption slot.
+		 */
+		if (!battmgr->fixed_backoff)
+			battmgr->fixed_retry = jiffies;
+		battmgr->fixed_backoff = true;
+		if (battmgr->pd_state == PD_ACTIVE &&
+		    time_after_eq(jiffies, battmgr->fixed_retry) &&
+		    !qcom_battmgr_pd_current(battmgr, PD_FIXED_MV, &ua) && ua &&
+		    qcom_battmgr_retry_slot(&battmgr->fixed_retries, &battmgr->fixed_next,
+					    battmgr->stable_since)) {
 			battmgr->fixed_backoff = false;
-		else
-			battmgr->fixed_retry = jiffies + msecs_to_jiffies(PD_CONFIG_TIMEOUT_MS);
+			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+		}
+	} else if (battmgr->fixed_backoff && time_after_eq(jiffies, battmgr->fixed_retry)) {
+		battmgr->fixed_backoff = false;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 	if (src.sink && dedicated && !battmgr->fixed_backoff && battmgr->pd_state != PD_ACTIVE &&
