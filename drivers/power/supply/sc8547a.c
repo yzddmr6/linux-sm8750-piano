@@ -480,7 +480,6 @@ struct sc8547a_device {
 	const struct erhai_charge_curve *auto_curve;	/* selected CC/CV table */
 	int			auto_curve_idx;	/* current row (descends only) */
 	bool			auto_protection;
-	bool			auto_known_svooc;
 	unsigned int		auto_taper_cnt;
 	int			auto_step_cnt;	/* advance debounce counter */
 	int			auto_reservo_cnt;	/* consecutive adapter-reset re-servos */
@@ -958,7 +957,11 @@ int sc8547a_pps_cp_engage(int *need_mv)
 	    diff > SC8547_CP_RESTART_MARGIN_CEIL_MV)
 		return -EAGAIN;
 
-	ret = sc->ufcs_owner ? sc8547_set_adc_enable(sc, true) : sc8547_svooc_hw_setting(sc);
+	/* The UFCS backend already owns the data pins. Apply the shared
+	 * pump profile (REG33/3A timing and UCP/soft-start fields) without
+	 * touching REG21, the UFCS PHY enable or its packet registers.
+	 */
+	ret = sc8547_svooc_hw_setting(sc);
 	if (!ret)
 		ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
 	if (!ret)
@@ -2210,7 +2213,6 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 		return;
 	}
 
-	sc->auto_known_svooc = true;
 	ret = sc8547_read_gauge(sc, &soc, &temp_ddc, &cell_mv, NULL);
 	if (ret) {
 		sc8547_auto_decline(sc, "gauge not ready");
@@ -2256,18 +2258,6 @@ static void sc8547_attach_work(struct work_struct *work)
 	if (!sc->vooc_started)
 		return;
 
-	if (sc->auto_state == SC_AUTO_DONE || sc->auto_state == SC_AUTO_DECLINED) {
-		int soc, temp, mv;
-
-		if (sc8547_read_gauge(sc, &soc, &temp, &mv, NULL) ||
-		    !sc8547_auto_update_curve(sc, soc, temp, mv, 0, true))
-			goto reschedule;
-		sc->auto_state = SC_AUTO_IDENTIFY;
-		sc->fastchg_auto = true;
-		sc->auto_armed = false;
-		sc->auto_ident_retries = 0;
-		sc->auto_reservo_cnt = 0;
-	}
 	vbus = sc8547_get_vbus(sc);
 	if (!sc->auto_armed) {
 		sc8547_vooc_arm_hw(sc);
@@ -2425,14 +2415,6 @@ static void sc8547_attach_work(struct work_struct *work)
 	}
 
 reschedule:
-	if ((sc->auto_state == SC_AUTO_DONE || sc->auto_state == SC_AUTO_DECLINED) &&
-	    !sc->auto_protection && (sc->auto_known_svooc || sc->vooc_saw_any)) {
-		/* A known brick can resume without unplugging. Keep the buck
-		 * in charge while CV/temperature or telemetry prevents entry.
-		 */
-		schedule_delayed_work(&sc->attach_work, msecs_to_jiffies(30000));
-		return;
-	}
 	if (sc->auto_state == SC_AUTO_IDENTIFY || sc->auto_state == SC_AUTO_DELIVER)
 		schedule_delayed_work(&sc->attach_work,
 				      msecs_to_jiffies(SC8547_ATTACH_POLL_MS));
@@ -2450,6 +2432,15 @@ int sc8547a_serial_session(bool enable)
 	sc = sc8547_master_dev;
 	if (!sc || !serial_enable)
 		return enable ? -EOPNOTSUPP : 0;
+	if (sc->auto_protection) {
+		if (enable)
+			return -EPERM;
+		/* Ordinary handoffs also stop serial. Only a confirmed detach
+		 * releases its hardware protection for the next charger.
+		 */
+		if (erhai_otg_adsp_usb_prop(0) == 0)
+			sc->auto_protection = false;
+	}
 	if (enable == sc->vooc_started) {
 		if (enable && (sc->auto_state == SC_AUTO_DECLINED || sc->auto_state == SC_AUTO_DONE))
 			return -ENODATA;
@@ -2464,8 +2455,6 @@ int sc8547a_serial_session(bool enable)
 		sc->auto_ident_retries = 0;
 		sc->auto_reservo_cnt = 0;
 		sc->slave_low_cnt = 0;
-		sc->auto_protection = false;
-		sc->auto_known_svooc = false;
 		sc->vooc_started = true;
 		mod_delayed_work(system_wq, &sc->attach_work,
 				 msecs_to_jiffies(SC8547_ATTACH_SETTLE_MS));

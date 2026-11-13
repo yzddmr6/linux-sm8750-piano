@@ -540,6 +540,7 @@ struct qcom_battmgr {
 	bool qc_probed;
 	unsigned long qc_probe_at;
 	bool serial_backoff;
+	bool serial_blocked;
 	bool aicl_done;
 	bool pd_logged;
 	u32 pd_input_limit_ua;
@@ -1452,6 +1453,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	}
 	if (!online) {
 		battmgr->serial_backoff = false;
+		battmgr->serial_blocked = false;
 		battmgr->serial_probe = false;
 		battmgr->aicl_done = false;
 		battmgr->ufcs_backoff = false;
@@ -1502,7 +1504,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		 * source at 5 V. Its decline/timeout releases the crossbar
 		 * before the next protocol (including firmware QC) can act.
 		 */
-		if (can_probe && !battmgr->pps_ops->ufcs_active(battmgr->pps_data) &&
+		if (can_probe && !battmgr->serial_blocked && !battmgr->pps_ops->ufcs_active(battmgr->pps_data) &&
 		    (!battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
 			if (battmgr->pps_ops->stop(battmgr->pps_data) ||
 			    qcom_battmgr_pd_stop(battmgr, false, "serial probe"))
@@ -1512,6 +1514,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 				battmgr->serial_probe = true;
 				return PD_POLL_MS;
 			}
+			battmgr->serial_blocked = ret == -EPERM;
 			battmgr->serial_backoff = true;
 			battmgr->serial_retry = jiffies + msecs_to_jiffies(CHARGE_CTRL_POLL_MS);
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
