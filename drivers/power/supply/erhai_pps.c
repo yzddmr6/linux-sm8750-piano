@@ -1458,6 +1458,7 @@ static const struct erhai_pps_ops erhai_pps_ops = {
 	.serial_session = sc8547a_serial_session,
 	.active = erhai_pps_active,
 	.available = erhai_pps_available,
+	.source_limit = pps_source_limit,
 	.ufcs_active = erhai_ufcs_active,
 	.ufcs_update = erhai_ufcs_update,
 	.update = erhai_pps_update,

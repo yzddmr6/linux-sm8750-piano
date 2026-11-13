@@ -26,6 +26,7 @@ struct erhai_pps_ops {
 	bool (*ufcs_active)(void *data);
 	unsigned int (*ufcs_update)(void *data);
 	bool (*available)(void *data);
+	int (*source_limit)(void);
 	bool (*active)(void *data);
 	unsigned int (*update)(void *data, bool caps_changed);
 	int (*stop)(void *data);
