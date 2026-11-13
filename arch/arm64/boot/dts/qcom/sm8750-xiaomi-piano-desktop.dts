@@ -188,6 +188,38 @@
 	status = "okay";
 };
 
+/* Project-SunUEFI 766ab7ca35d1: SE15 MOSI drives the IR emitter. */
+&spi15 {
+	pinctrl-names = "default", "idle", "sleep";
+	pinctrl-0 = <&qup_spi15_data_clk>, <&qup_spi15_cs>;
+	pinctrl-1 = <&ir_spi15_sleep &ir_spi15_mosi_idle>;
+	pinctrl-2 = <&ir_spi15_sleep &ir_spi15_mosi_idle>;
+	status = "okay";
+
+	irled@0 {
+		compatible = "xiaomi,piano-ir-spi";
+		reg = <0>;
+		spi-max-frequency = <1920000>;
+	};
+};
+
+&tlmm {
+	ir_spi15_sleep: ir-spi15-sleep-state {
+		pins = "gpio28", "gpio30", "gpio31";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+	};
+
+	ir_spi15_mosi_idle: ir-spi15-mosi-idle-state {
+		pins = "gpio29";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-disable;
+		output-low;
+	};
+};
+
 &spi2 {
 	status = "okay";
 
