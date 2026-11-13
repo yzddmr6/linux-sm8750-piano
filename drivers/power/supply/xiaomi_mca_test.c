@@ -2811,6 +2811,34 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, f->mca.cp_fault);
 }
 
+static void xiaomi_mca_test_auth_loss_latch(struct kunit *test)
+{
+	static const struct { bool enabled, valid; u32 firmware; bool latch; } cases[] = {
+		{ false, true, 1, false }, { true, false, 1, false },
+		{ true, true, 2, false }, { true, true, 0, true },
+	};
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	int i;
+
+	mca_test_stage(test, f);
+	guard(mutex)(&mca->lock);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		if (i)
+			mca->cp_psy = power_supply_get_by_name("mca-pm-test-cp");
+		mca->cp = MCA_CP_ON;
+		f->stage_on = true;
+		mca->cp_ma = 6000;
+		mipps_auth = cases[i].enabled;
+		mca->auth_ok = cases[i].valid;
+		f->verified = cases[i].firmware;
+		xiaomi_mca_cp_step(mca);
+		KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
+		KUNIT_EXPECT_FALSE(test, f->stage_on);
+		KUNIT_EXPECT_EQ(test, mca->auth_lost, cases[i].latch);
+	}
+}
+
 static void xiaomi_mca_test_pack_limit_recovers(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3080,7 +3108,7 @@ static void xiaomi_mca_test_auth_retry_contract(struct kunit *test)
 	charge_policy = hv_charge = true;
 	f->mca.mipps_attempted = true;
 	f->mca.auth_retry = jiffies - 300 * HZ;
-	f->mca.adapter_svid = 0x2717;
+	f->mca.adapter_svid = 0; /* identity discovery can be late */
 	f->mca.hv = MCA_HV_ON;
 	f->vbus = 9000000;
 	guard(mutex)(&f->mca.lock);
@@ -3420,6 +3448,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_ffc_conditions),
 	KUNIT_CASE(xiaomi_mca_test_ffc_handoff),
 	KUNIT_CASE(xiaomi_mca_test_cp_cell_guards),
+	KUNIT_CASE(xiaomi_mca_test_auth_loss_latch),
 	KUNIT_CASE(xiaomi_mca_test_pack_limit_recovers),
 	KUNIT_CASE(xiaomi_mca_test_bus_voltage_fault),
 	KUNIT_CASE(xiaomi_mca_test_qc_regulation),

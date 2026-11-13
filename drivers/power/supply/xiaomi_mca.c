@@ -717,7 +717,7 @@ struct xiaomi_mca {
 	int ucsi_state;
 	struct notifier_block psy_nb;
 	bool auth_cleanup;	/* verify_process clear still needs confirmation */
-	bool mipps_attempted;	/* one exchange per physical attachment */
+	bool mipps_attempted;	/* throttle repeated exchanges on the current cable */
 	unsigned long auth_at;	/* jiffies when it did */
 	bool auth_tried;	/* direct charging asked for before any reset */
 	unsigned long hv_retry;	/* jiffies before which 9 V is not asked for */
@@ -3282,10 +3282,16 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 			xiaomi_mca_cp_stop(mca, "authentication read failed");
 			return;
 		}
-		if (!mipps_auth || !xiaomi_mca_authenticated(mca) || verified != 1) {
-			mca->auth_lost = true;
+		if (!mipps_auth || !xiaomi_mca_authenticated(mca)) {
 			mca->auth_ok = false;
-			xiaomi_mca_cp_stop(mca, "adapter authentication lost");
+			xiaomi_mca_cp_stop(mca, "high current authorization inactive");
+			return;
+		}
+		if (verified != 1) {
+			mca->auth_lost = verified == 0;
+			mca->auth_ok = false;
+			xiaomi_mca_cp_stop(mca, mca->auth_lost ? "adapter authentication lost" :
+							     "invalid authentication status");
 			return;
 		}
 	}
@@ -4173,7 +4179,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 			xiaomi_mca_restore_icl(mca);
 		}
 	} else if (charge_policy && mipps_auth && !mca->auth_lost &&
-		   mca->adapter_svid == 0x2717 && mca->mipps_attempted &&
+		   mca->mipps_attempted &&
 		   !xiaomi_mca_authenticated(mca) && time_after_eq(jiffies, mca->auth_retry) &&
 		   mca->cp == MCA_CP_OFF && mca->hv == MCA_HV_OFF &&
 		   mca->vbus_uv < MCA_HV_VBUS_5V_MAX_UV && xiaomi_mca_is_pd(real_type)) {
