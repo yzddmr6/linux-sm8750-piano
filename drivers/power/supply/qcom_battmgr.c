@@ -2806,13 +2806,18 @@ out:
 static bool qcom_battmgr_is_charger_notification(const void *data, size_t len, void *priv)
 {
 	const struct qcom_battmgr_message *msg = data;
+	struct qcom_battmgr *battmgr = priv;
 	unsigned int notification;
 
 	if (le32_to_cpu(msg->hdr.opcode) != BATTMGR_NOTIFICATION ||
 	    len != sizeof(msg->hdr) + sizeof(msg->notification))
 		return false;
 
-	notification = le32_to_cpu(msg->notification) & 0xff;
+	notification = le32_to_cpu(msg->notification);
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD)
+		return notification == NOTIF_OPLUS_PLUGIN;
+
+	notification &= 0xff;
 
 	return notification == NOTIF_USB_PROPERTY || notification == NOTIF_WLS_PROPERTY;
 }
@@ -3171,6 +3176,12 @@ bool erhai_otg_charge_inhibited(void)
 }
 EXPORT_SYMBOL_GPL(erhai_otg_charge_inhibited);
 
+/* This endpoint carries pen boost acknowledgements on the battery device. */
+static bool erhai_pen_wakeup_filter(const void *data, size_t len, void *priv)
+{
+	return false;
+}
+
 /* Allocate on the real GLINK child, and bind the consumer's lifetime to it. */
 struct pmic_glink_client *
 erhai_otg_glink_client_register_sibling(struct device *consumer, u32 id,
@@ -3188,8 +3199,10 @@ erhai_otg_glink_client_register_sibling(struct device *consumer, u32 id,
 			     DL_FLAG_AUTOREMOVE_CONSUMER))
 		return ERR_PTR(-ENOMEM);
 	client = devm_pmic_glink_client_alloc(erhai_battmgr->dev, id, cb, pdr, priv);
-	if (!IS_ERR(client))
+	if (!IS_ERR(client)) {
+		pmic_glink_client_set_wakeup_filter(client, erhai_pen_wakeup_filter);
 		pmic_glink_client_register(client);
+	}
 	return client;
 }
 EXPORT_SYMBOL_GPL(erhai_otg_glink_client_register_sibling);
@@ -3429,7 +3442,13 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot create charging interface\n");
 
-	device_set_wakeup_capable(dev, true);
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
+		ret = devm_device_init_wakeup(dev);
+		if (ret)
+			return ret;
+	} else {
+		device_set_wakeup_capable(dev, true);
+	}
 	pmic_glink_client_set_wakeup_filter(battmgr->client,
 					    qcom_battmgr_is_charger_notification);
 
