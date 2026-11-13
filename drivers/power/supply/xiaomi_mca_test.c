@@ -786,6 +786,39 @@ static void xiaomi_mca_test_hv_fixed(struct kunit *test)
 	hv_charge = false;
 }
 
+static void xiaomi_mca_test_qc_voltage(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	unsigned int type;
+
+	hv_charge = true;
+	mutex_lock(&mca->lock);
+	for (type = MCA_TYPE_HVDCP; type <= MCA_TYPE_HVDCP_3P5; type++) {
+		f->type = mca->real_type = type;
+		f->vbus = mca->vbus_uv = 5000000;
+		mca->hv = MCA_HV_OFF;
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+		KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_QC_VOLT);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->last_data), 9000);
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_fcc(type, false), 2000U);
+		f->vbus = mca->vbus_uv = 9000000;
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), type == MCA_TYPE_HVDCP ? 1200 : 1600);
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_fcc(type, true),
+				type == MCA_TYPE_HVDCP ? 2600U : 3600U);
+		f->vbus = mca->vbus_uv = 10000000;
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+		KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_QC_VOLT);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->last_data), 5000);
+	}
+	f->type = MCA_TYPE_DCP;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_request_volt(mca, MCA_HV_MV), -EOPNOTSUPP);
+	f->type = MCA_TYPE_PD;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_request_volt(mca, MCA_HV_MV), -EOPNOTSUPP);
+	mutex_unlock(&mca->lock);
+	hv_charge = false;
+}
+
 static void xiaomi_mca_test_hv_pps(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_policy_fixture(test);
@@ -843,7 +876,10 @@ static void xiaomi_mca_test_policy_refusal(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_INPUT_CURRENT_LIMIT, 2500), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3000), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3500), 0);
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3501), -EPERM);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3501), -EINVAL);
+	f->type = MCA_TYPE_HVDCP_3;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3600), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3601), -EPERM);
 	f->type = MCA_TYPE_PD;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(mca, MCA_PROP_CHARGE_CURRENT, 3500), -EINVAL);
 	f->vbus = 5000000;
@@ -2738,6 +2774,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_full_charge_allowlist),
 	KUNIT_CASE(xiaomi_mca_test_hv_fixed),
 	KUNIT_CASE(xiaomi_mca_test_hv_pps),
+	KUNIT_CASE(xiaomi_mca_test_qc_voltage),
 	KUNIT_CASE(xiaomi_mca_test_policy_refusal),
 	KUNIT_CASE(xiaomi_mca_test_auth_read_only),
 	KUNIT_CASE(xiaomi_mca_test_temperature_follow),

@@ -146,6 +146,7 @@ static const __le32 xiaomi_mca_piano_otg_cfg[] = {
 
 /* Up to seven source PDOs, as decoded by the ADSP */
 #define MCA_PROP_PDOS		0x21011	/* struct xiaomi_mca_pdo[] */
+#define MCA_PROP_QC_VOLT	0x2011	/* HVDCP voltage request, little-endian mV */
 #define MCA_PROP_PD_FIXED_VOLT	0x21018	/* request a fixed PDO, mV */
 #define MCA_PROP_PPS_SELECT	0x21017	/* request a PPS APDO, see below */
 #define MCA_PROP_VERIFY_PROCESS	0x21002	/* non-zero during adapter auth */
@@ -254,7 +255,7 @@ MODULE_PARM_DESC(charge_policy,
  * ADSP restarts put the fallback value back.
  */
 #define MCA_FCC_MIN_MA		100
-#define MCA_FCC_MAX_MA		3500	/* stock buck chg_pps; PD stays at 3000 */
+#define MCA_FCC_MAX_MA		3600	/* maximum of the per-source buck profiles */
 #define MCA_FCC_DEFAULT_MA	500
 #define MCA_FCC_TBAT_MIN	15
 
@@ -820,6 +821,27 @@ static const struct xiaomi_mca_limits *xiaomi_mca_limits(u32 real_type)
 	return NULL;
 }
 
+static bool xiaomi_mca_is_qc(u32 type)
+{
+	return type >= MCA_TYPE_HVDCP && type <= MCA_TYPE_HVDCP_3P5;
+}
+
+static const struct xiaomi_mca_limits *xiaomi_mca_hv_limits(u32 type)
+{
+	static const struct xiaomi_mca_limits qc2 = { 1200, 2600 };
+	static const struct xiaomi_mca_limits qc3 = { 1600, 3600 };
+
+	if (type == MCA_TYPE_HVDCP)
+		return &qc2;
+	if (xiaomi_mca_is_qc(type))
+		return &qc3;
+	if (type == MCA_TYPE_PD)
+		return &xiaomi_mca_pd_limits;
+	if (type == MCA_TYPE_PD_VERIFY || type == MCA_TYPE_PD_PPS)
+		return &xiaomi_mca_pps_limits;
+	return NULL;
+}
+
 /*
  * Return 0 and the value in mA to write for @psp set to @ua with a source of
  * type @real_type attached, -EOPNOTSUPP for an unsupported source, or -EINVAL
@@ -833,11 +855,12 @@ static int xiaomi_mca_current_ma(enum power_supply_property psp, u32 real_type, 
 
 	if (!limits)
 		return -EOPNOTSUPP;
-	if (hv && real_type == MCA_USB_REAL_TYPE_PD)
-		limits = &xiaomi_mca_pd_limits;
-	else if (hv && (real_type == MCA_USB_REAL_TYPE_PD_VERIFY ||
-		       real_type == MCA_USB_REAL_TYPE_PPS))
-		limits = &xiaomi_mca_pps_limits;
+	if (hv) {
+		const struct xiaomi_mca_limits *high = xiaomi_mca_hv_limits(real_type);
+
+		if (high)
+			limits = high;
+	}
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
@@ -1062,6 +1085,7 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	case MCA_PROP_CHARGE_CURRENT:
 		return len == sizeof(u32) &&
 		       val >= MCA_FCC_MIN_MA && val <= MCA_FCC_MAX_MA;
+	case MCA_PROP_QC_VOLT:
 	case MCA_PROP_PD_FIXED_VOLT:
 		return len == sizeof(u32) &&
 		       (val == 5000 || (hv_charge && val == MCA_HV_MV));
@@ -1175,6 +1199,8 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		return ret;
 	if (!xiaomi_mca_limits(type))
 		return -EOPNOTSUPP;
+	if (prop == MCA_PROP_QC_VOLT && !xiaomi_mca_is_qc(type))
+		return -EOPNOTSUPP;
 	if (prop >= MCA_PROP_VERIFY_PROCESS && !xiaomi_mca_is_pd(type))
 		return -EOPNOTSUPP;
 	if (prop == MCA_PROP_INPUT_CURRENT_LIMIT || prop == MCA_PROP_CHARGE_CURRENT) {
@@ -1200,7 +1226,8 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	if (prop == MCA_PROP_CHARGE_CURRENT)
 		mca->fcc_written = true;
 	if (prop == MCA_PROP_PPS_SELECT ||
-	    (prop == MCA_PROP_PD_FIXED_VOLT && get_unaligned_le32(data) > 5000))
+	    ((prop == MCA_PROP_PD_FIXED_VOLT || prop == MCA_PROP_QC_VOLT) &&
+	     get_unaligned_le32(data) > 5000))
 		mca->voltage_written = true;
 	ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
 	xiaomi_mca_invalidate(mca);
@@ -1540,10 +1567,12 @@ static u32 xiaomi_mca_policy_fcc(u32 real_type, bool hv)
 
 	if (!limits)
 		return 0;
-	if (hv && real_type == MCA_TYPE_PD)
-		return xiaomi_mca_pd_limits.charge_current_ma;
-	if (hv && (real_type == MCA_TYPE_PD_VERIFY || real_type == MCA_TYPE_PD_PPS))
-		return xiaomi_mca_pps_limits.charge_current_ma;
+	if (hv) {
+		const struct xiaomi_mca_limits *high = xiaomi_mca_hv_limits(real_type);
+
+		if (high)
+			return high->charge_current_ma;
+	}
 	/* The community policy does not raise FCC for unclassified Type-C. */
 	if (real_type == MCA_TYPE_C)
 		return MCA_FCC_DEFAULT_MA;
@@ -1733,6 +1762,8 @@ static u32 xiaomi_mca_pd_9v_ma(struct xiaomi_mca *mca, bool *pps)
  */
 static int xiaomi_mca_request_volt(struct xiaomi_mca *mca, u32 mv)
 {
+	if (xiaomi_mca_is_qc(mca->real_type))
+		return xiaomi_mca_write_u32(mca, MCA_PROP_QC_VOLT, mv);
 	if (mv == MCA_HV_MV && mca->hv_pps)
 		return xiaomi_mca_write_u32(mca, MCA_PROP_PPS_SELECT,
 					   xiaomi_mca_pps_word(mv, mca->hv_pps_ma));
@@ -1762,6 +1793,7 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
 	bool vbus_hv = mca->vbus_uv >= MCA_HV_VBUS_MIN_UV &&
 		       mca->vbus_uv <= MCA_HV_VBUS_MAX_UV;
 	bool pps = false;
+	bool qc = xiaomi_mca_is_qc(mca->real_type);
 	u32 ma = 0;
 	int ret;
 
@@ -1770,18 +1802,30 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
 
 	if (xiaomi_mca_is_pd(mca->real_type))
 		ma = xiaomi_mca_pd_9v_ma(mca, &pps);
+	else if (qc)
+		ma = xiaomi_mca_hv_limits(mca->real_type)->input_current_ma;
 
-	/* The source must keep offering 9 V the way it was asked for */
+	/* The source must keep offering the negotiated protocol. */
 	if (mca->hv != MCA_HV_OFF && pps != mca->hv_pps)
 		ma = 0;
 
 	switch (mca->hv) {
 	case MCA_HV_OFF:
 		/* not in the middle of an adapter authentication */
-		if (!ma || time_before(jiffies, mca->hv_retry) ||
-		    xiaomi_mca_auth_pending(mca) ||
-		    xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
+		if (!ma || time_before(jiffies, mca->hv_retry))
 			return 0;
+		if (!qc && (xiaomi_mca_auth_pending(mca) ||
+			    xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS)))
+			return 0;
+		if (qc) {
+			/* QC2 allows less input current at 9 V than at 5 V. Keep
+			 * both limits valid throughout the voltage transition. */
+			u32 transition = min(ma, xiaomi_mca_policy_icl(mca->real_type));
+
+			if (xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, transition))
+				return 0;
+			mca->icl_set_ma = transition;
+		}
 		mca->hv_pps = pps;
 		mca->hv_pps_ma = ma;
 		ret = xiaomi_mca_request_volt(mca, MCA_HV_MV);
@@ -1791,7 +1835,7 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
 			break;
 		}
 		dev_info(mca->dev, "requested 9 V (%s %u mA)\n",
-			 pps ? "PPS" : "PDO", ma);
+			 qc ? "QC" : pps ? "PPS" : "PDO", ma);
 		mca->hv = MCA_HV_REQUESTED;
 		mca->hv_polls = 0;
 		return 0;
@@ -1833,11 +1877,9 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
  */
 static u32 xiaomi_mca_hv_icl(u32 real_type)
 {
-	if (real_type == MCA_TYPE_PD)
-		return xiaomi_mca_pd_limits.input_current_ma;
-	if (real_type == MCA_TYPE_PD_VERIFY || real_type == MCA_TYPE_PD_PPS)
-		return xiaomi_mca_pps_limits.input_current_ma;
-	return 0;
+	const struct xiaomi_mca_limits *limits = xiaomi_mca_hv_limits(real_type);
+
+	return limits ? limits->input_current_ma : 0;
 }
 
 /*
@@ -1857,16 +1899,20 @@ static void xiaomi_mca_apply_policy(struct xiaomi_mca *mca)
 	if (!target)
 		return;
 
+	hv_ma = xiaomi_mca_hv_step(mca);
 	if (charge_current)
 		xiaomi_mca_apply_fcc(mca, tbat);
-
-	hv_ma = xiaomi_mca_hv_step(mca);
 	if (hv_ma)
 		target = clamp(hv_ma, MCA_ICL_MIN_MA,
 			       xiaomi_mca_hv_icl(mca->real_type));
+	else if (xiaomi_mca_is_qc(mca->real_type) && mca->hv == MCA_HV_REQUESTED)
+		target = min(target, xiaomi_mca_hv_icl(mca->real_type));
 	else if (xiaomi_mca_is_pd(mca->real_type))
 		target = clamp(xiaomi_mca_pd_5v_ma(mca), MCA_ICL_MIN_MA, target);
 
+	/* A QC2 source can still be at 9 V after a refused downgrade. */
+	if (xiaomi_mca_is_qc(mca->real_type) && mca->vbus_uv >= MCA_HV_VBUS_5V_MAX_UV)
+		target = min(target, xiaomi_mca_hv_icl(mca->real_type));
 	if (target == mca->icl_set_ma)
 		return;
 
@@ -3333,10 +3379,16 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		}
 		mca->cp_on_at = jiffies;
 		/* a voltage change under way breaks the identity exchange */
-		if (mipps_auth)
+		if (mipps_auth && xiaomi_mca_is_pd(real_type))
 			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_AUTH_WAIT_MS);
 	}
 	if (real_type != mca->real_type && xiaomi_mca_limits(real_type)) {
+		/* A QC identification may appear after DCP or disappear on a
+		 * new attachment. Do not inherit the old protocol's 9 V state. */
+		if (xiaomi_mca_is_qc(real_type) || xiaomi_mca_is_qc(mca->real_type)) {
+			mca->hv = MCA_HV_OFF;
+			mca->hv_pps = false;
+		}
 		if (mca->icl_written)
 			xiaomi_mca_reset_icl(mca);
 		if (mca->fcc_written)
@@ -4011,6 +4063,8 @@ static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca, u32 fixed_ma)
 		return -EOPNOTSUPP;
 	if (fixed_ma)
 		icl = min(fixed_ma, xiaomi_mca_hv_icl(type));
+	else if (xiaomi_mca_is_qc(type))
+		icl = min(icl, xiaomi_mca_hv_icl(type));
 	else if (xiaomi_mca_is_pd(type))
 		icl = clamp(xiaomi_mca_pd_5v_ma(mca), MCA_ICL_MIN_MA, icl);
 
