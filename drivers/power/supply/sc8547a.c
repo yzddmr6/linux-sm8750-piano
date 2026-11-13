@@ -485,6 +485,7 @@ struct sc8547a_device {
 	int			auto_curve_idx;	/* current row (descends only) */
 	bool			auto_protection;
 	bool serial_quiesced;
+	bool monitor_pump_faults;
 	u8 pump_faults;
 	unsigned int adc_over_count;
 	unsigned int		auto_taper_cnt;
@@ -632,6 +633,8 @@ static int sc8547_write_word(struct sc8547a_device *sc, u8 reg, u16 val)
 
 static int sc8547_reg_reset(struct sc8547a_device *sc)
 {
+	sc->monitor_pump_faults = false;
+	sc->pump_faults = 0;
 	return sc8547_update_bits(sc, SC8547_REG_07, SC8547_REG_RESET_MASK,
 				  SC8547_REG_RESET_MASK);
 }
@@ -647,7 +650,24 @@ static bool sc8547_check_device_id(struct sc8547a_device *sc)
 
 static int sc8547_set_chg_enable(struct sc8547a_device *sc, bool enable)
 {
-	return sc8547_write_byte(sc, SC8547_REG_07, enable ? 0x80 : 0x00);
+	u8 stale;
+	int ret;
+
+	/* IRQ and charge operations serialize on sc8547_pps_lock. REG0F
+	 * can hold reset/idle flags. Drain it immediately before CHG_EN,
+	 * never on a watchdog refresh of an already enabled converter.
+	 */
+	if (enable && !sc->monitor_pump_faults) {
+		ret = sc8547_read_byte(sc, SC8547_REG_0F, &stale);
+		if (ret)
+			return ret;
+		sc->pump_faults = 0;
+	}
+	ret = sc8547_write_byte(sc, SC8547_REG_07,
+				(enable ? SC8547_CHG_EN_MASK : 0) | (sc->is_slave ? 1 : 0));
+	if (!ret)
+		sc->monitor_pump_faults = enable;
+	return ret;
 }
 
 static int sc8547_set_adc_enable(struct sc8547a_device *sc, bool enable)
@@ -846,7 +866,7 @@ static int sc8547_reset_voocphy(struct sc8547a_device *sc)
 {
 	int ret, err = 0;
 
-	ret = sc8547_write_byte(sc, SC8547_REG_07, 0x00);
+	ret = sc8547_set_chg_enable(sc, false);
 	/* Keep the watchdog armed if the pump-off write did not complete. */
 	if (ret)
 		return ret;
@@ -925,7 +945,7 @@ static int sc8547_collect_faults(struct sc8547a_device *sc)
 	if (!sc)
 		return 0;
 	ret = sc8547_read_byte(sc, SC8547_REG_0F, &flags);
-	if (!ret)
+	if (!ret && sc->monitor_pump_faults)
 		sc->pump_faults |= flags & GENMASK(7, 3);
 	return ret;
 }
@@ -1138,6 +1158,10 @@ static int sc8547_pps_disengage(void)
 		 */
 		pump_stopping = false;
 		pps_cp_engaged = pps_slave_engaged = false;
+		if (sc)
+			sc->monitor_pump_faults = false;
+		if (sc8547_slave_dev)
+			sc8547_slave_dev->monitor_pump_faults = false;
 		return 0;
 	}
 	if (sc && pps_cp_engaged)
@@ -1212,7 +1236,7 @@ static int sc8547_slave_hw_setting(struct sc8547a_device *master)
 	ret = sc8547_write_byte(sc, SC8547_REG_11, 0x80);		/* ADC enable */
 	if (ret)
 		return ret;
-	ret = sc8547_write_byte(sc, SC8547_REG_07, SC8547_SLAVE_CP_OFF);
+	ret = sc8547_set_chg_enable(sc, false);
 	if (ret)
 		return ret;
 	ret = sc8547_write_byte(sc, SC8547_REG_0D, 0x70);
@@ -1249,8 +1273,7 @@ static int sc8547_slave_cp_enable(struct sc8547a_device *master, bool on)
 		if (ret)
 			return ret;
 	}
-	return sc8547_write_byte(sc, SC8547_REG_07,
-				 on ? SC8547_SLAVE_CP_ON : SC8547_SLAVE_CP_OFF);
+	return sc8547_set_chg_enable(sc, on);
 }
 
 /*
@@ -1298,7 +1321,7 @@ static int sc8547_slave_reset(void)
 
 	if (!sc)
 		return 0;
-	ret = sc8547_write_byte(sc, SC8547_REG_07, SC8547_SLAVE_CP_OFF);
+	ret = sc8547_set_chg_enable(sc, false);
 	if (ret)
 		return ret;
 	return sc8547_update_bits(sc, SC8547_REG_09, SC8547_WATCHDOG_MASK,
