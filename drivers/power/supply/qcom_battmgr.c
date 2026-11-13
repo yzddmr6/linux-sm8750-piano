@@ -537,6 +537,8 @@ struct qcom_battmgr {
 	unsigned long serial_retry;
 	unsigned long ufcs_retry;
 	bool ufcs_backoff;
+	bool qc_probed;
+	unsigned long qc_probe_at;
 	bool serial_backoff;
 	bool aicl_done;
 	bool pd_logged;
@@ -1453,6 +1455,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->serial_probe = false;
 		battmgr->aicl_done = false;
 		battmgr->ufcs_backoff = false;
+		battmgr->qc_probed = false;
 		ret = qcom_battmgr_pps_stop(battmgr);
 		if (ret)
 			return PD_POLL_MS;
@@ -1569,6 +1572,20 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	}
 
 	qc = qc && !src.sink;
+	/* A DCP classification can precede HVDCP detection. Ask firmware
+	 * to negotiate identification (BATT_SET_QC=0), never raise VBUS
+	 * without its positive HVDCP response. Data ports keep D+/D-.
+	 */
+	if (can_probe && !qc && !battmgr->pd_restore && (!battmgr->qc_probed ||
+	    time_after_eq(jiffies, battmgr->qc_probe_at + msecs_to_jiffies(CHARGE_CTRL_POLL_MS)))) {
+		battmgr->qc_probed = true;
+		battmgr->qc_probe_at = jiffies;
+		if (!qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+					       BATT_OPLUS_SET_QC, 0)) {
+			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+			return PD_POLL_MS;
+		}
+	}
 	if ((!src.sink && !qc) || READ_ONCE(battmgr->otg_request)) {
 		if (qcom_battmgr_pd_stop(battmgr, false, "no high-voltage sink"))
 			return PD_POLL_MS;
@@ -1619,6 +1636,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	caps_changed = test_and_clear_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	if (caps_changed) {
 		if (qc) {
+			/* PMIC maximum for the detected QC source, in microamps. */
 			ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 							USB_CURR_MAX, &ua);
 			ua = ret ? 0 : min(ua, (u32)PD_INPUT_MAX_UA);
