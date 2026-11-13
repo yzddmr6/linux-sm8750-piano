@@ -3107,7 +3107,7 @@ static int mca_ucsi_supply_get(struct power_supply *psy,
 	return 0;
 }
 
-static void xiaomi_mca_test_pd_recovery(struct kunit *test)
+static void mca_register_ucsi_peer(struct kunit *test, struct mca_policy_fixture *f)
 {
 	static const enum power_supply_property props[] = {
 		POWER_SUPPLY_PROP_ONLINE, POWER_SUPPLY_PROP_USB_TYPE,
@@ -3120,15 +3120,71 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 		.usb_types = BIT(POWER_SUPPLY_USB_TYPE_PD),
 		.get_property = mca_ucsi_supply_get,
 	};
-	struct mca_policy_fixture *f = mca_auth_fixture(test);
 	struct power_supply_config cfg = { .drv_data = f };
 	struct device *peer_dev = kunit_device_register(test, "mca-test-ucsi-parent");
 	struct power_supply *peer;
-	u32 type;
 
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, peer_dev);
 	peer = devm_power_supply_register(peer_dev, &desc, &cfg);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, peer);
+}
+
+static void xiaomi_mca_test_ffc_handoff(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	mca_register_ucsi_peer(test, f);
+	full_charge = charge_policy = hv_charge = cp_charge = true;
+	mca_test_stage(test, f);
+	f->tbat = 35;
+	f->type = mca->cp_type = MCA_TYPE_PD_PPS;
+	f->vbus = 9700000;
+	f->pdos[1] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(9000), cpu_to_le32(9000), cpu_to_le32(3000) };
+	mca->cp_max_mv = 11000;
+	mca->cp_ma = 5000;
+	guard(mutex)(&mca->lock);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_ASSERT_TRUE(test, mca->ffc_active);
+	/* A brief excursion beyond CV hands off to buck at > warm iterm. */
+	f->cells[0].voltage = 4541000;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_ASSERT_TRUE(test, mca->ffc_handoff);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
+	f->type = MCA_TYPE_PD;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
+	f->vbus = 8900000;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
+	f->ucsi_online = 1;
+	f->ucsi_status = POWER_SUPPLY_STATUS_CHARGING;
+	f->ucsi_type = POWER_SUPPLY_USB_TYPE_PD;
+	f->ucsi_mv = 9000;
+	f->ucsi_rp_ua = 3000000;
+	mca->ffc_settle_until = jiffies;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
+	f->ucsi_online = 0;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_EXPECT_FALSE(test, mca->ffc_active);
+
+	/* Within the grace period the actual cutoff always wins. */
+	mca->ffc_active = mca->ffc_handoff = true;
+	mca->ffc_settle_until = jiffies + HZ;
+	f->cells[1].current_ua = 1164000;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_done);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
+}
+
+static void xiaomi_mca_test_pd_recovery(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_auth_fixture(test);
+	u32 type;
+
+	mca_register_ucsi_peer(test, f);
 	f->ucsi_online = 1;
 	f->ucsi_type = POWER_SUPPLY_USB_TYPE_C;
 	f->ucsi_status = POWER_SUPPLY_STATUS_CHARGING;
@@ -3303,6 +3359,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_mipps_detach),
 	KUNIT_CASE(xiaomi_mca_test_identity_edges),
 	KUNIT_CASE(xiaomi_mca_test_ffc_conditions),
+	KUNIT_CASE(xiaomi_mca_test_ffc_handoff),
 	KUNIT_CASE(xiaomi_mca_test_cp_cell_guards),
 	KUNIT_CASE(xiaomi_mca_test_bus_voltage_fault),
 	KUNIT_CASE(xiaomi_mca_test_qc_regulation),
