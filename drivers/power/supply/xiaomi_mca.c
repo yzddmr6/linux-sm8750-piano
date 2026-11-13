@@ -2764,8 +2764,12 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 
 			ret = xiaomi_mca_read_type(mca, &type);
 			ret = ret ?: xiaomi_mca_read(mca, MCA_PROP_INPUT_CURRENT_LIMIT, &icl);
-			if (!ret && icl < MCA_FCC_DEFAULT_MA && xiaomi_mca_limits(type)) {
-				/* A fresh boot starts with a 100 mA host vote. */
+			if (!ret && icl != MCA_FCC_DEFAULT_MA &&
+			    (xiaomi_mca_limits(type) || (type == MCA_TYPE_UNKNOWN &&
+							 mca->real_type == type))) {
+				/* Replace both the 100 mA boot vote and a stale
+				 * high-current vote inherited from a previous source.
+				 */
 				ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT,
 							   MCA_FCC_DEFAULT_MA);
 				if (!ret)
