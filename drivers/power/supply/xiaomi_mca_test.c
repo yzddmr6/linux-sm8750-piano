@@ -1268,18 +1268,19 @@ static int mca_test_stage_set(struct power_supply *psy, enum power_supply_proper
 	f->stage_stops++;
 	if (f->stage_error)
 		return f->stage_error;
+	if (psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT)
+		return 0;
 	f->stage_on = val->intval;
 	return 0;
 }
 
-static void mca_test_stage(struct kunit *test, struct mca_policy_fixture *f)
+static void mca_test_named_stage(struct kunit *test, struct mca_policy_fixture *f, const char *name)
 {
 	static const enum power_supply_property props[] = {
 		POWER_SUPPLY_PROP_ONLINE, POWER_SUPPLY_PROP_VOLTAGE_NOW,
-		POWER_SUPPLY_PROP_CURRENT_NOW, POWER_SUPPLY_PROP_TEMP,
+		POWER_SUPPLY_PROP_CURRENT_NOW, POWER_SUPPLY_PROP_TEMP, POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	};
-	static const struct power_supply_desc desc = {
-		.name = "mca-pm-test-cp",
+	static const struct power_supply_desc template = {
 		.type = POWER_SUPPLY_TYPE_MAINS,
 		.properties = props,
 		.num_properties = ARRAY_SIZE(props),
@@ -1288,13 +1289,22 @@ static void mca_test_stage(struct kunit *test, struct mca_policy_fixture *f)
 	};
 	struct power_supply_config cfg = { .drv_data = f };
 	struct power_supply *psy;
+	struct power_supply_desc *desc;
 
-	psy = devm_power_supply_register(f->mca.dev, &desc, &cfg);
+	desc = devm_kmemdup(f->mca.dev, &template, sizeof(template), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, desc);
+	desc->name = name;
+	psy = devm_power_supply_register(f->mca.dev, desc, &cfg);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, psy);
-	f->mca.cp_psy = power_supply_get_by_name(desc.name);
+	f->mca.cp_psy = power_supply_get_by_name(desc->name);
 	KUNIT_ASSERT_PTR_EQ(test, f->mca.cp_psy, psy);
 	f->mca.cp = MCA_CP_ON;
 	f->stage_on = true;
+}
+
+static void mca_test_stage(struct kunit *test, struct mca_policy_fixture *f)
+{
+	mca_test_named_stage(test, f, "mca-pm-test-cp");
 }
 
 static void xiaomi_mca_test_pm_gate(struct kunit *test)
@@ -2875,7 +2885,10 @@ static void xiaomi_mca_test_pack_limit_recovers(struct kunit *test)
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
 	struct xiaomi_mca *mca = &f->mca;
 
-	mca_test_stage(test, f);
+	mca_test_named_stage(test, f, "sc8541");
+	cp_charge = charge_current = hv_charge = charge_policy = full_charge = true;
+	f->pdos[1] = (struct xiaomi_mca_pdo) { cpu_to_le32(5000), cpu_to_le32(11000),
+					      cpu_to_le32(5000) };
 	mca->cp_ma = 5000;
 	mca->cp_max_mv = 11000;
 	mca->cp_ibat_trip = 12000;
@@ -2888,9 +2901,20 @@ static void xiaomi_mca_test_pack_limit_recovers(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
 	KUNIT_EXPECT_STREQ(test, mca->cp_last_exit, "battery current too high");
 	KUNIT_EXPECT_FALSE(test, mca->cp_fault);
+	f->cells[0].current_ua = f->cells[1].current_ua = 2000000;
+	mca->vbus_uv = f->vbus = 9000000;
+	mca->hv = MCA_HV_ON;
+	mca->cp_retry_at = jiffies + HZ;
+	xiaomi_mca_cp_try_start(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
 	mca->cp_retry_at = jiffies;
 	xiaomi_mca_cp_try_start(mca);
-	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OPENING);
+	xiaomi_mca_cp_step(mca);
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_EQ(test, mca->attach_generation, 0);
+	xiaomi_mca_cp_stop(mca, "test complete");
 }
 
 static void xiaomi_mca_test_bus_voltage_fault(struct kunit *test)
