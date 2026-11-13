@@ -293,18 +293,8 @@ static const char * const sc8547_gauge_names[] = {
 #define VBATT_DIV_FOR_ADAPTER		10
 #define VBATT_MAX_FOR_ADAPTER		4654
 
-/*
- * Requested constant-current level: the 7-bit ask-current code the adapter
- * reads as its CC setpoint. Android ground truth: code 73 <-> target_ibus
- * 7300 mA, i.e. code = ibus(bus-side) / 100 mA. The CP is divide-by-2, so
- * battery-side current is ~2x the bus-side ibus. A useful CC setpoint must
- * exceed the passive (vbus-2*vbat)/R bleed, else the adapter backs vbus off,
- * the margin collapses as vbat rises, VBUS_ERRORLO fires and CHG_EN self-
- * clears. Knob range [MIN,MAX]; MAX bounds the bus-side current under the
- * 6000 mA IBUS backstop. Default MIN keeps a bare arm near-zero.
- */
-#define SC8547_CURR_CODE_MIN		0x01	/* 100 mA bus (~0.2 A pack) */
-#define SC8547_CURR_CODE_MAX		0x49	/* 7300 mA bus (full SVOOC rung 73) */
+/* Seven-bit ASK_CURRENT is bus current in 100 mA units. */
+#define SC8547_CURR_CODE_MIN		0x01
 
 /*
  * Safety backstop while the CP is delivering (stage-2 only).
@@ -325,7 +315,7 @@ static const char * const sc8547_gauge_names[] = {
 						 * plus the measured ~0.3 V IR drop
 						 * at 8 A; a wilder reading than this
 						 * is a genuine over-voltage. */
-#define SC8547_IBUS_ABORT_MA		8000	/* total-bus (master+slave) hard abort; > code-73 7300 mA */
+#define SC8547_IBUS_ABORT_MA		8000	/* combined rating, 4 A per leg */
 #define SC8547_CP_RESTART_MARGIN_MV	110	/* min vbus-2*vbat to re-enable CP */
 #define SC8547_CP_RESTART_MARGIN_CEIL_MV 700	/* refuse re-enable into an over-volted bus (runaway) */
 #define SC8547_CELL_MIN_VALID_MV	2500	/* below this the gauge reading is used only as a fallback */
@@ -363,25 +353,7 @@ module_param(slave_drop_ticks, uint, 0644);
 MODULE_PARM_DESC(slave_drop_ticks,
 		 "dual-CP: consecutive low total-bus ticks before dropping the slave (default 3, 1 = old behaviour)");
 
-/*
- * Auto charge-manager (fastchg_auto) policy bounds. On charger attach the auto
- * path arms the PHY in observation, waits for the adapter to identify as a
- * genuine (S)VOOC adapter, checks battery preconditions, then steps the CC
- * ask-current code down the Android host curve as vbat rises. Every step is
- * clamped to SC8547_AUTO_CODE_CEILING. Now the full curve max (code 73 =
- * 7300 mA bus, the Android SVOOC peak rung) so the auto path delivers full
- * ~88 W SuperVOOC at low SoC. Safe because the dual charge-pump shares the bus
- * ~50/50 (each pump ~3.65 A, under its proven solo capability, validated to
- * 5.9 A bus with pack temp flat), and delivery is bounded by the CELL 4500 mV CV
- * ceiling, the CP-side 4800 mV over-voltage guard
- * (SC8547_CP_OVP_CEILING_MV), the 8000 mA total-bus
- * over-current abort, and the 45 C pack-temp backstop. Auto delivery only ever
- * descends the curve.
- *
- * NOTE (2026-09-28): "vbat" everywhere in this policy means the CELL voltage,
- * i.e. the gauge reading — NOT the charge pump's own Vbat ADC, which is
- * inflated by the delivery IR drop.  See the backstop comment above.
- */
+/* Project 24926 selects the domestic 67 W SC8547A curve. */
 #define SC8547_AUTO_CODE_CEILING	61	/* 24926 (24924 table): 6100 mA */
 
 #define SC8547_AUTO_IDENTIFY_MS		4000	/* window to see adapter_check_ok */
@@ -1792,7 +1764,6 @@ static void vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 	sc8547_set_txbuff(sc, (sc->voocphy_tx_buff[0] << 8) | sc->voocphy_tx_buff[1]);
 }
 
-/* Reset the ladder-tracking state for a fresh plug. */
 /*
  * Read pack SOC (%), temperature (0.1 C) and cell voltage (mV) from ONE named
  * gauge power-supply.  Returns -ENODEV when that psy is not registered yet.
