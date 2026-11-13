@@ -2562,7 +2562,20 @@ static int sc8547_ufcs_end(struct sc8547a_device *sc)
 		pps_cp_engaged = false;
 		pps_adc_hold = false;
 	}
-	ufcs_force_exit(sc->ufcs);
+	ret = ufcs_force_exit(sc->ufcs);
+	if (ret)
+		return ret;
+	/* A successful EXIT reply may precede the change at the connector.
+	 * Retain the route while a live source still supplies a high VBUS.
+	 */
+	ret = erhai_otg_adsp_usb_prop(0);
+	if (ret < 0)
+		return ret;
+	if (ret) {
+		ret = erhai_otg_adsp_usb_prop(1);
+		if (ret < 0 || ret > 5500000)
+			return ret < 0 ? ret : -EAGAIN;
+	}
 	guard(mutex)(&sc8547_pps_lock);
 	ret = sc8547_reset_voocphy(sc);
 	ret = ret ?: wcd939x_usbss_dpdm_switch_fast_charge(false);
@@ -2577,9 +2590,12 @@ int sc8547a_ufcs_stop(void)
 	return sc8547_ufcs_end(sc8547_master_dev);
 }
 
-/* Stock obtains the 16 authentication bytes from userspace. Keep this
- * device-local input out of the driver and reject failed authentication.
+/* oplus_chg_ufcs.c uses UFCS_VERIFY_CURR_THR_MA for unverified
+ * Oplus sources. Standard PDOs and cable limits apply in both modes.
+ * A transport error requires a new negotiation.
  */
+#define SC8547_UFCS_UNVERIFIED_MA	4000
+
 static int sc8547_ufcs_authenticate(struct sc8547a_device *sc)
 {
 	const struct firmware *key;
@@ -2591,22 +2607,24 @@ static int sc8547_ufcs_authenticate(struct sc8547a_device *sc)
 		return ret;
 	if (UFCS_DEVICE_INFO_IC_VENDOR(info) ||
 	    UFCS_DEVICE_INFO_DEV_VENDOR(info) != UFCS_OPLUS_DEV_ID)
-		return 0;
+		return INT_MAX;
 	ret = request_firmware_direct(&key, "oneplus/erhai/ufcs-auth.bin", sc->dev);
 	if (ret)
-		return ret;
+		return ret == -ENOENT ? SC8547_UFCS_UNVERIFIED_MA : ret;
 	if (key->size == UFCS_VERIFY_AUTH_DATA_SIZE)
 		ret = ufcs_intf_verify_adapter(sc->ufcs, 1, (u8 *)key->data, key->size);
 	else
-		ret = -EINVAL;
+		ret = 0;
 	release_firmware(key);
-	return ret == 1 ? 0 : ret < 0 ? ret : -EKEYREJECTED;
+	if (ret < 0)
+		return ret;
+	return ret == 1 ? INT_MAX : SC8547_UFCS_UNVERIFIED_MA;
 }
 
 int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 {
 	u64 modes[UFCS_OUTPUT_MODE_MAX], cable;
-	int count, ret, i, best = 0;
+	int count, ret, i, source_ma, best = 0;
 	struct sc8547a_device *sc;
 
 	guard(mutex)(&sc8547_ufcs_lock);
@@ -2624,9 +2642,6 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	ret = ufcs_handshake(sc->ufcs);
 	if (ret)
 		goto out;
-	ret = sc8547_ufcs_authenticate(sc);
-	if (ret)
-		goto out;
 	ret = ufcs_intf_config_watchdog(sc->ufcs, 3000);
 	if (ret)
 		goto out;
@@ -2641,8 +2656,18 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	ret = ufcs_intf_get_cable_info(sc->ufcs, &cable);
 	if (ret < 0)
 		goto out;
+	source_ma = sc8547_ufcs_authenticate(sc);
+	if (source_ma < 0) {
+		ret = source_ma;
+		goto out;
+	}
 	for (i = 0; i < count; i++) {
-		int ma = min(UFCS_OUTPUT_MODE_CURR_MAX(modes[i]), UFCS_CABLE_INFO_CURR_MAX(cable));
+		int ma = min_t(int, UFCS_OUTPUT_MODE_CURR_MAX(modes[i]),
+			       UFCS_CABLE_INFO_CURR_MAX(cable));
+
+		ma = min(ma, source_ma);
+		if (UFCS_OUTPUT_MODE_CURR_MIN(modes[i]) > ma)
+			continue;
 
 		if (UFCS_OUTPUT_MODE_VOL_MIN(modes[i]) > min_mv ||
 		    UFCS_OUTPUT_MODE_VOL_MAX(modes[i]) < max_mv ||
@@ -2652,7 +2677,7 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 		best = ma;
 	}
 	if (best) {
-		sc->ufcs_cable_ma = UFCS_CABLE_INFO_CURR_MAX(cable);
+		sc->ufcs_cable_ma = min_t(int, UFCS_CABLE_INFO_CURR_MAX(cable), source_ma);
 		sc->ufcs_granted_ma = 0;
 		sc->ufcs_packet_at = jiffies;
 		return best;
@@ -3000,5 +3025,6 @@ static struct i2c_driver sc8547a_driver = {
 };
 module_i2c_driver(sc8547a_driver);
 
+MODULE_FIRMWARE("oneplus/erhai/ufcs-auth.bin");
 MODULE_DESCRIPTION("Southchip SC8547A charge pump / VOOC PHY driver");
 MODULE_LICENSE("GPL");

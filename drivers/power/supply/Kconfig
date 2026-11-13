@@ -213,6 +213,7 @@ source "drivers/power/supply/ufcs/Kconfig"
 config CHARGER_SC8547A
 	tristate "Southchip SC8547A charge pump / VOOC PHY"
 	depends on I2C && OF && BATTERY_QCOM_BATTMGR
+	select REGMAP_I2C if OPLUS_UFCS_CLASS
 	help
 	  Southchip SC8547A charge pump and PPS hardware interface.
 	  The battery manager selects serial SUPERVOOC for dedicated chargers.
