@@ -304,8 +304,6 @@ MODULE_PARM_DESC(full_charge,
  */
 #define MCA_HV_VBUS_5V_MAX_UV	6000000
 #define MCA_HV_RENEG_MS		10000
-/* with mipps_auth, 9 V waits this long after attach for the authentication */
-#define MCA_HV_AUTH_WAIT_MS	15000
 #define MCA_HV_RENEG_MAX	3
 /* Current limit asked of a PPS source */
 #define MCA_HV_PPS_MIN_MA	500
@@ -420,8 +418,6 @@ MODULE_PARM_DESC(mipps_auth,
 /* see xiaomi_mca_cp_learn_drop() */
 #define MCA_CP_DROP_BACKOFF_MA	500
 #define MCA_CP_DROP_FORGET_MS	10000
-/* with mipps_auth, waits this long after attach for the authentication */
-#define MCA_CP_AUTH_WAIT_MS	60000
 /* an authenticated adapter resets itself within this, see xiaomi_mca_auth_pending() */
 #define MCA_AUTH_RESET_WAIT_MS	30000
 
@@ -2492,9 +2488,12 @@ static bool xiaomi_mca_adapter_verified(struct xiaomi_mca *mca)
  */
 static bool xiaomi_mca_cp_after_auth(struct xiaomi_mca *mca)
 {
-	if (!mipps_auth || mca->hv == MCA_HV_REQUESTED ||
+	if (mca->hv == MCA_HV_REQUESTED ||
 	    mca->vbus_uv >= MCA_HV_VBUS_5V_MAX_UV)
 		return false;
+	if (!mipps_auth || (mca->mipps_attempted && !mca->auth_cleanup &&
+			    !xiaomi_mca_authenticated(mca)))
+		return true;
 	if (xiaomi_mca_authenticated(mca) && time_after(mca->cp_on_at, mca->auth_at))
 		return true;
 	if (xiaomi_mca_auth_pending(mca) && mca->auth_tried)
@@ -2554,11 +2553,6 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	    min(tcool, tpack) < MCA_CP_TBAT_MIN ||
 	    max(tbat, tpack) >= MCA_CP_TBAT_EXIT ||
 	    xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
-		return;
-	/* PD requests in the middle of the authentication break it */
-	if (mipps_auth && !xiaomi_mca_authenticated(mca) &&
-	    time_before(jiffies, mca->cp_on_at +
-				 msecs_to_jiffies(MCA_CP_AUTH_WAIT_MS)))
 		return;
 
 	start_mv = 2 * vbat + MCA_CP_DELTA_MV;
@@ -3464,9 +3458,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 			mca->mipps_attempted = false;
 		}
 		mca->cp_on_at = jiffies;
-		/* a voltage change under way breaks the identity exchange */
-		if (mipps_auth && xiaomi_mca_is_pd(real_type))
-			mca->hv_retry = jiffies + msecs_to_jiffies(MCA_HV_AUTH_WAIT_MS);
+
 	}
 	if (real_type != mca->real_type && xiaomi_mca_limits(real_type)) {
 		/* A QC identification may appear after DCP or disappear on a

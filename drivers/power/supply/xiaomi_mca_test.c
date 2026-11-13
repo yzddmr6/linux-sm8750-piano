@@ -752,6 +752,15 @@ static void xiaomi_mca_test_policy_defaults(struct kunit *test)
 {
 	__le32 value = cpu_to_le32(9000);
 
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+
+	mipps_auth = true;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_cp_after_auth(&f->mca));
+	f->mca.mipps_attempted = true;
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_cp_after_auth(&f->mca));
+	f->mca.auth_cleanup = true;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_cp_after_auth(&f->mca));
+	mipps_auth = false;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_icl(MCA_TYPE_C), 500);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_icl(MCA_TYPE_FLOAT), 500);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_fcc(MCA_TYPE_C, false), 500);
