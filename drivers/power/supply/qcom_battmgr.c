@@ -1579,9 +1579,7 @@ void erhai_charge_tail_complete(void)
 }
 EXPORT_SYMBOL_GPL(erhai_charge_tail_complete);
 
-/* Every D+/D- acquisition starts with the preceding converter off and
- * VBUS back inside the 5 V range. A late firmware ACK can precede decay.
- */
+/* D+/D- probes share the existing charge-work polling interval. */
 static unsigned long qcom_battmgr_probe_retry(unsigned int *failures)
 {
 	/* Repeat only on idle 5 V. Bound the exponent so an unclassified
@@ -1633,11 +1631,11 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->fixed_backoff = false;
 		battmgr->pd_partner_checked = false;
 		battmgr->pd_charge_only = false;
-		if (ret)
+		if (ret || (qcom_battmgr_pd_stop(battmgr, !online, "charger removed") &&
+			    (battmgr->pd_restore_fcc || battmgr->pd_restore))) {
+			set_bit(PD_EVENT_DETACH, &battmgr->pd_events);
 			return PD_POLL_MS;
-		if (qcom_battmgr_pd_stop(battmgr, !online, "charger removed") &&
-		    (battmgr->pd_restore_fcc || battmgr->pd_restore))
-			return PD_POLL_MS;
+		}
 		battmgr->pd_state = PD_IDLE;
 		battmgr->pd_logged = false;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
@@ -1656,6 +1654,10 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 				      USB_REAL_TYPE, &real_type)) {
 		/* Classification is optional. The power contract has its own readback. */
 		real_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	}
+	if (type != battmgr->charge_detected_type) {
+		battmgr->serial_failures = battmgr->ufcs_failures = 0;
+		battmgr->serial_backoff = battmgr->ufcs_backoff = false;
 	}
 	battmgr->charge_detected_type = type;
 	if (!src.sink) {

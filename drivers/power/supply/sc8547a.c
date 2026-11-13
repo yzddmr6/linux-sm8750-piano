@@ -424,6 +424,8 @@ struct sc8547a_device {
 	unsigned int ufcs_cable_ma;
 	unsigned int ufcs_granted_ma;
 	unsigned long ufcs_packet_at;
+	unsigned long ufcs_exit_at;
+	bool ufcs_watchdog_set;
 #endif
 	bool ufcs_owner;
 	struct i2c_client	*client;
@@ -2685,9 +2687,15 @@ static int sc8547_ufcs_end(struct sc8547a_device *sc)
 		pps_cp_engaged = false;
 		pps_adc_hold = false;
 	}
-	ret = ufcs_force_exit(sc->ufcs);
-	if (ret)
-		return ret;
+	if (!sc->ufcs_exit_at) {
+		ret = ufcs_force_exit(sc->ufcs);
+		if (ret && sc->ufcs_watchdog_set) {
+			sc->ufcs_exit_at = (jiffies + 3 * HZ + 1) ?: 1;
+			return ret;
+		}
+	}
+	if (sc->ufcs_exit_at && time_before(jiffies, sc->ufcs_exit_at))
+		return -EAGAIN;
 	/* A successful EXIT reply may precede the change at the connector.
 	 * Retain the route while a live source still supplies a high VBUS.
 	 */
@@ -2700,10 +2708,16 @@ static int sc8547_ufcs_end(struct sc8547a_device *sc)
 			return ret < 0 ? ret : -EAGAIN;
 	}
 	guard(mutex)(&sc8547_pps_lock);
-	ret = sc8547_reset_voocphy(sc);
-	ret = ret ?: wcd939x_usbss_dpdm_switch_fast_charge(false);
-	if (!ret)
+	/* Converters are off, VBUS is safe. Reset is best effort; the
+	 * independent crossbar physically isolates an unresponsive PHY.
+	 */
+	sc8547_reset_voocphy(sc);
+	ret = wcd939x_usbss_dpdm_switch_fast_charge(false);
+	if (!ret) {
 		sc->ufcs_owner = false;
+		sc->ufcs_watchdog_set = false;
+		sc->ufcs_exit_at = 0;
+	}
 	return ret;
 }
 
@@ -2787,6 +2801,7 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	ret = ufcs_intf_config_watchdog(sc->ufcs, 3000);
 	if (ret)
 		goto out;
+	sc->ufcs_watchdog_set = true;
 	count = ufcs_intf_get_pdo_info(sc->ufcs, modes, ARRAY_SIZE(modes));
 	if (count <= 0) {
 		ret = count ?: -ENODATA;
