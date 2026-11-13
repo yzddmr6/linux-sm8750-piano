@@ -489,7 +489,7 @@ enum xiaomi_mca_cp {
 	MCA_CP_OPENING,		/* source asked for, stage being started */
 	MCA_CP_ON,		/* stage running */
 	MCA_CP_STOPPING,	/* stop failed; retain ownership until confirmed off */
-	MCA_CP_DONE,		/* buck charging until detach */
+	MCA_CP_COOLDOWN,	/* resume after the source settles */
 };
 
 
@@ -686,6 +686,9 @@ struct xiaomi_mca {
 	enum xiaomi_mca_profile cp_profile; /* follows the current FFC conditions */
 	unsigned int cp_stage; /* monotonic while the selected table is unchanged */
 	u32 cp_target_ma; /* effective battery target after table/thermal limits */
+	unsigned long cp_retry_at;
+	bool cp_fault;
+	bool cp_recharge;
 	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
@@ -2181,6 +2184,12 @@ static int xiaomi_mca_cp_set_buck(struct xiaomi_mca *mca, u32 icl_ma,
 	return 0;
 }
 
+static void xiaomi_mca_cp_backoff(struct xiaomi_mca *mca)
+{
+	mca->cp = MCA_CP_COOLDOWN;
+	mca->cp_retry_at = jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS);
+}
+
 static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 {
 	int ret;
@@ -2199,7 +2208,7 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	mca->cp_last_exit = why;
 	dev_info(mca->dev, "direct charging stopped: %s\n", why);
 
-	mca->cp = MCA_CP_DONE;
+	xiaomi_mca_cp_backoff(mca);
 	mca->cp_target_ma = 0;
 	mca->hv = MCA_HV_OFF;
 	mca->hv_retry = jiffies;
@@ -2520,6 +2529,10 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	int vbat, ibat, tcool, tbat, tpack, ret, vmin, imax;
 	u32 start_mv, ma, src_ma, vbat_max, max_mv = 0;
 
+	if (mca->cp == MCA_CP_COOLDOWN && time_after_eq(jiffies, mca->cp_retry_at))
+		mca->cp = MCA_CP_OFF;
+	if (mca->cp_fault)
+		return;
 	if (!cp_charge || !hv_charge || !charge_current ||
 	    !xiaomi_mca_is_pd(mca->real_type) ||
 	    mca->cp != MCA_CP_OFF ||
@@ -2534,7 +2547,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		xiaomi_mca_ffc_conditions(mca, min(tcool, tpack), max(tbat, tpack));
 	xiaomi_mca_select_profile(mca, min(tcool, tpack), max(tbat, tpack));
 	vbat_max = xiaomi_mca_cp_vbat_max(mca);
-	if (vmin < MCA_CP_VBAT_MIN_MV ||
+	if ((mca->cp_recharge && vbat >= 4350) || vmin < MCA_CP_VBAT_MIN_MV ||
 	    vbat >= vbat_max - MCA_CP_VBAT_HYS_MV ||
 	    imax >= MCA_CP_CELL_OCP_MA ||
 	    min(tcool, tpack) < MCA_CP_TBAT_MIN ||
@@ -2560,7 +2573,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	src_ma -= min_t(u32, src_ma, MCA_CP_BUCK_MA + 200);
 	mca->cp_ibus_ma = min_t(u32, MCA_CP_IBAT_MAX_MA / 2, src_ma);
 	if (mca->cp_ibus_ma < 2 * MCA_CP_OPEN_IBUS_MA) {
-		mca->cp = MCA_CP_DONE;
+		xiaomi_mca_cp_backoff(mca);
 		return;
 	}
 
@@ -2574,7 +2587,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		dev_warn(mca->dev, "switched-capacitor stage not ready\n");
 		power_supply_put(mca->cp_psy);
 		mca->cp_psy = NULL;
-		mca->cp = MCA_CP_DONE;
+		xiaomi_mca_cp_backoff(mca);
 		return;
 	}
 
@@ -2587,6 +2600,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_buck_par = false;
 	mca->cp_stage = 0;
 	mca->cp_target_ma = 0;
+	mca->cp_recharge = false;
 	mca->cp = MCA_CP_OPENING;
 	/* Confirm the new FV before asking the source to open this session. */
 	ret = xiaomi_mca_full_charge_poll(mca);
@@ -2604,11 +2618,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	ret = xiaomi_mca_cp_set_buck(mca, MCA_CP_BUCK_MA, MCA_CP_BUCK_MA);
 	ret = ret ?: xiaomi_mca_cp_request(mca, start_mv);
 	if (ret) {
-		if (xiaomi_mca_cp_stop(mca, "start refused"))
-			return;
-		/* again after the adapter reset */
-		if (xiaomi_mca_auth_pending(mca))
-			mca->cp = MCA_CP_OFF;
+		xiaomi_mca_cp_stop(mca, "start refused");
 		return;
 	}
 
@@ -2637,14 +2647,17 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	xiaomi_mca_select_profile(mca, min(tcool, tpack), max(tbat, tpack));
 	/* Never continue a high-current APDO after authentication is revoked. */
 	if (mca->cp_ma > MCA_CP_STD_PPS_MAX_MA && !xiaomi_mca_adapter_verified(mca)) {
+		mca->cp_fault = true;
 		xiaomi_mca_cp_stop(mca, "adapter authentication lost");
 		return;
 	}
 	if (vbat >= xiaomi_mca_cp_vbat_max(mca) || vmin < MCA_CP_VBAT_MIN_MV) {
+		mca->cp_recharge = vbat >= xiaomi_mca_cp_vbat_max(mca);
 		xiaomi_mca_cp_stop(mca, "battery voltage reached");
 		return;
 	}
 	if (imax >= MCA_CP_CELL_OCP_MA) {
+		mca->cp_fault = true;
 		xiaomi_mca_cp_stop(mca, "cell current too high");
 		return;
 	}
@@ -2655,8 +2668,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	}
 	if (xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS)) {
 		/* Retry authentication only after the stage is confirmed off. */
-		if (!xiaomi_mca_cp_stop(mca, "adapter authentication"))
-			mca->cp = MCA_CP_OFF;
+		xiaomi_mca_cp_stop(mca, "adapter authentication");
 		return;
 	}
 
@@ -2696,6 +2708,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	ibus = ibus_ua / 1000;
 	mca->cp_ibus_last = max(ibus + mca->ibus_ua / 1000, 0);
 	if (vbus_uv / 1000 > 2 * vbat + MCA_CP_VBUS_MAX_DELTA_MV) {
+		mca->cp_fault = true;
 		xiaomi_mca_cp_stop(mca, "bus voltage too high");
 		return;
 	}
@@ -2704,10 +2717,12 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		return;
 	}
 	if (ibus > (int)mca->cp_ibus_ma + MCA_CP_TRIP_IBUS_MA) {
+		mca->cp_fault = true;
 		xiaomi_mca_cp_stop(mca, "bus current too high");
 		return;
 	}
 	if (ibat > (int)mca->cp_ibat_trip + MCA_CP_TRIP_IBAT_MA) {
+		mca->cp_fault = true;
 		xiaomi_mca_cp_stop(mca, "battery current too high");
 		return;
 	}
@@ -3368,6 +3383,8 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		mca->hv_renegs = 0;
 		mca->cp_ibus_cap = 0;
 		mca->online = false;
+		mca->cp_fault = false;
+		mca->cp_recharge = false;
 		mca->policy_attach_generation = attachment;
 	}
 	if (xiaomi_mca_clear_auth(mca))
@@ -3446,6 +3463,10 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 
 	if (!online) {
 		/* Preserve an authentication reset only while its cable is connected. */
+		if (power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status) == MCA_UCSI_OFFLINE) {
+			mca->cp_fault = false;
+			mca->cp_recharge = false;
+		}
 		if (!xiaomi_mca_auth_pending(mca) ||
 		    power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status) < MCA_UCSI_CONNECTED) {
 			mca->auth_ok = false;

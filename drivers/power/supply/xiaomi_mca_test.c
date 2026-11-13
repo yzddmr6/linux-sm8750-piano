@@ -2436,14 +2436,21 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	mca_test_stage(test, f);
 	guard(mutex)(&f->mca.lock);
 	xiaomi_mca_cp_step(&f->mca);
-	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_DONE);
+	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_COOLDOWN);
 	KUNIT_EXPECT_FALSE(test, f->stage_on);
+	KUNIT_EXPECT_FALSE(test, f->mca.cp_fault);
+	xiaomi_mca_cp_try_start(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_COOLDOWN);
+	f->mca.cp_retry_at = jiffies;
+	xiaomi_mca_cp_try_start(&f->mca);
+	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_OFF);
 	f->cells[0].voltage = 4400000;
 	f->mca.cp_psy = power_supply_get_by_name("mca-pm-test-cp");
 	f->mca.cp = MCA_CP_ON;
 	f->stage_on = true;
 	xiaomi_mca_cp_step(&f->mca);
-	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_DONE);
+	KUNIT_EXPECT_EQ(test, f->mca.cp, MCA_CP_COOLDOWN);
+	KUNIT_EXPECT_TRUE(test, f->mca.cp_fault);
 	KUNIT_EXPECT_FALSE(test, f->stage_on);
 }
 
