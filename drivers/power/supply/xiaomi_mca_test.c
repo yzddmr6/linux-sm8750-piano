@@ -2402,12 +2402,14 @@ static void xiaomi_mca_test_ffc_conditions(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5500);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_vbat_max(mca), 4540);
 	KUNIT_EXPECT_EQ(test, mca->cp_profile, MCA_PROFILE_FFC);
-	/* Either cell reaching the SOC bound revokes FFC in the same poll. */
+	/* Crossing the entry SOC in an authenticated session keeps FFC. */
 	f->cells[1].capacity = 95;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
-	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_vbat_max(mca), 4473);
-	KUNIT_EXPECT_EQ(test, mca->cp_profile, MCA_PROFILE_NORMAL);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5500);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_vbat_max(mca), 4540);
+	KUNIT_EXPECT_EQ(test, mca->cp_profile, MCA_PROFILE_FFC);
+	mca->ffc_active = false;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_ffc_conditions(mca, 25, 25));
 	f->cells[1].capacity = 94;
 	f->type = MCA_TYPE_PD;
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_ffc_conditions(mca, 25, 25));

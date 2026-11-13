@@ -1410,6 +1410,7 @@ static void xiaomi_mca_mipps_authenticate(struct xiaomi_mca *mca)
 		return;
 
 	mca->auth_attach_generation = attachment;
+	mca->ffc_active = false;
 	mca->auth_ok = false;
 	mca->mipps_attempted = true;
 	ret = xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 1);
@@ -2030,7 +2031,8 @@ static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twa
 			return false;
 		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &soc);
 		power_supply_put(psy);
-		if (ret || soc.intval < 0 || soc.intval >= 95)
+		if (ret || soc.intval < 0 || soc.intval > 100 ||
+		    (!mca->ffc_active && soc.intval >= 95))
 			return false;
 	}
 	return true;
@@ -2060,14 +2062,15 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 	lockdep_assert_held(&mca->lock);
 	if (mca->sleeping)
 		return -EHOSTDOWN;
-	mca->ffc_active = false;
 	if (!full_charge || !charge_policy) {
+		mca->ffc_active = false;
 		return xiaomi_mca_restore_term_volt(mca);
 	}
 
 	ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
 	ret = ret ?: xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax);
 	if (ret) {
+		mca->ffc_active = false;
 		mca->term_hot = true;
 	} else {
 		tbat = max_t(s32, tbat, tpack);
@@ -2655,8 +2658,8 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 {
 	int vbat, ibat, tcool, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibus, over;
 	int ibat_max, target, ibus_all, vmin, imax;
-	u32 mv = mca->cp_mv;
-	bool par;
+	u32 mv = mca->cp_mv, cv;
+	bool taper, par;
 
 	if (xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax) ||
 	    xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &on)) {
@@ -2675,8 +2678,11 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_stop(mca, "adapter authentication lost");
 		return;
 	}
-	if (vbat >= xiaomi_mca_cp_vbat_max(mca) || vmin < MCA_CP_VBAT_MIN_MV) {
-		mca->cp_recharge = vbat >= xiaomi_mca_cp_vbat_max(mca);
+	cv = xiaomi_mca_cp_vbat_max(mca);
+	taper = vbat >= cv - 9;	/* pps_taper_vol_hys */
+	if (vmin < MCA_CP_VBAT_MIN_MV || vbat > cv + 4 ||
+	    (taper && (mca->cp != MCA_CP_ON || ibat <= 3000))) {
+		mca->cp_recharge = taper;
 		xiaomi_mca_cp_stop(mca, "battery voltage reached");
 		return;
 	}
@@ -2815,7 +2821,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		if (over > 0)
 			mv -= clamp(over / MCA_CP_REG_STEP_MA * MCA_CP_REG_STEP_MV,
 				    MCA_CP_REG_STEP_MV, MCA_CP_REG_MAX_STEP_MV);
-		else if (ibat > ibat_max && mca->cp_ibat_trip <= ibat_max)
+		else if (taper || (ibat > ibat_max && mca->cp_ibat_trip <= ibat_max))
 			mv -= MCA_CP_REG_STEP_MV;
 		else if (ibus + MCA_CP_BAND_MA < target &&
 			 ibat + MCA_CP_BAND_MA < ibat_max)
@@ -3396,6 +3402,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 	if (attachment != mca->policy_attach_generation) {
 		if (xiaomi_mca_cp_stop(mca, "physical disconnect"))
 			return;
+		mca->ffc_active = false;
 		mca->auth_ok = false;
 		mca->mipps_attempted = false;
 		mca->cp = MCA_CP_OFF;
@@ -3446,6 +3453,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		/* away longer than a reset takes: another attach */
 		if (time_after(jiffies, mca->cp_off_at +
 				msecs_to_jiffies(MCA_CP_DROP_FORGET_MS))) {
+			mca->ffc_active = false;
 			mca->auth_ok = false;
 			mca->mipps_attempted = false;
 		}
@@ -3489,6 +3497,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		}
 		if (!xiaomi_mca_auth_pending(mca) ||
 		    power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status) < MCA_UCSI_CONNECTED) {
+			mca->ffc_active = false;
 			mca->auth_ok = false;
 			mca->mipps_attempted = false;
 		}
@@ -3561,6 +3570,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->icl_set_ma = 0;
 			mca->fcc_set_ma = 0;
 			mca->fcc_written = false;
+			mca->ffc_active = false;
 			mca->auth_ok = false;
 			mca->mipps_attempted = false;
 			mca->auth_cleanup = false;
@@ -4238,6 +4248,7 @@ out:
 	mca->voltage_written = !!fixed_ma;
 	mca->hv_pps = false;
 	mca->hv_renegs = 0;
+	mca->ffc_active = false;
 	mca->auth_ok = false;
 	mca->mipps_attempted = false;
 	mca->online = false;
