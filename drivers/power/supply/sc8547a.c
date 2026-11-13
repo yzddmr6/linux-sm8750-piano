@@ -2434,9 +2434,12 @@ int sc8547a_serial_session(bool enable)
 	guard(mutex)(&sc8547_pps_lock);
 	sc = sc8547_master_dev;
 	if (!sc || !serial_enable)
+		return enable ? -EOPNOTSUPP : 0;
+	if (enable == sc->vooc_started) {
+		if (enable && (sc->auto_state == SC_AUTO_DECLINED || sc->auto_state == SC_AUTO_DONE))
+			return -ENODATA;
 		return 0;
-	if (enable == sc->vooc_started)
-		return 0;
+	}
 	if (enable) {
 		if (!sc8547_slave_dev || sc->irq <= 0 || pps_cp_engaged || pps_adc_hold)
 			return -EAGAIN;

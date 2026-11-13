@@ -136,6 +136,7 @@ enum qcom_battmgr_variant {
 #define BATT_OPLUS_HMAC			40
 #define BATT_OPLUS_CHG_EN		24
 /* Fixed PDO voltage in mV, written with BATTMGR_BAT_PROPERTY_SET */
+#define BATT_OPLUS_SET_QC		26	/* non-soccp BATT_SET_QC, mV */
 #define BATT_OPLUS_SET_PDO		25
 
 #define BATTMGR_USB_PROPERTY_GET	0x32
@@ -150,6 +151,7 @@ enum qcom_battmgr_variant {
 #define USB_ADAP_TYPE			7
 #define USB_MOISTURE_DET_EN		8
 #define USB_MOISTURE_DET_STS		9
+#define USB_OPLUS_RERUN_AICL		67
 #define USB_REAL_TYPE			11
 /* OPLUS firmware: VBUS boost control */
 #define USB_OPLUS_OTG_AP_ENABLE		17
@@ -528,6 +530,11 @@ struct qcom_battmgr {
 	enum qcom_battmgr_pd_state pd_state;
 	unsigned long pd_since;
 	bool pd_restore;
+	bool qc_contract;
+	bool serial_probe;
+	unsigned long serial_retry;
+	bool serial_backoff;
+	bool aicl_done;
 	bool pd_logged;
 	u32 pd_input_limit_ua;
 	u32 pd_saved_fcc_ua;
@@ -1271,9 +1278,11 @@ static ssize_t charge_contract_show(struct device *dev, struct device_attribute 
 
 	guard(mutex)(&b->charge_lock);
 	len = sysfs_emit(buf, "fixed_pd_mv=%u fixed_icl_ua=%u ",
-			 b->pd_state == PD_ACTIVE ? PD_FIXED_MV : 0,
+			 b->pd_state == PD_ACTIVE && !b->qc_contract ? PD_FIXED_MV : 0,
 			 b->pd_state == PD_ACTIVE ? b->pd_input_limit_ua : 0);
 
+	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d ",
+			     b->pd_state == PD_ACTIVE && b->qc_contract ? PD_FIXED_MV : 0, b->serial_probe);
 	if (b->pps_ops)
 		return b->pps_ops->describe(b->pps_data, buf, len);
 	return len + sysfs_emit_at(buf, len, "state=idle\n");
@@ -1384,7 +1393,8 @@ static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 					USB_INPUT_CURR_LIMIT,
 					min(battmgr->pd_input_limit_ua, PD_TRANSITION_UA));
 	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
-					BATT_OPLUS_SET_PDO, PD_DEFAULT_MV);
+					battmgr->qc_contract ? BATT_OPLUS_SET_QC : BATT_OPLUS_SET_PDO,
+					PD_DEFAULT_MV);
 	if (!ret && !offline) {
 		msleep(PD_SHUTDOWN_WAIT_MS);
 		ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
@@ -1412,7 +1422,7 @@ static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
-	bool prefer_pps, caps_changed, current_changed = false;
+	bool prefer_pps, dedicated, qc, caps_changed, current_changed = false;
 	u32 online, type, health, vbat, vbus, ua, real_type;
 	int ret;
 
@@ -1420,8 +1430,9 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->pd_restore_fcc = false;
 	if (test_and_clear_bit(PD_EVENT_RESET, &battmgr->pd_events)) {
 		qcom_battmgr_pps_stop(battmgr);
+		if (qcom_battmgr_pd_stop(battmgr, false, "PD reset"))
+			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
-		battmgr->pd_restore = false;
 		battmgr->pd_logged = false;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
@@ -1432,11 +1443,14 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		return PD_POLL_MS;
 	}
 	if (!online) {
+		battmgr->serial_backoff = false;
+		battmgr->serial_probe = false;
+		battmgr->aicl_done = false;
 		ret = qcom_battmgr_pps_stop(battmgr);
 		if (ret)
 			return PD_POLL_MS;
 		if (qcom_battmgr_pd_stop(battmgr, true, "charger removed") &&
-		    battmgr->pd_restore_fcc)
+		    (battmgr->pd_restore_fcc || battmgr->pd_restore))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
 		battmgr->pd_logged = false;
@@ -1466,28 +1480,40 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	 * can identify as DCP or Apple-style before its first serial frame.
 	 * Leave SDP, CDP, PD and OTG on their normal routes.
 	 */
+	qc = (type >= 0x80 && type <= 0x82) || (real_type >= 0x80 && real_type <= 0x82);
+	dedicated = !src.sink && (qc || type == POWER_SUPPLY_USB_TYPE_DCP ||
+				  type == OPLUS_USB_TYPE_APPLE_BRICK_ID);
 	if (battmgr->pps_ops) {
-		bool dedicated = type == POWER_SUPPLY_USB_TYPE_DCP ||
-				 type == OPLUS_USB_TYPE_APPLE_BRICK_ID;
-
-		if (dedicated && (real_type == POWER_SUPPLY_USB_TYPE_DCP ||
-				  real_type == OPLUS_USB_TYPE_APPLE_BRICK_ID) &&
-		    !READ_ONCE(battmgr->pps_suspended) && !READ_ONCE(battmgr->otg_request) &&
-		    !battmgr->charge_inhibited && !battmgr->charge_policy_hold &&
-		    !battmgr->charge_error) {
+		/* A probe gets exclusive D+/D- ownership only on a dedicated
+		 * source at 5 V. Its decline/timeout releases the crossbar
+		 * before the next protocol (including firmware QC) can act.
+		 */
+		if (dedicated && !READ_ONCE(battmgr->pps_suspended) &&
+		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
+		    !battmgr->charge_policy_hold && !battmgr->charge_error &&
+		    (!battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
 			if (battmgr->pps_ops->stop(battmgr->pps_data) ||
-			    qcom_battmgr_pd_stop(battmgr, false, "serial charger") ||
-			    battmgr->pps_ops->serial_session(true))
+			    qcom_battmgr_pd_stop(battmgr, false, "serial probe"))
 				return PD_POLL_MS;
-			return 0;
+			ret = battmgr->pps_ops->serial_session(true);
+			if (!ret) {
+				battmgr->serial_probe = true;
+				return PD_POLL_MS;
+			}
+			battmgr->serial_backoff = true;
+			battmgr->serial_retry = jiffies + msecs_to_jiffies(CHARGE_CTRL_POLL_MS);
+			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 		}
 		if (battmgr->pps_ops->serial_session(false))
 			return PD_POLL_MS;
+		battmgr->serial_probe = false;
 	}
+	/* The Type-C partner's PD capabilities are stronger evidence than
+	 * an incomplete BC1.2 classification. PPS also checks its APDO.
+	 */
 	prefer_pps = !READ_ONCE(battmgr->pps_suspended) &&
 		     battmgr->pps_ops && battmgr->pps_ops->enabled() &&
-		     src.sink && !READ_ONCE(battmgr->otg_request) &&
-		     real_type == POWER_SUPPLY_USB_TYPE_PD_PPS;
+		     src.sink && !READ_ONCE(battmgr->otg_request);
 	if (prefer_pps && !battmgr->charge_inhibited && !battmgr->charge_policy_hold &&
 	    !battmgr->charge_error && battmgr->pps_ops->available(battmgr->pps_data)) {
 		unsigned int delay;
@@ -1517,12 +1543,27 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->pps_input_used = false;
 	}
 
-	if (!src.sink || READ_ONCE(battmgr->otg_request) ||
-	    (type != POWER_SUPPLY_USB_TYPE_PD && type != POWER_SUPPLY_USB_TYPE_PD_DRP &&
-	     type != POWER_SUPPLY_USB_TYPE_PD_PPS && type != OPLUS_USB_TYPE_PD_SDP && !prefer_pps)) {
-		qcom_battmgr_pd_stop(battmgr, false, "no PD sink");
+	qc = qc && !src.sink;
+	if ((!src.sink && !qc) || READ_ONCE(battmgr->otg_request)) {
+		if (qcom_battmgr_pd_stop(battmgr, false, "no high-voltage sink"))
+			return PD_POLL_MS;
 		qcom_battmgr_pd_log(battmgr, type);
-		return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
+		/* Stock ADSP implements USB_SET_RERUN_AICL. Let its PMIC
+		 * regulate a weak port within the negotiated Type-C/BC limit.
+		 */
+		if (!battmgr->aicl_done && !READ_ONCE(battmgr->otg_request) &&
+		    !qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
+					       USB_OPLUS_RERUN_AICL, 0))
+			battmgr->aicl_done = true;
+		return CHARGE_CTRL_POLL_MS;
+	}
+	battmgr->aicl_done = false;
+	if (battmgr->qc_contract != qc) {
+		if (qcom_battmgr_pd_stop(battmgr, false, "source protocol changed"))
+			return PD_POLL_MS;
+		battmgr->pd_state = PD_IDLE;
+		battmgr->qc_contract = qc;
+		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 
 	if (battmgr->pd_state == PD_FAILED) {
@@ -1552,14 +1593,19 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 
 	caps_changed = test_and_clear_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	if (caps_changed) {
-		ret = qcom_battmgr_pd_current(battmgr, PD_FIXED_MV, &ua);
+		if (qc) {
+			ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+							USB_CURR_MAX, &ua);
+			ua = ret ? 0 : min(ua, (u32)PD_INPUT_MAX_UA);
+		} else {
+			ret = qcom_battmgr_pd_current(battmgr, PD_FIXED_MV, &ua);
+		}
 		if (ret || !ua) {
 			dev_info(battmgr->dev, "PD: no verified 9 V fixed PDO (error %d)\n", ret);
 			qcom_battmgr_pd_stop(battmgr, false, "source capabilities");
 			qcom_battmgr_pd_log(battmgr, type);
-			if (prefer_pps)
-				set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
-			return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
+			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+			return CHARGE_CTRL_POLL_MS;
 		}
 		current_changed = ua != battmgr->pd_input_limit_ua;
 		battmgr->pd_input_limit_ua = ua;
@@ -1568,14 +1614,13 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	switch (battmgr->pd_state) {
 	case PD_IDLE:
 		if (!caps_changed)
-			return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
+			return CHARGE_CTRL_POLL_MS;
 		ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 						USB_INPUT_CURR_LIMIT, &battmgr->pd_saved_limit_ua);
 		if (ret || !battmgr->pd_saved_limit_ua) {
 			qcom_battmgr_pd_log(battmgr, type);
-			if (prefer_pps)
-				set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
-			return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
+			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+			return CHARGE_CTRL_POLL_MS;
 		}
 		/* Also undo a timed-out write, since the firmware may have applied it. */
 		battmgr->pd_restore = true;
@@ -1584,26 +1629,27 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 						min(battmgr->pd_input_limit_ua, PD_TRANSITION_UA));
 		if (!ret)
 			ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
-							BATT_OPLUS_SET_PDO, PD_FIXED_MV);
+							qc ? BATT_OPLUS_SET_QC : BATT_OPLUS_SET_PDO,
+							PD_FIXED_MV);
 		if (ret)
 			goto failed;
 		battmgr->pd_state = PD_WAIT;
 		battmgr->pd_since = jiffies;
 		battmgr->pd_logged = false;
-		dev_info(battmgr->dev, "PD: requested 9000 mV, input limit up to %u mA\n",
-			 battmgr->pd_input_limit_ua / 1000);
-		return PD_POLL_MS;
+		dev_info(battmgr->dev, "%s: requested 9000 mV, input limit up to %u mA\n",
+			 qc ? "QC" : "PD", battmgr->pd_input_limit_ua / 1000);
+		return qc ? 350 : PD_POLL_MS; /* oplus_chg_8350_set_qc_config */
 	case PD_WAIT:
 	case PD_ACTIVE:
 		ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 						USB_VOLT_NOW, &vbus);
 		if (ret)
 			goto failed;
-		if (vbus < PD_VBUS_RISEN_UV) {
+		if (vbus < (qc ? 8000000 : PD_VBUS_RISEN_UV)) {
 			if (battmgr->pd_state == PD_WAIT &&
 			    time_before(jiffies, battmgr->pd_since +
-					msecs_to_jiffies(PD_CONFIG_TIMEOUT_MS)))
-				return PD_POLL_MS;
+					msecs_to_jiffies(qc ? 350 : PD_CONFIG_TIMEOUT_MS)))
+				return qc ? 350 : PD_POLL_MS;
 			ret = -ETIMEDOUT;
 			goto failed;
 		}
@@ -1611,7 +1657,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			ret = -ERANGE;
 			goto failed;
 		}
-		if (battmgr->pd_state == PD_WAIT || current_changed) {
+		if (battmgr->pd_state == PD_WAIT || current_changed || READ_ONCE(battmgr->pps_suspended)) {
 			ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
 							USB_INPUT_CURR_LIMIT,
 							battmgr->pd_input_limit_ua);
@@ -1625,7 +1671,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		qcom_battmgr_pd_log(battmgr, type);
 		return CHARGE_CTRL_POLL_MS;
 	default:
-		return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
+		return CHARGE_CTRL_POLL_MS;
 	}
 
 failed:
@@ -1649,8 +1695,8 @@ static void qcom_battmgr_log_handoff(struct qcom_battmgr *b, const char *phase)
 	    qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_CURR_NOW, &ua) ||
 	    qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_COUNTER, &counter))
 		return;
-	dev_info(b->dev, "fixed PD %s: input %u uV %u uA ICL %u uA FCC %u uA charge %u uAh\n",
-		 phase, uv, ua, icl, fcc, counter);
+	dev_info(b->dev, "fixed %s %s: input %u uV %u uA ICL %u uA FCC %u uA charge %u uAh\n",
+		 b->qc_contract ? "QC" : "PD", phase, uv, ua, icl, fcc, counter);
 }
 
 /* Finish the existing fixed-PD transition before the charge worker freezes. */

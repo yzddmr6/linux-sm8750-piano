@@ -523,15 +523,14 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 
 static bool pps_deployable(struct erhai_pps *p, bool *vooc_engaged)
 {
-	int real, pps_type, fct;
+	int pps_type, fct;
 
 	*vooc_engaged = false;
 
-	real = pps_usb_get(PPS_PROP_USB_REAL_TYPE);
 	pps_type = pps_usb_get(PPS_PROP_USB_GET_PPS_TYPE);
 	fct = pps_usb_get(PPS_PROP_USB_VOOC_FAST_CHG_TYPE);
 
-	if (real != PPS_USB_TYPE_PD_PPS || pps_type != 1 || fct < 0)
+	if (pps_type != 1 || fct < 0)
 		return false;
 	if (fct >= (int)pps_vooc_min || pps_sc_delivering() ||
 	    pps_sc_identifying()) {
