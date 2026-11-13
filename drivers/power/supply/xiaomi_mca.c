@@ -657,6 +657,7 @@ struct xiaomi_mca {
 	u32 cp_type;	/* protocol at stage entry */
 	enum xiaomi_mca_cp cp;
 	const char *cp_last_exit;
+	u32 cp_retry_ms;
 	const char *hv_last_exit;
 	u32 cp_exits;
 	struct power_supply *cp_psy;	/* the stage, held while not MCA_CP_OFF */
@@ -2413,10 +2414,15 @@ static int xiaomi_mca_cp_set_buck(struct xiaomi_mca *mca, u32 icl_ma,
 	return 0;
 }
 
-static void xiaomi_mca_cp_backoff(struct xiaomi_mca *mca)
+static void xiaomi_mca_cp_backoff(struct xiaomi_mca *mca, const char *reason)
 {
+	if (mca->cp_last_exit && !strcmp(mca->cp_last_exit, reason))
+		mca->cp_retry_ms = min(2 * mca->cp_retry_ms, 300000U);
+	else
+		mca->cp_retry_ms = MCA_HV_RENEG_MS;
+	mca->cp_last_exit = reason;
 	mca->cp = MCA_CP_COOLDOWN;
-	mca->cp_retry_at = jiffies + msecs_to_jiffies(MCA_HV_RENEG_MS);
+	mca->cp_retry_at = jiffies + msecs_to_jiffies(mca->cp_retry_ms);
 }
 
 static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
@@ -2434,11 +2440,10 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	}
 	power_supply_put(mca->cp_psy);
 	mca->cp_psy = NULL;
-	mca->cp_last_exit = why;
 	mca->cp_exits++;
 	dev_info(mca->dev, "direct charging stopped: %s\n", why);
 
-	xiaomi_mca_cp_backoff(mca);
+	xiaomi_mca_cp_backoff(mca, why);
 	mca->cp_target_ma = 0;
 	mca->hv = MCA_HV_OFF;
 	mca->hv_retry = jiffies;
@@ -2862,14 +2867,14 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		 */
 		if (mca->cp_ibus_cap && time_after_eq(jiffies, mca->cp_cap_retry))
 			mca->cp_ibus_cap = 0;
-		xiaomi_mca_cp_backoff(mca);
+		xiaomi_mca_cp_backoff(mca, "opening current unavailable");
 		return;
 	}
 
 	mca->cp_psy = power_supply_get_by_name("sc8541");
 	if (!mca->cp_psy) {
 		dev_warn_ratelimited(mca->dev, "SC8541 unavailable, using buck charging\n");
-		xiaomi_mca_cp_backoff(mca);
+		xiaomi_mca_cp_backoff(mca, "pump unavailable");
 		return;
 	}
 	if (mca->cp_die_hot) {
@@ -2879,7 +2884,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		    tdie >= MCA_CP_TDIE_HOT) {
 			power_supply_put(mca->cp_psy);
 			mca->cp_psy = NULL;
-			xiaomi_mca_cp_backoff(mca);
+			xiaomi_mca_cp_backoff(mca, "stage temperature");
 			return;
 		}
 		mca->cp_die_hot = false;
@@ -2891,7 +2896,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		dev_warn(mca->dev, "switched-capacitor stage not ready\n");
 		power_supply_put(mca->cp_psy);
 		mca->cp_psy = NULL;
-		xiaomi_mca_cp_backoff(mca);
+		xiaomi_mca_cp_backoff(mca, "pump not ready");
 		return;
 	}
 
@@ -4285,13 +4290,13 @@ static ssize_t charge_profile_show(struct device *dev,
 	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
 
 	guard(mutex)(&mca->lock);
-	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u hv_exit=%s last_exit=%s\n",
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u hv_exit=%s last_exit=%s\n",
 		 xiaomi_mca_profile_names[mca->cp_profile],
 		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
 		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma, mca->hv, mca->hv_pps,
 		 xiaomi_mca_cp_active(mca) ? mca->cp_mv : 0, READ_ONCE(mca->attach_generation),
 		 mca->real_type, xiaomi_mca_cp_active(mca) ? mca->cp_type : 0, mca->cp_exits,
-		 mca->hv_last_exit ?: "none", mca->cp_last_exit ?: "none");
+		 mca->cp_retry_ms, mca->hv_last_exit ?: "none", mca->cp_last_exit ?: "none");
 }
 static DEVICE_ATTR_RO(charge_profile);
 

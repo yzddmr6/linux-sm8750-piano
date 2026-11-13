@@ -1371,6 +1371,20 @@ static void xiaomi_mca_test_sleep_fixed_pd(struct kunit *test)
 	hv_charge = false;
 }
 
+static void xiaomi_mca_test_retry_schedule(struct kunit *test)
+{
+	struct xiaomi_mca *mca = &mca_policy_fixture(test)->mca;
+	static const u32 delays[] = { 10000, 20000, 40000, 80000, 160000, 300000, 300000 };
+	int n;
+
+	for (n = 0; n < ARRAY_SIZE(delays); n++) {
+		xiaomi_mca_cp_backoff(mca, "start refused");
+		KUNIT_EXPECT_EQ(test, mca->cp_retry_ms, delays[n]);
+	}
+	xiaomi_mca_cp_backoff(mca, "stage temperature");
+	KUNIT_EXPECT_EQ(test, mca->cp_retry_ms, 10000);
+}
+
 static void xiaomi_mca_test_cp_stop_failure(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_policy_fixture(test);
@@ -3050,6 +3064,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_pm_source_currents),
 	KUNIT_CASE(xiaomi_mca_test_sleep_fixed_pd),
 	KUNIT_CASE(xiaomi_mca_test_cp_stop_failure),
+	KUNIT_CASE(xiaomi_mca_test_retry_schedule),
 	KUNIT_CASE(xiaomi_mca_test_auth_stop_failure),
 	KUNIT_CASE(xiaomi_mca_test_vbus_error_not_detach),
 	KUNIT_CASE(xiaomi_mca_test_threshold_interface),
