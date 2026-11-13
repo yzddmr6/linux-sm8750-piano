@@ -389,7 +389,7 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_REQ_MAX_DELTA_MV	2000
 #define MCA_CP_PPS_MIN_MV	6000
 #define MCA_CP_PPS_MAX_MV	11000	/* stock third_pps_vbus_max */
-#define MCA_CP_BUCK_MA		500	/* SC8541 is rated for 8 A output at 2:1. Remaining FCC comes from buck. */
+#define MCA_CP_BUCK_MA		500	/* buck input during opening */
 #define MCA_CP_STAGE_IBUS_MA	4000
 #define MCA_CP_PAR_HYS_MA	300
 #define MCA_CP_PAR_FCC_MAX_MA	4000
@@ -397,7 +397,7 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_STD_PPS_MAX_MA	5000
 /* bus over-current protection of the stage, above the target */
 #define MCA_CP_BUSOCP_MARGIN_MA	1000
-#define MCA_CP_BUSOCP_MAX_MA	6000
+#define MCA_CP_BUSOCP_MAX_MA	7000	/* Piano bus-ocp-threshold */
 #define MCA_CP_OPEN_IBUS_MA	500	/* the stage counts as running above */
 #define MCA_CP_OPEN_TRIES	10
 #define MCA_CP_LOW_IBUS_MA	300	/* leaves when below for MCA_CP_LOW_POLLS */
@@ -2926,11 +2926,29 @@ static u32 xiaomi_mca_die_limit(struct xiaomi_mca *mca, int tdie)
 	return mca->cp_ibus_hot;
 }
 
+static int xiaomi_mca_cp_band(u32 type)
+{
+	/* One QC3 class B pulse is ten PPS voltage steps. */
+	return type == MCA_TYPE_HVDCP_3_B ? 10 * MCA_CP_REG_STEP_MA : MCA_CP_BAND_MA;
+}
+
+static bool xiaomi_mca_cp_bus_trip(struct xiaomi_mca *mca, int ibus)
+{
+	int margin = max(xiaomi_mca_cp_band(mca->cp_type), MCA_CP_TRIP_IBUS_MA);
+
+	if (ibus >= MCA_CP_BUSOCP_MAX_MA) {
+		mca->cp_fault = true;
+		return true;
+	}
+	return ibus > (int)mca->cp_ibus_ma + margin;
+}
+
 /* One step of direct charging, every MCA_CP_POLL_MS */
 static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 {
 	int vbat, ibat, tcool, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibus, over;
 	int ibat_max, target, ibus_all, vmin, imax;
+	int band = xiaomi_mca_cp_band(mca->cp_type);
 	u32 mv = mca->cp_mv, cv;
 	bool taper;
 	u32 fcc, icl;
@@ -3060,8 +3078,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_stop(mca, "stage temperature");
 		return;
 	}
-	if (ibus > MCA_CP_STAGE_IBUS_MA || ibus > (int)mca->cp_ibus_ma + MCA_CP_TRIP_IBUS_MA) {
-		mca->cp_fault = ibus > MCA_CP_STAGE_IBUS_MA;
+	if (xiaomi_mca_cp_bus_trip(mca, ibus)) {
 		xiaomi_mca_cp_stop(mca, "bus current too high");
 		return;
 	}
@@ -3081,7 +3098,9 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		mv = mca->vbus_uv / 1000;
 	if (mca->cp == MCA_CP_OPENING) {
 		if (ibus < MCA_CP_OPEN_IBUS_MA) {
-			mv += MCA_CP_STEP_MV;
+			if (mca->cp_type != MCA_TYPE_HVDCP_3_B ||
+			    (ibus + band <= target && ibat + 2 * band <= ibat_max))
+				mv += MCA_CP_STEP_MV;
 		} else {
 			dev_info(mca->dev, "direct charging at %u mV: bus %d mV %d mA, battery %d mV %d mA\n",
 				 mca->cp_mv, vbus_uv / 1000, ibus,
@@ -3132,8 +3151,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 				    MCA_CP_REG_STEP_MV, MCA_CP_REG_MAX_STEP_MV);
 		else if (taper || (ibat > ibat_max && mca->cp_ibat_trip <= ibat_max))
 			mv -= MCA_CP_REG_STEP_MV;
-		else if (ibus + MCA_CP_BAND_MA < target &&
-			 ibat + MCA_CP_BAND_MA < ibat_max)
+		else if (ibus + band <= target && ibat + 2 * band <= ibat_max)
 			mv += MCA_CP_REG_STEP_MV;
 		/* the gauges catch up with a lowered limit only from here */
 		if (over > MCA_CP_BAND_MA)
