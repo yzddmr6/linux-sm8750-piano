@@ -45,6 +45,7 @@ bool sc8547a_fastchg_identifying(void);
  * (sc8547a_fastchg_delivering) trumps this path.
  */
 int sc8547a_pps_snapshot(int *vbus_mv, int *vbat_mv, int *ibus_ma);
+int sc8547a_pps_faults(void);
 bool sc8547a_pps_cp_engaged(void);
 int sc8547a_pps_cp_engage(int *need_mv);
 int sc8547a_pps_cp_feed(int *vbus_mv, int *vbat_mv);

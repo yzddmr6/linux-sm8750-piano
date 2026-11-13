@@ -480,6 +480,7 @@ struct sc8547a_device {
 	const struct erhai_charge_curve *auto_curve;	/* selected CC/CV table */
 	int			auto_curve_idx;	/* current row (descends only) */
 	bool			auto_protection;
+	u8 pump_faults;
 	unsigned int		auto_taper_cnt;
 	int			auto_step_cnt;	/* advance debounce counter */
 	int			auto_reservo_cnt;	/* consecutive adapter-reset re-servos */
@@ -865,6 +866,49 @@ static int sc8547_reset_voocphy(struct sc8547a_device *sc)
  */
 static bool pps_slave_engaged;
 static bool pps_cp_engaged;
+
+/* REG0F is read-to-clear. Save OVP/OCP before the shared IRQ is
+ * dispatched to either PHY. UCP, adapter insertion and CHG_EN clearing
+ * alone do not identify an overcurrent. Oplus oplus_voocphy.h.
+ */
+static int sc8547_collect_faults(struct sc8547a_device *sc)
+{
+	u8 flags;
+	int ret;
+
+	if (!sc)
+		return 0;
+	ret = sc8547_read_byte(sc, SC8547_REG_0F, &flags);
+	if (!ret)
+		sc->pump_faults |= flags & GENMASK(7, 3);
+	return ret;
+}
+
+static int sc8547_take_faults(void)
+{
+	struct sc8547a_device *master = sc8547_master_dev, *slave = sc8547_slave_dev;
+	int ret, flags = 0;
+
+	ret = sc8547_collect_faults(master);
+	if (master) {
+		flags = master->pump_faults;
+		master->pump_faults = 0;
+	}
+	if (slave) {
+		/* A missing slave sample cannot erase a real master fault. */
+		sc8547_collect_faults(slave);
+		flags |= slave->pump_faults;
+		slave->pump_faults = 0;
+	}
+	return flags ?: ret;
+}
+
+int sc8547a_pps_faults(void)
+{
+	guard(mutex)(&sc8547_pps_lock);
+	return sc8547_take_faults();
+}
+EXPORT_SYMBOL_GPL(sc8547a_pps_faults);
 static bool pps_adc_hold;	/* keep the ADC on across drops (PPS session) */
 static bool sc8547_slave_is_on(void);	/* defined in the slave section below */
 
@@ -2296,10 +2340,16 @@ static void sc8547_attach_work(struct work_struct *work)
 		int cibus_total = cibus + slave_ma;
 		int margin = vbus - 2 * cpbat;
 		u8 r6 = 0, r7 = 0;
-		if ((!gret && ibat > 13600) || cpbat >= SC8547_CP_OVP_CEILING_MV || cibus >= 4500 ||
-		    slave_ma >= 4500 || cibus_total >= SC8547_IBUS_ABORT_MA) {
+		int faults = sc8547_take_faults();
+
+		if (faults > 0) {
 			sc->auto_protection = true;
-			sc8547_auto_finish(sc, "pump overvoltage or overcurrent");
+			sc8547_auto_finish(sc, "SC8547A OVP/OCP");
+			goto reschedule;
+		}
+		if (faults < 0 || (!gret && ibat > 13600) || cpbat >= SC8547_CP_OVP_CEILING_MV || cibus >= 4500 ||
+		    slave_ma >= 4500 || cibus_total >= SC8547_IBUS_ABORT_MA) {
+			sc8547_auto_finish(sc, "ADC limit or status unavailable");
 			goto reschedule;
 		}
 		if (gret || cpbat <= 0 || vbus <= 0 || cibus < 0 || slave_ma < 0 ||
@@ -2769,10 +2819,11 @@ EXPORT_SYMBOL_GPL(sc8547a_ufcs_monitor);
 static irqreturn_t sc8547_irq_handler(int irq, void *data)
 {
 	struct sc8547a_device *sc = data;
-	u8 flag = 0, state = 0;
+	u8 state = 0;
 
 	/* When the PHY is armed, an IRQ is an adapter VOOC frame. */
 	guard(mutex)(&sc8547_pps_lock);
+	sc8547_collect_faults(sc);
 #if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
 	if (sc->ufcs_owner) {
 		sc8547a_ufcs_irq(sc->ufcs);
@@ -2785,9 +2836,8 @@ static irqreturn_t sc8547_irq_handler(int irq, void *data)
 			return IRQ_HANDLED;
 	}
 
-	sc8547_read_byte(sc, SC8547_REG_0F, &flag);
 	sc8547_read_byte(sc, SC8547_REG_06, &state);
-	dev_dbg(sc->dev, "irq: int_flag=0x%02x status=0x%02x\n", flag, state);
+	dev_dbg(sc->dev, "irq: int_flag=0x%02x status=0x%02x\n", sc->pump_faults, state);
 	return IRQ_HANDLED;
 }
 

@@ -334,6 +334,7 @@ struct erhai_pps {
 	u32 fcc_ceiling_ua;
 	u32 applied_fcc_ua;
 	bool protection;
+	unsigned int high_bus_samples;
 	bool ufcs_protection;
 	bool pps_protection;
 	unsigned long retry_at;
@@ -598,6 +599,7 @@ static int pps_revert(struct erhai_pps *p)
 	p->set_volt_mv = 0;
 	p->set_curr_ma = 0;
 	p->stall_count = 0;
+	p->high_bus_samples = 0;
 	p->buck_off = false;
 	p->cp_lift_since = 0;
 	return 0;
@@ -748,10 +750,8 @@ static int pps_cp_step(struct erhai_pps *p)
 	}
 	if (a->snapshot(&cvbus, &cvbat, &cibus))
 		return -EIO;
-	if (cvbat >= 4800 || cvbus > pps_cp_max_volt_mv) {
-		p->protection = true;
+	if (cvbat >= 4800)
 		return -ERANGE;
-	}
 	if (cvbat < pps_vbat_min_mv || cvbus < pps_vbus_collapse_mv)
 		return -ERANGE;
 
@@ -777,10 +777,7 @@ static int pps_cp_step(struct erhai_pps *p)
 			return pps_cp_release(p, "slave unlatched", true);
 		if (rc)
 			return rc;
-		if (cibus >= 4500 || slave_ma >= 4500) {
-			p->protection = true;
-			return -ERANGE;
-		}
+
 		/* Until the ADC shows sharing, budget one pump. An unbalanced
 		 * pair can only increase by the headroom of its busiest leg.
 		 */
@@ -807,7 +804,8 @@ static int pps_cp_step(struct erhai_pps *p)
 			p->cp_low_cnt = 0;
 		}
 		nv = p->set_volt_mv;
-		if (cibus > (int)(target + 500))
+		if (cibus > (int)(target + 500) || cvbus > pps_cp_max_volt_mv ||
+		    p->vbus_mv > pps_cp_max_volt_mv || max(p->pump_ibus_ma - slave_ma, slave_ma) >= 4500)
 			nv -= pps_cp_vstep_over_mv;
 		else if (cibus > (int)(target + pps_cp_ibus_band_ma) ||
 			 p->ibat_ma > (int)min(pps_cp_ibat_max_ma, 13600U))
@@ -917,9 +915,22 @@ static void pps_poll(struct erhai_pps *p)
 			pps_exit(p, "source, policy or battery unavailable");
 			return;
 		}
-		if (p->vbus_mv > (int)pps_cp_max_volt_mv ||
+		rc = sc8547a_pps_faults();
+		if (rc > 0) {
+			p->protection = true;
+			pps_exit(p, "SC8547A OVP/OCP");
+			return;
+		}
+		if (p->vbus_mv <= (int)pps_cp_max_volt_mv)
+			p->high_bus_samples = 0;
+		else
+			p->high_bus_samples++;
+		/* Allow the 100 mV down-step one servo cycle within the
+		 * 9.9--10 V margin; at board VBUS_OVP immediately release.
+		 */
+		if (rc < 0 || p->vbus_mv >= 10000 || p->high_bus_samples > 1 ||
+		    (p->high_bus_samples && !pps_cp_is_engaged()) ||
 		    p->vbus_mv < (int)pps_vbus_collapse_mv) {
-			p->protection = p->vbus_mv > (int)pps_cp_max_volt_mv;
 			pps_exit(p, "VBUS outside limits");
 			return;
 		}
@@ -941,8 +952,7 @@ static void pps_poll(struct erhai_pps *p)
 			if (!p->ibat_over_since)
 				p->ibat_over_since = jiffies | 1;
 			else if (time_after_eq(jiffies, p->ibat_over_since + 8 * HZ)) {
-				p->protection = true;
-				pps_exit(p, "PPS battery overcurrent");
+				pps_exit(p, "sustained battery overcurrent");
 				return;
 			}
 		} else {
