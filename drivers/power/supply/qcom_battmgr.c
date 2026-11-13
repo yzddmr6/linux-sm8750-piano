@@ -536,6 +536,7 @@ struct qcom_battmgr {
 	bool serial_probe;
 	u32 charge_detected_type;
 	const char *fixed_exit;
+	unsigned int serial_failures, ufcs_failures;
 	unsigned long serial_retry;
 	unsigned long ufcs_retry;
 	bool ufcs_backoff;
@@ -1469,24 +1470,22 @@ static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 /* Every D+/D- acquisition starts with the preceding converter off and
  * VBUS back inside the 5 V range. A late firmware ACK can precede decay.
  */
-static int qcom_battmgr_prepare_probe(struct qcom_battmgr *b)
+static unsigned long qcom_battmgr_probe_retry(unsigned int *failures)
 {
-	u32 uv;
-	int ret;
+	/* Repeat only on idle 5 V. Bound the exponent so an unclassified
+	 * charger is revisited even without an attach/capability interrupt.
+	 */
+	unsigned int shift = min(*failures, 4U);
 
-	ret = b->pps_ops->stop(b->pps_data);
-	ret = ret ?: qcom_battmgr_pd_stop(b, false, "protocol handover");
-	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &uv);
-	if (ret)
-		return ret;
-	return uv >= 4000000 && uv <= 5500000 ? 0 : -EAGAIN;
+	*failures = shift + 1;
+	return jiffies + msecs_to_jiffies(CHARGE_CTRL_POLL_MS << shift);
 }
 
 /* Fixed PDOs and PPS share a worker and never write the contract concurrently. */
 static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
-	bool prefer_pps, dedicated, can_probe, qc, try_qc, caps_changed, current_changed = false;
+	bool probe_idle, prefer_pps, dedicated, can_probe, qc, try_qc, caps_changed, current_changed = false;
 	u32 online, type, health, vbat, vbus, ua, real_type;
 	int ret;
 
@@ -1507,6 +1506,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		return PD_POLL_MS;
 	}
 	if (!online) {
+		battmgr->serial_failures = battmgr->ufcs_failures = 0;
 		battmgr->serial_backoff = false;
 		battmgr->serial_blocked = false;
 		battmgr->serial_probe = false;
@@ -1561,23 +1561,25 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	can_probe = dedicated && !READ_ONCE(battmgr->pps_suspended) &&
 		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
 		    !battmgr->charge_policy_hold && !battmgr->charge_error;
+	probe_idle = can_probe && !battmgr->pd_restore && !battmgr->pd_restore_fcc &&
+		     !qcom_battmgr_pps_running(battmgr) &&
+		     !qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &vbus) &&
+		     vbus >= 4000000 && vbus <= 5500000;
 	if (battmgr->pps_ops) {
 		/* A probe gets exclusive D+/D- ownership only on a dedicated
 		 * source at 5 V. Its decline/timeout releases the crossbar
 		 * before the next protocol (including firmware QC) can act.
 		 */
-		if (can_probe && !battmgr->serial_blocked &&
+		if ((probe_idle || (can_probe && battmgr->serial_probe)) && !battmgr->serial_blocked &&
 		    (!battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
-			ret = battmgr->serial_probe ? 0 : qcom_battmgr_prepare_probe(battmgr);
-			if (!ret)
-				ret = battmgr->pps_ops->serial_session(true);
+			ret = battmgr->pps_ops->serial_session(true);
 			if (!ret) {
 				battmgr->serial_probe = true;
 				return PD_POLL_MS;
 			}
 			battmgr->serial_blocked = ret == -EPERM;
 			battmgr->serial_backoff = true;
-			battmgr->serial_retry = jiffies + msecs_to_jiffies(CHARGE_CTRL_POLL_MS);
+			battmgr->serial_retry = qcom_battmgr_probe_retry(&battmgr->serial_failures);
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 		}
 		if (battmgr->pps_ops->serial_session(false))
@@ -1585,16 +1587,15 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->serial_probe = false;
 	}
 	if (IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS) && can_probe && battmgr->pps_ops &&
-	    (!battmgr->ufcs_backoff || time_after_eq(jiffies, battmgr->ufcs_retry))) {
+	    (battmgr->pps_ops->ufcs_active(battmgr->pps_data) ||
+	     (probe_idle && (!battmgr->ufcs_backoff || time_after_eq(jiffies, battmgr->ufcs_retry))))) {
 		unsigned int delay;
 
-		delay = 0;
-		if (battmgr->pps_ops->ufcs_active(battmgr->pps_data) || !qcom_battmgr_prepare_probe(battmgr))
-			delay = battmgr->pps_ops->ufcs_update(battmgr->pps_data);
+		delay = battmgr->pps_ops->ufcs_update(battmgr->pps_data);
 		if (battmgr->pps_ops->ufcs_active(battmgr->pps_data))
 			return delay ?: PD_POLL_MS;
 		battmgr->ufcs_backoff = true;
-		battmgr->ufcs_retry = jiffies + msecs_to_jiffies(CHARGE_CTRL_POLL_MS);
+		battmgr->ufcs_retry = qcom_battmgr_probe_retry(&battmgr->ufcs_failures);
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 	if (battmgr->pps_ops && battmgr->pps_ops->ufcs_active(battmgr->pps_data) &&
@@ -1640,7 +1641,12 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	 * negotiate, and revisit the fixed PDO after its normal timeout.
 	 */
 	if (battmgr->fixed_backoff && time_after_eq(jiffies, battmgr->fixed_retry)) {
-		battmgr->fixed_backoff = false;
+		/* Check the PDO without releasing a live QC contract. */
+		if (!battmgr->qc_contract || !battmgr->pd_restore ||
+		    (!qcom_battmgr_pd_current(battmgr, PD_FIXED_MV, &ua) && ua))
+			battmgr->fixed_backoff = false;
+		else
+			battmgr->fixed_retry = jiffies + msecs_to_jiffies(PD_CONFIG_TIMEOUT_MS);
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 	if (src.sink && dedicated && !battmgr->fixed_backoff && battmgr->pd_state != PD_ACTIVE &&
