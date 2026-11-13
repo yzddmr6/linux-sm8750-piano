@@ -531,6 +531,7 @@ struct mca_policy_fixture {
 	int error;
 	int write_error;
 	bool voltage_stuck;
+	int ucsi_rp_ua;
 	bool stage_on;
 	int stage_error;
 	unsigned int stage_stops;
@@ -738,6 +739,7 @@ static struct mca_policy_fixture *mca_policy_fixture(struct kunit *test)
 	f->charging_enabled = 1;
 	f->usb_online = 1;
 	f->type = MCA_TYPE_PD;
+	f->pdos[0] = (struct xiaomi_mca_pdo) { cpu_to_le32(5000), cpu_to_le32(5000), cpu_to_le32(1500) };
 	f->vbus = 5000000;
 	f->icl = 100;
 	f->fcc = 500;
@@ -763,7 +765,7 @@ static void xiaomi_mca_test_policy_defaults(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_cp_after_auth(&f->mca));
 	mipps_auth = false;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_icl(MCA_TYPE_C), 500);
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_icl(MCA_TYPE_FLOAT), 500);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_icl(MCA_TYPE_FLOAT), 1000);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_fcc(MCA_TYPE_C, false), 500);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_policy_icl(MCA_TYPE_UNKNOWN), 0);
 	KUNIT_EXPECT_FALSE(test, charge_policy);
@@ -928,13 +930,13 @@ static void xiaomi_mca_test_temperature_follow(struct kunit *test)
 	mca->hv = MCA_HV_ON;
 	f->vbus = 9000000;
 	mutex_lock(&mca->lock);
-	xiaomi_mca_apply_fcc(mca, 25);
+	xiaomi_mca_apply_fcc(mca, 25, 1500);
 	KUNIT_EXPECT_EQ(test, f->fcc, 3000);
-	xiaomi_mca_apply_fcc(mca, 47);
+	xiaomi_mca_apply_fcc(mca, 47, 1500);
 	KUNIT_EXPECT_EQ(test, f->fcc, 3000);
-	xiaomi_mca_apply_fcc(mca, 48);
+	xiaomi_mca_apply_fcc(mca, 48, 1500);
 	KUNIT_EXPECT_EQ(test, f->fcc, 3000);
-	xiaomi_mca_apply_fcc(mca, -1);
+	xiaomi_mca_apply_fcc(mca, -1, 1500);
 	KUNIT_EXPECT_EQ(test, f->fcc, 880);
 	KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_CHARGE_CURRENT);
 	mutex_unlock(&mca->lock);
@@ -1192,9 +1194,9 @@ static void xiaomi_mca_test_pm_source_currents(struct kunit *test)
 		{ MCA_TYPE_CDP, 900, 900 },
 		{ MCA_TYPE_DCP, 1500, 2000 },
 		{ MCA_TYPE_C, 500, 500 },
-		{ MCA_TYPE_PD, 900, 2000 },
-		{ MCA_TYPE_PD_VERIFY, 900, 2000 },
-		{ MCA_TYPE_PD_PPS, 900, 2000 },
+		{ MCA_TYPE_PD, 900, 900 },
+		{ MCA_TYPE_PD_VERIFY, 900, 900 },
+		{ MCA_TYPE_PD_PPS, 900, 900 },
 	};
 	struct mca_policy_fixture *f = mca_policy_fixture(test);
 	int i;
@@ -1227,7 +1229,7 @@ static void xiaomi_mca_test_pm_source_currents(struct kunit *test)
 	/* The 5 V handoff retains the existing warm-battery derating. */
 	f->tbat = 48;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_prepare(f->mca.dev), 0);
-	KUNIT_EXPECT_EQ(test, f->fcc, xiaomi_mca_fcc_thermal(2000, 48));
+	KUNIT_EXPECT_EQ(test, f->fcc, xiaomi_mca_fcc_thermal(900, 48));
 }
 
 static void xiaomi_mca_test_sleep_fixed_pd(struct kunit *test)
@@ -2645,6 +2647,9 @@ static int mca_ucsi_supply_get(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_USB_TYPE:
 		val->intval = f->ucsi_type;
 		break;
+	case POWER_SUPPLY_PROP_CURRENT_NOW:
+		val->intval = f->ucsi_rp_ua;
+		break;
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = f->ucsi_status;
 		break;
@@ -2658,7 +2663,7 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 {
 	static const enum power_supply_property props[] = {
 		POWER_SUPPLY_PROP_ONLINE, POWER_SUPPLY_PROP_USB_TYPE,
-		POWER_SUPPLY_PROP_STATUS,
+		POWER_SUPPLY_PROP_STATUS, POWER_SUPPLY_PROP_CURRENT_NOW,
 	};
 	static const struct power_supply_desc desc = {
 		.name = "mca-test-ucsi", .type = POWER_SUPPLY_TYPE_USB,
@@ -2676,6 +2681,14 @@ static void xiaomi_mca_test_pd_recovery(struct kunit *test)
 	peer = devm_power_supply_register(peer_dev, &desc, &cfg);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, peer);
 	f->ucsi_online = 1;
+	f->ucsi_type = POWER_SUPPLY_USB_TYPE_C;
+	f->ucsi_status = POWER_SUPPLY_STATUS_CHARGING;
+	f->ucsi_rp_ua = 1500000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_5v_input(&f->mca, MCA_TYPE_C), 1500);
+	f->ucsi_rp_ua = 3000000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_5v_input(&f->mca, MCA_TYPE_C), 2500);
+	f->ucsi_status = POWER_SUPPLY_STATUS_DISCHARGING;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_5v_input(&f->mca, MCA_TYPE_C), 500);
 	f->ucsi_type = POWER_SUPPLY_USB_TYPE_PD;
 	f->ucsi_status = POWER_SUPPLY_STATUS_CHARGING;
 	f->type = MCA_TYPE_UNKNOWN;
