@@ -503,7 +503,9 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 	unsigned int ma, idx;
 
 	curve = erhai_curve_select(pps_curves, p->soc, p->temp_ddc);
-	if (!curve || p->vbat_mv < pps_vbat_min_mv ||
+	/* Stock admission keeps 1 C of headroom below the 51 C stop. */
+	if (!curve || (entering && p->temp_ddc >= 500) ||
+	    p->vbat_mv < (int)pps_vbat_min_mv ||
 	    p->vbat_mv >= min_t(unsigned int, pps_vbat_max_mv,
 				p->temp_ddc >= 440 ? 4130 : 4490))
 		return 0;
@@ -920,6 +922,12 @@ static void pps_poll(struct erhai_pps *p)
 			pps_exit(p, "source, policy or battery unavailable");
 			return;
 		}
+		if (p->vbus_mv > (int)pps_cp_max_volt_mv ||
+		    p->vbus_mv < (int)pps_vbus_collapse_mv) {
+			p->protection = p->vbus_mv > (int)pps_cp_max_volt_mv;
+			pps_exit(p, "VBUS outside limits");
+			return;
+		}
 		cell_ma = pps_cell_limit(p, false);
 		if (!cell_ma) {
 			pps_exit(p, "battery limit");
@@ -949,12 +957,7 @@ static void pps_poll(struct erhai_pps *p)
 			pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}
-		if (p->vbus_mv > (int)pps_cp_max_volt_mv ||
-		    p->vbus_mv < (int)pps_vbus_collapse_mv) {
-			p->protection = p->vbus_mv > (int)pps_cp_max_volt_mv;
-			pps_exit(p, "VBUS outside limits");
-			return;
-		}
+
 	}
 
 	switch (p->state) {

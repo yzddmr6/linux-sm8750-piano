@@ -1956,7 +1956,8 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 	const struct erhai_charge_step *step;
 
 	curve = erhai_curve_select(svooc_curves, soc, temp);
-	if (!curve || mv <= SC8547_CELL_MIN_VALID_MV ||
+	/* vooc_high_temp (entry) and over_high_temp (running). */
+	if (!curve || (entering && temp > 500) || mv <= SC8547_CELL_MIN_VALID_MV ||
 	    mv >= sc8547_cell_cv(temp))
 		return false;
 
