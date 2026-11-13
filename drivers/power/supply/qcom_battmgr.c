@@ -1195,7 +1195,10 @@ static bool qcom_battmgr_pps_running(struct qcom_battmgr *battmgr)
 
 static int qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr)
 {
-	return battmgr->pps_ops ? battmgr->pps_ops->stop(battmgr->pps_data) : 0;
+	if (!battmgr->pps_ops)
+		return 0;
+	return battmgr->pps_ops->serial_session(false) ?:
+		battmgr->pps_ops->stop(battmgr->pps_data);
 }
 
 /* Match only the Type-C supply belonging to this PMIC GLINK instance. */
@@ -1427,6 +1430,28 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		}
 		/* Optional classification must not disable ordinary fixed PD. */
 		real_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	}
+	/* Dedicated legacy supplies have no USB data role. A VOOC brick
+	 * can identify as DCP or Apple-style before its first serial frame.
+	 * Leave SDP, CDP, PD and OTG on their normal routes.
+	 */
+	if (battmgr->pps_ops) {
+		bool dedicated = type == POWER_SUPPLY_USB_TYPE_DCP ||
+				 type == OPLUS_USB_TYPE_APPLE_BRICK_ID;
+
+		if (dedicated && (real_type == POWER_SUPPLY_USB_TYPE_DCP ||
+				  real_type == OPLUS_USB_TYPE_APPLE_BRICK_ID) &&
+		    !READ_ONCE(battmgr->pps_suspended) && !READ_ONCE(battmgr->otg_request) &&
+		    !battmgr->charge_inhibited && !battmgr->charge_policy_hold &&
+		    !battmgr->charge_error) {
+			if (battmgr->pps_ops->stop(battmgr->pps_data) ||
+			    qcom_battmgr_pd_stop(battmgr, false, "serial charger") ||
+			    battmgr->pps_ops->serial_session(true))
+				return PD_POLL_MS;
+			return 0;
+		}
+		if (battmgr->pps_ops->serial_session(false))
+			return PD_POLL_MS;
 	}
 	prefer_pps = !READ_ONCE(battmgr->pps_suspended) &&
 		     battmgr->pps_ops && battmgr->pps_ops->enabled() &&

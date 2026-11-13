@@ -61,9 +61,9 @@
  * (sc->vooc_saw_any) — so a non-VOOC charger still declines on the FIRST
  * window exactly as before (D+/D- restored promptly).
  */
-static bool serial_enable;
+static bool serial_enable = true;
 module_param(serial_enable, bool, 0444);
-MODULE_PARM_DESC(serial_enable, "Enable experimental serial VOOC/SVOOC (default off)");
+MODULE_PARM_DESC(serial_enable, "Identify SUPERVOOC adapters on dedicated charging ports");
 
 static DEFINE_MUTEX(sc8547_pps_lock);
 
@@ -473,10 +473,7 @@ struct sc8547a_device {
 	int			last_vbus;	/* last servo readings (for logging) */
 	int			last_vbat;
 	struct delayed_work	attach_work;	/* post-attach crossbar/arm poller */
-	bool			vbus_was_present;/* attach/detach edge tracking (debounced) */
-	unsigned long		vbus_absent_since;/* jiffies of first absent poll, 0 = present */
 	bool			auto_armed;	/* crossbar+PHY armed for this plug */
-	unsigned long		arm_at;		/* jiffies: settle deadline post-attach */
 	enum sc8547_adapter_type adapter_type;
 	u8			vooc_head;	/* invert head written into TX */
 	bool			vooc_move_head;
@@ -497,6 +494,8 @@ struct sc8547a_device {
 	u8			adapter_check_cmmu_count;
 	u8			adapter_model_count;
 	u8			adapter_model_ver;
+	u8			adapter_cap;
+	bool			model_received;
 	bool			adapter_check_ok;
 	u8			ask_batt_sys;
 
@@ -642,23 +641,6 @@ static int sc8547_set_chg_enable(struct sc8547a_device *sc, bool enable)
 	return sc8547_write_byte(sc, SC8547_REG_07, enable ? 0x80 : 0x00);
 }
 
-static int sc8547_get_chg_enable(struct sc8547a_device *sc, bool *enabled)
-{
-	u8 val = 0;
-	int ret = sc8547_read_byte(sc, SC8547_REG_07, &val);
-
-	if (ret)
-		return ret;
-	*enabled = !!(val & SC8547_CHG_EN_MASK);
-	return 0;
-}
-
-static int sc8547_set_charge_mode(struct sc8547a_device *sc, bool half)
-{
-	return sc8547_update_bits(sc, SC8547_REG_09, SC8547_CHARGE_MODE_MASK,
-				  half ? SC8547_CHARGE_MODE_MASK : 0);
-}
-
 static int sc8547_set_adc_enable(struct sc8547a_device *sc, bool enable)
 {
 	return sc8547_write_byte(sc, SC8547_REG_11, enable ? 0x80 : 0x00);
@@ -670,8 +652,8 @@ static int sc8547_get_vbus(struct sc8547a_device *sc)
 	u8 buf[2];
 	int ret = i2c_smbus_read_i2c_block_data(sc->client, SC8547_REG_15, 2, buf);
 
-	if (ret < 0)
-		return ret;
+	if (ret != sizeof(buf))
+		return ret < 0 ? ret : -EIO;
 	return (((buf[0] & SC8547_VBUS_POL_H_MASK) << 8) | buf[1]) *
 	       SC8547_VBUS_ADC_LSB_NUM / SC8547_VBUS_ADC_LSB_DEN;
 }
@@ -682,8 +664,8 @@ static int sc8547_get_ibus(struct sc8547a_device *sc)
 	u8 buf[2];
 	int ret = i2c_smbus_read_i2c_block_data(sc->client, SC8547_REG_13, 2, buf);
 
-	if (ret < 0)
-		return ret;
+	if (ret != sizeof(buf))
+		return ret < 0 ? ret : -EIO;
 	return ((buf[0] << 8) | buf[1]) *
 	       SC8547_IBUS_ADC_LSB_NUM / SC8547_IBUS_ADC_LSB_DEN;
 }
@@ -694,8 +676,8 @@ static int sc8547_get_vbat(struct sc8547a_device *sc)
 	u8 buf[2];
 	int ret = i2c_smbus_read_i2c_block_data(sc->client, SC8547_REG_1B, 2, buf);
 
-	if (ret < 0)
-		return ret;
+	if (ret != sizeof(buf))
+		return ret < 0 ? ret : -EIO;
 	return ((buf[0] << 8) | buf[1]) *
 	       SC8547_VBAT_ADC_LSB_NUM / SC8547_VBAT_ADC_LSB_DEN;
 }
@@ -721,11 +703,6 @@ static int sc8547_set_txbuff(struct sc8547a_device *sc, u16 val)
 static int sc8547_get_adapter_info(struct sc8547a_device *sc)
 {
 	return sc8547_read_word(sc, SC8547_REG_2E);
-}
-
-static void sc8547_send_handshake(struct sc8547a_device *sc)
-{
-	sc8547_write_byte(sc, SC8547_REG_2B, 0x81);
 }
 
 /* Base hardware config, applied at probe and on reset. */
@@ -784,22 +761,14 @@ static int sc8547_hardware_init(struct sc8547a_device *sc)
  */
 static int sc8547_init_vooc(struct sc8547a_device *sc)
 {
-	u8 value = 0;
+	int ret = sc8547_hardware_init(sc);
 
-	sc8547_reg_reset(sc);
-	sc8547_init_device(sc);
-
-	sc8547_write_word(sc, SC8547_REG_31, 0x0);	/* predata */
-	sc8547_read_byte(sc, SC8547_REG_3A, &value);
-	value |= BIT(6);
-	sc8547_write_byte(sc, SC8547_REG_3A, value);
-
-	sc8547_write_byte(sc, SC8547_REG_21, 0x21);	/* DPDM */
-	sc8547_write_byte(sc, SC8547_REG_22, 0x00);
-	sc8547_write_byte(sc, SC8547_REG_33, 0xD1);	/* loose_det */
-
-	sc8547_write_byte(sc, SC8547_REG_30, 0x05);	/* VOOC irq enable */
-	return 0;
+	return ret ?: sc8547_write_word(sc, SC8547_REG_31, 0) ?:
+		sc8547_update_bits(sc, SC8547_REG_3A, BIT(6), BIT(6)) ?:
+		sc8547_write_byte(sc, SC8547_REG_21, 0x21) ?:
+		sc8547_write_byte(sc, SC8547_REG_22, 0) ?:
+		sc8547_write_byte(sc, SC8547_REG_33, 0xd1) ?:
+		sc8547_write_byte(sc, SC8547_REG_30, 0x05);
 }
 
 /* SVOOC constant-current hardware profile (vendor sc8547_svooc_hw_setting). */
@@ -1132,31 +1101,53 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_adc_hold);
 #define SC8547_SLAVE_CP_ON		0x81
 #define SC8547_SLAVE_CP_OFF		0x01
 
-static void sc8547_slave_hw_setting(struct sc8547a_device *master)
+static int sc8547_slave_hw_setting(struct sc8547a_device *master)
 {
 	struct sc8547a_device *sc = sc8547_slave_dev;
+	int ret;
 
 	if (!sc)
-		return;
-	sc8547_write_byte(sc, SC8547_REG_02, 0x01);		/* VAC_OVP 12V */
-	sc8547_write_byte(sc, SC8547_REG_04, 0x50);		/* VBUS_OVP 10V */
-	sc8547_write_byte(sc, SC8547_REG_05, 0x10 | (sc->ocp_reg & 0x0f));
-	sc8547_write_byte(sc, SC8547_REG_09, 0x03);		/* watchdog 1000ms */
-	sc8547_write_byte(sc, SC8547_REG_3C, 0x40);		/* VOOC_CTRL disable */
-	sc8547_write_byte(sc, SC8547_REG_11, 0x80);		/* ADC enable */
-	sc8547_write_byte(sc, SC8547_REG_07, SC8547_SLAVE_CP_OFF);
-	sc8547_write_byte(sc, SC8547_REG_0D, 0x70);
+		return -ENODEV;
+	ret = sc8547_write_byte(sc, SC8547_REG_02, 0x01);		/* VAC_OVP 12V */
+	if (ret)
+		return ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_04, 0x50);		/* VBUS_OVP 10V */
+	if (ret)
+		return ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_05, 0x10 | (sc->ocp_reg & 0x0f));
+	if (ret)
+		return ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_09, 0x03);		/* watchdog 1000ms */
+	if (ret)
+		return ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_3C, 0x40);		/* VOOC_CTRL disable */
+	if (ret)
+		return ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_11, 0x80);		/* ADC enable */
+	if (ret)
+		return ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_07, SC8547_SLAVE_CP_OFF);
+	if (ret)
+		return ret;
+	ret = sc8547_write_byte(sc, SC8547_REG_0D, 0x70);
+	if (ret)
+		return ret;
 	/*
 	 * Same as the master: at parallel CP-close the slave current is near zero
 	 * and only ramps as Vbus rises, so an armed IBUS-UCP (5 ms) or soft-start
 	 * timeout trips the slave off instantly and it never shares load (reads ~0).
 	 * Disable both; OCP/OVP still bound it.
 	 */
-	sc8547_update_bits(sc, SC8547_REG_05, SC8547_IBUS_UCP_DIS_MASK,
+	ret = sc8547_update_bits(sc, SC8547_REG_05, SC8547_IBUS_UCP_DIS_MASK,
 			   SC8547_IBUS_UCP_DIS_MASK);
-	sc8547_update_bits(sc, SC8547_REG_08, SC8547_SS_TIMEOUT_SET_MASK,
+	if (ret)
+		return ret;
+	ret = sc8547_update_bits(sc, SC8547_REG_08, SC8547_SS_TIMEOUT_SET_MASK,
 			   SC8547_SS_TIMEOUT_DISABLE);
+	if (ret)
+		return ret;
 	dev_info(master->dev, "slave CP: parallel hw profile applied\n");
+	return 0;
 }
 
 static void sc8547_slave_cp_enable(struct sc8547a_device *master, bool on)
@@ -1193,12 +1184,9 @@ static void sc8547_slave_feed_wd(void)
 /* Slave bus current (mA); 0 when no slave or its ADC/CP is idle. */
 static int sc8547_slave_ibus(void)
 {
-	int ibus;
-
 	if (!sc8547_slave_dev)
 		return 0;
-	ibus = sc8547_get_ibus(sc8547_slave_dev);
-	return ibus > 0 ? ibus : 0;
+	return sc8547_get_ibus(sc8547_slave_dev);
 }
 
 /* True if the slave CP has its CHG_EN latched (i.e. it is actually converting). */
@@ -1476,6 +1464,7 @@ static void vooc_handle_tell_model_process(struct sc8547a_device *sc)
 				     VOOC_BIT_ACTIVE);
 		sc->adapter_model_ver |= sc->adapter_mesg;
 		sc->adapter_model_ver &= 0x7F;
+		sc->model_received = true;
 		dev_info(sc->dev, "adapter model 0x%02x\n", sc->adapter_model_ver);
 		sc->fastchg_ask_cmd = VOOC_CMD_UNKNOWN;
 	}
@@ -1558,8 +1547,8 @@ static void sc8547_vbus_vbatt_detect(struct sc8547a_device *sc)
 	sc->last_vbus = vbus;
 	sc->last_vbat = vbat;
 
-	if (vbus < 0 || vbat < 0) {
-		sc->vooc_vbus_status = SC_VBUS_LOW;
+	if (vbus <= 0 || vbat <= 0) {
+		sc->vooc_vbus_status = SC_VBUS_HIGH;
 		return;
 	}
 
@@ -1621,8 +1610,9 @@ static void vooc_handle_is_vbus_ok(struct sc8547a_device *sc)
 	 */
 	if (sc->vooc_vbus_status == SC_VBUS_NORMAL && sc->fastchg_deliver &&
 	    sc->hw_profile_set && !sc->cp_enabled) {
-		sc8547_write_byte(sc, SC8547_REG_09, 0x13);	/* watchdog 1000ms */
-		sc8547_set_chg_enable(sc, true);
+		if (sc8547_write_byte(sc, SC8547_REG_09, 0x13) ||
+		    sc8547_set_chg_enable(sc, true))
+			return;
 		sc->cp_enabled = true;
 		/*
 		 * The slave CP is NOT closed here: at cold CP-close Vbus-2*Vbat is
@@ -1922,9 +1912,56 @@ static int sc8547_auto_init_idx(const struct sc8547_curve_row *curve, int len,
 }
 
 /* Clamp an Android curve code to the auto ceiling. */
-static u8 sc8547_auto_clamp_code(u8 code)
+/* SUPERVOOC model IDs and rated watts from OnePlusOSS sm8750,
+ * cc463675855a, oplus_chg_vooc.c adapter_id_table (GPL-2.0-only).
+ * Use the 11 V SUPERVOOC rating
+ * (100 mA per step) and the live connector current limit together. Unknown models stay on the ordinary charging path.
+ */
+static u8 sc8547_adapter_cap(u8 model)
 {
-	return code > SC8547_AUTO_CODE_CEILING ? SC8547_AUTO_CODE_CEILING : code;
+	static const struct { u8 first, last, watts; } ratings[] = {
+		{ 0x11, 0x12, 50 },
+		{ 0x14, 0x14, 65 },
+		{ 0x1a, 0x1b, 33 },
+		{ 0x1c, 0x1c, 45 },
+		{ 0x1d, 0x1e, 44 },
+		{ 0x21, 0x21, 50 },
+		{ 0x22, 0x22, 44 },
+		{ 0x23, 0x23, 50 },
+		{ 0x24, 0x27, 55 },
+		{ 0x28, 0x28, 65 },
+		{ 0x2a, 0x2a, 65 },
+		{ 0x2b, 0x2b, 66 },
+		{ 0x2c, 0x2e, 67 },
+		{ 0x31, 0x31, 50 },
+		{ 0x32, 0x32, 120 },
+		{ 0x33, 0x33, 50 },
+		{ 0x35, 0x35, 65 },
+		{ 0x36, 0x36, 66 },
+		{ 0x37, 0x3a, 88 },
+		{ 0x3b, 0x3e, 100 },
+		{ 0x47, 0x48, 120 },
+		{ 0x49, 0x4a, 33 },
+		{ 0x4b, 0x4e, 80 },
+		{ 0x51, 0x51, 125 },
+		{ 0x61, 0x61, 33 },
+		{ 0x62, 0x62, 50 },
+		{ 0x63, 0x63, 65 },
+		{ 0x64, 0x64, 66 },
+		{ 0x65, 0x65, 80 },
+		{ 0x66, 0x66, 65 },
+		{ 0x67, 0x68, 125 },
+		{ 0x69, 0x6a, 100 },
+		{ 0x6b, 0x6b, 120 },
+		{ 0x6c, 0x6d, 67 },
+		{ 0x6e, 0x6e, 65 },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(ratings); i++)
+		if (model >= ratings[i].first && model <= ratings[i].last)
+			return min_t(u8, ratings[i].watts * 10 / 11, SC8547_AUTO_CODE_CEILING);
+	return 0;
 }
 
 /*
@@ -1937,7 +1974,7 @@ static u8 sc8547_auto_clamp_code(u8 code)
 static bool sc8547_auto_step(struct sc8547a_device *sc, int vbat, int ibus)
 {
 	const struct sc8547_curve_row *row = &sc->auto_curve[sc->auto_curve_idx];
-	u8 clamped = sc8547_auto_clamp_code(row->code);
+	u8 clamped = min(row->code, sc->adapter_cap);
 	bool advance;
 
 	if (row->exit) {
@@ -1954,7 +1991,7 @@ static bool sc8547_auto_step(struct sc8547a_device *sc, int vbat, int ibus)
 			sc->auto_curve_idx++;
 			sc->auto_step_cnt = 0;
 			row = &sc->auto_curve[sc->auto_curve_idx];
-			clamped = sc8547_auto_clamp_code(row->code);
+			clamped = min(row->code, sc->adapter_cap);
 			dev_info(sc->dev,
 				 "auto: step to curve[%d] target_vbat %d code %u (clamped %u)%s\n",
 				 sc->auto_curve_idx, row->target_vbat, row->code,
@@ -1978,6 +2015,8 @@ static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
 	sc->adapter_ask_check_count = 3;
 	sc->adapter_check_cmmu_count = 0;
 	sc->adapter_model_count = 0;
+	sc->model_received = false;
+	sc->adapter_cap = 0;
 	sc->ask_batt_sys = 0;
 	sc->curve_sent = false;
 	sc->vooc_head = SVOOC_INVERT_HEAD;
@@ -2000,44 +2039,26 @@ static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
  */
 static void sc8547_vooc_arm_hw(struct sc8547a_device *sc)
 {
-	int ret = wcd939x_usbss_dpdm_switch_fast_charge(true);
+	int ret;
 
-	/*
-	 * -EBUSY = DisplayPort alt-mode owns the USBSS switches. A DP sink is
-	 * never a VOOC adapter, and stealing the switch block kills DP AUX, so
-	 * stay out and charge over the normal path for this plug.
-	 */
-	if (ret == -EBUSY) {
-		dev_info(sc->dev, "DP alt-mode active — skipping VOOC arm\n");
+	sc8547_vooc_reset_state(sc);
+	ret = wcd939x_usbss_dpdm_switch_fast_charge(true);
+	if (!ret)
+		ret = sc8547_init_vooc(sc);
+	if (!ret)
+		ret = sc8547_svooc_hw_setting(sc);
+	if (!ret)
+		ret = sc8547_slave_hw_setting(sc);
+	if (!ret)
+		ret = sc8547_write_byte(sc, SC8547_REG_2B, 0x81);
+	if (ret) {
+		sc8547_reset_voocphy(sc);
+		sc8547_slave_reset();
+		wcd939x_usbss_dpdm_switch_fast_charge(false);
 		sc->auto_state = SC_AUTO_DECLINED;
 		return;
 	}
-
-	if (ret && ret != -ENODEV)
-		dev_warn(sc->dev, "DPDM switch to charge path failed: %d\n", ret);
-
-	sc8547_vooc_reset_state(sc);
-	sc8547_init_vooc(sc);
-	sc8547_set_adc_enable(sc, true);	/* init_vooc cleared it; keep VBUS ADC */
-
-	/*
-	 * Apply the CP hardware profile NOW, in the settle window before any VOOC
-	 * frame flows, when delivery is armed. svooc_hw_setting writes CP config
-	 * (REG_0D/33/3A etc.) that disturbs the D+/D- path if done mid-servo, and is
-	 * too many I2C writes to do in the timing-critical is_vbus reply. Doing it
-	 * here means the NORMAL frame only needs watchdog-enable + chg-enable.
-	 * The auto path arms in observation (fastchg_deliver still 0) but will
-	 * escalate to delivery mid-ladder, so pre-apply the profile now too —
-	 * doing it here (before any frame) avoids disturbing the D+/D- servo,
-	 * and it is harmless if the adapter is later declined (CP never closes).
-	 */
-	if (sc->fastchg_deliver || sc->fastchg_auto) {
-		sc8547_svooc_hw_setting(sc);
-		sc->hw_profile_set = true;
-		sc8547_slave_hw_setting(sc);	/* pre-arm parallel CP (stays off) */
-	}
-
-	sc8547_send_handshake(sc);
+	sc->hw_profile_set = true;
 }
 
 /*
@@ -2110,7 +2131,9 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc)
 	sc8547_slave_cp_enable(sc, false);	/* drop parallel CP before re-arm */
 	sc->fastchg_enable = false;
 	sc->fastchg_deliver = false;
-	sc8547_vooc_arm_hw(sc);			/* re-init PHY + resend handshake */
+	sc8547_vooc_arm_hw(sc);
+	if (sc->auto_state == SC_AUTO_DECLINED)
+		return;
 	sc->auto_state = SC_AUTO_IDENTIFY;
 	sc->auto_identify_deadline = jiffies +
 		msecs_to_jiffies(SC8547_AUTO_IDENTIFY_MS);
@@ -2209,9 +2232,9 @@ static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
 static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 {
 	const struct sc8547_curve_row *curve;
-	int soc, temp_ddc, vbat, cell_mv = -1, vref, len, idx, ret;
+	int soc, temp_ddc, vbat, cell_mv = -1, vref, len, idx, ret, ua;
 
-	if (!sc->adapter_check_ok) {
+	if (!sc->adapter_check_ok || !sc->model_received) {
 		if (time_before(jiffies, sc->auto_identify_deadline))
 			return;
 		if (sc8547_auto_identify_retry(sc))
@@ -2220,7 +2243,10 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 		return;
 	}
 
-	if (sc->adapter_type != SC_ADAPTER_SVOOC) {
+	ua = erhai_otg_adsp_usb_prop(4); /* USB_CURR_MAX, microamps */
+	sc->adapter_cap = min_t(int, sc8547_adapter_cap(sc->adapter_model_ver),
+				max(ua, 0) / 100000);
+	if (sc->adapter_type != SC_ADAPTER_SVOOC || !sc->adapter_cap) {
 		sc8547_auto_decline(sc, "not an SVOOC adapter");
 		return;
 	}
@@ -2277,7 +2303,7 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 	sc->auto_curve_len = len;
 	sc->auto_curve_idx = idx;
 	sc->auto_step_cnt = 0;
-	sc->fastchg_curr_code = sc8547_auto_clamp_code(curve[idx].code);
+	sc->fastchg_curr_code = min(curve[idx].code, sc->adapter_cap);
 	if (!sc->hw_profile_set) {		/* normally pre-applied at arm */
 		sc8547_svooc_hw_setting(sc);
 		sc->hw_profile_set = true;
@@ -2293,140 +2319,24 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 		 sc->fastchg_curr_code);
 }
 
-#define SC8547_VBUS_PRESENT_MV	3000
 #define SC8547_ATTACH_SETTLE_MS	300
 #define SC8547_ATTACH_POLL_MS	250
-/*
- * Once the ladder reaches is_vbus_ok the SVOOC adapter transiently collapses
- * Vbus on protocol resets/timeouts. A single absent poll must NOT be read as an
- * unplug (that would restore the USB route + re-flip the crossbar → audible USB
- * re-enumeration churn). Require Vbus absent for this sustained window before
- * declaring detach; a real unplug stays absent and still trips it.
- */
-#define SC8547_DETACH_DEBOUNCE_MS	600
 
-/*
- * Attach poller: while armed, watch the CP's own VBUS ADC for charger
- * plug/unplug. On the attach edge, wait a short settle window (so the Type-C
- * mux has finished reprogramming the USBSS) then arm the crossbar + VOOC
- * handshake; on unplug, restore the normal USB route. This makes a single
- * `echo 1 > vooc` self-manage every plug cycle without manual re-arm timing.
- */
 static void sc8547_attach_work(struct work_struct *work)
 {
 	struct sc8547a_device *sc =
 		container_of(work, struct sc8547a_device, attach_work.work);
 	int vbus;
-	bool present;
 
+	guard(mutex)(&sc8547_pps_lock);
 	if (!sc->vooc_started)
 		return;
 
 	vbus = sc8547_get_vbus(sc);
-
-	/*
-	 * Present source: prefer the ADSP connector state (USB_ONLINE, prop 0)
-	 * while reachable — it tracks the PHYSICAL plug even when the erhai_pps
-	 * engine holds an internal PPS rail that keeps the SC8547 VBUS ADC above
-	 * the present threshold across a real detach.  Relying on the ADC alone
-	 * stranded the serial-VOOC ladder in `declined` for the whole boot on the
-	 * engine kernels (2026-09-25): the SC8547-VBUS attach edge never fired on
-	 * a physical replug, so the historical "replug = fresh 5 V identify"
-	 * recovery was dead and a genuine SuperVOOC brick stayed locked to PPS.
-	 * Fall back to the SC8547 VBUS ADC while the ADSP is not yet reachable
-	 * (early boot / firmware absent).
-	 */
-	{
-		int adsp_online = erhai_otg_adsp_usb_prop(0);	/* USB_ONLINE */
-
-		if (adsp_online >= 0)
-			present = adsp_online > 0;
-		else
-			present = vbus > SC8547_VBUS_PRESENT_MV;
-	}
-
-	if (!present) {
-		/*
-		 * Debounce absence: a raw-absent state only becomes a logical
-		 * detach after the debounce window of continuous absence, so brief
-		 * SVOOC protocol Vbus-dips during the servo don't flip
-		 * vbus_was_present (which would fire a spurious detach→attach edge
-		 * and re-flip the crossbar). A real unplug stays absent past the
-		 * window → detach fires.
-		 *
-		 * Widen the absence window while auto is delivering or re-servoing:
-		 * an SVOOC keep-alive reset can hold Vbus low longer than the plain
-		 * detach debounce, and tearing down there would flip the crossbar
-		 * and lose the re-handshake. A real unplug still trips, just slower.
-		 */
-		unsigned long debounce_ms = SC8547_DETACH_DEBOUNCE_MS;
-
-		if (sc->auto_state == SC_AUTO_DELIVER ||
-		    (sc->auto_state == SC_AUTO_IDENTIFY && sc->auto_reservo_cnt > 0))
-			debounce_ms = SC8547_AUTO_DETACH_DEBOUNCE_MS;
-
-		if (!sc->vbus_was_present) {
-			present = false;	/* already detached, stay so */
-			sc->vbus_absent_since = 0;
-		} else if (!sc->vbus_absent_since) {
-			sc->vbus_absent_since = jiffies;
-			present = true;		/* debounce in progress */
-		} else {
-			present = !time_after(jiffies, sc->vbus_absent_since +
-					      msecs_to_jiffies(debounce_ms));
-		}
-	} else {
-		sc->vbus_absent_since = 0;
-	}
-
-	if (present && !sc->vbus_was_present) {
-		/* attach edge: start settle timer, arm once it expires */
-		sc->arm_at = jiffies + msecs_to_jiffies(SC8547_ATTACH_SETTLE_MS);
-		sc->auto_armed = false;
-		sc->slave_low_cnt = 0;
-		sc->slave_on_since = jiffies;	/* fresh plug: full settle grace */
-		/* Hands-free: re-arm the auto charge-manager on every fresh attach. */
-		sc->fastchg_auto = true;
-		if (sc->fastchg_auto) {
-			/*
-			 * Auto charge-manager engaged: arm in observation, gate
-			 * real delivery behind adapter-identify. Force the manual
-			 * gates off so the settle-window arm is observation-only
-			 * until sc8547_auto_identify_tick escalates.
-			 */
-			sc->auto_state = SC_AUTO_IDENTIFY;
-			sc->fastchg_enable = false;
-			sc->fastchg_deliver = false;
-			sc->auto_curve = NULL;
-			sc->auto_step_cnt = 0;
-			sc->auto_reservo_cnt = 0;	/* fresh plug: full budget */
-			sc->auto_ident_retries = 0;	/* fresh plug: full retry budget */
-			dev_info(sc->dev,
-				 "auto fast-charge: attach, identifying adapter\n");
-		}
-		dev_info(sc->dev, "charger attach (vbus %d mV), settling\n", vbus);
-	} else if (!present && sc->vbus_was_present) {
-		/* detach edge: restore USB route, disarm the PHY */
-		sc8547_reset_voocphy(sc);	/* also drops REG_07 (CP off) */
-		wcd939x_usbss_dpdm_switch_fast_charge(false);
-		sc8547_set_adc_enable(sc, true);	/* re-arm ADC to sense next attach */
-		sc->auto_armed = false;
-		sc->cp_enabled = false;
-		sc->hw_profile_set = false;
-		sc->auto_state = SC_AUTO_OFF;
-		sc->auto_reservo_cnt = 0;
-		sc->vbus_absent_since = 0;
-		dev_info(sc->dev, "charger removed, USB route restored\n");
-	}
-
-	if (present && !sc->auto_armed && time_after_eq(jiffies, sc->arm_at)) {
+	if (!sc->auto_armed) {
 		sc8547_vooc_arm_hw(sc);
 		sc->auto_armed = true;
-		if (sc->auto_state == SC_AUTO_IDENTIFY)
-			sc->auto_identify_deadline = jiffies +
-				msecs_to_jiffies(identify_ms);
-		dev_info(sc->dev, "VOOC armed post-attach, vbus %d mV (%s)\n", vbus,
-			 sc->fastchg_enable ? "fastchg-enabled" : "observation");
+		sc->auto_identify_deadline = jiffies + msecs_to_jiffies(identify_ms);
 	}
 
 	/* Auto path: watch for identify, escalate to delivery or decline. */
@@ -2438,7 +2348,7 @@ static void sc8547_attach_work(struct work_struct *work)
 	 * watchdog fed and hard-stop on an over-voltage / over-current reading.
 	 * Latches fastchg_deliver off so a trip needs an explicit re-arm.
 	 */
-	if (sc->cp_enabled) {
+	if (sc->auto_state == SC_AUTO_DELIVER) {
 		int cpbat = sc8547_get_vbat(sc);	/* cell + delivery IR drop */
 		int cibus = sc8547_get_ibus(sc);
 		int gsoc = -1, gtemp = 0, gvbat = -1;
@@ -2459,57 +2369,33 @@ static void sc8547_attach_work(struct work_struct *work)
 		 * current; the CC taper compare and the over-current backstop both
 		 * need the TOTAL bus, so sum in the slave's half (0 if single-CP).
 		 */
-		int cibus_total = cibus + sc8547_slave_ibus();
+		int slave_ma = sc8547_slave_ibus();
+		int cibus_total = cibus + slave_ma;
 		int margin = vbus - 2 * cpbat;
 		u8 r6 = 0, r7 = 0;
+		if (gret || gvbat <= SC8547_CELL_MIN_VALID_MV || cpbat <= 0 ||
+		    vbus <= 0 || cibus < 0 || slave_ma < 0 || gtemp < SC8547_AUTO_TEMP_MIN_DDC ||
+		    gtemp > SC8547_AUTO_TEMP_MAX_DDC || gsoc >= sc->max_soc) {
+			sc8547_auto_finish(sc, "pack or pump outside delivery envelope");
+			goto reschedule;
+		}
+		if (!sc->cp_enabled)
+			goto reschedule;
 
 		/*
 		 * Auto CC/CV: step the ask-current code down the curve as vbat
 		 * rises / current tapers. The terminal exit row ends fast-charge
 		 * and hands back to normal charging.
 		 */
-		if (sc->auto_state == SC_AUTO_DELIVER &&
-		    sc8547_auto_step(sc, cvbat, cibus_total)) {
+		if (sc8547_auto_step(sc, cvbat, cibus_total)) {
 			sc8547_auto_finish(sc, "curve exit");
 			goto reschedule;
 		}
 
-		sc8547_read_byte(sc, SC8547_REG_06, &r6);
-		sc8547_read_byte(sc, SC8547_REG_07, &r7);
-
-		/*
-		 * Pack-temperature backstop + max-SoC charge limit. High-current
-		 * SVOOC CC dumps real heat into the pack (gauge temp = the
-		 * battery-safety sensor); and fast-charge stops once SoC reaches the
-		 * user-set ceiling (max_soc, default 80 %, longevity limit). A failed
-		 * gauge read returns <=0 and is ignored (other backstops still bound
-		 * delivery).
-		 */
-		{
-			if (!gret && gsoc >= sc->max_soc) {
-				sc8547_slave_cp_enable(sc, false);
-				sc8547_set_chg_enable(sc, false);
-				sc->cp_enabled = false;
-				sc->fastchg_deliver = false;
-				dev_info(sc->dev,
-					 "fastchg stop: SoC %d%% >= limit %d%% — handing back to normal charge\n",
-					 gsoc, sc->max_soc);
-				if (sc->auto_state == SC_AUTO_DELIVER)
-					sc8547_auto_finish(sc, "SoC limit reached");
-				goto reschedule;
-			}
-			if (!gret && gtemp >= SC8547_TEMP_ABORT_DDC) {
-				sc8547_slave_cp_enable(sc, false);
-				sc8547_set_chg_enable(sc, false);
-				sc->cp_enabled = false;
-				sc->fastchg_deliver = false;
-				dev_warn(sc->dev,
-					 "fastchg thermal backstop (pack %d.%d C) — CP off, deliver disarmed\n",
-					 gtemp / 10, gtemp % 10);
-				if (sc->auto_state == SC_AUTO_DELIVER)
-					sc8547_auto_finish(sc, "thermal backstop");
-				goto reschedule;
-			}
+		if (sc8547_read_byte(sc, SC8547_REG_06, &r6) ||
+		    sc8547_read_byte(sc, SC8547_REG_07, &r7)) {
+			sc8547_auto_finish(sc, "pump status unavailable");
+			goto reschedule;
 		}
 
 		if (cvbat >= SC8547_VBAT_CV_CEILING_MV ||
@@ -2625,47 +2511,53 @@ static void sc8547_attach_work(struct work_struct *work)
 	}
 
 reschedule:
-	sc->vbus_was_present = present;
-
-	if (sc->vooc_started)
+	if (sc->auto_state == SC_AUTO_IDENTIFY || sc->auto_state == SC_AUTO_DELIVER)
 		schedule_delayed_work(&sc->attach_work,
 				      msecs_to_jiffies(SC8547_ATTACH_POLL_MS));
 }
 
-/* Arm / disarm the auto VOOC bring-up (bench control via debugfs). */
-static void sc8547_vooc_start(struct sc8547a_device *sc)
+/* Called by the battery manager under its charge policy lock. Stop is
+ * synchronous with both frame handling and the pump watchdog worker.
+ */
+int sc8547a_serial_session(bool enable)
 {
-	sc8547_vooc_reset_state(sc);
-	sc->vbus_was_present = false;
-	sc->vbus_absent_since = 0;
-	sc->auto_armed = false;
-	sc->auto_state = SC_AUTO_OFF;
-	sc->auto_reservo_cnt = 0;
-	sc->arm_at = jiffies;
-	sc->vooc_started = true;
-	sc8547_set_adc_enable(sc, true);	/* VBUS ADC on for the attach poll */
-	schedule_delayed_work(&sc->attach_work, 0);
-	dev_info(sc->dev, "VOOC PHY armed (auto, %s)\n",
-		 sc->fastchg_enable ? "fastchg-enabled" : "observation");
-}
+	struct sc8547a_device *sc;
+	int ret, route;
 
-static void sc8547_vooc_stop(struct sc8547a_device *sc)
-{
-	sc->vooc_started = false;
-	cancel_delayed_work_sync(&sc->attach_work);
-	sc8547_slave_reset();		/* drop parallel CP */
-	sc8547_reset_voocphy(sc);	/* CP off */
-	/* Return the D+/D- crossbar to the normal USB path. */
-	wcd939x_usbss_dpdm_switch_fast_charge(false);
-	sc->auto_armed = false;
-	sc->cp_enabled = false;
-	sc->hw_profile_set = false;
+	guard(mutex)(&sc8547_pps_lock);
+	sc = sc8547_master_dev;
+	if (!sc || !serial_enable)
+		return 0;
+	if (enable == sc->vooc_started)
+		return 0;
+	if (enable) {
+		if (!sc8547_slave_dev || sc->irq <= 0 || pps_cp_engaged || pps_adc_hold)
+			return -EAGAIN;
+		sc->auto_state = SC_AUTO_IDENTIFY;
+		sc->fastchg_auto = true;
+		sc->auto_armed = false;
+		sc->auto_ident_retries = 0;
+		sc->auto_reservo_cnt = 0;
+		sc->slave_low_cnt = 0;
+		sc->vooc_started = true;
+		mod_delayed_work(system_wq, &sc->attach_work,
+				 msecs_to_jiffies(SC8547_ATTACH_SETTLE_MS));
+		return 0;
+	}
+
+	cancel_delayed_work(&sc->attach_work);
 	sc->auto_state = SC_AUTO_OFF;
-	sc->auto_reservo_cnt = 0;
-	sc->fastchg_auto = false;
-	sc->fastchg_deliver = false;	/* full disarm: re-arm needs explicit re-enable */
-	dev_info(sc->dev, "VOOC PHY stopped\n");
+	sc->fastchg_enable = false;
+	sc->fastchg_deliver = false;
+	sc->cp_enabled = false;
+	sc8547_slave_reset();
+	ret = sc8547_reset_voocphy(sc);
+	route = wcd939x_usbss_dpdm_switch_fast_charge(false);
+	if (!ret && !route)
+		sc->vooc_started = false;
+	return ret ?: route;
 }
+EXPORT_SYMBOL_GPL(sc8547a_serial_session);
 
 /* IRQ-time frame processing. Returns true if a frame was handled. */
 static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
@@ -2703,7 +2595,9 @@ static irqreturn_t sc8547_irq_handler(int irq, void *data)
 	u8 flag = 0, state = 0;
 
 	/* When the PHY is armed, an IRQ is an adapter VOOC frame. */
-	if (sc->vooc_started && !sc->is_slave) {
+	guard(mutex)(&sc8547_pps_lock);
+	if (sc->vooc_started && sc->auto_armed &&
+	    (sc->auto_state == SC_AUTO_IDENTIFY || sc->auto_state == SC_AUTO_DELIVER)) {
 		if (sc8547_voocphy_isr(sc))
 			return IRQ_HANDLED;
 	}
@@ -2753,202 +2647,11 @@ static int sc8547_adc_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(sc8547_adc);
 
-static int sc8547_enable_get(void *data, u64 *val)
-{
-	struct sc8547a_device *sc = data;
-	bool en = false;
-	int ret = sc8547_get_chg_enable(sc, &en);
-
-	if (ret)
-		return ret;
-	*val = en;
-	return 0;
-}
-
-static int sc8547_enable_set(void *data, u64 val)
-{
-	return sc8547_set_chg_enable(data, !!val);
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_enable_fops, sc8547_enable_get,
-			 sc8547_enable_set, "%llu\n");
-
-static int sc8547_initvooc_set(void *data, u64 val)
-{
-	struct sc8547a_device *sc = data;
-
-	if (val)
-		return sc8547_init_vooc(sc);
-	sc8547_slave_reset();		/* never leave the slave switching alone */
-	return sc8547_reset_voocphy(sc);
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_initvooc_fops, NULL, sc8547_initvooc_set, "%llu\n");
-
-static int sc8547_adcen_set(void *data, u64 val)
-{
-	return sc8547_set_adc_enable(data, !!val);
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_adcen_fops, NULL, sc8547_adcen_set, "%llu\n");
-
-/* 0 = 2:1 divide-by-2, 1 = 1:1 bypass */
-static int sc8547_mode_set(void *data, u64 val)
-{
-	return sc8547_set_charge_mode(data, !!val);
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_mode_fops, NULL, sc8547_mode_set, "%llu\n");
-
-static int sc8547_svooc_set(void *data, u64 val)
-{
-	return val ? sc8547_svooc_hw_setting(data) : 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_svooc_fops, NULL, sc8547_svooc_set, "%llu\n");
-
-/* Arm/disarm the VOOC protocol engine (bench control). */
-static int sc8547_vooc_set(void *data, u64 val)
-{
-	struct sc8547a_device *sc = data;
-
-	if (val)
-		sc8547_vooc_start(sc);
-	else
-		sc8547_vooc_stop(sc);
-	return 0;
-}
-static int sc8547_vooc_get(void *data, u64 *val)
-{
-	*val = ((struct sc8547a_device *)data)->vooc_started;
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_vooc_fops, sc8547_vooc_get, sc8547_vooc_set, "%llu\n");
-
-/*
- * Stage-2b gate. 0 = observation (adapter authenticates but fastchg is refused,
- * no Vbus ramp, no current). Do NOT set 1 on a real battery until the
- * constant-current policy lands — enabling only tells the adapter fastchg is
- * allowed; nothing here manages the resulting Vbus/current yet.
- */
-static int sc8547_fastchg_set(void *data, u64 val)
-{
-	struct sc8547a_device *sc = data;
-
-	sc->fastchg_enable = !!val;
-	if (sc->fastchg_enable)
-		dev_warn(sc->dev,
-			 "fastchg_enable set: adapter will ramp Vbus; CC policy (stage 2b) not yet wired\n");
-	return 0;
-}
-static int sc8547_fastchg_get(void *data, u64 *val)
-{
-	*val = ((struct sc8547a_device *)data)->fastchg_enable;
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_fastchg_fops, sc8547_fastchg_get,
-			 sc8547_fastchg_set, "%llu\n");
-
-/*
- * Stage-2 gate. 0 = the full ladder runs but the charge pump is never enabled
- * (Vbus may ramp, but zero current reaches the pack). Set 1 ONLY for a
- * supervised gated real-current test: it lets the CP close inside the Vbus
- * window and pull up to fastchg_current into the pack, backed by the vbat/ibus
- * backstop. Requires fastchg_enable=1 as well.
- */
-static int sc8547_deliver_set(void *data, u64 val)
-{
-	struct sc8547a_device *sc = data;
-
-	sc->fastchg_deliver = !!val;
-	if (sc->fastchg_deliver) {
-		dev_warn(sc->dev,
-			 "fastchg_deliver ARMED: CP will deliver current at Vbus window (curr code %u); backstop vbat %d mV\n",
-			 sc->fastchg_curr_code, SC8547_VBAT_CV_CEILING_MV);
-	} else if (sc->cp_enabled) {
-		sc8547_set_chg_enable(sc, false);
-		sc->cp_enabled = false;
-		dev_info(sc->dev, "fastchg_deliver disarmed: CP off\n");
-	}
-	return 0;
-}
-static int sc8547_deliver_get(void *data, u64 *val)
-{
-	*val = ((struct sc8547a_device *)data)->fastchg_deliver;
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_deliver_fops, sc8547_deliver_get,
-			 sc8547_deliver_set, "%llu\n");
-
-/* Requested CC current setpoint (ask-current code = bus-side ibus / 100 mA). */
-static int sc8547_curr_set(void *data, u64 val)
-{
-	struct sc8547a_device *sc = data;
-
-	if (val < SC8547_CURR_CODE_MIN || val > SC8547_CURR_CODE_MAX)
-		return -EINVAL;
-	sc->fastchg_curr_code = val;
-	return 0;
-}
-static int sc8547_curr_get(void *data, u64 *val)
-{
-	*val = ((struct sc8547a_device *)data)->fastchg_curr_code;
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_curr_fops, sc8547_curr_get, sc8547_curr_set, "%llu\n");
-
-/*
- * Max-SoC charge limit (%). Fast-charge is declined at arm and stopped mid-CC
- * once the gauge SoC reaches this value; normal charging then continues. Default
- * 80 % (battery longevity). Set 100 to disable the limit.
- */
-static int sc8547_maxsoc_set(void *data, u64 val)
-{
-	struct sc8547a_device *sc = data;
-
-	if (val < 1 || val > 100)
-		return -EINVAL;
-	sc->max_soc = val;
-	dev_info(sc->dev, "fast-charge max SoC set to %d%%\n", sc->max_soc);
-	return 0;
-}
-static int sc8547_maxsoc_get(void *data, u64 *val)
-{
-	*val = ((struct sc8547a_device *)data)->max_soc;
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_maxsoc_fops, sc8547_maxsoc_get, sc8547_maxsoc_set, "%llu\n");
-
-/*
- * Auto charge-manager master arm (one-shot, kill-switch). Setting 1 arms the
- * next charger attach for hands-free fast-charge: the driver identifies the
- * adapter and, only if it is a genuine SVOOC adapter and the battery is within
- * the auto envelope (SOC <= 90, normal temperature, vbat below CV), delivers
- * real current stepped down the Android CC/CV curve (clamped to code
- * SC8547_AUTO_CODE_CEILING) and hands back to normal charging at the exit row.
- * A non-VOOC adapter or any failed precondition declines and leaves normal
- * charging running. One-shot: consumed on the escalation to delivery, so a
- * human is in the loop for each fast-charge session. Setting 0 disarms.
- * Requires the PHY started (`echo 1 > vooc`).
- */
-static int sc8547_auto_set(void *data, u64 val)
-{
-	struct sc8547a_device *sc = data;
-
-	sc->fastchg_auto = !!val;
-	if (sc->fastchg_auto)
-		dev_warn(sc->dev,
-			 "fastchg_auto ARMED (one-shot): next SVOOC attach will auto-deliver real current (curve, <= code %u); backstop vbat %d mV / ibus %d mA\n",
-			 SC8547_AUTO_CODE_CEILING, SC8547_VBAT_CV_CEILING_MV,
-			 SC8547_IBUS_ABORT_MA);
-	return 0;
-}
-static int sc8547_auto_get(void *data, u64 *val)
-{
-	*val = ((struct sc8547a_device *)data)->fastchg_auto;
-	return 0;
-}
-DEFINE_DEBUGFS_ATTRIBUTE(sc8547_auto_fops, sc8547_auto_get, sc8547_auto_set, "%llu\n");
-
 /* Read-only auto/fast-charge status for userspace. */
 static int sc8547_state_show(struct seq_file *m, void *unused)
 {
 	struct sc8547a_device *sc = m->private;
+	guard(mutex)(&sc8547_pps_lock);
 	static const char * const names[] = {
 		"off", "identify", "deliver", "declined", "done",
 	};
@@ -2976,34 +2679,9 @@ static void sc8547_create_debugfs(struct sc8547a_device *sc)
 	debugfs_create_file("registers", 0444, sc->debug_root, sc,
 			    &sc8547_dump_fops);
 	debugfs_create_file("adc", 0444, sc->debug_root, sc, &sc8547_adc_fops);
-	if (!serial_enable)
-		return;
-	debugfs_create_file("cp_enable", 0644, sc->debug_root, sc,
-			    &sc8547_enable_fops);
-	debugfs_create_file("init_vooc", 0200, sc->debug_root, sc,
-			    &sc8547_initvooc_fops);
-	debugfs_create_file("adc_enable", 0200, sc->debug_root, sc,
-			    &sc8547_adcen_fops);
-	debugfs_create_file("charge_mode", 0200, sc->debug_root, sc,
-			    &sc8547_mode_fops);
-	debugfs_create_file("svooc_setting", 0200, sc->debug_root, sc,
-			    &sc8547_svooc_fops);
-	if (!sc->is_slave) {
-		debugfs_create_file("vooc", 0644, sc->debug_root, sc,
-				    &sc8547_vooc_fops);
-		debugfs_create_file("fastchg_enable", 0644, sc->debug_root, sc,
-				    &sc8547_fastchg_fops);
-		debugfs_create_file("fastchg_deliver", 0644, sc->debug_root, sc,
-				    &sc8547_deliver_fops);
-		debugfs_create_file("fastchg_current", 0644, sc->debug_root, sc,
-				    &sc8547_curr_fops);
-		debugfs_create_file("max_soc", 0644, sc->debug_root, sc,
-				    &sc8547_maxsoc_fops);
-		debugfs_create_file("fastchg_auto", 0644, sc->debug_root, sc,
-				    &sc8547_auto_fops);
+	if (!sc->is_slave)
 		debugfs_create_file("fastchg_state", 0444, sc->debug_root, sc,
 				    &sc8547_state_fops);
-	}
 }
 
 /* ------------------------------- probe -------------------------------- */
@@ -3085,17 +2763,6 @@ static int sc8547a_probe(struct i2c_client *client)
 		sc8547_master_dev = sc;
 	mutex_unlock(&sc8547_pps_lock);
 
-	/*
-	 * Hands-free: start the master's attach poller now so a SuperVOOC adapter
-	 * that is already plugged (or plugged later) auto-arms and fast-charges
-	 * without any debugfs poke. The poller waits for the attach + settle
-	 * window, identifies the adapter (declines non-SVOOC to normal charge),
-	 * and is bounded by the max_soc / vbat-CV / ibus / thermal backstops. A
-	 * not-yet-ready DPDM crossbar (-ENODEV) is non-fatal and simply retried.
-	 */
-	if (!sc->is_slave && serial_enable)
-		sc8547_vooc_start(sc);
-
 	dev_info(sc->dev, "SC8547A %s charge pump probed (addr 0x%02x)\n",
 		 sc->is_slave ? "slave" : "master", client->addr);
 	return 0;
@@ -3105,7 +2772,7 @@ static void sc8547a_remove(struct i2c_client *client)
 {
 	struct sc8547a_device *sc = i2c_get_clientdata(client);
 
-	sc->vooc_started = false;
+	sc8547a_serial_session(false);
 	cancel_delayed_work_sync(&sc->attach_work);
 	debugfs_remove_recursive(sc->debug_root);
 	guard(mutex)(&sc8547_pps_lock);
@@ -3123,26 +2790,23 @@ static int sc8547a_suspend(struct device *dev)
 {
 	struct sc8547a_device *sc = dev_get_drvdata(dev);
 
-	sc->vooc_started = false;
+	int ret = sc8547a_serial_session(false);
+
+	if (ret)
+		return ret;
 	cancel_delayed_work_sync(&sc->attach_work);
 	guard(mutex)(&sc8547_pps_lock);
 	if (!sc->is_slave) {
+		sc->auto_state = SC_AUTO_OFF;
+		sc->fastchg_deliver = false;
+		sc->fastchg_enable = false;
 		pps_adc_hold = false;
 		pps_cp_engaged = false;
 	}
 	return sc8547_reset_voocphy(sc);
 }
 
-static int sc8547a_resume(struct device *dev)
-{
-	struct sc8547a_device *sc = dev_get_drvdata(dev);
-
-	if (!sc->is_slave && serial_enable)
-		sc8547_vooc_start(sc);
-	return 0;
-}
-
-static DEFINE_SIMPLE_DEV_PM_OPS(sc8547a_pm_ops, sc8547a_suspend, sc8547a_resume);
+static DEFINE_SIMPLE_DEV_PM_OPS(sc8547a_pm_ops, sc8547a_suspend, NULL);
 
 static void sc8547a_shutdown(struct i2c_client *client)
 {

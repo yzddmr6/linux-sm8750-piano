@@ -1272,6 +1272,7 @@ static int erhai_pps_stop(void *data)
 
 static const struct erhai_pps_ops erhai_pps_ops = {
 	.enabled = erhai_pps_enabled,
+	.serial_session = sc8547a_serial_session,
 	.active = erhai_pps_active,
 	.update = erhai_pps_update,
 	.stop = erhai_pps_stop,
