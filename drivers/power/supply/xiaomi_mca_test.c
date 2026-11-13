@@ -2721,6 +2721,44 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->stage_on);
 }
 
+static void xiaomi_mca_test_qc_regulation(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	cp_charge = hv_charge = full_charge = true;
+	mca_test_stage(test, f);
+	f->mca.cp_type = f->type = MCA_TYPE_HVDCP_3_B;
+	f->mca.real_type = f->type;
+	mca->vbus_uv = f->vbus = 8400000;
+	mca->cp_mv = f->stage_mv = 8400;
+	mca->cp_max_mv = 9500;
+	mca->cp_request_ma = mca->cp_ma = 2500;
+	mca->cp_ibus_hot = mca->cp_ibus_ma = 1800;
+	mca->icl_set_ma = 500;
+	mca->fcc_set_ma = 1000;
+	f->cells[0].voltage = f->cells[1].voltage = 4000000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 1000000;
+	guard(mutex)(&mca->lock);
+	f->stage_ma = 401;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_NE(test, f->last_prop, MCA_PROP_QC_PULSE);
+	f->stage_ma = 400;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_QC_PULSE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->last_data), MCA_QC_UP);
+	mca->vbus_uv = f->vbus = 8600000;
+	f->stage_mv = 8600;
+	f->stage_ma = 1800;
+	f->writes = 0;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, f->writes, 0);
+	KUNIT_EXPECT_FALSE(test, mca->cp_fault);
+	xiaomi_mca_cp_stop(mca, "test complete");
+}
+
 static void xiaomi_mca_test_taper_handoff(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3122,6 +3160,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_identity_edges),
 	KUNIT_CASE(xiaomi_mca_test_ffc_conditions),
 	KUNIT_CASE(xiaomi_mca_test_cp_cell_guards),
+	KUNIT_CASE(xiaomi_mca_test_qc_regulation),
 	KUNIT_CASE(xiaomi_mca_test_taper_handoff),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_values),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_errors),
