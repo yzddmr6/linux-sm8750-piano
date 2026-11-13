@@ -245,6 +245,7 @@ static const char * const mca_real_type_names[MCA_TYPE_MAX] = {
 #define MCA_ICL_5V_MAX_MA	3000	/* Piano ADSP fixed 5 V sink PDO */
 #define MCA_ICL_HV_MAX_MA	2500	/* at 9 V, see xiaomi_mca_hv_icl() */
 #define MCA_POLICY_ICL_DEFAULT_MA	500
+#define MCA_FLOAT_ICL_MA		1000	/* Piano in_float */
 
 static bool charge_policy = true;
 module_param(charge_policy, bool, 0644);
@@ -1302,7 +1303,9 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 
 			if (value > xiaomi_mca_5v_input(mca, type))
 				return -EINVAL;
-			if (xiaomi_mca_probe_5v(type) && value > MCA_POLICY_ICL_DEFAULT_MA &&
+			if (xiaomi_mca_probe_5v(type) &&
+			    value > ((type == MCA_TYPE_FLOAT || type == MCA_TYPE_UNKNOWN) ?
+				     MCA_FLOAT_ICL_MA : MCA_POLICY_ICL_DEFAULT_MA) &&
 			    (xiaomi_mca_read_blob(mca, MCA_PROP_AICL_ENABLE, &enabled, 1) ||
 			     enabled != 1))
 				return -EAGAIN;
@@ -2172,6 +2175,12 @@ static void xiaomi_mca_apply_policy(struct xiaomi_mca *mca)
 		xiaomi_mca_is_pd(mca->real_type));
 	if (aicl && (target != mca->icl_set_ma || target != mca->fcc_set_ma)) {
 		ret = xiaomi_mca_aicl(mca, false);
+		if (ret && (mca->real_type == MCA_TYPE_FLOAT || mca->real_type == MCA_TYPE_UNKNOWN)) {
+			target = MCA_FLOAT_ICL_MA;
+			aicl = false;
+			dev_warn_ratelimited(mca->dev, "AICL unavailable, using FLOAT input limit\n");
+			ret = 0;
+		}
 		if (ret) {
 			dev_warn_ratelimited(mca->dev, "cannot enable input current detection: %d\n", ret);
 			return;
@@ -2185,6 +2194,11 @@ static void xiaomi_mca_apply_policy(struct xiaomi_mca *mca)
 	ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, target);
 	if (!ret && aicl)
 		ret = xiaomi_mca_aicl(mca, true);
+	if (ret && aicl && (mca->real_type == MCA_TYPE_FLOAT || mca->real_type == MCA_TYPE_UNKNOWN)) {
+		target = MCA_FLOAT_ICL_MA;
+		dev_warn_ratelimited(mca->dev, "AICL scan failed, using FLOAT input limit\n");
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, target);
+	}
 	if (ret) {
 		dev_warn(mca->dev, "failed to set input limit %u mA: %d\n",
 			 target, ret);

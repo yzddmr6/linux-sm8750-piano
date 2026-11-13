@@ -533,6 +533,7 @@ struct mca_policy_fixture {
 	bool voltage_stuck;
 	int ucsi_rp_ua, ucsi_mv;
 	u8 aicl_enabled;
+	u32 fail_aicl_prop;
 	unsigned int aicl_runs;
 	int stage_mv, stage_ma, stage_temp;
 	bool stage_on;
@@ -553,6 +554,8 @@ static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 	if (prop == MCA_PROP_AICL_ENABLE || prop == MCA_PROP_RERUN_AICL) {
 		if (len != 1)
 			return -EINVAL;
+		if (f->fail_aicl_prop == prop)
+			return -EIO;
 		if (op == MCA_OPCODE_READ)
 			*(u8 *)data = f->aicl_enabled;
 		else if (prop == MCA_PROP_AICL_ENABLE)
@@ -878,6 +881,15 @@ static void xiaomi_mca_test_aicl(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, f->fcc, 3000);
 		xiaomi_mca_apply_policy(&f->mca);
 		KUNIT_EXPECT_EQ(test, f->aicl_runs, i + 1);
+	}
+	for (i = 0; i < 2; i++) {
+		f->mca.icl_set_ma = f->aicl_enabled = 0;
+		f->fail_aicl_prop = i ? MCA_PROP_RERUN_AICL : MCA_PROP_AICL_ENABLE;
+		xiaomi_mca_apply_policy(&f->mca);
+		KUNIT_EXPECT_EQ(test, f->icl, 1000);
+		f->fail_aicl_prop = 0;
+		xiaomi_mca_apply_policy(&f->mca);
+		KUNIT_EXPECT_EQ(test, f->icl, 3000);
 	}
 	f->vbus = 9000000;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 3000),
