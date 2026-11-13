@@ -3218,8 +3218,12 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_stop(mca, "source voltage range exhausted");
 		return;
 	}
-	if (vbus_uv / 1000 > 2 * vbat + MCA_CP_VBUS_MAX_DELTA_MV) {
-		mca->cp_fault = true;
+	if (vbus_uv / 1000 >= MCA_CP_PPS_MAX_MV ||
+	    vbus_uv / 1000 > 2 * vbat + MCA_CP_VBUS_MAX_DELTA_MV) {
+		/* A relative control excursion is recoverable. The independent
+		 * forward BUSOVP programmed in SC8541 is 11 V.
+		 */
+		mca->cp_fault = vbus_uv / 1000 >= MCA_CP_PPS_MAX_MV;
 		xiaomi_mca_cp_stop(mca, "bus voltage too high");
 		return;
 	}

@@ -2724,6 +2724,30 @@ static void xiaomi_mca_test_cp_cell_guards(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->stage_on);
 }
 
+static void xiaomi_mca_test_bus_voltage_fault(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	int n;
+
+	mca_test_stage(test, f);
+	mca->cp_max_mv = 11000;
+	mca->cp_ma = 3000;
+	guard(mutex)(&mca->lock);
+	for (n = 0; n < 2; n++) {
+		if (n) {
+			mca->cp_psy = power_supply_get_by_name("mca-pm-test-cp");
+			mca->cp = MCA_CP_ON;
+			f->stage_on = true;
+		}
+		f->stage_mv = n ? 11000 : 9300;
+		xiaomi_mca_cp_step(mca);
+		KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
+		KUNIT_EXPECT_EQ(test, mca->cp_fault, !!n);
+		KUNIT_EXPECT_STREQ(test, mca->cp_last_exit, "bus voltage too high");
+	}
+}
+
 static void xiaomi_mca_test_qc_regulation(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3194,6 +3218,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_identity_edges),
 	KUNIT_CASE(xiaomi_mca_test_ffc_conditions),
 	KUNIT_CASE(xiaomi_mca_test_cp_cell_guards),
+	KUNIT_CASE(xiaomi_mca_test_bus_voltage_fault),
 	KUNIT_CASE(xiaomi_mca_test_qc_regulation),
 	KUNIT_CASE(xiaomi_mca_test_taper_handoff),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_values),
