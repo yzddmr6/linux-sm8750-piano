@@ -985,6 +985,15 @@ static void xiaomi_mca_test_source_limits(struct kunit *test)
 	struct mca_policy_fixture *f = mca_policy_fixture(test);
 	struct xiaomi_mca *mca = &f->mca;
 
+	static const struct { int ibat, ibus, fcc; } rows[] = {
+		{ 12000, 5201, 4000 }, { 10000, 5201, 3000 }, { 9040, 4201, 3000 },
+		{ 8000, 4201, 2000 }, { 7230, 2701, 2000 }, { 5000, 2701, 1000 },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(rows); i++)
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_parallel_fcc(rows[i].ibat, rows[i].ibus, 500),
+				rows[i].fcc);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_capability_ma(6700, true), 6000U);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_capability_ma(6700, false), 5000U);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_capability_ma(3000, true), 3000U);

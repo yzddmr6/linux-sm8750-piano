@@ -396,21 +396,10 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_REQ_MAX_DELTA_MV	2000
 #define MCA_CP_PPS_MIN_MV	6000
 #define MCA_CP_PPS_MAX_MV	11000	/* stock third_pps_vbus_max */
-#define MCA_CP_BUCK_MA		500	/* buck input limit and charge current */
-/*
- * Stock (strategy_quickchg_pmic_single_cp_charging) has the buck charger
- * carry part of the battery current next to the stage once the source
- * gives more than MCA_CP_PAR_IBUS_MA (stage and buck charger together,
- * which the share moving between them leaves alone) with more than
- * MCA_CP_PAR_IBAT_MA asked of the battery: its 5000/2700 mA row, the one
- * within 8 A, at FCC 2000 and input 1500 mA.  That moves heat from the
- * stage to the PMIC.
- */
-#define MCA_CP_PAR_IBUS_MA	2700
-#define MCA_CP_PAR_IBAT_MA	5000
+#define MCA_CP_BUCK_MA		500	/* SC8541 is rated for 8 A output at 2:1. Remaining FCC comes from buck. */
+#define MCA_CP_STAGE_IBUS_MA	4000
 #define MCA_CP_PAR_HYS_MA	300
-#define MCA_CP_PAR_FCC_MA	2000
-#define MCA_CP_PAR_ICL_MA	1500
+#define MCA_CP_PAR_FCC_MAX_MA	4000
 #define MCA_CP_PPS_MAX_MA	6000	/* current limit asked of the source */
 #define MCA_CP_STD_PPS_MAX_MA	5000
 /* bus over-current protection of the stage, above the target */
@@ -690,7 +679,6 @@ struct xiaomi_mca {
 	bool cp_die_hot;
 	bool cp_fault;
 	bool cp_recharge;
-	bool cp_buck_par;	/* buck charger at MCA_CP_PAR_* */
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
 	u32 cp_ibus_last;	/* stage and buck input current at the last step */
@@ -1095,7 +1083,7 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 			val == MCA_TERM_FFC_MV);
 	case MCA_PROP_CHARGE_CURRENT:
 		return len == sizeof(u32) &&
-		       val >= MCA_FCC_MIN_MA && val <= MCA_FCC_MAX_MA;
+		       val >= MCA_FCC_MIN_MA && val <= MCA_CP_PAR_FCC_MAX_MA;
 	case MCA_PROP_QC_VOLT:
 	case MCA_PROP_PD_FIXED_VOLT:
 		return len == sizeof(u32) &&
@@ -1224,6 +1212,15 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 			POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT, type,
 			vbus >= MCA_HV_VBUS_MIN_UV && vbus <= MCA_HV_VBUS_MAX_UV,
 			value * MILLI, &checked);
+		/* The stock buck votes for CP parallel operation apply only
+		 * under the active PPS contract, also below the 9 V window.
+		 * The public setter checks the ordinary per-source limits.
+		 */
+		if (mca->cp == MCA_CP_ON && xiaomi_mca_is_pd(type) &&
+		    vbus >= MCA_CP_PPS_MIN_MV * 1000 && vbus <= MCA_CP_PPS_MAX_MV * 1000 &&
+		    value <= (prop == MCA_PROP_INPUT_CURRENT_LIMIT ?
+			      min(mca->cp_request_ma, 2500U) : MCA_CP_PAR_FCC_MAX_MA))
+			ret = 0;
 		if (ret)
 			return ret;
 		if (prop == MCA_PROP_INPUT_CURRENT_LIMIT) {
@@ -2575,7 +2572,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_mv = start_mv;
 	src_ma = xiaomi_mca_cp_src_ma(mca);
 	src_ma -= min_t(u32, src_ma, MCA_CP_BUCK_MA + 200);
-	mca->cp_ibus_ma = min_t(u32, MCA_CP_IBAT_MAX_MA / 2, src_ma);
+	mca->cp_ibus_ma = min_t(u32, MCA_CP_STAGE_IBUS_MA, src_ma);
 	if (mca->cp_ibus_ma < 2 * MCA_CP_OPEN_IBUS_MA) {
 		xiaomi_mca_cp_backoff(mca);
 		return;
@@ -2613,7 +2610,6 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_low = 0;
 	mca->cp_ibus_hot = mca->cp_ibus_ma;
 	mca->cp_ibat_trip = 0;
-	mca->cp_buck_par = false;
 	mca->cp_stage = 0;
 	mca->cp_target_ma = 0;
 	mca->cp_recharge = false;
@@ -2642,6 +2638,23 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		 mca->cp_mv, mca->cp_ma, max_mv, ma, vbat, tbat, mca->cp_ibus_ma);
 }
 
+/* Piano cur_max_threshold, ibus_threshold and pmih_fcc_value. */
+static u32 xiaomi_mca_parallel_fcc(int ibat_max, int ibus, u32 current_fcc)
+{
+	static const struct { int ibat, ibus, fcc; } rows[] = {
+		{ 10000, 5200, 4000 }, { 8000, 4200, 3000 }, { 5000, 2700, 2000 },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(rows); i++) {
+		int hyst = current_fcc >= rows[i].fcc ? MCA_CP_PAR_HYS_MA : 0;
+
+		if (ibat_max > rows[i].ibat && ibus > rows[i].ibus - hyst)
+			return rows[i].fcc;
+	}
+	return 1000;
+}
+
 static u32 xiaomi_mca_die_limit(struct xiaomi_mca *mca, int tdie)
 {
 	if (tdie >= MCA_CP_TDIE_HOT)
@@ -2659,7 +2672,8 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	int vbat, ibat, tcool, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibus, over;
 	int ibat_max, target, ibus_all, vmin, imax;
 	u32 mv = mca->cp_mv, cv;
-	bool taper, par;
+	bool taper;
+	u32 fcc, icl;
 
 	if (xiaomi_mca_gauges(&vbat, &ibat, &tcool, &tbat, &vmin, &imax) ||
 	    xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &on)) {
@@ -2784,30 +2798,22 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 
 		/* only from a source that feeds both at that bus current */
 		ibus_all = ibus + mca->ibus_ua / 1000;
-		par = ibat_max > MCA_CP_PAR_IBAT_MA &&
-		      xiaomi_mca_cp_src_ma(mca) >=
-				MCA_CP_PAR_IBUS_MA + MCA_CP_PAR_ICL_MA + 200 &&
-		      (ibus_all > MCA_CP_PAR_IBUS_MA ||
-		       (mca->cp_buck_par &&
-			ibus_all > MCA_CP_PAR_IBUS_MA - MCA_CP_PAR_HYS_MA));
-		if (par != mca->cp_buck_par) {
-			if (xiaomi_mca_cp_set_buck(mca,
-						  par ? MCA_CP_PAR_ICL_MA : MCA_CP_BUCK_MA,
-						  par ? MCA_CP_PAR_FCC_MA : MCA_CP_BUCK_MA)) {
+		fcc = xiaomi_mca_parallel_fcc(ibat_max, ibus_all, mca->fcc_set_ma);
+		icl = fcc / 2 + (fcc > 1000 ? 500 : 0);
+		/* The stock vbat_threshold ends parallel boosting near CV. */
+		if (vbat >= 4480 || taper)
+			fcc = icl = MCA_CP_BUCK_MA;
+		target = min(target, (int)xiaomi_mca_cp_src_ma(mca) - 200 - (int)icl);
+		/* Make headroom on the bus before raising the buck vote. */
+		if (fcc != mca->fcc_set_ma &&
+		    (fcc < mca->fcc_set_ma || ibus <= target)) {
+			if (xiaomi_mca_cp_set_buck(mca, icl, fcc)) {
 				xiaomi_mca_cp_stop(mca, "buck charger refused");
 				return;
 			}
-			mca->cp_buck_par = par;
-			/* make room on the bus for the buck charger's share */
-			if (par)
-				mv -= (MCA_CP_PAR_FCC_MA - MCA_CP_BUCK_MA) / 2 /
-				      MCA_CP_REG_STEP_MA * MCA_CP_REG_STEP_MV;
-			dev_info(mca->dev, "buck charger at %u mA%s\n",
-				 mca->fcc_set_ma, par ? " in parallel" : "");
 		}
-		/* what the source gives, less the buck charger's input */
 		target = min(target, (int)xiaomi_mca_cp_src_ma(mca) - 200 -
-			     (mca->cp_buck_par ? MCA_CP_PAR_ICL_MA : MCA_CP_BUCK_MA));
+			     (int)mca->icl_set_ma);
 		/*
 		 * The stage gives the battery about twice its bus current,
 		 * next to the buck charger's share.  The gauges average over
