@@ -238,10 +238,10 @@ static const char * const mca_real_type_names[MCA_TYPE_MAX] = {
 #define MCA_ICL_HV_MAX_MA	2500	/* at 9 V, see xiaomi_mca_hv_icl() */
 #define MCA_POLICY_ICL_DEFAULT_MA	500
 
-static bool charge_policy;
+static bool charge_policy = true;
 module_param(charge_policy, bool, 0644);
 MODULE_PARM_DESC(charge_policy,
-		 "Raise the USB input current limit by charger type (default: off, ADSP defaults)");
+		 "Raise the USB input current limit by charger type (default: on)");
 
 /*
  * charge_current: left alone, the ADSP charges the battery at about 500 mA
@@ -259,10 +259,10 @@ MODULE_PARM_DESC(charge_policy,
 #define MCA_FCC_DEFAULT_MA	500
 #define MCA_TERM_COLD_MV	4500	/* CN buck JEITA below 18 C */
 
-static bool charge_current;
+static bool charge_current = true;
 module_param(charge_current, bool, 0644);
 MODULE_PARM_DESC(charge_current,
-		 "Raise the battery charge current by charger type; needs charge_policy (default: off, about 500 mA)");
+		 "Raise the battery charge current by charger type; needs charge_policy (default: on)");
 
 /*
  * full_charge: use the stock normal float voltage, lowered at 48 degC with
@@ -276,10 +276,10 @@ MODULE_PARM_DESC(charge_current,
 #define MCA_TERM_HOT_DEGC	48
 #define MCA_TERM_COOL_DEGC	46
 
-static bool full_charge;
+static bool full_charge = true;
 module_param(full_charge, bool, 0644);
 MODULE_PARM_DESC(full_charge,
-		 "Use the stock full-charge voltage with thermal derating; needs charge_policy (default: off)");
+		 "Use the stock full-charge voltage with thermal derating; needs charge_policy (default: on)");
 
 /*
  * hv_charge: a PD source with a fixed 9 V PDO is asked for 9 V, as the
@@ -308,16 +308,16 @@ MODULE_PARM_DESC(full_charge,
 #define MCA_HV_PPS_MIN_MA	500
 #define MCA_HV_PPS_MAX_MA	3000
 
-static bool hv_charge;
+static bool hv_charge = true;
 module_param(hv_charge, bool, 0644);
 MODULE_PARM_DESC(hv_charge,
-		 "Ask PD sources with a fixed 9 V PDO for 9 V; needs charge_policy (default: off, 5 V)");
+		 "Ask PD sources with a fixed 9 V PDO for 9 V; needs charge_policy (default: on)");
 
 
-static bool mipps_auth;
+static bool mipps_auth = true;
 module_param(mipps_auth, bool, 0644);
 MODULE_PARM_DESC(mipps_auth,
-		 "Authenticate Xiaomi MiPPS adapters before PPS negotiation (default: off)");
+		 "Authenticate Xiaomi MiPPS adapters before PPS negotiation (default: on)");
 
 /*
  * cp_charge: direct charging through the SC8541 2:1 switched-capacitor
@@ -420,10 +420,10 @@ MODULE_PARM_DESC(mipps_auth,
 /* an authenticated adapter resets itself within this, see xiaomi_mca_auth_pending() */
 #define MCA_AUTH_RESET_WAIT_MS	30000
 
-static bool cp_charge;
+static bool cp_charge = true;
 module_param(cp_charge, bool, 0644);
 MODULE_PARM_DESC(cp_charge,
-		 "Charge through the SC8541 switched-capacitor stage from PPS sources; needs hv_charge and charge_current (default: off)");
+		 "Charge through the SC8541 switched-capacitor stage from PPS sources; needs hv_charge and charge_current (default: on)");
 
 static unsigned int cp_ibat_max;
 module_param(cp_ibat_max, uint, 0444);
@@ -2632,8 +2632,11 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	}
 
 	mca->cp_psy = power_supply_get_by_name("sc8541");
-	if (!mca->cp_psy)
+	if (!mca->cp_psy) {
+		dev_warn_ratelimited(mca->dev, "SC8541 unavailable, using buck charging\n");
+		xiaomi_mca_cp_backoff(mca);
 		return;
+	}
 	if (mca->cp_die_hot) {
 		int tdie;
 

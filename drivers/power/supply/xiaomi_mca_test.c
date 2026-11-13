@@ -818,6 +818,7 @@ static void xiaomi_mca_test_qc_voltage(struct kunit *test)
 	mutex_lock(&mca->lock);
 	for (type = MCA_TYPE_HVDCP; type <= MCA_TYPE_HVDCP_3P5; type++) {
 		f->type = mca->real_type = type;
+		mca->hv_retry = jiffies;
 		f->vbus = mca->vbus_uv = 5000000;
 		mca->hv = MCA_HV_OFF;
 		KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
@@ -2902,7 +2903,35 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	{}
 };
 
+static bool * const mca_test_switches[] = {
+	&charge_policy, &charge_current, &full_charge, &hv_charge, &mipps_auth, &cp_charge,
+};
+
+static void mca_test_restore_switches(void *data)
+{
+	bool *saved = data;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(mca_test_switches); i++)
+		*mca_test_switches[i] = saved[i];
+}
+
+static int mca_test_init(struct kunit *test)
+{
+	bool *saved = kunit_kcalloc(test, ARRAY_SIZE(mca_test_switches), sizeof(bool), GFP_KERNEL);
+	int i;
+
+	if (!saved)
+		return -ENOMEM;
+	for (i = 0; i < ARRAY_SIZE(mca_test_switches); i++) {
+		saved[i] = *mca_test_switches[i];
+		*mca_test_switches[i] = false;
+	}
+	return kunit_add_action_or_reset(test, mca_test_restore_switches, saved);
+}
+
 static struct kunit_suite xiaomi_mca_test_suite = {
+	.init = mca_test_init,
 	.name = "xiaomi-mca",
 	.test_cases = xiaomi_mca_test_cases,
 };
