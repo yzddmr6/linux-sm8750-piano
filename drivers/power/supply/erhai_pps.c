@@ -918,11 +918,13 @@ static int pps_cp_step(struct erhai_pps *p)
 
 
 /* The maximum scalar alone does not identify the APDO's voltage range. */
-static int pps_source_limit(u32 *selected)
+static int pps_source_limit(u32 *selected, bool *grant_known)
 {
 	int ma = pps_usb_get(PPS_PROP_USB_GET_PPS_MAX_CURR);
 	int apdo = erhai_pps_apdo_current(pps_target_volt_mv, pps_cp_max_volt_mv, selected);
 
+	if (grant_known)
+		*grant_known = ma > 0;
 	if (apdo <= 0)
 		return apdo;
 	if (ma <= 0)
@@ -1042,7 +1044,7 @@ static void pps_poll(struct erhai_pps *p)
 			return;
 		}
 
-		adapter_ma = pps_source_limit(&p->session_apdo);
+		adapter_ma = pps_source_limit(&p->session_apdo, NULL);
 		if (adapter_ma <= 0) {
 			pps_exit(p, "no usable PPS APDO");
 			return;
@@ -1331,7 +1333,7 @@ static unsigned int erhai_pps_update(void *data, bool caps_changed)
 	if (!p->ufcs && caps_changed && (p->state == PPS_RAMP || p->state == PPS_CHARGING ||
 			     p->state == PPS_TAPER)) {
 		u32 apdo;
-		int ma = pps_source_limit(&apdo);
+		int ma = pps_source_limit(&apdo, NULL);
 
 		if (ma <= 0 || ma != p->source_ma || apdo != p->session_apdo)
 			pps_exit(p, "source capabilities changed");
@@ -1418,7 +1420,7 @@ static bool erhai_pps_enabled(void)
 static bool erhai_pps_available(void *data)
 {
 	struct erhai_pps *p = data;
-
+	bool grant_known;
 	u32 apdo;
 	int ma;
 
@@ -1426,8 +1428,12 @@ static bool erhai_pps_available(void *data)
 		return true;
 	if (p->pps_protection || time_before(jiffies, p->retry_at) || !pps_deployable(p))
 		return false;
-	ma = pps_source_limit(&apdo);
-	if (ma >= 0 && (apdo != p->exhausted_apdo || ma != p->exhausted_ma))
+	ma = pps_source_limit(&apdo, &grant_known);
+	/* The 3 A fallback after a failed grant read is a safe operating
+	 * current, not evidence that the partner changed capabilities.
+	 */
+	if (ma >= 0 && (apdo != p->exhausted_apdo ||
+			(grant_known && ma != p->exhausted_ma)))
 		p->exhausted_apdo = 0;
 	return ma > 0 && !p->exhausted_apdo;
 }
