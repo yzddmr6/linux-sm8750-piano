@@ -241,7 +241,9 @@ static int sc8541_arm(struct sc8541 *sc)
 				(sc->busocp_ma - SC8541_BUSOCP_OFFSET_MA) /
 				SC8541_BUSOCP_STEP_MA);
 	/* Reverse mode may leave IBAT_OCP disabled. SC8541 is rated
-	 * for 8 A output; REG02 programs it in 100 mA steps.
+	 * for 8 A output. Southchip's SC8541_IBAT_OCP converter for REG02
+	 * starts at zero in 100 mA steps; REG11 selects the sense resistor.
+	 * Preserve the board setting. The gauges independently limit pack current.
 	 */
 	ret = ret ?: sc8541_write_check(sc, SC8541_BATOCP, 0xff, 8000 / 100);
 	ret = ret ?: sc8541_write_check(sc, SC8541_TEMP_CTRL, SC8541_TSHUT_DISABLE, 0);

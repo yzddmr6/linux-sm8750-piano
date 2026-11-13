@@ -390,7 +390,11 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_PPS_MIN_MV	6000
 #define MCA_CP_PPS_MAX_MV	11000	/* stock third_pps_vbus_max */
 #define MCA_CP_BUCK_MA		500	/* buck input during opening */
-#define MCA_CP_STAGE_IBUS_MA	4000
+/* SC8541 EVM, table 3: 8 A output at 2:1. Piano div_single_curr
+ * allows 12 A, with a 7 A bus OCP. Leave one regulation band below
+ * the programmed 8 A battery OCP even on a higher-current contract.
+ */
+#define MCA_CP_STAGE_IBUS_MA	(8000 / 2 - MCA_CP_BAND_MA)
 #define MCA_CP_PAR_HYS_MA	300
 #define MCA_CP_PAR_FCC_MAX_MA	4000
 #define MCA_CP_PPS_MAX_MA	6000	/* current limit asked of the source */
