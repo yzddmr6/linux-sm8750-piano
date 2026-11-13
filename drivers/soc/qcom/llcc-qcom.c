@@ -3869,7 +3869,8 @@ static const struct llcc_slice_config sm8750_data[] = {
 		.priority = 5,
 		.fixed_size = true,
 		.bonus_ways = 0xffffffff,
-		.vict_prio = true,
+		.ovcap_en = true,
+		.parent_slice_id = 33,
 	}, {
 		.usecase_id = LLCC_MODPE,
 		.slice_id = 29,
@@ -3923,7 +3924,7 @@ static const struct llcc_slice_config sm8750_data[] = {
 		.max_cap = 7936,
 		.priority = 7,
 		.fixed_size = true,
-		.bonus_ways = 0x7fffffff,
+		.res_ways = 0x7fffffff,
 	}, {
 		.usecase_id = LLCC_DISP_WB,
 		.slice_id = 23,
@@ -3946,7 +3947,7 @@ static const struct llcc_slice_config sm8750_data[] = {
 		.fixed_size = true,
 		.bonus_ways = 0xffffffff,
 		.cache_mode = 2,
-		.ovcap_prio = true,
+		.ovcap_en = true,
 		.parent_slice_id = 33,
 	}, {
 		.usecase_id = LLCC_CAMOFE,
@@ -3956,7 +3957,7 @@ static const struct llcc_slice_config sm8750_data[] = {
 		.fixed_size = true,
 		.bonus_ways = 0xffffffff,
 		.stale_en = true,
-		.ovcap_prio = true,
+		.ovcap_en = true,
 		.parent_slice_id = 33,
 	}, {
 		.usecase_id = LLCC_CAMRTIP,
@@ -3966,7 +3967,7 @@ static const struct llcc_slice_config sm8750_data[] = {
 		.fixed_size = true,
 		.bonus_ways = 0xffffffff,
 		.stale_en = true,
-		.ovcap_prio = true,
+		.ovcap_en = true,
 		.parent_slice_id = 33,
 	}, {
 		.usecase_id = LLCC_CAMSRTIP,
@@ -3976,17 +3977,17 @@ static const struct llcc_slice_config sm8750_data[] = {
 		.fixed_size = true,
 		.bonus_ways = 0xffffffff,
 		.stale_en = true,
-		.ovcap_prio = true,
+		.ovcap_en = true,
 		.parent_slice_id = 33,
 	}, {
 		.usecase_id = LLCC_CAMRTRF,
 		.slice_id = 7,
 		.max_cap = 3584,
-		.priority = 1,
+		.priority = 3,
 		.fixed_size = true,
 		.bonus_ways = 0xffffffff,
 		.stale_en = true,
-		.ovcap_prio = true,
+		.ovcap_en = true,
 		.parent_slice_id = 33,
 	}, {
 		.usecase_id = LLCC_CAMSRTRF,
@@ -3996,7 +3997,7 @@ static const struct llcc_slice_config sm8750_data[] = {
 		.fixed_size = true,
 		.bonus_ways = 0xffffffff,
 		.stale_en = true,
-		.ovcap_prio = true,
+		.ovcap_en = true,
 		.parent_slice_id = 33,
 	}, {
 		.usecase_id = LLCC_CPUSSMPAM,
