@@ -1491,6 +1491,8 @@ static void erhai_probe_status(void *data, struct erhai_probe_status *status)
 	sc8547a_probe_status(status);
 	if (p->ufcs_protection || !pps_enable || !pps_cp_enable)
 		status->protected |= ERHAI_UFCS;
+	if (!pps_cp_enable) /* Buck-only PPS does not require the pump. */
+		status->ready |= ERHAI_PPS;
 	status->delivering = p->state == PPS_CHARGING || p->state == PPS_TAPER;
 }
 

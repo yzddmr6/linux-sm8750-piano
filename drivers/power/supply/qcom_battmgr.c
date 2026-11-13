@@ -1866,8 +1866,9 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		if (battmgr->pd_state == PD_WAIT)
 			goto fixed_contract;
 		if (battmgr->pd_state == PD_ACTIVE &&
-		    !qcom_battmgr_retry_slot(&battmgr->pps_retries, &battmgr->pps_next,
-					     battmgr->stable_since))
+		    (!(status.ready & ERHAI_PPS) ||
+		     !qcom_battmgr_retry_slot(&battmgr->pps_retries, &battmgr->pps_next,
+					     battmgr->stable_since)))
 			goto fixed_contract;
 		if (qcom_battmgr_pd_stop(battmgr, false, "PPS handover"))
 			return PD_POLL_MS;

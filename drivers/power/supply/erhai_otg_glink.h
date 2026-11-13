@@ -18,9 +18,10 @@
 struct device;
 struct pmic_glink_client;
 
-/* Status of the two D+/D- charging protocols on this attachment. */
+/* Direct-charge route status on this attachment. */
 #define ERHAI_SERIAL		1U
 #define ERHAI_UFCS		2U
+#define ERHAI_PPS		4U
 struct erhai_probe_status {
 	unsigned int ready;
 	unsigned int responded;

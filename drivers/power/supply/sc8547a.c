@@ -1193,11 +1193,14 @@ int sc8547a_pps_adc_hold(bool on)
 {
 	guard(mutex)(&sc8547_pps_lock);
 	struct sc8547a_device *sc = sc8547_master_dev;
+	int ret = 0;
 
-	pps_adc_hold = on;
+	if (!sc && on)
+		return -ENODEV;
 	if (sc && !pps_cp_engaged)
-		return sc8547_set_adc_enable(sc, on);
-	return sc || !on ? 0 : -ENODEV;
+		ret = sc8547_set_adc_enable(sc, on);
+	pps_adc_hold = on && !ret;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(sc8547a_pps_adc_hold);
 
@@ -2615,7 +2618,10 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 
 	guard(mutex)(&sc8547_pps_lock);
 	sc = sc8547_master_dev;
-	if (!sc || sc->irq <= 0)
+	if (!sc)
+		return;
+	status->ready |= ERHAI_PPS;
+	if (sc->irq <= 0)
 		return;
 	if (serial_enable && sc8547_slave_dev)
 		status->ready |= ERHAI_SERIAL;
