@@ -452,7 +452,7 @@ static int pps_read_battery(struct erhai_pps *p)
 {
 	struct power_supply *psy = power_supply_get_by_name("qcom-battmgr-bat");
 	union power_supply_propval val;
-	int ret, temp;
+	int ret;
 
 	if (!psy)
 		return -ENODEV;
@@ -471,8 +471,7 @@ static int pps_read_battery(struct erhai_pps *p)
 	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_TEMP, &val);
 	if (ret)
 		goto out;
-	temp = val.intval;
-	p->temp_ddc = temp;
+	p->temp_ddc = val.intval;
 	ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_HEALTH, &val);
 	if (!ret && val.intval != POWER_SUPPLY_HEALTH_GOOD &&
 	    val.intval != POWER_SUPPLY_HEALTH_COOL && val.intval != POWER_SUPPLY_HEALTH_WARM)
@@ -802,8 +801,11 @@ static int pps_cp_step(struct erhai_pps *p)
 		if (cibus < (int)pps_cp_min_ibus_ma &&
 		    time_after_eq(jiffies, p->cp_engaged_since +
 				  msecs_to_jiffies(pps_cp_settle_ms))) {
-			if (++p->cp_low_cnt >= 4)
+			if (++p->cp_low_cnt >= 4) {
+				if (p->curve->steps[p->curve_idx].last)
+					return -ENODATA;
 				return pps_cp_release(p, "low-ibus", true);
+			}
 		} else {
 			p->cp_low_cnt = 0;
 		}
@@ -915,11 +917,10 @@ static void pps_poll(struct erhai_pps *p)
 
 	if (p->state > PPS_NEGOTIATE && p->state < PPS_EXIT) {
 		if (online <= 0 || erhai_otg_charge_inhibited() || pps_read_battery(p)) {
-
 			pps_exit(p, "source, policy or battery unavailable");
 			return;
 		}
-		cell_ma = pps_cell_limit(p, p->state == PPS_NEGOTIATE);
+		cell_ma = pps_cell_limit(p, false);
 		if (!cell_ma) {
 			pps_exit(p, "battery limit");
 			return;
@@ -930,28 +931,26 @@ static void pps_poll(struct erhai_pps *p)
 			if (taper != (p->state == PPS_TAPER))
 				pps_enter(p, taper ? PPS_TAPER : PPS_CHARGING, "cell curve");
 		}
-		if (p->state != PPS_NEGOTIATE) {
-			if (p->ibat_ma > 7400) {
-				if (!p->ibat_over_since)
-					p->ibat_over_since = jiffies | 1;
-				else if (time_after_eq(jiffies, p->ibat_over_since + 8 * HZ)) {
-					p->protection = true;
-					pps_exit(p, "PPS battery overcurrent");
-					return;
-				}
-			} else {
-				p->ibat_over_since = 0;
-			}
-			p->cell_ma = cell_ma;
-			p->target_curr_ma = min3(p->source_ma, cell_ma, p->pump_limit_ma);
-			if (p->set_curr_ma > p->target_curr_ma &&
-			    pps_pdo_set(p, p->set_volt_mv, p->target_curr_ma)) {
-				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
+		if (p->ibat_ma > 7400) {
+			if (!p->ibat_over_since)
+				p->ibat_over_since = jiffies | 1;
+			else if (time_after_eq(jiffies, p->ibat_over_since + 8 * HZ)) {
+				p->protection = true;
+				pps_exit(p, "PPS battery overcurrent");
 				return;
 			}
+		} else {
+			p->ibat_over_since = 0;
+		}
+		p->cell_ma = cell_ma;
+		p->target_curr_ma = min3(p->source_ma, cell_ma, p->pump_limit_ma);
+		if (p->set_curr_ma > p->target_curr_ma &&
+		    pps_pdo_set(p, p->set_volt_mv, p->target_curr_ma)) {
+			pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
+			return;
 		}
 		if (p->vbus_mv > (int)pps_cp_max_volt_mv ||
-		    (p->state != PPS_NEGOTIATE && p->vbus_mv < (int)pps_vbus_collapse_mv)) {
+		    p->vbus_mv < (int)pps_vbus_collapse_mv) {
 			p->protection = p->vbus_mv > (int)pps_cp_max_volt_mv;
 			pps_exit(p, "VBUS outside limits");
 			return;
@@ -962,10 +961,8 @@ static void pps_poll(struct erhai_pps *p)
 	case PPS_IDLE: {
 		bool vooc;
 
-		if (online <= 0) {
-
+		if (online <= 0)
 			return;
-		}
 		if (p->protection || time_before(jiffies, p->retry_at))
 			return;
 
@@ -973,8 +970,10 @@ static void pps_poll(struct erhai_pps *p)
 			return;
 		/* The disabled serial poller no longer prewarms the ADC for us. */
 		if (pps_cp_enable && !p->adc_held) {
-			if (pps_sc_adc_hold(true))
+			if (pps_sc_adc_hold(true)) {
+				p->retry_at = jiffies + msecs_to_jiffies(pps_cp_rearm_ms);
 				return;
+			}
 			p->adc_held = true;
 		}
 		pps_enter(p, PPS_NEGOTIATE, "PD_PPS adapter");
@@ -1102,7 +1101,6 @@ fail:
 		next = min(p->set_volt_mv + pps_volt_step_mv, pps_target_volt_mv);
 		next = min(next, pps_max_volt_mv);
 		if (pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, next)) {
-
 			pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}
@@ -1110,7 +1108,6 @@ fail:
 		if (p->set_curr_ma < p->target_curr_ma) {
 			ci = min(p->set_curr_ma + 250U, p->target_curr_ma);
 			if (pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, ci)) {
-
 				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 				return;
 			}
@@ -1160,7 +1157,6 @@ fail:
 					     p->target_curr_ma);
 
 			if (pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, n)) {
-
 				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 				return;
 			}
@@ -1189,8 +1185,7 @@ fail:
 			rc = pps_cp_release(p, "disabled", false);
 		}
 		if (rc) {
-
-			pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
+			pps_exit(p, rc == -ENODATA ? "cell taper complete" : PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}
 		p->charg_ticks++;
@@ -1317,7 +1312,8 @@ static bool erhai_pps_available(void *data)
 
 	if (p->state != PPS_IDLE || p->cleanup || p->adc_held)
 		return true;
-	return !p->protection && !time_before(jiffies, p->retry_at) && pps_deployable(p, &vooc) && pps_source_limit() > 0;
+	return !p->protection && !time_before(jiffies, p->retry_at) &&
+	       pps_deployable(p, &vooc) && pps_source_limit() > 0;
 }
 
 static bool erhai_pps_active(void *data)
@@ -1332,7 +1328,7 @@ static int erhai_pps_stop(void *data)
 	struct erhai_pps *p = data;
 
 	pps_exit(p, "policy stop");
-	if (!pps_usb_get(0)) {
+	if (p->protection && !pps_usb_get(0)) {
 		p->protection = false;
 		p->retry_at = jiffies;
 	}

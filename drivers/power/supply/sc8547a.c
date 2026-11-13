@@ -493,6 +493,7 @@ struct sc8547a_device {
 	const struct erhai_charge_curve *auto_curve;	/* selected CC/CV table */
 	int			auto_curve_idx;	/* current row (descends only) */
 	bool			auto_protection;
+	bool			auto_known_svooc;
 	unsigned int		auto_taper_cnt;
 	int			auto_step_cnt;	/* advance debounce counter */
 	int			auto_reservo_cnt;	/* consecutive adapter-reset re-servos */
@@ -1243,7 +1244,7 @@ int sc8547a_pps_share(int master_ma, int margin_mv, unsigned int demand_ma,
 		return sc8547_pps_slave_off();
 	if (!pps_slave_engaged) {
 		/* virtual_cp cp_open_curr_thr_ma / cp_close_curr_thr_ma. */
-		if (master_ma <= 1900 || margin_mv < 200)
+		if (demand_ma <= 1900 || master_ma <= 1900 || margin_mv < 200)
 			return 0;
 		ret = sc8547_slave_hw_setting(sc8547_master_dev);
 		if (ret)
@@ -1797,7 +1798,7 @@ static void vooc_reply_adapter_mesg(struct sc8547a_device *sc)
  * gauge power-supply.  Returns -ENODEV when that psy is not registered yet.
  */
 static int sc8547_read_gauge_name(const char *name, int *soc, int *temp_ddc,
-				  int *vbat_mv)
+				  int *vbat_mv, int *ibat_ma)
 {
 	struct power_supply *psy = power_supply_get_by_name(name);
 	union power_supply_propval v;
@@ -1828,6 +1829,11 @@ static int sc8547_read_gauge_name(const char *name, int *soc, int *temp_ddc,
 			goto out;
 		*vbat_mv = v.intval / 1000;	/* uV -> mV */
 	}
+	if (ibat_ma) {
+		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &v);
+		if (!ret)
+			*ibat_ma = v.intval / 1000;
+	}
 out:
 	power_supply_put(psy);
 	return ret;
@@ -1845,20 +1851,20 @@ out:
  * yet), which the caller reports as "gauge not ready".
  */
 static int sc8547_read_gauge(struct sc8547a_device *sc, int *soc, int *temp_ddc,
-			     int *vbat_mv)
+			     int *vbat_mv, int *ibat_ma)
 {
 	int last = -ENODEV;
 	size_t i;
 
 	if (gauge_name) {
-		last = sc8547_read_gauge_name(gauge_name, soc, temp_ddc, vbat_mv);
+		last = sc8547_read_gauge_name(gauge_name, soc, temp_ddc, vbat_mv, ibat_ma);
 		if (!last)
 			return 0;
 	}
 
 	for (i = 0; i < ARRAY_SIZE(sc8547_gauge_names); i++) {
 		last = sc8547_read_gauge_name(sc8547_gauge_names[i], soc, temp_ddc,
-					      vbat_mv);
+					      vbat_mv, ibat_ma);
 		if (!last) {
 			/*
 			 * Evidence line for a board whose primary pack gauge is
@@ -2066,8 +2072,8 @@ static void sc8547_auto_decline(struct sc8547a_device *sc, const char *why)
  * Called on curve exit, on a safety backstop trip, or on a margin-low stop.
  * The adapter drops to 5 V once VOOC frames stop; restoring the crossbar
  * returns D+/D- to the SoC for BC1.2/PD, so the pack keeps charging over the
- * normal battmgr path. Stays DONE until physical detach so it does not re-arm
- * on this plug.
+ * normal battmgr path. Re-evaluate known bricks after a holdoff; a
+ * protection trip keeps the pumps off for the rest of the session.
  */
 static void sc8547_auto_finish(struct sc8547a_device *sc, const char *why)
 {
@@ -2229,7 +2235,8 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 		return;
 	}
 
-	ret = sc8547_read_gauge(sc, &soc, &temp_ddc, &cell_mv);
+	sc->auto_known_svooc = true;
+	ret = sc8547_read_gauge(sc, &soc, &temp_ddc, &cell_mv, NULL);
 	if (ret) {
 		sc8547_auto_decline(sc, "gauge not ready");
 		return;
@@ -2277,7 +2284,7 @@ static void sc8547_attach_work(struct work_struct *work)
 	if (sc->auto_state == SC_AUTO_DONE || sc->auto_state == SC_AUTO_DECLINED) {
 		int soc, temp, mv;
 
-		if (sc8547_read_gauge(sc, &soc, &temp, &mv) ||
+		if (sc8547_read_gauge(sc, &soc, &temp, &mv, NULL) ||
 		    !sc8547_auto_update_curve(sc, soc, temp, mv, 0, true))
 			goto reschedule;
 		sc->auto_state = SC_AUTO_IDENTIFY;
@@ -2305,11 +2312,11 @@ static void sc8547_attach_work(struct work_struct *work)
 	if (sc->auto_state == SC_AUTO_DELIVER) {
 		int cpbat = sc8547_get_vbat(sc);	/* cell + delivery IR drop */
 		int cibus = sc8547_get_ibus(sc);
-		int gsoc = -1, gtemp = 0, gvbat = -1;
+		int gsoc = -1, gtemp = 0, gvbat = -1, ibat = 0;
 		int gret;
 		int cvbat;
 
-		gret = sc8547_read_gauge(sc, &gsoc, &gtemp, &gvbat);
+		gret = sc8547_read_gauge(sc, &gsoc, &gtemp, &gvbat, &ibat);
 		cvbat = gvbat;
 		/*
 		 * Under dual-CP the master REG_13 reads only its half of the bus
@@ -2320,7 +2327,7 @@ static void sc8547_attach_work(struct work_struct *work)
 		int cibus_total = cibus + slave_ma;
 		int margin = vbus - 2 * cpbat;
 		u8 r6 = 0, r7 = 0;
-		if (cpbat >= SC8547_CP_OVP_CEILING_MV || cibus >= 4500 ||
+		if ((!gret && ibat > 13600) || cpbat >= SC8547_CP_OVP_CEILING_MV || cibus >= 4500 ||
 		    slave_ma >= 4500 || cibus_total >= SC8547_IBUS_ABORT_MA) {
 			sc->auto_protection = true;
 			sc8547_auto_finish(sc, "pump overvoltage or overcurrent");
@@ -2444,7 +2451,7 @@ static void sc8547_attach_work(struct work_struct *work)
 
 reschedule:
 	if ((sc->auto_state == SC_AUTO_DONE || sc->auto_state == SC_AUTO_DECLINED) &&
-	    !sc->auto_protection && sc->adapter_type == SC_ADAPTER_SVOOC) {
+	    !sc->auto_protection && (sc->auto_known_svooc || sc->vooc_saw_any)) {
 		/* A known brick can resume without unplugging. Keep the buck
 		 * in charge while CV/temperature or telemetry prevents entry.
 		 */
@@ -2480,6 +2487,7 @@ int sc8547a_serial_session(bool enable)
 		sc->auto_reservo_cnt = 0;
 		sc->slave_low_cnt = 0;
 		sc->auto_protection = false;
+		sc->auto_known_svooc = false;
 		sc->vooc_started = true;
 		mod_delayed_work(system_wq, &sc->attach_work,
 				 msecs_to_jiffies(SC8547_ATTACH_SETTLE_MS));
