@@ -40,6 +40,11 @@
 #include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/random.h>
+#if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
+#include <linux/regmap.h>
+#include "ufcs/sc8547a_ufcs.h"
+#include "ufcs/include/internal/ufcs_msg.h"
+#endif
 #include <linux/seq_file.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
@@ -411,6 +416,13 @@ enum sc8547_auto_state {
 };
 
 struct sc8547a_device {
+#if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
+	struct sc8547a_ufcs_phy ufcs_phy;
+	struct ufcs_dev *ufcs;
+	u64 ufcs_mode;
+	unsigned long ufcs_packet_at;
+#endif
+	bool ufcs_owner;
 	struct i2c_client	*client;
 	struct device		*dev;
 	struct mutex		i2c_lock;	/* serialises multi-op RMW */
@@ -943,7 +955,7 @@ int sc8547a_pps_cp_engage(int *need_mv)
 	    diff > SC8547_CP_RESTART_MARGIN_CEIL_MV)
 		return -EAGAIN;
 
-	ret = sc8547_svooc_hw_setting(sc);
+	ret = sc->ufcs_owner ? sc8547_set_adc_enable(sc, true) : sc8547_svooc_hw_setting(sc);
 	if (!ret)
 		ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
 	if (!ret)
@@ -1021,7 +1033,7 @@ static int sc8547_pps_disengage(void)
 		pps_cp_engaged = false;
 		return 0;
 	}
-	ret = sc8547_reset_voocphy(sc);
+	ret = sc->ufcs_owner ? sc8547_set_chg_enable(sc, false) : sc8547_reset_voocphy(sc);
 	if (ret)
 		return ret;
 	pps_cp_engaged = false;
@@ -2441,7 +2453,7 @@ int sc8547a_serial_session(bool enable)
 		return 0;
 	}
 	if (enable) {
-		if (!sc8547_slave_dev || sc->irq <= 0 || pps_cp_engaged || pps_adc_hold)
+		if (sc->ufcs_owner || !sc8547_slave_dev || sc->irq <= 0 || pps_cp_engaged || pps_adc_hold)
 			return -EAGAIN;
 		sc->auto_state = SC_AUTO_IDENTIFY;
 		sc->fastchg_auto = true;
@@ -2499,6 +2511,188 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
 	return true;
 }
 
+/* Serialize synchronous protocol transactions against unbind. The
+ * threaded IRQ only takes pps_lock; the engine waits for IRQs with
+ * that lock released. The charger worker owns the route and pumps.
+ */
+static DEFINE_MUTEX(sc8547_ufcs_lock);
+
+#if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
+static int sc8547_ufcs_prepare(void *ctx)
+{
+	struct sc8547a_device *sc = ctx;
+	int ret;
+
+	guard(mutex)(&sc8547_pps_lock);
+	if (!sc->ufcs_owner || sc->vooc_started || pps_cp_engaged)
+		return -EBUSY;
+	ret = sc8547_reg_reset(sc);
+	if (ret)
+		return ret;
+	msleep(10); /* vendor SC8547A reset settling time */
+	return sc8547_init_device(sc);
+}
+
+static void sc8547_ufcs_unregister(void *arg)
+{
+	ufcs_device_unregister(arg);
+}
+
+static int sc8547_ufcs_init(struct sc8547a_device *sc)
+{
+	static const struct regmap_config config = { .reg_bits = 8, .val_bits = 8 };
+
+	if (sc->is_slave || sc->irq <= 0)
+		return 0;
+	sc->ufcs_phy.map = devm_regmap_init_i2c(sc->client, &config);
+	if (IS_ERR(sc->ufcs_phy.map))
+		return PTR_ERR(sc->ufcs_phy.map);
+	sc->ufcs_phy.ctx = sc;
+	sc->ufcs_phy.prepare = sc8547_ufcs_prepare;
+	sc->ufcs = sc8547a_ufcs_register(sc->dev, &sc->ufcs_phy);
+	if (IS_ERR(sc->ufcs))
+		return PTR_ERR(sc->ufcs);
+	return devm_add_action_or_reset(sc->dev, sc8547_ufcs_unregister, sc->ufcs);
+}
+
+/* Stop the pumps before disabling the PHY watchdog or releasing D+/D-. */
+static int sc8547_ufcs_end(struct sc8547a_device *sc)
+{
+	int ret;
+
+	if (!sc || !sc->ufcs_owner)
+		return 0;
+	scoped_guard(mutex, &sc8547_pps_lock) {
+		ret = sc8547_pps_slave_off();
+		ret = ret ?: sc8547_set_chg_enable(sc, false);
+		if (ret)
+			return ret;
+		pps_cp_engaged = false;
+		pps_adc_hold = false;
+	}
+	ufcs_force_exit(sc->ufcs);
+	guard(mutex)(&sc8547_pps_lock);
+	ret = sc8547_reset_voocphy(sc);
+	ret = ret ?: wcd939x_usbss_dpdm_switch_fast_charge(false);
+	if (!ret)
+		sc->ufcs_owner = false;
+	return ret;
+}
+
+int sc8547a_ufcs_stop(void)
+{
+	guard(mutex)(&sc8547_ufcs_lock);
+	return sc8547_ufcs_end(sc8547_master_dev);
+}
+
+int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
+{
+	u64 modes[UFCS_OUTPUT_MODE_MAX], cable;
+	int count, ret, i, best = 0;
+	struct sc8547a_device *sc;
+
+	guard(mutex)(&sc8547_ufcs_lock);
+	sc = sc8547_master_dev;
+	if (!sc || !sc->ufcs)
+		return -EOPNOTSUPP;
+	scoped_guard(mutex, &sc8547_pps_lock) {
+		if (sc->vooc_started || pps_cp_engaged || pps_adc_hold || sc->ufcs_owner)
+			return -EBUSY;
+		sc->ufcs_owner = true;
+		ret = wcd939x_usbss_dpdm_switch_fast_charge(true);
+	}
+	if (ret)
+		goto out;
+	ret = ufcs_handshake(sc->ufcs);
+	if (ret)
+		goto out;
+	ret = ufcs_intf_config_watchdog(sc->ufcs, 3000);
+	if (ret)
+		goto out;
+	count = ufcs_intf_get_pdo_info(sc->ufcs, modes, ARRAY_SIZE(modes));
+	if (count <= 0) {
+		ret = count ?: -ENODATA;
+		goto out;
+	}
+	/* Standard, non-proprietary UFCS modes. A larger cable budget
+	 * requires a successful cable information exchange.
+	 */
+	ret = ufcs_intf_get_cable_info(sc->ufcs, &cable);
+	if (ret < 0)
+		goto out;
+	for (i = 0; i < count; i++) {
+		int ma = min(UFCS_OUTPUT_MODE_CURR_MAX(modes[i]), UFCS_CABLE_INFO_CURR_MAX(cable));
+
+		if (UFCS_OUTPUT_MODE_VOL_MIN(modes[i]) > min_mv ||
+		    UFCS_OUTPUT_MODE_VOL_MAX(modes[i]) < max_mv ||
+		    UFCS_CABLE_INFO_VOL_MAX(cable) < max_mv || ma <= best)
+			continue;
+		sc->ufcs_mode = modes[i];
+		best = ma;
+	}
+	if (best) {
+		sc->ufcs_packet_at = jiffies;
+		return best;
+	}
+	ret = -ENODATA;
+out:
+	return sc8547_ufcs_end(sc) ?: ret;
+}
+
+int sc8547a_ufcs_request(unsigned int *mv, unsigned int *ma)
+{
+	struct sc8547a_device *sc;
+	u64 mode;
+	unsigned int base_mv, base_ma;
+
+	guard(mutex)(&sc8547_ufcs_lock);
+	sc = sc8547_master_dev;
+	if (!sc || !sc->ufcs_owner || !ufcs_handshake_success(sc->ufcs))
+		return -ENOLINK;
+	mode = sc->ufcs_mode;
+	base_mv = UFCS_OUTPUT_MODE_VOL_MIN(mode);
+	base_ma = UFCS_OUTPUT_MODE_CURR_MIN(mode);
+	if (*mv < base_mv || *ma < base_ma)
+		return -ERANGE;
+	*mv -= (*mv - base_mv) % UFCS_OUTPUT_MODE_VOL_STEP(mode);
+	*ma -= (*ma - base_ma) % UFCS_OUTPUT_MODE_CURR_STEP(mode);
+	if (ufcs_intf_pdo_set(sc->ufcs, *mv, *ma))
+		return -EIO;
+	sc->ufcs_packet_at = jiffies;
+	return 0;
+}
+/* Source watchdog is set to 3 s; monitor the live contract before
+ * that deadline even when the servo has no voltage change to request.
+ */
+int sc8547a_ufcs_monitor(void)
+{
+	struct sc8547a_device *sc;
+	u64 info;
+	int ret;
+
+	guard(mutex)(&sc8547_ufcs_lock);
+	sc = sc8547_master_dev;
+	if (!sc || !sc->ufcs_owner || !ufcs_handshake_success(sc->ufcs))
+		return -ENOLINK;
+	if (time_before(jiffies, sc->ufcs_packet_at + HZ))
+		return 0;
+	ret = ufcs_intf_get_source_info(sc->ufcs, &info);
+	if (!ret)
+		sc->ufcs_packet_at = jiffies;
+	return ret;
+}
+#else
+static int sc8547_ufcs_init(struct sc8547a_device *sc) { return 0; }
+int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv) { return -EOPNOTSUPP; }
+int sc8547a_ufcs_request(unsigned int *mv, unsigned int *ma) { return -EOPNOTSUPP; }
+int sc8547a_ufcs_stop(void) { return 0; }
+int sc8547a_ufcs_monitor(void) { return -EOPNOTSUPP; }
+#endif
+EXPORT_SYMBOL_GPL(sc8547a_ufcs_start);
+EXPORT_SYMBOL_GPL(sc8547a_ufcs_request);
+EXPORT_SYMBOL_GPL(sc8547a_ufcs_stop);
+EXPORT_SYMBOL_GPL(sc8547a_ufcs_monitor);
+
 /* ------------------------------- IRQ ---------------------------------- */
 
 static irqreturn_t sc8547_irq_handler(int irq, void *data)
@@ -2508,6 +2702,12 @@ static irqreturn_t sc8547_irq_handler(int irq, void *data)
 
 	/* When the PHY is armed, an IRQ is an adapter VOOC frame. */
 	guard(mutex)(&sc8547_pps_lock);
+#if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
+	if (sc->ufcs_owner) {
+		sc8547a_ufcs_irq(sc->ufcs);
+		return IRQ_HANDLED;
+	}
+#endif
 	if (sc->vooc_started && sc->auto_armed &&
 	    (sc->auto_state == SC_AUTO_IDENTIFY || sc->auto_state == SC_AUTO_DELIVER)) {
 		if (sc8547_voocphy_isr(sc))
@@ -2655,6 +2855,10 @@ static int sc8547a_probe(struct i2c_client *client)
 	if (ret)
 		return dev_err_probe(sc->dev, ret, "hardware init failed\n");
 
+	ret = sc8547_ufcs_init(sc);
+	if (ret)
+		return dev_err_probe(sc->dev, ret, "UFCS PHY registration failed\n");
+
 	if (sc->irq > 0) {
 		ret = devm_request_threaded_irq(sc->dev, sc->irq, NULL,
 						sc8547_irq_handler,
@@ -2667,6 +2871,7 @@ static int sc8547a_probe(struct i2c_client *client)
 
 	sc8547_create_debugfs(sc);
 
+	guard(mutex)(&sc8547_ufcs_lock);
 	mutex_lock(&sc8547_pps_lock);
 	if (sc->is_slave)
 		sc8547_slave_dev = sc;	/* master delivery path drives it */
@@ -2686,6 +2891,11 @@ static void sc8547a_remove(struct i2c_client *client)
 	sc8547a_serial_session(false);
 	cancel_delayed_work_sync(&sc->attach_work);
 	debugfs_remove_recursive(sc->debug_root);
+	guard(mutex)(&sc8547_ufcs_lock);
+#if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
+	if (!sc->is_slave)
+		sc8547_ufcs_end(sc);
+#endif
 	guard(mutex)(&sc8547_pps_lock);
 	sc8547_reset_voocphy(sc);
 	if (sc->is_slave) {
@@ -2703,7 +2913,7 @@ static int sc8547a_suspend(struct device *dev)
 {
 	struct sc8547a_device *sc = dev_get_drvdata(dev);
 
-	int ret = sc8547a_serial_session(false);
+	int ret = sc8547a_ufcs_stop() ?: sc8547a_serial_session(false);
 
 	if (ret)
 		return ret;

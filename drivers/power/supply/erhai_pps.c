@@ -347,9 +347,12 @@ static const char *const pps_state_names[PPS_LAST_STATE] = {
 
 struct erhai_pps {
 	bool cleanup;
+	bool ufcs;
 	bool restore_fcc;
 	u32 saved_fcc_ua;
 	bool protection;
+	bool ufcs_protection;
+	bool pps_protection;
 	unsigned long retry_at;
 	unsigned long next_poll;
 
@@ -551,22 +554,26 @@ static int pps_revert(struct erhai_pps *p)
 #define PPS_RESTORE(call) do { rc = (call); if (rc && !err) err = rc; } while (0)
 	PPS_RESTORE(pps_sc_adc_hold(false));
 	PPS_RESTORE(pps_cp_drop());
-	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, min(p->target_curr_ma, 2000U)));
-	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, 5000));
-	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_PPS_MOS_CTRL, 0));
-	PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_AP_FASTCHG_ALLOW, 0));
-	if (p->restore_fcc) {
-		rc = pps_batt_set(PPS_PROP_BATT_CHG_CTRL_LIM, p->saved_fcc_ua);
-		if (!rc)
-			p->restore_fcc = false;
-		else if (!err)
-			err = rc;
+	if (p->ufcs) {
+		PPS_RESTORE(sc8547a_ufcs_stop());
+	} else {
+		PPS_RESTORE(pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, min(p->target_curr_ma, 2000U)));
+		PPS_RESTORE(pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, 5000));
+		PPS_RESTORE(pps_usb_set(PPS_PROP_USB_PPS_MOS_CTRL, 0));
+		PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_AP_FASTCHG_ALLOW, 0));
+		if (p->restore_fcc) {
+			rc = pps_batt_set(PPS_PROP_BATT_CHG_CTRL_LIM, p->saved_fcc_ua);
+			if (!rc)
+				p->restore_fcc = false;
+			else if (!err)
+				err = rc;
+		}
+		PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_CHG_EN,
+				       erhai_otg_charge_inhibited() ? 0 : 1));
+		PPS_RESTORE(pps_usb_set(PPS_PROP_USB_PPS_VOOCPHY_ENABLE, 0));
+		/* Explicitly leave the APDO as well as lowering its requested voltage. */
+		PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_SET_PDO, 5000));
 	}
-	PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_CHG_EN,
-			       erhai_otg_charge_inhibited() ? 0 : 1));
-	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_PPS_VOOCPHY_ENABLE, 0));
-	/* Explicitly leave the APDO as well as lowering its requested voltage. */
-	PPS_RESTORE(pps_batt_set(PPS_PROP_BATT_SET_PDO, 5000));
 	PPS_RESTORE(pps_usb_set(PPS_PROP_USB_INPUT_CURR_LIMIT, PPS_ICL_UNSUSPEND));
 #undef PPS_RESTORE
 	online = pps_usb_get(0);
@@ -583,6 +590,7 @@ static int pps_revert(struct erhai_pps *p)
 		pr_warn_ratelimited("erhai_pps: 5 V cleanup pending: %d\n", err);
 		return err;
 	}
+	p->ufcs = false;
 	p->adc_held = false;
 	p->set_volt_mv = 0;
 	p->set_curr_ma = 0;
@@ -612,7 +620,15 @@ static void pps_exit(struct erhai_pps *p, const char *reason)
 	/* Cleanup has priority over the holdoff. While idle, battmgr can
 	 * supply the system from a fixed PDO throughout the holdoff.
 	 */
-	p->retry_at = jiffies + msecs_to_jiffies(pps_cp_rearm_ms);
+	if (p->protection) {
+		if (p->ufcs)
+			p->ufcs_protection = true;
+		else
+			p->pps_protection = true;
+		p->protection = false;
+	}
+	if (!p->ufcs)
+		p->retry_at = jiffies + msecs_to_jiffies(pps_cp_rearm_ms);
 	p->last_reason = reason;
 	p->exits++;
 	p->charg_ticks = 0;
@@ -638,8 +654,16 @@ static int pps_pdo_set(struct erhai_pps *p, unsigned int mv, unsigned int ma)
 {
 	int rc;
 
-	if (mv < 5000 || mv > pps_cp_max_volt_mv || !ma || ma > pps_max_curr_ma)
+	if (mv < 5000 || mv > pps_cp_max_volt_mv || !ma || ma > (p->ufcs ? 8000 : pps_max_curr_ma))
 		return -ERANGE;
+	if (p->ufcs) {
+		rc = sc8547a_ufcs_request(&mv, &ma);
+		if (!rc) {
+			p->set_volt_mv = mv;
+			p->set_curr_ma = ma;
+		}
+		return rc;
+	}
 	rc = pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, mv);
 	if (rc)
 		return rc;
@@ -758,7 +782,7 @@ static int pps_cp_step(struct erhai_pps *p)
 		/* Until the ADC shows sharing, budget one pump. An unbalanced
 		 * pair can only increase by the headroom of its busiest leg.
 		 */
-		p->pump_limit_ma = min(4000 + min(cibus, slave_ma), 5000);
+		p->pump_limit_ma = min(4000 + min(cibus, slave_ma), p->ufcs ? 8000 : 5000);
 		p->pump_ibus_ma = cibus + slave_ma;
 		target = min(target, p->pump_limit_ma);
 		if (p->set_curr_ma > target && pps_pdo_set(p, p->set_volt_mv, target))
@@ -798,7 +822,7 @@ static int pps_cp_step(struct erhai_pps *p)
 	if (p->cp_rearms >= pps_cp_rearm_max)
 		return -ETIMEDOUT;
 	if (time_before(jiffies, p->cp_holdoff_until) ||
-	    p->set_curr_ma < p->target_curr_ma)
+	    (!p->ufcs && p->set_curr_ma < p->target_curr_ma))
 		return 0;
 
 	if (!p->cp_lift_since) {
@@ -935,7 +959,7 @@ static void pps_poll(struct erhai_pps *p)
 
 		if (online <= 0)
 			return;
-		if (p->protection || time_before(jiffies, p->retry_at))
+		if (p->pps_protection || time_before(jiffies, p->retry_at))
 			return;
 
 		if (!pps_deployable(p, &vooc))
@@ -1128,11 +1152,10 @@ fail:
 			unsigned int n = min(p->set_curr_ma + 250U,
 					     p->target_curr_ma);
 
-			if (pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, n)) {
+			if (pps_pdo_set(p, p->set_volt_mv, n)) {
 				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 				return;
 			}
-			p->set_curr_ma = n;
 		}
 
 		/*
@@ -1246,7 +1269,7 @@ static unsigned int erhai_pps_update(void *data, bool caps_changed)
 	struct erhai_pps *p = data;
 	unsigned int delay;
 
-	if (caps_changed && (p->state == PPS_RAMP || p->state == PPS_CHARGING ||
+	if (!p->ufcs && caps_changed && (p->state == PPS_RAMP || p->state == PPS_CHARGING ||
 			     p->state == PPS_TAPER)) {
 		int ma = pps_source_limit();
 
@@ -1269,6 +1292,57 @@ static unsigned int erhai_pps_update(void *data, bool caps_changed)
 	return delay;
 }
 
+/* Use the same cell policy, dual-pump servo and watchdog as PPS.
+ * A failed UFCS request leaves both pumps off and restores the crossbar
+ * before battmgr admits the next protocol.
+ */
+static bool erhai_ufcs_active(void *data)
+{
+	return ((struct erhai_pps *)data)->ufcs;
+}
+
+static unsigned int erhai_ufcs_update(void *data)
+{
+	struct erhai_pps *p = data;
+	int ma, rc;
+
+	if (p->ufcs) {
+		if (p->state != PPS_EXIT && sc8547a_ufcs_monitor())
+			pps_exit(p, "UFCS source unavailable");
+		return p->ufcs ? erhai_pps_update(p, false) : 0;
+	}
+	if (p->ufcs_protection)
+		return 0;
+	if (p->state != PPS_IDLE || p->cleanup || !pps_cp_enable ||
+	    erhai_otg_charge_inhibited() || pps_read_battery(p))
+		return 0;
+	p->cell_ma = pps_cell_limit(p, true);
+	if (!p->cell_ma)
+		return 0;
+	ma = sc8547a_ufcs_start(pps_target_volt_mv, pps_cp_max_volt_mv);
+	if (ma <= 0) {
+		if (!sc8547a_ufcs_stop())
+			return 0;
+		/* Keep ownership after an unacknowledged teardown. */
+		p->ufcs = p->cleanup = true;
+		pps_enter(p, PPS_EXIT, "UFCS cleanup");
+		return pps_poll_ms;
+	}
+	p->ufcs = p->cleanup = true;
+	p->source_ma = min_t(unsigned int, ma, 2 * 4000);
+	p->pump_limit_ma = 4000;
+	p->target_curr_ma = min3(p->cell_ma, p->source_ma, p->pump_limit_ma);
+	p->cp_rearms = 0;
+	p->cp_holdoff_until = jiffies;
+	p->ibat_over_since = 0;
+	p->next_poll = jiffies;
+	pps_enter(p, PPS_CHARGING, "UFCS");
+	rc = pps_pdo_set(p, pps_target_volt_mv, min(pps_start_curr_ma, p->target_curr_ma));
+	if (rc)
+		pps_exit(p, "UFCS initial request");
+	return pps_cp_feed_ms;
+}
+
 static bool erhai_pps_enabled(void)
 {
 	return READ_ONCE(pps_enable);
@@ -1284,7 +1358,7 @@ static bool erhai_pps_available(void *data)
 
 	if (p->state != PPS_IDLE || p->cleanup || p->adc_held)
 		return true;
-	return !p->protection && !time_before(jiffies, p->retry_at) &&
+	return !p->pps_protection && !time_before(jiffies, p->retry_at) &&
 	       pps_deployable(p, &vooc) && pps_source_limit() > 0;
 }
 
@@ -1300,8 +1374,8 @@ static int erhai_pps_stop(void *data)
 	struct erhai_pps *p = data;
 
 	pps_exit(p, "policy stop");
-	if (p->protection && !pps_usb_get(0)) {
-		p->protection = false;
+	if ((p->pps_protection || p->ufcs_protection) && !pps_usb_get(0)) {
+		p->pps_protection = p->ufcs_protection = false;
 		p->retry_at = jiffies;
 	}
 	if (p->cleanup)
@@ -1315,7 +1389,8 @@ static ssize_t erhai_pps_describe(void *data, char *buf, ssize_t off)
 {
 	struct erhai_pps *p = data;
 
-	return off + sysfs_emit_at(buf, off, "state=%s request_mv=%u request_ma=%u pump=%u pump_ibus_ma=%d exits=%u last_exit=%s\n",
+	return off + sysfs_emit_at(buf, off, "protocol=%s state=%s request_mv=%u request_ma=%u pump=%u pump_ibus_ma=%d exits=%u last_exit=%s\n",
+			  p->ufcs ? "ufcs" : p->state == PPS_IDLE ? "none" : "pps",
 			  pps_state_names[p->state], p->set_volt_mv, p->set_curr_ma,
 			  pps_cp_is_engaged(), pps_cp_is_engaged() ? p->pump_ibus_ma : 0, p->exits, p->last_reason ?: "none");
 }
@@ -1326,6 +1401,8 @@ static const struct erhai_pps_ops erhai_pps_ops = {
 	.serial_session = sc8547a_serial_session,
 	.active = erhai_pps_active,
 	.available = erhai_pps_available,
+	.ufcs_active = erhai_ufcs_active,
+	.ufcs_update = erhai_ufcs_update,
 	.update = erhai_pps_update,
 	.stop = erhai_pps_stop,
 };

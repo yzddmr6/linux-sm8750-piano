@@ -22,6 +22,10 @@
  * genuine serial-SVOOC path keeps ownership of the plug.
  */
 bool sc8547a_fastchg_delivering(void);
+int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv);
+int sc8547a_ufcs_request(unsigned int *mv, unsigned int *ma);
+int sc8547a_ufcs_stop(void);
+int sc8547a_ufcs_monitor(void);
 int sc8547a_serial_session(bool enable);
 
 /*

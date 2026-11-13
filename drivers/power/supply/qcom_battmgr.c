@@ -533,6 +533,8 @@ struct qcom_battmgr {
 	bool qc_contract;
 	bool serial_probe;
 	unsigned long serial_retry;
+	unsigned long ufcs_retry;
+	bool ufcs_backoff;
 	bool serial_backoff;
 	bool aicl_done;
 	bool pd_logged;
@@ -1446,6 +1448,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->serial_backoff = false;
 		battmgr->serial_probe = false;
 		battmgr->aicl_done = false;
+		battmgr->ufcs_backoff = false;
 		ret = qcom_battmgr_pps_stop(battmgr);
 		if (ret)
 			return PD_POLL_MS;
@@ -1488,7 +1491,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		 * source at 5 V. Its decline/timeout releases the crossbar
 		 * before the next protocol (including firmware QC) can act.
 		 */
-		if (dedicated && !READ_ONCE(battmgr->pps_suspended) &&
+		if (!battmgr->pps_ops->ufcs_active(battmgr->pps_data) && dedicated && !READ_ONCE(battmgr->pps_suspended) &&
 		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
 		    !battmgr->charge_policy_hold && !battmgr->charge_error &&
 		    (!battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
@@ -1508,6 +1511,24 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			return PD_POLL_MS;
 		battmgr->serial_probe = false;
 	}
+	if (IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS) && dedicated && battmgr->pps_ops &&
+	    !battmgr->pps_suspended && !battmgr->otg_request && !battmgr->charge_inhibited &&
+	    !battmgr->charge_policy_hold && !battmgr->charge_error &&
+	    (!battmgr->ufcs_backoff || time_after_eq(jiffies, battmgr->ufcs_retry))) {
+		unsigned int delay;
+
+		if (qcom_battmgr_pd_stop(battmgr, false, "UFCS probe"))
+			return PD_POLL_MS;
+		delay = battmgr->pps_ops->ufcs_update(battmgr->pps_data);
+		if (battmgr->pps_ops->ufcs_active(battmgr->pps_data))
+			return delay ?: PD_POLL_MS;
+		battmgr->ufcs_backoff = true;
+		battmgr->ufcs_retry = jiffies + msecs_to_jiffies(CHARGE_CTRL_POLL_MS);
+		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+	}
+	if (battmgr->pps_ops && battmgr->pps_ops->ufcs_active(battmgr->pps_data) &&
+	    qcom_battmgr_pps_stop(battmgr))
+		return PD_POLL_MS;
 	/* The Type-C partner's PD capabilities are stronger evidence than
 	 * an incomplete BC1.2 classification. PPS also checks its APDO.
 	 */
