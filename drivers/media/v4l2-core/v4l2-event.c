@@ -150,23 +150,27 @@ static void __v4l2_event_queue_fh(struct v4l2_fh *fh,
 	wake_up_all(&fh->wait);
 }
 
-void v4l2_event_queue(struct video_device *vdev, const struct v4l2_event *ev)
+void v4l2_event_queue_timestamp(struct video_device *vdev, const struct v4l2_event *ev,
+				u64 monotonic_ns)
 {
 	struct v4l2_fh *fh;
 	unsigned long flags;
-	u64 ts;
 
 	if (vdev == NULL)
 		return;
 
-	ts = ktime_get_ns();
-
 	spin_lock_irqsave(&vdev->fh_lock, flags);
 
 	list_for_each_entry(fh, &vdev->fh_list, list)
-		__v4l2_event_queue_fh(fh, ev, ts);
+		__v4l2_event_queue_fh(fh, ev, monotonic_ns);
 
 	spin_unlock_irqrestore(&vdev->fh_lock, flags);
+}
+EXPORT_SYMBOL_GPL(v4l2_event_queue_timestamp);
+
+void v4l2_event_queue(struct video_device *vdev, const struct v4l2_event *ev)
+{
+	v4l2_event_queue_timestamp(vdev, ev, ktime_get_ns());
 }
 EXPORT_SYMBOL_GPL(v4l2_event_queue);
 

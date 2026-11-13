@@ -78,6 +78,12 @@ struct vfe_output {
 	};
 	enum vfe_output_state state;
 	unsigned int sequence;
+	/* Protected by output_lock, like the two-entry DMA buffer FIFO. */
+	u64 last_sof_ticks;
+	u64 last_eof_ticks;
+	u32 frame_sequence;
+	bool frame_timeline_error;
+	bool frame_timeline_initialized;
 
 	int wait_reg_update;
 	struct completion sof;
@@ -310,6 +316,15 @@ int vfe_enable_v2(struct vfe_line *line);
  * @wm: Write master id
  */
 void vfe_buf_done(struct vfe_device *vfe, int wm);
+void vfe_frame_sync(struct vfe_device *vfe, int port_id, bool start,
+		    u64 ticks, u64 previous_ticks, u64 arch_ticks,
+		      u64 arch_after, u64 irq_ns, u64 mono_ns);
+
+void vfe_frame_reset(struct vfe_device *vfe, int port_id,
+		     u64 sof_ticks, u64 eof_ticks);
+
+void vfe_frame_error(struct vfe_device *vfe, int port_id, u32 status, u64 irq_ns);
+
 u32 vfe_next_sequence(struct vfe_device *vfe, int wm);
 
 /*

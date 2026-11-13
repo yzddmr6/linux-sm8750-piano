@@ -11,7 +11,13 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/of.h>
+#include <linux/timekeeping.h>
+#include <clocksource/arm_arch_timer.h>
+#ifdef CONFIG_ARM64
+#include <asm/arch_timer.h>
+#endif
 #include "camss.h"
 #include "camss-csid.h"
 #include "camss-csid-gen3.h"
@@ -151,6 +157,31 @@
 #define CSID_IPP_IRQ_STATUS			0xD4
 #define CSID_IPP_IRQ_MASK			0xD8
 #define CSID_IPP_IRQ_CLEAR			0xDC
+#define CSID_IPP_TOP_IRQ				BIT(8)
+#define CSID_PATH_SOF_IRQ				BIT(4)
+#define CSID_PATH_EOF_IRQ				BIT(3)
+/* Official CSID980 IPP and RDI0 path error masks, excluding SOF/EOF/RUP. */
+#define CSID_PATH_FATAL_IRQS			0x241C6001
+#define CSID_PATH_NON_FATAL_IRQS			0x12000000
+#define CSID_PATH_ERROR_IRQS			(CSID_PATH_FATAL_IRQS | CSID_PATH_NON_FATAL_IRQS)
+/* The official CSID980 table selects QTimer with 2 << 8. */
+#define CSID_TIMESTAMP_STROBE			(2 << 8)
+#define CSID_IPP_CURRENT_SOF			0x6A8
+#define CSID_IPP_PREVIOUS_SOF			0x6B0
+#define CSID_IPP_CURRENT_EOF			0x6B8
+#define CSID_IPP_PREVIOUS_EOF			0x6C0
+/* These RDI0 offsets are listed independently in the official CSID980 table;
+ * they are not IPP offsets shifted to a presumed RDI address range.
+ */
+#define CSID_RDI0_CURRENT_SOF			0xEA0
+#define CSID_RDI0_PREVIOUS_SOF			0xEA8
+#define CSID_RDI0_CURRENT_EOF			0xEB0
+#define CSID_RDI0_PREVIOUS_EOF			0xEB8
+#define CSID_RDI0_IRQ_MASK			0x118
+#define CSID_RDI0_IRQ_CLEAR			0x11C
+#define CSID_RDI0_TOP_IRQ			BIT(16)
+#define CSID_RDI0_IRQ_SUBSAMPLE_PATTERN		0xE50
+#define CSID_RDI0_IRQ_SUBSAMPLE_PERIOD		0xE54
 #define CSID_RUP_AUP_IPP			BIT(0)
 #define		IPP_CTXT_ID				0
 /* TFE bus composite group 1 (FD_Y + FD_C) done, in CSID_BUF_DONE_IRQ_* */
@@ -158,6 +189,155 @@
 
 #define csid_port_is_ipp(csid, port) \
 	(!csid_is_lite(csid) && (port) == CSID_IPP_PORT)
+
+static bool csid_rdi_frame_timing(struct csid_device *csid, unsigned int port)
+{
+	return IS_ENABLED(CONFIG_ARM64) && csid->camss->res->version == CAMSS_8750 &&
+	       !csid_is_lite(csid) && port == 0;
+}
+
+/* The CSID QTimer strobe uses the 19.2 MHz architectural physical counter.
+ * Keep each conversion local to its IRQ: CLOCK_MONOTONIC may be NTP-slewed,
+ * while CNTPCT and the receiver latch retain their nominal tick frequency.
+ */
+#define CSID_COUNTER_RATE                   19200000U
+#define CSID_COUNTER_MAX_BRACKET            (CSID_COUNTER_RATE / 20000)
+#define CSID_COUNTER_MAX_AGE                CSID_COUNTER_RATE
+
+/* Cross-stamp P_before / ktime_get_ns() / P_after. The midpoint is an
+ * estimate inside that measured bracket, not an average IRQ delay.
+ * Reject brackets wider than 50 us and events older than one second.
+ * At normal NTP rates (+/-500 ppm), bracket, quantisation and rate error
+ * then total less than 550 us. This is not nanosecond absolute accuracy.
+ */
+static u64 csid_timestamp_ns(u64 ticks, u64 before, u64 after, u64 mono)
+{
+	u64 midpoint, age, elapsed_ns;
+
+	if (!ticks || after < before || ticks > before ||
+	    after - before > CSID_COUNTER_MAX_BRACKET)
+		return 0;
+	midpoint = before + (after - before) / 2;
+	age = midpoint - ticks;
+	if (age > CSID_COUNTER_MAX_AGE)
+		return 0;
+	elapsed_ns = div_u64(age * NSEC_PER_SEC, CSID_COUNTER_RATE);
+	if (elapsed_ns >= mono)
+		return 0;
+	return mono - elapsed_ns;
+}
+
+struct csid_frame_timestamps {
+	u64 sof, previous_sof, eof, previous_eof;
+	u64 arch_ticks, arch_after, irq_ns;
+};
+
+static u64 csid_read_timestamp(struct csid_device *csid, u32 offset)
+{
+	u32 high, low, after;
+
+	do {
+		high = readl(csid->base + offset + 4);
+		low = readl(csid->base + offset);
+		after = readl(csid->base + offset + 4);
+	} while (high != after);
+	return (u64)high << 32 | low;
+}
+
+static bool csid_read_frame_timestamps(struct csid_device *csid, unsigned int port,
+				     struct csid_frame_timestamps *time)
+{
+	unsigned int attempt;
+	u32 sof, previous_sof, eof, previous_eof;
+
+	if (!IS_ENABLED(CONFIG_ARM64) || csid->camss->res->version != CAMSS_8750)
+		return false;
+#ifdef CONFIG_ARM64
+	if (arch_timer_get_cntfrq() != CSID_COUNTER_RATE)
+		return false;
+#endif
+	if (csid_port_is_ipp(csid, port)) {
+		sof = CSID_IPP_CURRENT_SOF;
+		previous_sof = CSID_IPP_PREVIOUS_SOF;
+		eof = CSID_IPP_CURRENT_EOF;
+		previous_eof = CSID_IPP_PREVIOUS_EOF;
+	} else if (csid_rdi_frame_timing(csid, port)) {
+		sof = CSID_RDI0_CURRENT_SOF;
+		previous_sof = CSID_RDI0_PREVIOUS_SOF;
+		eof = CSID_RDI0_CURRENT_EOF;
+		previous_eof = CSID_RDI0_PREVIOUS_EOF;
+	} else {
+		return false;
+	}
+
+	/* The current and previous registers latch at frame boundaries. Check
+	 * that neither current value changed while reading its previous value.
+	 */
+	for (attempt = 0; attempt < 3; attempt++) {
+		time->sof = csid_read_timestamp(csid, sof);
+		time->previous_sof = csid_read_timestamp(csid, previous_sof);
+		time->eof = csid_read_timestamp(csid, eof);
+		time->previous_eof = csid_read_timestamp(csid, previous_eof);
+		if (time->sof == csid_read_timestamp(csid, sof) &&
+		    time->eof == csid_read_timestamp(csid, eof)) {
+#ifdef CONFIG_ARM64
+			/* QTimer and CNTPCT share the physical counter on SM8750.
+			 * Do not use CNTVCT: its hypervisor offset is independent.
+			 */
+			time->arch_ticks = __arch_counter_get_cntpct_stable();
+			time->irq_ns = ktime_get_ns();
+			time->arch_after = __arch_counter_get_cntpct_stable();
+			return true;
+#else
+			return false;
+#endif
+		}
+	}
+	return false;
+}
+
+static void csid_frame_irq(struct csid_device *csid, int port, u32 status)
+{
+	struct csid_frame_timestamps time = { 0 };
+	u64 sof_ns, eof_ns;
+	bool sof = status & CSID_PATH_SOF_IRQ;
+	bool eof = status & CSID_PATH_EOF_IRQ;
+
+	/* Frame drop/overflow can leave plausible SOF/EOF ticks. Invalidate
+	 * before publishing any markers or completing this IRQ's DMA buffer.
+	 * This must also run when the IRQ contains no SOF or EOF at all.
+	 */
+	if (status & CSID_PATH_ERROR_IRQS)
+		camss_frame_error(csid->camss, csid->id, port,
+				  status, ktime_get_ns());
+	if (!sof && !eof)
+		return;
+	if (!csid_read_frame_timestamps(csid, port, &time)) {
+		/* Zero ticks invalidate the timeline instead of inventing a time. */
+		time = (struct csid_frame_timestamps){ .irq_ns = ktime_get_ns() };
+	}
+
+	sof_ns = csid_timestamp_ns(time.sof, time.arch_ticks,
+				       time.arch_after, time.irq_ns);
+	eof_ns = csid_timestamp_ns(time.eof, time.arch_ticks,
+				       time.arch_after, time.irq_ns);
+
+	/* A delayed IRQ can contain EOF(n) and SOF(n+1). Dispatch by the
+	 * hardware timestamps, before handling the same IRQ's DMA completion.
+	 */
+	if (eof && (!sof || time.eof < time.sof))
+		camss_frame_sync(csid->camss, csid->id, port, false,
+				 time.eof, time.previous_eof, time.arch_ticks,
+				 time.arch_after, time.irq_ns, eof_ns);
+	if (sof)
+		camss_frame_sync(csid->camss, csid->id, port, true,
+				 time.sof, time.previous_sof, time.arch_ticks,
+				 time.arch_after, time.irq_ns, sof_ns);
+	if (eof && sof && time.eof >= time.sof)
+		camss_frame_sync(csid->camss, csid->id, port, false,
+				 time.eof, time.previous_eof, time.arch_ticks,
+				 time.arch_after, time.irq_ns, eof_ns);
+}
 
 /* RDI IRQ Status in wrapper */
 #define CSID_CSI2_RDIN_IRQ_STATUS(rdi) \
@@ -297,6 +477,7 @@ static void __csid_configure_rdi_stream(struct csid_device *csid, u8 enable, u8 
 {
 	u8 lane_cnt = csid->phy.lane_cnt;
 	u32 val;
+	bool frame_timing = csid_rdi_frame_timing(csid, port);
 
 	/* Source pads matching RDI channels on hardware.
 	 * E.g. Pad 1 -> RDI0, Pad 2 -> RDI1, etc.
@@ -326,8 +507,13 @@ static void __csid_configure_rdi_stream(struct csid_device *csid, u8 enable, u8 
 	u32 rdi_cfg1_offset = CSID_RDI_CFG1(port);
 	u32 rdi_ctrl_offset = CSID_RDI_CTRL(port);
 
+	if (frame_timing) {
+		writel(0, csid->base + CSID_RDI0_IRQ_MASK);
+		val = readl(csid->base + CSID_TOP_IRQ_MASK) & ~CSID_RDI0_TOP_IRQ;
+		writel(val, csid->base + CSID_TOP_IRQ_MASK);
+	}
 	val = RDI_CFG0_TIMESTAMP_EN;
-	val |= RDI_CFG0_TIMESTAMP_STB_SEL;
+	val |= frame_timing ? CSID_TIMESTAMP_STROBE : RDI_CFG0_TIMESTAMP_STB_SEL;
 	val |= RDI_CFG0_RETIME_BS;
 
 	/* note: for non-RDI path, this should be format->decode_format */
@@ -346,6 +532,26 @@ static void __csid_configure_rdi_stream(struct csid_device *csid, u8 enable, u8 
 
 	val = 0;
 	writel(val, csid->base + rdi_ctrl_offset);
+	if (frame_timing && enable) {
+		/* Record the old latch values while the path is still disabled.
+		 * The same FIFO continuity checks used by IPP then detect even a
+		 * lost first SOF. Every physical frame must produce its markers.
+		 */
+		writel(1, csid->base + CSID_RDI0_IRQ_SUBSAMPLE_PATTERN);
+		writel(0, csid->base + CSID_RDI0_IRQ_SUBSAMPLE_PERIOD);
+		camss_frame_reset(csid->camss, csid->id, port,
+				  csid_read_timestamp(csid, CSID_RDI0_CURRENT_SOF),
+				  csid_read_timestamp(csid, CSID_RDI0_CURRENT_EOF));
+		writel(~0, csid->base + CSID_RDI0_IRQ_CLEAR);
+		writel(IRQ_CMD_CLEAR, csid->base + CSID_IRQ_CMD);
+		val = readl(csid->base + CSID_TOP_IRQ_MASK) | CSID_RDI0_TOP_IRQ;
+		writel(val, csid->base + CSID_TOP_IRQ_MASK);
+		/* CSID980 independently specifies the same marker/error masks
+		 * for RDI0 and IPP, including overflow and frame-drop faults.
+		 */
+		writel(INFO_RUP_DONE | CSID_PATH_SOF_IRQ | CSID_PATH_EOF_IRQ |
+		       CSID_PATH_ERROR_IRQS, csid->base + CSID_RDI0_IRQ_MASK);
+	}
 
 	val = readl(csid->base + rdi_cfg0_offset);
 
@@ -410,13 +616,16 @@ static void __csid_configure_ipp_stream(struct csid_device *csid, u8 enable,
 	writel(0, csid->base + CSID_IPP_CTRL);
 
 	if (!enable) {
+		writel(0, csid->base + CSID_IPP_IRQ_MASK);
+		val = readl(csid->base + CSID_TOP_IRQ_MASK) & ~CSID_IPP_TOP_IRQ;
+		writel(val, csid->base + CSID_TOP_IRQ_MASK);
 		camss_isp_set_live(CAMSS_ISP_CSID, NULL);
 		val = readl(csid->base + CSID_IPP_CFG0) & ~RDI_CFG0_EN;
 		writel(val, csid->base + CSID_IPP_CFG0);
 		return;
 	}
 
-	val = RDI_CFG0_TIMESTAMP_EN | RDI_CFG0_TIMESTAMP_STB_SEL;
+	val = RDI_CFG0_TIMESTAMP_EN | CSID_TIMESTAMP_STROBE;
 	val |= RDI_CFG0_RETIME_BS;	/* SOF retiming off, as downstream */
 	val |= format->decode_format << RDI_CFG0_DECODE_FORMAT;
 	val |= vc << RDI_CFG0_VC;
@@ -439,9 +648,18 @@ static void __csid_configure_ipp_stream(struct csid_device *csid, u8 enable,
 	       csid->base + CSID_IPP_IRQ_COMP_CFG0);
 	writel(1, csid->base + CSID_IPP_IRQ_SUBSAMPLE_PATTERN);
 	writel(0, csid->base + CSID_IPP_IRQ_SUBSAMPLE_PERIOD);
-	writel(INFO_RUP_DONE, csid->base + CSID_IPP_IRQ_MASK);
+	writel(0, csid->base + CSID_IPP_IRQ_MASK);
 
 	camss_isp_apply_script(CAMSS_ISP_CSID, csid->base);
+	camss_frame_reset(csid->camss, csid->id, CSID_IPP_PORT,
+			  csid_read_timestamp(csid, CSID_IPP_CURRENT_SOF),
+			  csid_read_timestamp(csid, CSID_IPP_CURRENT_EOF));
+	writel(~0, csid->base + CSID_IPP_IRQ_CLEAR);
+	writel(IRQ_CMD_CLEAR, csid->base + CSID_IRQ_CMD);
+	val = readl(csid->base + CSID_TOP_IRQ_MASK) | CSID_IPP_TOP_IRQ;
+	writel(val, csid->base + CSID_TOP_IRQ_MASK);
+	writel(INFO_RUP_DONE | CSID_PATH_SOF_IRQ | CSID_PATH_EOF_IRQ | CSID_PATH_ERROR_IRQS,
+	       csid->base + CSID_IPP_IRQ_MASK);
 
 	val = readl(csid->base + CSID_IPP_CFG0) | RDI_CFG0_EN;
 	writel(val, csid->base + CSID_IPP_CFG0);
@@ -523,19 +741,22 @@ static irqreturn_t csid_isr(int irq, void *dev)
 	for (i = 0; i < MSM_CSID_MAX_SRC_STREAMS_980; i++) {
 		if (csid->phy.en_vc & BIT(i) && csid_port_is_ipp(csid, i)) {
 			val = readl(csid->base + CSID_IPP_IRQ_STATUS);
-			writel(val, csid->base + CSID_IPP_IRQ_CLEAR);
 
 			if (val & INFO_RUP_DONE)
 				csid_subdev_reg_update(csid, i, true);
+			csid_frame_irq(csid, i, val);
+			writel(val, csid->base + CSID_IPP_IRQ_CLEAR);
 
 			if (buf_done_val & BUF_DONE_IRQ_STATUS_IPP_FD)
 				camss_buf_done(csid->camss, csid->id, i);
 		} else if (csid->phy.en_vc & BIT(i)) {
 			val = readl(csid->base + CSID_CSI2_RDIN_IRQ_STATUS(i));
-			writel(val, csid->base + CSID_CSI2_RDIN_IRQ_CLEAR(i));
 
 			if (val & INFO_RUP_DONE)
 				csid_subdev_reg_update(csid, i, true);
+			if (csid_rdi_frame_timing(csid, i))
+				csid_frame_irq(csid, i, val);
+			writel(val, csid->base + CSID_CSI2_RDIN_IRQ_CLEAR(i));
 
 			if (buf_done_val & BIT(BUF_DONE_IRQ_STATUS_RDI_OFFSET + i))
 				camss_buf_done(csid->camss, csid->id, i);

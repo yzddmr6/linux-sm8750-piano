@@ -183,6 +183,16 @@ int camss_vfe_get(struct camss *camss, int id);
 void camss_vfe_put(struct camss *camss, int id);
 void camss_delete(struct camss *camss);
 void camss_buf_done(struct camss *camss, int hw_id, int port_id);
+
+void camss_frame_sync(struct camss *camss, int hw_id, int port_id, bool start,
+		      u64 ticks, u64 previous_ticks, u64 arch_ticks,
+		      u64 arch_after, u64 irq_ns, u64 mono_ns);
+
+void camss_frame_reset(struct camss *camss, int hw_id, int port_id,
+		      u64 sof_ticks, u64 eof_ticks);
+
+void camss_frame_error(struct camss *camss, int hw_id, int port_id,
+		      u32 status, u64 irq_ns);
 u32 camss_next_sequence(struct camss *camss, int hw_id, int port_id);
 void camss_reg_update(struct camss *camss, int hw_id,
 		      int port_id, bool is_clear);

@@ -23,6 +23,9 @@
 #include <media/v4l2-event.h>
 #include <media/v4l2-subdev.h>
 
+#define CREATE_TRACE_POINTS
+#include "camss-trace.h"
+
 #include "camss-vfe.h"
 #include "camss.h"
 
@@ -498,6 +501,134 @@ u32 vfe_next_sequence(struct vfe_device *vfe, int wm)
  * @vfe: VFE Device
  * @wm: Write master id
  */
+void vfe_frame_error(struct vfe_device *vfe, int port_id, u32 status, u64 irq_ns)
+{
+	struct vfe_output *output;
+	unsigned long flags;
+
+	if ((port_id != VFE_LINE_PIX && port_id != VFE_LINE_RDI0) ||
+	    !vfe->line[port_id].video_out.frame_sync)
+		return;
+	output = &vfe->line[port_id].output;
+	spin_lock_irqsave(&vfe->output_lock, flags);
+	if (output->state == VFE_OUTPUT_ON) {
+		output->frame_timeline_error = true;
+		trace_camss_frame_error(vfe->id, port_id, output->frame_sequence,
+					status, irq_ns);
+	}
+	spin_unlock_irqrestore(&vfe->output_lock, flags);
+}
+
+void vfe_frame_reset(struct vfe_device *vfe, int port_id,
+		     u64 sof_ticks, u64 eof_ticks)
+{
+	struct vfe_output *output;
+	unsigned long flags;
+
+	if ((port_id != VFE_LINE_PIX && port_id != VFE_LINE_RDI0) ||
+	    !vfe->line[port_id].video_out.frame_sync)
+		return;
+	output = &vfe->line[port_id].output;
+	spin_lock_irqsave(&vfe->output_lock, flags);
+	/* Capture the previous stream's last hardware values before enabling
+	 * the receiver. Even a lost first SOF then breaks the previous chain.
+	 */
+	output->last_sof_ticks = sof_ticks;
+	output->last_eof_ticks = eof_ticks;
+	output->frame_timeline_initialized = true;
+	trace_camss_frame(vfe->id, port_id, output->frame_sequence, 3,
+			  sof_ticks, eof_ticks, 0, 0, ktime_get_ns(), -1,
+			  output->state == VFE_OUTPUT_ON && !output->frame_timeline_error);
+	spin_unlock_irqrestore(&vfe->output_lock, flags);
+}
+
+/* The WM has a two-entry address FIFO. Attach SOF/EOF to those entries,
+ * rather than copying the newest SOF onto a buffer that completed earlier.
+ * A missing marker invalidates the timeline until the next stream start.
+ */
+void vfe_frame_sync(struct vfe_device *vfe, int port_id, bool start,
+		    u64 ticks, u64 previous_ticks, u64 arch_ticks,
+		    u64 arch_after, u64 irq_ns, u64 mono_ns)
+{
+	struct v4l2_event event = { .type = V4L2_EVENT_FRAME_SYNC };
+	struct camss_buffer *buffer = NULL;
+	struct vfe_line *line;
+	struct vfe_output *output;
+	unsigned long flags;
+	u32 sequence;
+	bool emit = false;
+	unsigned int i;
+
+	if (port_id != VFE_LINE_PIX && port_id != VFE_LINE_RDI0)
+		return;
+	line = &vfe->line[port_id];
+	if (!line->video_out.frame_sync)
+		return;
+	output = &line->output;
+
+	spin_lock_irqsave(&vfe->output_lock, flags);
+	if (output->state != VFE_OUTPUT_ON || !output->frame_timeline_initialized)
+		goto unlock;
+	sequence = output->frame_sequence;
+	if (start) {
+		if (ticks && ticks <= output->last_sof_ticks)
+			goto unlock;
+		if (!ticks || !mono_ns || previous_ticks != output->last_sof_ticks)
+			output->frame_timeline_error = true;
+		output->last_sof_ticks = ticks;
+		sequence = output->frame_sequence++;
+		for (i = 0; i < CAMSS_INIT_BUF_COUNT; i++) {
+			struct camss_buffer *entry = output->buf[i];
+
+			if (entry && entry->frame_started && !entry->frame_complete)
+				output->frame_timeline_error = true;
+			if (entry && !entry->frame_started && !buffer)
+				buffer = entry;
+		}
+		if (buffer) {
+			buffer->sof_ticks = ticks;
+			buffer->vb.vb2_buf.timestamp = 0;
+			buffer->frame_sequence = sequence;
+			buffer->frame_started = true;
+		}
+		emit = !output->frame_timeline_error;
+	} else {
+		if (ticks && ticks <= output->last_eof_ticks)
+			goto unlock;
+		if (!ticks || !mono_ns || previous_ticks != output->last_eof_ticks)
+			output->frame_timeline_error = true;
+		output->last_eof_ticks = ticks;
+		for (i = 0; i < CAMSS_INIT_BUF_COUNT; i++) {
+			struct camss_buffer *entry = output->buf[i];
+
+			if (entry && entry->frame_started && !entry->frame_complete) {
+				buffer = entry;
+				break;
+			}
+		}
+		if (buffer) {
+			sequence = buffer->frame_sequence;
+			if (ticks <= buffer->sof_ticks)
+				output->frame_timeline_error = true;
+			buffer->eof_ticks = ticks;
+			buffer->vb.vb2_buf.timestamp = mono_ns;
+			buffer->frame_complete = true;
+		}
+	}
+	trace_camss_frame(vfe->id, port_id, sequence, start ? 0 : 1,
+			  ticks, previous_ticks, arch_ticks,
+			  arch_after, irq_ns,
+			  buffer ? (int)buffer->vb.vb2_buf.index : -1,
+			  buffer && !output->frame_timeline_error);
+unlock:
+	spin_unlock_irqrestore(&vfe->output_lock, flags);
+	if (emit) {
+		event.u.frame_sync.frame_sequence = sequence;
+		/* FRAME_SYNC is the physical CSI SOF, not exposure SOE. */
+		v4l2_event_queue_timestamp(&line->video_out.vdev, &event, mono_ns);
+	}
+}
+
 void vfe_buf_done(struct vfe_device *vfe, int wm)
 {
 	struct vfe_line *line = &vfe->line[vfe->wm_output_map[wm]];
@@ -507,6 +638,7 @@ void vfe_buf_done(struct vfe_device *vfe, int wm)
 	unsigned long flags;
 	u32 index;
 	u64 ts = ktime_get_ns();
+	bool frame_valid = true;
 
 	spin_lock_irqsave(&vfe->output_lock, flags);
 
@@ -524,8 +656,26 @@ void vfe_buf_done(struct vfe_device *vfe, int wm)
 		goto out_unlock;
 	}
 
-	ready_buf->vb.vb2_buf.timestamp = ts;
+	if (!line->video_out.frame_sync)
+		ready_buf->vb.vb2_buf.timestamp = ts;
 	ready_buf->vb.sequence = output->sequence++;
+	if (line->video_out.frame_sync) {
+		frame_valid = ready_buf->frame_started && ready_buf->frame_complete &&
+			      ready_buf->vb.vb2_buf.timestamp && !output->frame_timeline_error;
+		if (!frame_valid) {
+			output->frame_timeline_error = true;
+			ready_buf->vb.vb2_buf.timestamp = 0;
+		}
+		if (ready_buf->frame_started)
+			ready_buf->vb.sequence = ready_buf->frame_sequence;
+		/* EOF was cross-stamped when its marker reached this FIFO entry.
+		 * Keep the physical EOF through the later DMA-completion IRQ.
+		 * The queue retains the standard TSTAMP_SRC_EOF convention.
+		 */
+		trace_camss_frame(vfe->id, line->id, ready_buf->vb.sequence, 2,
+				  ready_buf->eof_ticks, ready_buf->sof_ticks,
+				  0, 0, ts, ready_buf->vb.vb2_buf.index, frame_valid);
+	}
 
 	index = 0;
 	output->buf[0] = output->buf[1];
@@ -545,7 +695,8 @@ void vfe_buf_done(struct vfe_device *vfe, int wm)
 
 	spin_unlock_irqrestore(&vfe->output_lock, flags);
 
-	vb2_buffer_done(&ready_buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+	vb2_buffer_done(&ready_buf->vb.vb2_buf,
+			frame_valid ? VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR);
 
 	return;
 
@@ -592,6 +743,11 @@ int vfe_enable_output_v2(struct vfe_line *line)
 	output->state = VFE_OUTPUT_ON;
 
 	output->sequence = 0;
+	output->frame_sequence = 0;
+	output->last_sof_ticks = 0;
+	output->last_eof_ticks = 0;
+	output->frame_timeline_error = false;
+	output->frame_timeline_initialized = false;
 	output->wait_reg_update = 0;
 	reinit_completion(&output->reg_update);
 
@@ -873,6 +1029,8 @@ static void vfe_disable_output(struct vfe_line *line)
 	for (i = 0; i < output->wm_num; i++)
 		vfe->res->hw_ops->vfe_wm_stop(vfe, output->wm_idx[i]);
 	output->gen2.active_num = 0;
+	output->frame_timeline_error = true;
+	output->frame_timeline_initialized = false;
 	spin_unlock_irqrestore(&vfe->output_lock, flags);
 }
 
@@ -1259,6 +1417,9 @@ int vfe_flush_buffers(struct camss_video *vid,
 		vb2_buffer_done(&output->last_buffer->vb.vb2_buf, state);
 		output->last_buffer = NULL;
 	}
+	output->last_sof_ticks = 0;
+	output->last_eof_ticks = 0;
+	output->frame_timeline_error = true;
 
 	spin_unlock_irqrestore(&vfe->output_lock, flags);
 
@@ -2288,6 +2449,10 @@ int msm_vfe_register_entities(struct vfe_device *vfe,
 		}
 
 		video_out->ops = &vfe->video_ops;
+		video_out->frame_sync = IS_ENABLED(CONFIG_ARM64) &&
+					vfe->camss->res->version == CAMSS_8750 &&
+					!vfe->res->is_lite &&
+					(i == VFE_LINE_PIX || i == VFE_LINE_RDI0);
 		if (i == VFE_LINE_PIX) {
 			video_out->bpl_alignment = vfe_bpl_align_pix(vfe);
 			video_out->line_based = 1;

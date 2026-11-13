@@ -23,6 +23,12 @@ struct camss_buffer {
 	struct vb2_v4l2_buffer vb;
 	dma_addr_t addr[3];
 	struct list_head queue;
+	/* CSID IPP frame markers for the buffer currently in the WM FIFO. */
+	u64 sof_ticks;
+	u64 eof_ticks;
+	u32 frame_sequence;
+	bool frame_started;
+	bool frame_complete;
 };
 
 struct camss_video;
@@ -46,6 +52,7 @@ struct camss_video {
 	struct mutex q_lock;
 	unsigned int bpl_alignment;
 	unsigned int line_based;
+	bool frame_sync;
 	const struct camss_format_info *formats;
 	unsigned int nformats;
 };

@@ -11,6 +11,7 @@
 #include <media/media-entity.h>
 #include <media/v4l2-dev.h>
 #include <media/v4l2-device.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mc.h>
 #include <media/videobuf2-dma-sg.h>
@@ -181,6 +182,7 @@ static int video_buf_init(struct vb2_buffer *vb)
 static int video_buf_prepare(struct vb2_buffer *vb)
 {
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct camss_buffer *buffer = container_of(vbuf, struct camss_buffer, vb);
 	struct camss_video *video = vb2_get_drv_priv(vb->vb2_queue);
 	const struct v4l2_pix_format_mplane *format =
 						&video->active_fmt.fmt.pix_mp;
@@ -194,6 +196,10 @@ static int video_buf_prepare(struct vb2_buffer *vb)
 	}
 
 	vbuf->field = V4L2_FIELD_NONE;
+	buffer->sof_ticks = 0;
+	buffer->eof_ticks = 0;
+	buffer->frame_started = false;
+	buffer->frame_complete = false;
 
 	return 0;
 }
@@ -603,6 +609,17 @@ static int video_s_input(struct file *file, void *fh, unsigned int input)
 	return input == 0 ? 0 : -EINVAL;
 }
 
+static int video_subscribe_event(struct v4l2_fh *fh,
+				const struct v4l2_event_subscription *sub)
+{
+	struct camss_video *video = video_get_drvdata(fh->vdev);
+
+	if (!video->frame_sync || sub->type != V4L2_EVENT_FRAME_SYNC || sub->id)
+		return -EINVAL;
+
+	return v4l2_event_subscribe(fh, sub, 16, NULL);
+}
+
 static const struct v4l2_ioctl_ops msm_vid_ioctl_ops = {
 	.vidioc_querycap		= video_querycap,
 	.vidioc_enum_fmt_vid_cap	= video_enum_fmt,
@@ -622,6 +639,8 @@ static const struct v4l2_ioctl_ops msm_vid_ioctl_ops = {
 	.vidioc_enum_input		= video_enum_input,
 	.vidioc_g_input			= video_g_input,
 	.vidioc_s_input			= video_s_input,
+	.vidioc_subscribe_event		= video_subscribe_event,
+	.vidioc_unsubscribe_event	= v4l2_event_unsubscribe,
 };
 
 /* -----------------------------------------------------------------------------

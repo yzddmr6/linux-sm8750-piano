@@ -106,6 +106,21 @@ int v4l2_event_dequeue(struct v4l2_fh *fh, struct v4l2_event *event,
 void v4l2_event_queue(struct video_device *vdev, const struct v4l2_event *ev);
 
 /**
+ * v4l2_event_queue_timestamp - Queue an event with its hardware occurrence time.
+ *
+ * @vdev: pointer to &struct video_device
+ * @ev: pointer to &struct v4l2_event
+ * @monotonic_ns: occurrence time in CLOCK_MONOTONIC nanoseconds
+ *
+ * Queue the event for all subscribed file handles, preserving the supplied
+ * occurrence time instead of using the queueing time. Drivers must convert
+ * hardware timestamps to CLOCK_MONOTONIC before calling this helper.
+ * All other event fields follow v4l2_event_queue().
+ */
+void v4l2_event_queue_timestamp(struct video_device *vdev, const struct v4l2_event *ev,
+				u64 monotonic_ns);
+
+/**
  * v4l2_event_queue_fh - Queue events to video device.
  *
  * @fh: pointer to &struct v4l2_fh
