@@ -1001,6 +1001,26 @@ static void xiaomi_mca_test_temperature_follow(struct kunit *test)
 	mutex_unlock(&mca->lock);
 }
 
+static void xiaomi_mca_test_jeita_hysteresis(struct kunit *test)
+{
+	static const int rows[][2] = {
+		{ 7, 0 }, { 8, 0 }, { 10, 8 }, { 13, 8 }, { 15, 13 },
+		{ 18, 13 }, { 20, 18 }, { 17, 13 }, { 12, 8 }, { 7, 0 },
+	};
+	struct xiaomi_mca *mca = &mca_policy_fixture(test)->mca;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(rows); i++) {
+		xiaomi_mca_update_zones(mca, rows[i][0], 25);
+		KUNIT_EXPECT_EQ(test, mca->cell_zone, rows[i][1]);
+	}
+	xiaomi_mca_update_zones(mca, 25, 35);
+	xiaomi_mca_update_zones(mca, 25, 34);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_warm);
+	xiaomi_mca_update_zones(mca, 25, 33);
+	KUNIT_EXPECT_FALSE(test, mca->ffc_warm);
+}
+
 static void xiaomi_mca_test_profile_switch(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_policy_fixture(test);
@@ -1015,6 +1035,7 @@ static void xiaomi_mca_test_profile_switch(struct kunit *test)
 
 	full_charge = true;
 	for (n = 0; n < ARRAY_SIZE(rows); n++) {
+		mca->zone_valid = false;
 		xiaomi_mca_select_profile(mca, rows[n].cold, rows[n].hot);
 		KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000), rows[n].ma);
 		KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_vbat_max(mca), rows[n].mv);
@@ -3016,6 +3037,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_pen_allowlist),
 
 	KUNIT_CASE(xiaomi_mca_test_profile_switch),
+	KUNIT_CASE(xiaomi_mca_test_jeita_hysteresis),
 	KUNIT_CASE(xiaomi_mca_test_source_limits),
 	KUNIT_CASE(xiaomi_mca_test_pd_recovery),
 	KUNIT_CASE(xiaomi_mca_test_mipps_exchange),

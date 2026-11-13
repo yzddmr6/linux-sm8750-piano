@@ -629,6 +629,8 @@ struct xiaomi_mca {
 	bool term_hot;		/* float-voltage thermal hysteresis */
 	bool fv_derated;
 	unsigned int gauge_failures;
+	int cell_zone;		/* coldest sensor: 0, 8, 13 or 18 C row */
+	bool zone_valid, ffc_warm;
 	bool ffc_done;
 	u32 ffc_type, ffc_attach;
 	bool ffc_active;		/* checked again every poll, never latched by auth */
@@ -2175,17 +2177,41 @@ static int xiaomi_mca_gauges(int *vbat_mv, int *ibat_ma, int *tcool, int *tbat,
 	return 0;
 }
 
+static void xiaomi_mca_update_zones(struct xiaomi_mca *mca, int cold, int warm)
+{
+	static const int boundaries[] = { 8, 13, 18 };
+	int zone = 0, i;
+
+	/* Cross promptly into a more restrictive row. Require 2 C of
+	 * headroom before taking a higher-current row again.
+	 */
+	for (i = 0; i < ARRAY_SIZE(boundaries); i++) {
+		int edge = boundaries[i];
+
+		if (cold < edge + (mca->zone_valid && mca->cell_zone < edge ? 2 : 0))
+			break;
+		zone = edge;
+	}
+	mca->cell_zone = zone;
+	if (warm >= 35)
+		mca->ffc_warm = true;
+	else if (warm <= 33)
+		mca->ffc_warm = false;
+	mca->zone_valid = true;
+}
+
 static void xiaomi_mca_select_profile(struct xiaomi_mca *mca, int tcool, int twarm)
 {
 	enum xiaomi_mca_profile profile;
 
-	mca->cp_normal_cv = twarm >= 18 && tcool < 18;
+	xiaomi_mca_update_zones(mca, tcool, twarm);
+	mca->cp_normal_cv = twarm >= 18 && mca->cell_zone < 18;
 
 	if (twarm >= MCA_TERM_HOT_DEGC || mca->term_hot)
 		profile = MCA_PROFILE_WARM;
-	else if (tcool < 13)
+	else if (mca->cell_zone < 13)
 		profile = MCA_PROFILE_COLD;
-	else if (tcool < 18)
+	else if (mca->cell_zone < 18)
 		profile = MCA_PROFILE_COOL;
 	else
 		profile = mca->ffc_active ? MCA_PROFILE_FFC : MCA_PROFILE_NORMAL;
@@ -2203,7 +2229,7 @@ static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twa
 				      int vbat, int ibat)
 {
 	u32 online, type, attached = READ_ONCE(mca->attach_generation);
-	int iterm = twarm >= 35 ? 3164 : 2350;
+	int iterm = mca->ffc_warm ? 3164 : 2350;
 	bool running;
 
 	if (mca->ffc_attach != attached || vbat < 4350)
@@ -2213,7 +2239,7 @@ static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twa
 		mca->ffc_done = false;
 		return false;
 	}
-	if (!full_charge || tcool < 18 || twarm >= MCA_TERM_HOT_DEGC ||
+	if (!full_charge || mca->cell_zone < 18 || tcool < 18 || twarm >= MCA_TERM_HOT_DEGC ||
 	    mca->policy_generation != READ_ONCE(mca->service_generation) ||
 	    online != 1 ||
 	    xiaomi_mca_read_type(mca, &type) || !xiaomi_mca_limits(type) ||
@@ -2271,9 +2297,11 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 			mca->term_hot = true;
 		else if (tbat < MCA_TERM_COOL_DEGC)
 			mca->term_hot = false;
+		xiaomi_mca_update_zones(mca, tcool, tbat);
 		mca->ffc_active = !mca->term_hot && xiaomi_mca_ffc_conditions(mca, tcool, tbat, vbat, ibat);
 	}
-	xiaomi_mca_select_profile(mca, tcool, tbat);
+	if (!ret)
+		xiaomi_mca_select_profile(mca, tcool, tbat);
 	target = mca->term_hot ? MCA_TERM_HOT_MV : MCA_TERM_FULL_MV;
 	if (!mca->term_hot && tbat < 18)
 		target = MCA_TERM_COLD_MV;
@@ -2832,7 +2860,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	if ((mca->cp_recharge_cv >= vbat_max && vbat >= 4350) || vmin < MCA_CP_VBAT_MIN_MV ||
 	    vbat >= vbat_max - MCA_CP_VBAT_HYS_MV ||
 	    imax >= MCA_CP_CELL_OCP_MA ||
-	    min(tcool, tpack) < MCA_CP_TBAT_MIN ||
+	    mca->cell_zone < MCA_CP_TBAT_MIN ||
 	    max(tbat, tpack) >= MCA_CP_TBAT_EXIT ||
 	    xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
 		return;
@@ -3030,7 +3058,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_stop(mca, "battery voltage reached");
 		return;
 	}
-	if (min(tcool, tpack) < MCA_CP_TBAT_MIN ||
+	if (mca->cell_zone < MCA_CP_TBAT_MIN ||
 	    max(tbat, tpack) >= MCA_CP_TBAT_EXIT) {
 		xiaomi_mca_cp_stop(mca, "battery temperature");
 		return;
@@ -3781,6 +3809,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		mca->hv_last_exit = NULL;
 		mca->cp_recharge_cv = 0;
 		mca->hv_retry = jiffies;
+		mca->zone_valid = false;
 		mca->policy_attach_generation = attachment;
 	}
 	if (xiaomi_mca_clear_auth(mca))
