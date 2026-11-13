@@ -18,3 +18,4 @@ ccflags-y += -I$(src)/include
 ccflags-y += -I$(src)/include/internal
 
 obj-$(CONFIG_OPLUS_UFCS_CLASS) += ufcs_class.o
+ufcs_class-$(CONFIG_OPLUS_UFCS_KUNIT_TEST) += ufcs_test.o
