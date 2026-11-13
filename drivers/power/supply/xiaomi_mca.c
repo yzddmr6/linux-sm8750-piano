@@ -2219,8 +2219,7 @@ static char *xiaomi_mca_supplied_to[] = { "bq27z561-0", "bq27z561-1" };
  * current and largest absolute cell current. A low or overloaded cell
  * must not be hidden by the other cell's voltage or opposite current.
  */
-static bool xiaomi_mca_cell_ocp(struct xiaomi_mca *mca, struct power_supply *psy,
-				int ua)
+static bool xiaomi_mca_cell_ocp(struct fwnode_handle *charger, struct fwnode_handle *gauge, int ua)
 {
 	struct fwnode_handle *pump, *pump_bus, *gauge_bus;
 	bool exceeded;
@@ -2233,11 +2232,11 @@ static bool xiaomi_mca_cell_ocp(struct xiaomi_mca *mca, struct power_supply *psy
 	/* The master gauge and SC8541 share SE5. Only the slave on SE11
 	 * crosses its stock OCP between 7 A and 9 A.
 	 */
-	pump = fwnode_find_reference(dev_fwnode(mca->dev), "xiaomi,charge-pump", 0);
+	pump = fwnode_find_reference(charger, "xiaomi,charge-pump", 0);
 	if (IS_ERR_OR_NULL(pump))
 		return false;
 	pump_bus = fwnode_get_parent(pump);
-	gauge_bus = fwnode_get_parent(dev_fwnode(&psy->dev));
+	gauge_bus = fwnode_get_parent(gauge);
 	exceeded = pump_bus && gauge_bus && pump_bus != gauge_bus;
 	fwnode_handle_put(gauge_bus);
 	fwnode_handle_put(pump_bus);
@@ -2266,7 +2265,8 @@ static void xiaomi_mca_sample_cells(struct xiaomi_mca *mca, struct xiaomi_mca_ce
 		ret = ret ?: power_supply_get_property(psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &v);
 		ret = ret ?: power_supply_get_property(psy, POWER_SUPPLY_PROP_CURRENT_NOW, &i);
 		if (!ret)
-			cells->cell_ocp |= xiaomi_mca_cell_ocp(mca, psy, abs(i.intval));
+			cells->cell_ocp |= xiaomi_mca_cell_ocp(dev_fwnode(mca->dev),
+							       dev_fwnode(&psy->dev), abs(i.intval));
 		power_supply_put(psy);
 		if (ret) {
 			cells->status = ret;

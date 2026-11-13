@@ -2839,6 +2839,37 @@ static void xiaomi_mca_test_auth_loss_latch(struct kunit *test)
 	}
 }
 
+static void xiaomi_mca_test_gauge_ocp_identity(struct kunit *test)
+{
+	static const struct software_node se5 = { .name = "mca-test-se5" };
+	static const struct software_node se11 = { .name = "mca-test-se11" };
+	static const struct software_node pump = { .name = "cp", .parent = &se5 };
+	static const struct software_node master = { .name = "fg", .parent = &se5 };
+	static const struct software_node slave = { .name = "fg", .parent = &se11 };
+	const struct property_entry props[] = {
+		PROPERTY_ENTRY_REF("xiaomi,charge-pump", &pump), {}
+	};
+	const struct software_node charger = { .name = "mca-test", .properties = props };
+	const struct software_node *group[] = { &se5, &se11, &pump, &master, &slave,
+						       &charger, NULL };
+	static const struct { int ua; bool master, slave; } cases[] = {
+		{ 7000000, false, false }, { 7000001, false, true },
+		{ 9000000, false, true }, { 9000001, true, true },
+	};
+	struct fwnode_handle *node;
+	int i;
+
+	KUNIT_ASSERT_EQ(test, software_node_register_node_group(group), 0);
+	node = software_node_fwnode(&charger);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_cell_ocp(node, software_node_fwnode(&master),
+							 cases[i].ua), cases[i].master);
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_cell_ocp(node, software_node_fwnode(&slave),
+							 cases[i].ua), cases[i].slave);
+	}
+	software_node_unregister_node_group(group);
+}
+
 static void xiaomi_mca_test_pack_limit_recovers(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -2848,6 +2879,7 @@ static void xiaomi_mca_test_pack_limit_recovers(struct kunit *test)
 	mca->cp_ma = 5000;
 	mca->cp_max_mv = 11000;
 	mca->cp_ibat_trip = 12000;
+	mca->cp_ibus_ma = 3800;
 	f->stage_mv = 8400;
 	f->stage_ma = 1500;
 	f->cells[0].current_ua = f->cells[1].current_ua = 6100000;
@@ -3449,6 +3481,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_ffc_handoff),
 	KUNIT_CASE(xiaomi_mca_test_cp_cell_guards),
 	KUNIT_CASE(xiaomi_mca_test_auth_loss_latch),
+	KUNIT_CASE(xiaomi_mca_test_gauge_ocp_identity),
 	KUNIT_CASE(xiaomi_mca_test_pack_limit_recovers),
 	KUNIT_CASE(xiaomi_mca_test_bus_voltage_fault),
 	KUNIT_CASE(xiaomi_mca_test_qc_regulation),
