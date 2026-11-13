@@ -219,6 +219,7 @@ enum qcom_battmgr_pd_event {
 	PD_EVENT_SERVICE_RESET,
 	PD_EVENT_PARTNER,
 	PD_EVENT_TAIL,
+	PD_EVENT_DETACH,
 };
 
 static DEFINE_MUTEX(erhai_bridge_lock);
@@ -546,6 +547,7 @@ struct qcom_battmgr {
 	bool ufcs_backoff;
 	bool pd_charge_only;
 	bool pd_partner_checked;
+	struct class_interface partner_events;
 	bool fixed_backoff;
 	unsigned long fixed_retry;
 	unsigned long pd_classified_at;
@@ -1246,6 +1248,47 @@ struct qcom_battmgr_pd_source {
 	bool sink;
 };
 
+/* A GLINK PLUGIN notification has no direction. Observe the removal
+ * of the UCSI Type-C partner itself, even when attach overtakes the
+ * charge worker. Match only the port of this battery manager.
+ */
+static int qcom_battmgr_typec_port(struct device *dev, const void *unused)
+{
+	return dev->type && !strcmp(dev->type->name, "typec_port");
+}
+
+static void qcom_battmgr_partner_removed(struct device *dev)
+{
+	struct qcom_battmgr *b;
+	struct device *port = dev->parent;
+
+	if (!dev->type || strcmp(dev->type->name, "typec_partner") ||
+	    !port || !port->parent)
+		return;
+	guard(mutex)(&erhai_bridge_lock);
+	b = erhai_battmgr;
+	if (b && port->parent->parent == b->dev->parent && !READ_ONCE(b->removing)) {
+		set_bit(PD_EVENT_DETACH, &b->pd_events);
+		mod_delayed_work(system_freezable_wq, &b->charge_work, 0);
+	}
+}
+
+static void qcom_battmgr_watch_partner(struct qcom_battmgr *b, struct device *ucsi)
+{
+	struct device *port;
+
+	if (b->partner_events.class || !(b->quirks & QCOM_BATTMGR_QUIRK_PPS))
+		return;
+	port = device_find_child(ucsi, NULL, qcom_battmgr_typec_port);
+	if (!port)
+		return;
+	b->partner_events.class = port->class;
+	b->partner_events.remove_dev = qcom_battmgr_partner_removed;
+	if (class_interface_register(&b->partner_events))
+		b->partner_events.class = NULL;
+	put_device(port);
+}
+
 static int qcom_battmgr_pd_source_match(struct power_supply *psy, void *data)
 {
 	struct qcom_battmgr_pd_source *src = data;
@@ -1253,6 +1296,7 @@ static int qcom_battmgr_pd_source_match(struct power_supply *psy, void *data)
 
 	if (!qcom_battmgr_is_ucsi_supply(src->battmgr, psy))
 		return 0;
+	qcom_battmgr_watch_partner(src->battmgr, psy->dev.parent);
 	if (power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val) ||
 	    !val.intval)
 		return 0;
@@ -1573,7 +1617,10 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		qcom_battmgr_pps_stop(battmgr);
 		return PD_POLL_MS;
 	}
-	if (!online) {
+	if (test_and_clear_bit(PD_EVENT_DETACH, &battmgr->pd_events) || !online) {
+		ret = qcom_battmgr_pps_stop(battmgr);
+		if (battmgr->pps_ops)
+			battmgr->pps_ops->detached(battmgr->pps_data);
 		test_and_clear_bit(PD_EVENT_TAIL, &battmgr->pd_events);
 		battmgr->tail_owned = false;
 		battmgr->serial_failures = battmgr->ufcs_failures = 0;
@@ -1586,16 +1633,16 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		battmgr->fixed_backoff = false;
 		battmgr->pd_partner_checked = false;
 		battmgr->pd_charge_only = false;
-		ret = qcom_battmgr_pps_stop(battmgr);
 		if (ret)
 			return PD_POLL_MS;
-		if (qcom_battmgr_pd_stop(battmgr, true, "charger removed") &&
+		if (qcom_battmgr_pd_stop(battmgr, !online, "charger removed") &&
 		    (battmgr->pd_restore_fcc || battmgr->pd_restore))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
 		battmgr->pd_logged = false;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
-		return 0;
+		if (!online)
+			return 0;
 	}
 
 	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
@@ -3512,6 +3559,12 @@ static void qcom_battmgr_charging_remove(void *data)
 {
 	struct platform_device *pdev = data;
 
+	struct qcom_battmgr *b = dev_get_drvdata(pdev->dev.parent);
+
+	/* Stop discovery before removing the observer. */
+	disable_delayed_work_sync(&b->charge_work);
+	if (b->partner_events.class)
+		class_interface_unregister(&b->partner_events);
 	platform_device_unregister(pdev);
 	guard(mutex)(&erhai_bridge_lock);
 	erhai_battmgr = NULL;

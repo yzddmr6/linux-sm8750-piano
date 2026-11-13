@@ -29,6 +29,7 @@ struct erhai_pps_ops {
 	bool (*active)(void *data);
 	unsigned int (*update)(void *data, bool caps_changed);
 	int (*stop)(void *data);
+	void (*detached)(void *data);
 };
 int erhai_pps_register(struct device *parent, const struct erhai_pps_ops *ops,
 		       void *data);

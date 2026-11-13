@@ -2540,6 +2540,18 @@ reschedule:
 /* Called by the battery manager under its charge policy lock. Stop is
  * synchronous with both frame handling and the pump watchdog worker.
  */
+void sc8547a_detached(void)
+{
+	guard(mutex)(&sc8547_pps_lock);
+	if (sc8547_master_dev) {
+		sc8547_master_dev->auto_protection = false;
+		sc8547_master_dev->pump_faults = 0;
+	}
+	if (sc8547_slave_dev)
+		sc8547_slave_dev->pump_faults = 0;
+}
+EXPORT_SYMBOL_GPL(sc8547a_detached);
+
 int sc8547a_serial_session(bool enable)
 {
 	struct sc8547a_device *sc;
@@ -2549,15 +2561,8 @@ int sc8547a_serial_session(bool enable)
 	sc = sc8547_master_dev;
 	if (!sc || !serial_enable)
 		return enable ? -EOPNOTSUPP : 0;
-	if (sc->auto_protection) {
-		if (enable)
-			return -EPERM;
-		/* Ordinary handoffs also stop serial. Only a confirmed detach
-		 * releases its hardware protection for the next charger.
-		 */
-		if (erhai_otg_adsp_usb_prop(0) == 0)
-			sc->auto_protection = false;
-	}
+	if (enable && sc->auto_protection)
+		return -EPERM;
 	if (enable == sc->vooc_started) {
 		if (enable && (sc->auto_state == SC_AUTO_DECLINED || sc->auto_state == SC_AUTO_DONE))
 			return -ENODATA;

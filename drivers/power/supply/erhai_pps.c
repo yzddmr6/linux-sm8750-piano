@@ -1423,15 +1423,20 @@ static int erhai_pps_stop(void *data)
 	struct erhai_pps *p = data;
 
 	pps_exit(p, "policy stop");
-	if ((p->pps_protection || p->ufcs_protection) && !pps_usb_get(0)) {
-		p->pps_protection = p->ufcs_protection = false;
-		p->retry_at = jiffies;
-	}
 	if (p->cleanup)
 		return -EIO;
 	p->next_poll = 0;
 
 	return 0;
+}
+
+static void erhai_pps_detached(void *data)
+{
+	struct erhai_pps *p = data;
+
+	p->pps_protection = p->ufcs_protection = false;
+	p->retry_at = jiffies;
+	sc8547a_detached();
 }
 
 static ssize_t erhai_pps_describe(void *data, char *buf, ssize_t off)
@@ -1455,6 +1460,7 @@ static const struct erhai_pps_ops erhai_pps_ops = {
 	.ufcs_update = erhai_ufcs_update,
 	.update = erhai_pps_update,
 	.stop = erhai_pps_stop,
+	.detached = erhai_pps_detached,
 };
 
 static int erhai_pps_probe(struct platform_device *pdev)
