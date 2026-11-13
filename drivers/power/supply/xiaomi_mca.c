@@ -665,6 +665,7 @@ struct xiaomi_mca {
 	bool hv_pps;		/* 9 V is asked of a PPS APDO */
 	u32 hv_pps_ma;		/* its requested current limit */
 	enum xiaomi_mca_cp cp;
+	const char *cp_last_exit;
 	struct power_supply *cp_psy;	/* the stage, held while not MCA_CP_OFF */
 	u32 cp_mv;		/* voltage asked of the PPS source */
 	u32 cp_ma;		/* APDO current limit, with source/authentication caps */
@@ -2124,6 +2125,7 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	}
 	power_supply_put(mca->cp_psy);
 	mca->cp_psy = NULL;
+	mca->cp_last_exit = why;
 	dev_info(mca->dev, "direct charging stopped: %s\n", why);
 
 	mca->cp = MCA_CP_DONE;
@@ -3780,10 +3782,12 @@ static ssize_t charge_profile_show(struct device *dev,
 	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
 
 	guard(mutex)(&mca->lock);
-	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u\n",
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u last_exit=%s\n",
 		 xiaomi_mca_profile_names[mca->cp_profile],
 		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
-		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma);
+		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma, mca->hv, mca->hv_pps,
+		 xiaomi_mca_cp_active(mca) ? mca->cp_mv : 0, READ_ONCE(mca->attach_generation),
+		 mca->cp_last_exit ?: "none");
 }
 static DEVICE_ATTR_RO(charge_profile);
 

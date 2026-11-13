@@ -1258,6 +1258,28 @@ out:
 	return ret;
 }
 
+static ssize_t charge_contract_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct qcom_battmgr *b = power_supply_get_drvdata(to_power_supply(dev));
+	ssize_t len;
+
+	guard(mutex)(&b->charge_lock);
+	len = sysfs_emit(buf, "fixed_pd_mv=%u fixed_icl_ua=%u ",
+			 b->pd_state == PD_ACTIVE ? PD_FIXED_MV : 0,
+			 b->pd_state == PD_ACTIVE ? b->pd_input_limit_ua : 0);
+
+	if (b->pps_ops)
+		return b->pps_ops->describe(b->pps_data, buf, len);
+	return len + sysfs_emit_at(buf, len, "state=idle\n");
+}
+static DEVICE_ATTR_RO(charge_contract);
+
+static struct attribute *erhai_charge_attrs[] = {
+	&dev_attr_charge_contract.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(erhai_charge);
+
 /* Record measured input, not the value merely accepted by a SET response. */
 static void qcom_battmgr_pd_log(struct qcom_battmgr *battmgr, u32 type)
 {
@@ -1571,6 +1593,22 @@ failed:
 	return battmgr->pd_restore || battmgr->pd_restore_fcc ? PD_POLL_MS : 0;
 }
 
+/* Firmware owns the converter while asleep. Its FCC is distinct from the
+ * fixed PDO and from the input ceiling. Capture both sides at handoff. */
+static void qcom_battmgr_log_handoff(struct qcom_battmgr *b, const char *phase)
+{
+	u32 fcc, icl, uv, ua, counter;
+
+	if (qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM, &fcc) ||
+	    qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_INPUT_CURR_LIMIT, &icl) ||
+	    qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &uv) ||
+	    qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_CURR_NOW, &ua) ||
+	    qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_COUNTER, &counter))
+		return;
+	dev_info(b->dev, "fixed PD %s: input %u uV %u uA ICL %u uA FCC %u uA charge %u uAh\n",
+		 phase, uv, ua, icl, fcc, counter);
+}
+
 /* Finish the existing fixed-PD transition before the charge worker freezes. */
 static void qcom_battmgr_pd_suspend(struct qcom_battmgr *battmgr)
 {
@@ -1589,8 +1627,10 @@ static void qcom_battmgr_pd_suspend(struct qcom_battmgr *battmgr)
 		msleep(PD_POLL_MS);
 		qcom_battmgr_pd_update(battmgr);
 	}
-	if (battmgr->pd_state == PD_ACTIVE)
+	if (battmgr->pd_state == PD_ACTIVE) {
+		qcom_battmgr_log_handoff(battmgr, "suspend");
 		return;
+	}
 	if (battmgr->pd_state == PD_WAIT)
 		qcom_battmgr_pd_stop(battmgr, false, "suspend timeout");
 
@@ -3295,7 +3335,10 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 			return dev_err_probe(dev, PTR_ERR(battmgr->bat_psy),
 					     "failed to register battery power supply\n");
 
+		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD)
+			psy_cfg_supply.attr_grp = erhai_charge_groups;
 		battmgr->usb_psy = devm_power_supply_register(dev, &sm8350_usb_psy_desc, &psy_cfg_supply);
+		psy_cfg_supply.attr_grp = NULL;
 		if (IS_ERR(battmgr->usb_psy))
 			return dev_err_probe(dev, PTR_ERR(battmgr->usb_psy),
 					     "failed to register USB power supply\n");
