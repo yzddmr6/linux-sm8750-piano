@@ -1523,8 +1523,10 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 				return PD_POLL_MS;
 			battmgr->pd_state = PD_FAILED;
 		}
-		qcom_battmgr_pd_log(battmgr, type);
-		return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
+		if (time_before(jiffies, battmgr->pd_since + msecs_to_jiffies(PD_CONFIG_TIMEOUT_MS)))
+			return PD_POLL_MS;
+		battmgr->pd_state = PD_IDLE;
+		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 
 	if (qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_HEALTH, &health) ||
@@ -1620,9 +1622,10 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 failed:
 	dev_warn(battmgr->dev, "PD: 9 V request failed: %d\n", ret);
 	qcom_battmgr_pd_stop(battmgr, false, "request failed");
+	battmgr->pd_since = jiffies;
 	battmgr->pd_state = PD_FAILED;
 	qcom_battmgr_pd_log(battmgr, type);
-	return battmgr->pd_restore || battmgr->pd_restore_fcc ? PD_POLL_MS : 0;
+	return PD_POLL_MS;
 }
 
 /* Firmware owns the converter while asleep. Its FCC is distinct from the

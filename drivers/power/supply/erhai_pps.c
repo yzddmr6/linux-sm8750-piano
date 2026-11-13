@@ -365,7 +365,8 @@ struct erhai_pps {
 	bool cleanup;
 	bool restore_fcc;
 	u32 saved_fcc_ua;
-	bool failed;
+	bool protection;
+	unsigned long retry_at;
 	unsigned long next_poll;
 
 	enum pps_state		state;
@@ -655,11 +656,10 @@ static void pps_exit(struct erhai_pps *p, const char *reason)
 {
 	if (p->state == PPS_IDLE && !p->cleanup && !p->adc_held)
 		return;
-	if (!strcmp(reason, PPS_EXIT_REASON_SET_FAIL) ||
-	    !strcmp(reason, PPS_EXIT_REASON_COLLAPSE) ||
-	    !strcmp(reason, PPS_EXIT_REASON_STALL) ||
-	    !strcmp(reason, PPS_EXIT_REASON_RAMP_TIMEOUT))
-		p->failed = true;
+	/* Cleanup has priority over the holdoff. While idle, battmgr can
+	 * supply the system from a fixed PDO throughout the holdoff.
+	 */
+	p->retry_at = jiffies + msecs_to_jiffies(pps_cp_rearm_ms);
 	p->last_reason = reason;
 	p->exits++;
 	p->charg_ticks = 0;
@@ -768,8 +768,11 @@ static int pps_cp_step(struct erhai_pps *p)
 	}
 	if (a->snapshot(&cvbus, &cvbat, &cibus))
 		return -EIO;
-	if (cvbat < pps_vbat_min_mv || cvbat >= 4800 /* loaded rail OVP backstop */ ||
-	    cvbus < pps_vbus_collapse_mv || cvbus > pps_cp_max_volt_mv)
+	if (cvbat >= 4800 || cvbus > pps_cp_max_volt_mv) {
+		p->protection = true;
+		return -ERANGE;
+	}
+	if (cvbat < pps_vbat_min_mv || cvbus < pps_vbus_collapse_mv)
 		return -ERANGE;
 
 	p->pump_ibus_ma = cibus;
@@ -815,8 +818,9 @@ static int pps_cp_step(struct erhai_pps *p)
 		return 0;
 	}
 
-	if (p->cp_rearms >= pps_cp_rearm_max ||
-	    time_before(jiffies, p->cp_holdoff_until) ||
+	if (p->cp_rearms >= pps_cp_rearm_max)
+		return -ETIMEDOUT;
+	if (time_before(jiffies, p->cp_holdoff_until) ||
 	    p->set_curr_ma < p->target_curr_ma)
 		return 0;
 
@@ -907,7 +911,7 @@ static void pps_poll(struct erhai_pps *p)
 
 	if (p->state >= PPS_NEGOTIATE && p->state < PPS_EXIT) {
 		if (online <= 0 || erhai_otg_charge_inhibited() || pps_read_battery(p)) {
-			p->failed = online > 0;
+
 			pps_exit(p, "source, policy or battery unavailable");
 			return;
 		}
@@ -927,7 +931,7 @@ static void pps_poll(struct erhai_pps *p)
 				if (!p->ibat_over_since)
 					p->ibat_over_since = jiffies | 1;
 				else if (time_after_eq(jiffies, p->ibat_over_since + 8 * HZ)) {
-					p->failed = true;
+					p->protection = true;
 					pps_exit(p, "PPS battery overcurrent");
 					return;
 				}
@@ -944,7 +948,7 @@ static void pps_poll(struct erhai_pps *p)
 		}
 		if (p->vbus_mv > (int)pps_cp_max_volt_mv ||
 		    (p->state != PPS_NEGOTIATE && p->vbus_mv < (int)pps_vbus_collapse_mv)) {
-			p->failed = true;
+			p->protection = p->vbus_mv > (int)pps_cp_max_volt_mv;
 			pps_exit(p, "VBUS outside limits");
 			return;
 		}
@@ -956,10 +960,10 @@ static void pps_poll(struct erhai_pps *p)
 
 		if (online <= 0) {
 			p->plug_logged = false;
-			p->failed = false;
+
 			return;
 		}
-		if (p->failed)
+		if (p->protection || time_before(jiffies, p->retry_at))
 			return;
 		p->plug_logged = true;
 
@@ -1099,7 +1103,7 @@ static void pps_poll(struct erhai_pps *p)
 
 fail:
 		pps_prop_err(p, "PPS ENTER", rc);
-		p->failed = true;
+
 		pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 		return;
 	}
@@ -1130,7 +1134,7 @@ fail:
 		next = min(p->set_volt_mv + pps_volt_step_mv, pps_target_volt_mv);
 		next = min(next, pps_max_volt_mv);
 		if (pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, next)) {
-			p->failed = true;
+
 			pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}
@@ -1138,7 +1142,7 @@ fail:
 		if (p->set_curr_ma < p->target_curr_ma) {
 			ci = min(p->set_curr_ma + 250U, p->target_curr_ma);
 			if (pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, ci)) {
-				p->failed = true;
+
 				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 				return;
 			}
@@ -1188,7 +1192,7 @@ fail:
 					     p->target_curr_ma);
 
 			if (pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, n)) {
-				p->failed = true;
+
 				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 				return;
 			}
@@ -1217,7 +1221,7 @@ fail:
 			rc = pps_cp_release(p, "disabled", false);
 		}
 		if (rc) {
-			p->failed = true;
+
 			pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 			return;
 		}
@@ -1258,7 +1262,7 @@ static void pps_cp_backstop(struct erhai_pps *p)
 	if (!stuck)
 		return;
 	pr_warn("erhai_pps: CP backstop: buck suspended without a working pump - resuming the buck\n");
-	p->failed = true;
+
 	pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
 }
 
@@ -1314,11 +1318,11 @@ static unsigned int erhai_pps_update(void *data, bool caps_changed)
 		if (ma <= 0 || ma != p->source_ma)
 			pps_exit(p, "source capabilities changed");
 	}
-	if (time_before(jiffies, p->next_poll))
+	if (p->state != PPS_IDLE && time_before(jiffies, p->next_poll))
 		return jiffies_to_msecs(p->next_poll - jiffies) + 1;
 	if (pps_cp_is_engaged() &&
 	    time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(1000))) {
-		p->failed = true;
+
 		pps_exit(p, "pump watchdog deadline missed");
 	} else {
 		pps_poll(p);
@@ -1345,7 +1349,7 @@ static bool erhai_pps_available(void *data)
 
 	if (p->state != PPS_IDLE || p->cleanup || p->adc_held)
 		return true;
-	return !p->failed && pps_deployable(p, &vooc) && pps_source_limit() > 0;
+	return !p->protection && !time_before(jiffies, p->retry_at) && pps_deployable(p, &vooc) && pps_source_limit() > 0;
 }
 
 static bool erhai_pps_active(void *data)
@@ -1360,10 +1364,14 @@ static int erhai_pps_stop(void *data)
 	struct erhai_pps *p = data;
 
 	pps_exit(p, "policy stop");
+	if (!pps_usb_get(0)) {
+		p->protection = false;
+		p->retry_at = jiffies;
+	}
 	if (p->cleanup)
 		return -EIO;
 	p->next_poll = 0;
-	p->failed = false;
+
 	return 0;
 }
 
@@ -1393,6 +1401,7 @@ static int erhai_pps_probe(struct platform_device *pdev)
 	p = devm_kzalloc(&pdev->dev, sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
+	p->retry_at = jiffies;
 	return erhai_pps_register(pdev->dev.parent, &erhai_pps_ops, p);
 }
 
