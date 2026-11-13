@@ -627,6 +627,8 @@ struct xiaomi_mca {
 	bool term_written;	/* restore even after a lost write acknowledgment */
 	bool cp_normal_cv;
 	bool term_hot;		/* float-voltage thermal hysteresis */
+	bool ffc_done;
+	u32 ffc_type, ffc_attach;
 	bool ffc_active;		/* checked again every poll, never latched by auth */
 	/* Thresholds are shared by the two cells and protected by rx_lock. */
 	unsigned int charge_start, charge_end;
@@ -2191,15 +2193,37 @@ static void xiaomi_mca_select_profile(struct xiaomi_mca *mca, int tcool, int twa
 	}
 }
 
-/* FFC describes the cells. Adapter identity limits the source current. */
-static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twarm)
+/* Enter only after observing both cells actually take more than iterm.
+ * A source advertisement by itself is no evidence of usable charge current.
+ */
+static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twarm,
+				      int vbat, int ibat)
 {
-	u32 type;
+	u32 online, type, attached = READ_ONCE(mca->attach_generation);
+	int iterm = twarm >= 35 ? 3164 : 2350;
+	bool running;
 
-	return full_charge && tcool >= 18 && twarm < MCA_TERM_HOT_DEGC &&
-	       mca->policy_generation == READ_ONCE(mca->service_generation) &&
-	       xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE) == 1 &&
-	       !xiaomi_mca_read_type(mca, &type) && xiaomi_mca_limits(type);
+	if (mca->ffc_attach != attached || vbat < 4350)
+		mca->ffc_done = false;
+	online = xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE);
+	if (!online) {
+		mca->ffc_done = false;
+		return false;
+	}
+	if (!full_charge || tcool < 18 || twarm >= MCA_TERM_HOT_DEGC ||
+	    mca->policy_generation != READ_ONCE(mca->service_generation) ||
+	    online != 1 ||
+	    xiaomi_mca_read_type(mca, &type) || !xiaomi_mca_limits(type) ||
+	    type == MCA_TYPE_SDP || type == MCA_TYPE_CDP)
+		return false;
+
+	running = mca->ffc_active && mca->ffc_type == type && mca->ffc_attach == attached;
+	mca->ffc_type = type;
+	mca->ffc_attach = attached;
+	/* Allow the stock 9 mV taper band for ADC/float regulation. */
+	if (running && vbat >= MCA_TERM_FFC_MV - 9 && ibat <= iterm)
+		mca->ffc_done = true;
+	return !mca->ffc_done && (running || ibat > iterm);
 }
 
 static int xiaomi_mca_restore_term_volt(struct xiaomi_mca *mca)
@@ -2243,7 +2267,7 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 			mca->term_hot = true;
 		else if (tbat < MCA_TERM_COOL_DEGC)
 			mca->term_hot = false;
-		mca->ffc_active = !mca->term_hot && xiaomi_mca_ffc_conditions(mca, tcool, tbat);
+		mca->ffc_active = !mca->term_hot && xiaomi_mca_ffc_conditions(mca, tcool, tbat, vbat, ibat);
 	}
 	xiaomi_mca_select_profile(mca, tcool, tbat);
 	target = mca->term_hot ? MCA_TERM_HOT_MV : MCA_TERM_FULL_MV;
@@ -2765,8 +2789,6 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		return;
 	if (xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack))
 		return;
-	mca->ffc_active = !mca->term_hot &&
-		xiaomi_mca_ffc_conditions(mca, min(tcool, tpack), max(tbat, tpack));
 	xiaomi_mca_select_profile(mca, min(tcool, tpack), max(tbat, tpack));
 	vbat_max = xiaomi_mca_cp_vbat_max(mca);
 	if ((mca->cp_recharge_cv >= vbat_max && vbat >= 4350) || vmin < MCA_CP_VBAT_MIN_MV ||
@@ -4486,6 +4508,12 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 	ret = xiaomi_mca_cp_stop(mca, "system sleep");
 	if (ret)
 		return ret;
+	if (mca->ffc_active) {
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, MCA_TERM_FULL_MV);
+		if (ret)
+			return ret;
+		mca->ffc_active = false;
+	}
 	ret = xiaomi_mca_clear_auth(mca);
 	if (ret)
 		return ret;
