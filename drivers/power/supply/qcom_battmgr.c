@@ -1480,17 +1480,19 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		     battmgr->pps_ops && battmgr->pps_ops->enabled() &&
 		     src.sink && !READ_ONCE(battmgr->otg_request) &&
 		     real_type == POWER_SUPPLY_USB_TYPE_PD_PPS;
-	if (prefer_pps) {
+	if (prefer_pps && !battmgr->charge_inhibited && !battmgr->charge_policy_hold &&
+	    !battmgr->charge_error && battmgr->pps_ops->available(battmgr->pps_data)) {
+		unsigned int delay;
+
 		if (qcom_battmgr_pd_stop(battmgr, false, "PPS handover"))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
-		if (battmgr->charge_inhibited || battmgr->charge_policy_hold ||
-		    battmgr->charge_error) {
-			qcom_battmgr_pps_stop(battmgr);
-			return PD_POLL_MS;
-		}
-		return battmgr->pps_ops->update(battmgr->pps_data,
+		delay = battmgr->pps_ops->update(battmgr->pps_data,
 				test_and_clear_bit(PD_EVENT_CAPS, &battmgr->pd_events));
+		if (qcom_battmgr_pps_running(battmgr))
+			return delay;
+		/* Cleanup completed. Re-read a fixed PDO in this same poll. */
+		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 	if (qcom_battmgr_pps_running(battmgr)) {
 		if (qcom_battmgr_pps_stop(battmgr))
@@ -1509,10 +1511,10 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 
 	if (!src.sink || READ_ONCE(battmgr->otg_request) ||
 	    (type != POWER_SUPPLY_USB_TYPE_PD && type != POWER_SUPPLY_USB_TYPE_PD_DRP &&
-	     type != POWER_SUPPLY_USB_TYPE_PD_PPS && type != OPLUS_USB_TYPE_PD_SDP)) {
+	     type != POWER_SUPPLY_USB_TYPE_PD_PPS && type != OPLUS_USB_TYPE_PD_SDP && !prefer_pps)) {
 		qcom_battmgr_pd_stop(battmgr, false, "no PD sink");
 		qcom_battmgr_pd_log(battmgr, type);
-		return 0;
+		return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
 	}
 
 	if (battmgr->pd_state == PD_FAILED) {
@@ -1522,7 +1524,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			battmgr->pd_state = PD_FAILED;
 		}
 		qcom_battmgr_pd_log(battmgr, type);
-		return 0;
+		return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
 	}
 
 	if (qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET, BATT_HEALTH, &health) ||
@@ -1544,7 +1546,9 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			dev_info(battmgr->dev, "PD: no verified 9 V fixed PDO (error %d)\n", ret);
 			qcom_battmgr_pd_stop(battmgr, false, "source capabilities");
 			qcom_battmgr_pd_log(battmgr, type);
-			return 0;
+			if (prefer_pps)
+				set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+			return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
 		}
 		current_changed = ua != battmgr->pd_input_limit_ua;
 		battmgr->pd_input_limit_ua = ua;
@@ -1553,12 +1557,14 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	switch (battmgr->pd_state) {
 	case PD_IDLE:
 		if (!caps_changed)
-			return 0;
+			return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
 		ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 						USB_INPUT_CURR_LIMIT, &battmgr->pd_saved_limit_ua);
 		if (ret || !battmgr->pd_saved_limit_ua) {
 			qcom_battmgr_pd_log(battmgr, type);
-			return 0;
+			if (prefer_pps)
+				set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+			return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
 		}
 		/* Also undo a timed-out write, since the firmware may have applied it. */
 		battmgr->pd_restore = true;
@@ -1608,7 +1614,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		qcom_battmgr_pd_log(battmgr, type);
 		return CHARGE_CTRL_POLL_MS;
 	default:
-		return 0;
+		return prefer_pps ? CHARGE_CTRL_POLL_MS : 0;
 	}
 
 failed:

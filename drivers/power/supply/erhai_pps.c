@@ -1335,6 +1335,19 @@ static bool erhai_pps_enabled(void)
 	return READ_ONCE(pps_enable);
 }
 
+/* An idle engine must qualify before battmgr releases a working fixed
+ * PDO. A partially reverted session still owns the port until cleanup.
+ */
+static bool erhai_pps_available(void *data)
+{
+	struct erhai_pps *p = data;
+	bool vooc;
+
+	if (p->state != PPS_IDLE || p->cleanup || p->adc_held)
+		return true;
+	return !p->failed && pps_deployable(p, &vooc) && pps_source_limit() > 0;
+}
+
 static bool erhai_pps_active(void *data)
 {
 	struct erhai_pps *p = data;
@@ -1368,6 +1381,7 @@ static const struct erhai_pps_ops erhai_pps_ops = {
 	.enabled = erhai_pps_enabled,
 	.serial_session = sc8547a_serial_session,
 	.active = erhai_pps_active,
+	.available = erhai_pps_available,
 	.update = erhai_pps_update,
 	.stop = erhai_pps_stop,
 };
