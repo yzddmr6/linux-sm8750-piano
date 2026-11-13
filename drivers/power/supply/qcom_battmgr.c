@@ -82,6 +82,8 @@ enum qcom_battmgr_variant {
 #define NOTIF_OPLUS_PLUGIN		0x57
 #define NOTIF_OPLUS_APSD_DONE		0x58
 /* OPLUS firmware: UFCS and reverse charging events */
+#define NOTIF_OPLUS_PD_SVOOC		0x56
+#define NOTIF_OPLUS_UFCS_HANDSHAKE_OK	0x71
 #define NOTIF_OPLUS_UFCS_DISABLE_MOS	0x73
 #define NOTIF_OPLUS_SOURCECAP_DONE	0x79
 #define NOTIF_OPLUS_POWER_ROLE		0x7d
@@ -220,6 +222,8 @@ enum qcom_battmgr_pd_event {
 	PD_EVENT_PARTNER,
 	PD_EVENT_TAIL,
 	PD_EVENT_DETACH,
+	PD_EVENT_SVOOC_RESPONSE,
+	PD_EVENT_UFCS_RESPONSE,
 };
 
 static DEFINE_MUTEX(erhai_bridge_lock);
@@ -536,6 +540,14 @@ struct qcom_battmgr {
 	bool pd_restore;
 	bool qc_contract;
 	bool serial_probe;
+	bool stable_seen;
+	unsigned long stable_since;
+	unsigned int missing_routes;
+	unsigned int retry_evidence;
+	unsigned int retry_once;
+	unsigned int retry_pending;
+	unsigned int serial_retries, ufcs_retries, pps_retries;
+	unsigned long serial_next, ufcs_next, pps_next;
 	bool tail_owned;
 	unsigned int recharge_samples;
 	unsigned long recharge_at;
@@ -1565,6 +1577,7 @@ static bool qcom_battmgr_tail_owned(struct qcom_battmgr *b)
 		b->recharge_samples = 0;
 	} else if (++b->recharge_samples >= 6) {
 		b->tail_owned = false;
+		b->retry_once |= ERHAI_SERIAL | ERHAI_UFCS;
 		if (b->pps_ops)
 			b->pps_ops->recharge(b->pps_data);
 		b->serial_backoff = b->ufcs_backoff = false;
@@ -1594,10 +1607,54 @@ static unsigned long qcom_battmgr_probe_retry(unsigned int *failures)
 }
 
 /* Fixed PDOs and PPS share a worker and never write the contract concurrently. */
+/* Absolute retry slots following stable power: 30 s, 120 s, 480 s.
+ * If the evidence arrives late, keep the spacing between later slots.
+ */
+static bool qcom_battmgr_retry_slot(unsigned int *attempts, unsigned long *next,
+				    unsigned long stable_since)
+{
+	static const unsigned int slots[] = { 30, 120, 480 };
+	unsigned int slot = *attempts;
+	unsigned long due;
+
+	if (slot >= ARRAY_SIZE(slots))
+		return false;
+	due = slot ? *next : stable_since + slots[0] * HZ;
+	if (time_before(jiffies, due))
+		return false;
+	(*attempts)++;
+	if (*attempts < ARRAY_SIZE(slots))
+		*next = jiffies + (slots[*attempts] - slots[slot]) * HZ;
+	return true;
+}
+
+/* Reserve each interruption before issuing any stop command. PHY readiness,
+ * cell termination and per-protocol hardware protection take precedence.
+ */
+static unsigned int qcom_battmgr_retry_routes(struct qcom_battmgr *b,
+					      const struct erhai_probe_status *status,
+					      bool ufcs_active)
+{
+	unsigned int eligible = (b->retry_once | b->retry_evidence | status->responded) &
+				status->ready & ~status->protected;
+	unsigned int routes = 0;
+
+	if ((eligible & ERHAI_SERIAL) && !b->serial_blocked &&
+	    qcom_battmgr_retry_slot(&b->serial_retries, &b->serial_next, b->stable_since))
+		routes |= ERHAI_SERIAL;
+	if ((eligible & ERHAI_UFCS) && !ufcs_active &&
+	    qcom_battmgr_retry_slot(&b->ufcs_retries, &b->ufcs_next, b->stable_since))
+		routes |= ERHAI_UFCS;
+	b->retry_once &= ~routes;
+	return routes;
+}
+
 static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
-	bool tail, probe_idle, prefer_pps, dedicated, can_probe, qc, try_qc, caps_changed, current_changed = false;
+	struct erhai_probe_status status = {};
+	bool stable, ufcs_active, tail, probe_idle, prefer_pps, dedicated, can_probe;
+	bool qc, try_qc, caps_changed, current_changed = false;
 	u32 online, type, health, vbat, vbus, ua, real_type;
 	int ret;
 
@@ -1623,6 +1680,12 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 			battmgr->pps_ops->detached(battmgr->pps_data);
 		test_and_clear_bit(PD_EVENT_TAIL, &battmgr->pd_events);
 		battmgr->tail_owned = false;
+		battmgr->stable_seen = false;
+		battmgr->missing_routes = battmgr->retry_pending = 0;
+		battmgr->retry_once = battmgr->retry_evidence = 0;
+		battmgr->serial_retries = battmgr->ufcs_retries = battmgr->pps_retries = 0;
+		test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events);
+		test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events);
 		battmgr->serial_failures = battmgr->ufcs_failures = 0;
 		battmgr->serial_backoff = false;
 		battmgr->serial_blocked = false;
@@ -1658,6 +1721,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		real_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	}
 	if (type != battmgr->charge_detected_type) {
+		battmgr->aicl_done = false;
 		battmgr->serial_failures = battmgr->ufcs_failures = 0;
 		battmgr->serial_backoff = battmgr->ufcs_backoff = false;
 	}
@@ -1683,6 +1747,39 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	can_probe = dedicated && !READ_ONCE(battmgr->pps_suspended) &&
 		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
 		    !battmgr->charge_policy_hold && !battmgr->charge_error;
+	if (battmgr->pps_ops)
+		battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
+	ufcs_active = battmgr->pps_ops && battmgr->pps_ops->ufcs_active(battmgr->pps_data);
+	if (dedicated)
+		battmgr->missing_routes |= (ERHAI_SERIAL | ERHAI_UFCS) & ~status.ready;
+	battmgr->retry_once |= battmgr->missing_routes & status.ready;
+	battmgr->missing_routes &= ~status.ready;
+	if (test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events) ||
+	    real_type == 9 /* Erhai ADSP USB_REAL_TYPE VOOC family */)
+		battmgr->retry_evidence |= ERHAI_SERIAL;
+	if (test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events))
+		battmgr->retry_evidence |= ERHAI_UFCS;
+	stable = battmgr->pd_state == PD_ACTIVE || status.delivering;
+	if (stable && !battmgr->stable_seen) {
+		battmgr->stable_seen = true;
+		battmgr->stable_since = jiffies;
+	}
+	if (!can_probe || tail)
+		battmgr->retry_pending = 0;
+	else if (stable && !battmgr->retry_pending && !battmgr->serial_probe) {
+		battmgr->retry_pending = qcom_battmgr_retry_routes(battmgr, &status, ufcs_active);
+		if (battmgr->retry_pending) {
+			if (ufcs_active)
+				battmgr->retry_pending |= ERHAI_UFCS;
+			ret = qcom_battmgr_pps_stop(battmgr);
+			ret = ret ?: qcom_battmgr_pd_stop(battmgr, false, "qualified protocol retry");
+			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
+			if (ret) {
+				battmgr->retry_pending = 0;
+				return PD_POLL_MS;
+			}
+		}
+	}
 	probe_idle = !tail && can_probe && !battmgr->pd_restore && !battmgr->pd_restore_fcc &&
 		     !qcom_battmgr_pps_running(battmgr) &&
 		     !qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &vbus) &&
@@ -1692,13 +1789,16 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		 * source at 5 V. Its decline/timeout releases the crossbar
 		 * before the next protocol (including firmware QC) can act.
 		 */
-		if ((probe_idle || (!tail && can_probe && battmgr->serial_probe)) && !battmgr->serial_blocked &&
-		    (!battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
+		if ((status.ready & ERHAI_SERIAL) &&
+		    (!battmgr->retry_pending || (battmgr->retry_pending & ERHAI_SERIAL)) &&
+		    (probe_idle || (!tail && can_probe && battmgr->serial_probe)) && !battmgr->serial_blocked &&
+		    ((battmgr->retry_pending & ERHAI_SERIAL) || !battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
 			ret = battmgr->pps_ops->serial_session(true);
 			if (!ret) {
 				battmgr->serial_probe = true;
 				return PD_POLL_MS;
 			}
+			/* Keep the reservation until the entire retry ladder is done. */
 			battmgr->serial_blocked = ret == -EPERM;
 			battmgr->serial_backoff = true;
 			battmgr->serial_retry = qcom_battmgr_probe_retry(&battmgr->serial_failures);
@@ -1710,9 +1810,13 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	}
 	if (IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS) && can_probe && battmgr->pps_ops &&
 	    (battmgr->pps_ops->ufcs_active(battmgr->pps_data) ||
-	     (probe_idle && (!battmgr->ufcs_backoff || time_after_eq(jiffies, battmgr->ufcs_retry))))) {
+	     (probe_idle && (status.ready & ERHAI_UFCS) && !(status.protected & ERHAI_UFCS) &&
+	      (!battmgr->retry_pending || (battmgr->retry_pending & ERHAI_UFCS)) &&
+	      ((battmgr->retry_pending & ERHAI_UFCS) || !battmgr->ufcs_backoff ||
+	       time_after_eq(jiffies, battmgr->ufcs_retry))))) {
 		unsigned int delay;
 
+		battmgr->retry_pending = 0;
 		delay = battmgr->pps_ops->ufcs_update(battmgr->pps_data);
 		if (battmgr->pps_ops->ufcs_active(battmgr->pps_data))
 			return delay ?: PD_POLL_MS;
@@ -1723,6 +1827,8 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	if (battmgr->pps_ops && battmgr->pps_ops->ufcs_active(battmgr->pps_data) &&
 	    qcom_battmgr_pps_stop(battmgr))
 		return PD_POLL_MS;
+	/* A failed 5 V readback or a disappearing PHY cancels this reservation. */
+	battmgr->retry_pending = 0;
 	/* The Type-C partner's PD capabilities are stronger evidence than
 	 * an incomplete BC1.2 classification. PPS also checks its APDO.
 	 */
@@ -1733,6 +1839,16 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	    !battmgr->charge_error && battmgr->pps_ops->available(battmgr->pps_data)) {
 		unsigned int delay;
 
+		/* A live APDO is affirmative evidence. Budget retries that
+		 * would break working fixed power; on idle 5 V the PPS
+		 * engine handles recoverable errors with its own holdoff.
+		 */
+		if (battmgr->pd_state == PD_WAIT)
+			goto fixed_contract;
+		if (battmgr->pd_state == PD_ACTIVE &&
+		    !qcom_battmgr_retry_slot(&battmgr->pps_retries, &battmgr->pps_next,
+					     battmgr->stable_since))
+			goto fixed_contract;
 		if (qcom_battmgr_pd_stop(battmgr, false, "PPS handover"))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
@@ -1749,6 +1865,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 
+fixed_contract:
 	/* A suspend vote can persist across a cable removal in this firmware. */
 	if (battmgr->pps_input_used) {
 		ret = qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
@@ -1916,6 +2033,10 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		ret = qcom_battmgr_pd_fcc(battmgr);
 		if (ret)
 			goto failed;
+		if (!battmgr->stable_seen) {
+			battmgr->stable_seen = true;
+			battmgr->stable_since = jiffies;
+		}
 		battmgr->pd_state = PD_ACTIVE;
 		qcom_battmgr_pd_log(battmgr, type);
 		return CHARGE_CTRL_POLL_MS;
@@ -2108,6 +2229,7 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 	case PM_POST_RESTORE:
 	case PM_POST_SUSPEND:
 		scoped_guard(mutex, &battmgr->charge_lock) {
+			battmgr->retry_once |= ERHAI_SERIAL | ERHAI_UFCS;
 			if (battmgr->service_up && battmgr->pd_state == PD_ACTIVE)
 				qcom_battmgr_log_handoff(battmgr, "resume");
 		}
@@ -2625,6 +2747,14 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 			break;
 		}
 		fallthrough;
+	case NOTIF_OPLUS_PD_SVOOC:
+	case NOTIF_OPLUS_UFCS_HANDSHAKE_OK:
+		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_PPS) {
+			set_bit(notification == NOTIF_OPLUS_PD_SVOOC ? PD_EVENT_SVOOC_RESPONSE :
+				PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events);
+			qcom_battmgr_usb_event(battmgr);
+		}
+		break;
 	case NOTIF_OPLUS_UFCS_DISABLE_MOS:
 	case NOTIF_OPLUS_POWER_ROLE:
 	case NOTIF_OPLUS_PD_HARD_RESET:

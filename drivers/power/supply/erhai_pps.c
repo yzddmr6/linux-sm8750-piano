@@ -1480,9 +1480,20 @@ static ssize_t erhai_pps_describe(void *data, char *buf, ssize_t off)
 			  pps_cp_is_engaged(), pps_cp_is_engaged() ? p->pump_ibus_ma : 0, p->exits, p->last_reason ?: "none");
 }
 
+static void erhai_probe_status(void *data, struct erhai_probe_status *status)
+{
+	struct erhai_pps *p = data;
+
+	sc8547a_probe_status(status);
+	if (p->ufcs_protection || !pps_enable || !pps_cp_enable)
+		status->protected |= ERHAI_UFCS;
+	status->delivering = p->state == PPS_CHARGING || p->state == PPS_TAPER;
+}
+
 static const struct erhai_pps_ops erhai_pps_ops = {
 	.describe = erhai_pps_describe,
 	.enabled = erhai_pps_enabled,
+	.probe_status = erhai_probe_status,
 	.serial_session = sc8547a_serial_session,
 	.active = erhai_pps_active,
 	.available = erhai_pps_available,

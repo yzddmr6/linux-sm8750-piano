@@ -18,10 +18,21 @@
 struct device;
 struct pmic_glink_client;
 
+/* Status of the two D+/D- charging protocols on this attachment. */
+#define ERHAI_SERIAL		1U
+#define ERHAI_UFCS		2U
+struct erhai_probe_status {
+	unsigned int ready;
+	unsigned int responded;
+	unsigned int protected;
+	bool delivering;
+};
+
 /* All callbacks run under battmgr's charge_lock, including suspend/teardown. */
 struct erhai_pps_ops {
 	ssize_t (*describe)(void *data, char *buf, ssize_t off);
 	bool (*enabled)(void);
+	void (*probe_status)(void *data, struct erhai_probe_status *status);
 	int (*serial_session)(bool enable);
 	bool (*ufcs_active)(void *data);
 	unsigned int (*ufcs_update)(void *data);

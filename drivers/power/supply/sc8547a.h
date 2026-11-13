@@ -26,6 +26,8 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv);
 int sc8547a_ufcs_request(unsigned int *mv, unsigned int *ma);
 int sc8547a_ufcs_stop(void);
 int sc8547a_ufcs_monitor(void);
+struct erhai_probe_status;
+void sc8547a_probe_status(struct erhai_probe_status *status);
 void sc8547a_detached(void);
 int sc8547a_serial_session(bool enable);
 

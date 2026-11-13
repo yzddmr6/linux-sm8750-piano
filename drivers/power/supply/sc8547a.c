@@ -484,6 +484,7 @@ struct sc8547a_device {
 	unsigned int curve_ma;	/* selected CC/CV table */
 	int			auto_curve_idx;	/* current row (descends only) */
 	bool			auto_protection;
+	unsigned int responded;
 	bool serial_quiesced;
 	bool monitor_pump_faults;
 	u8 pump_faults;
@@ -1512,6 +1513,7 @@ static int vooc_get_mesg_from_adapter(struct sc8547a_device *sc)
 	 * need delay"): any decodable VOOC frame marks a live VOOC adapter even
 	 * if the check-commu exchange has not completed yet. */
 	sc->vooc_saw_any = true;
+	sc->responded |= ERHAI_SERIAL;
 	return 0;
 }
 
@@ -2325,6 +2327,8 @@ static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
 	 * identical to the old single-shot behaviour, so D+/D- and normal
 	 * charging are not held hostage by the retry loop.
 	 */
+	if (adsp_vooc || real_vooc)
+		sc->responded |= ERHAI_SERIAL;
 	if (!adsp_vooc && !real_vooc && !sc->vooc_saw_any) {
 		dev_info(sc->dev,
 			 "no VOOC evidence (adsp %d, real %d, frames %d) — declining\n",
@@ -2603,10 +2607,31 @@ reschedule:
 /* Called by the battery manager under its charge policy lock. Stop is
  * synchronous with both frame handling and the pump watchdog worker.
  */
+void sc8547a_probe_status(struct erhai_probe_status *status)
+{
+	struct sc8547a_device *sc;
+
+	guard(mutex)(&sc8547_pps_lock);
+	sc = sc8547_master_dev;
+	if (!sc || sc->irq <= 0)
+		return;
+	if (serial_enable && sc8547_slave_dev)
+		status->ready |= ERHAI_SERIAL;
+#if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
+	if (sc->ufcs)
+		status->ready |= ERHAI_UFCS;
+#endif
+	status->responded = sc->responded;
+	if (sc->auto_protection)
+		status->protected |= ERHAI_SERIAL;
+}
+EXPORT_SYMBOL_GPL(sc8547a_probe_status);
+
 void sc8547a_detached(void)
 {
 	guard(mutex)(&sc8547_pps_lock);
 	if (sc8547_master_dev) {
+		sc8547_master_dev->responded = 0;
 		sc8547_master_dev->auto_protection = false;
 		sc8547_master_dev->pump_faults = 0;
 	}
@@ -2855,6 +2880,8 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	ret = ufcs_handshake(sc->ufcs);
 	if (ret)
 		goto out;
+	scoped_guard(mutex, &sc8547_pps_lock)
+		sc->responded |= ERHAI_UFCS;
 	/* Stock sets the CP watchdog to 5 s after PHY handshake. The
 	 * source packet watchdog is a separate 3 s contract.
 	 */
