@@ -12,6 +12,7 @@ struct sc8541_test {
 	u8 write_regs[64];
 	u8 write_values[64];
 	unsigned int writes;
+	unsigned int reads[SC8541_MAX_REG + 1];
 };
 
 static int sc8541_test_read(void *ctx, unsigned int reg, unsigned int *value)
@@ -20,6 +21,7 @@ static int sc8541_test_read(void *ctx, unsigned int reg, unsigned int *value)
 
 	if (reg == f->fail_read_reg)
 		return -EREMOTEIO;
+	f->reads[reg]++;
 	*value = f->regs[reg];
 	if (f->stuck_enabled && reg == SC8541_CTRL2)
 		*value |= SC8541_CHG_EN;
@@ -296,12 +298,34 @@ static void sc8541_test_pen_gate(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->regs[0x40], 0x25);
 }
 
+static void sc8541_test_off_snapshot(struct kunit *test)
+{
+	struct sc8541_test *f = sc8541_test_init(test);
+	int online, n;
+
+	KUNIT_ASSERT_EQ(test, sc8541_enable(&f->sc), 0);
+	KUNIT_ASSERT_EQ(test, sc8541_online(&f->sc, &online), 0);
+	KUNIT_EXPECT_EQ(test, online, 1);
+	f->regs[SC8541_CTRL2] &= ~SC8541_CHG_EN;
+	for (n = 0x13; n <= 0x1c; n++)
+		f->regs[n] = n;
+	KUNIT_ASSERT_EQ(test, sc8541_online(&f->sc, &online), 0);
+	KUNIT_EXPECT_EQ(test, online, 0);
+	for (n = 0x13; n <= 0x1c; n++)
+		KUNIT_EXPECT_EQ(test, f->reads[n], 1);
+	KUNIT_ASSERT_EQ(test, sc8541_online(&f->sc, &online), 0);
+	for (n = 0x13; n <= 0x1c; n++)
+		KUNIT_EXPECT_EQ(test, f->reads[n], 1);
+	KUNIT_EXPECT_TRUE(test, f->sc.enabled);
+}
+
 static struct kunit_case sc8541_test_cases[] = {
 	KUNIT_CASE(sc8541_test_pen_gate),
 	KUNIT_CASE(sc8541_test_otg_failure),
 	KUNIT_CASE(sc8541_test_otg_detach),
 	KUNIT_CASE(sc8541_test_otg_sequence),
 	KUNIT_CASE(sc8541_test_protections),
+	KUNIT_CASE(sc8541_test_off_snapshot),
 	KUNIT_CASE(sc8541_test_failed_arm),
 	KUNIT_CASE(sc8541_test_hw_watchdog),
 	KUNIT_CASE(sc8541_test_remove),

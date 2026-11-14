@@ -3676,7 +3676,7 @@ static void xiaomi_mca_test_mipps_tail_replay(struct kunit *test)
 	struct xiaomi_mca *mca = &f->mca;
 	int n, before;
 
-	full_charge = charge_policy = cp_charge = hv_charge = true;
+	full_charge = charge_policy = charge_current = cp_charge = hv_charge = true;
 	mca_register_ucsi_peer(test, f);
 	mca_test_stage(test, f);
 	f->type = mca->real_type = mca->cp_type = MCA_TYPE_PD_PPS;
