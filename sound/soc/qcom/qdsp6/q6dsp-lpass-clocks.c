@@ -146,6 +146,12 @@ int q6dsp_clock_dev_probe(struct platform_device *pdev)
 	cc->dev = dev;
 	q6dsp_clks = desc->clks;
 
+	/*
+	 * The clk ops read the driver data, and a consumer can prepare a
+	 * clock as soon as it is registered, so set it before the first one.
+	 */
+	dev_set_drvdata(dev, cc);
+
 	for (i = 0; i < desc->num_clks; i++) {
 		unsigned int id = q6dsp_clks[i].clk_id;
 		struct clk_init_data init = {
@@ -174,12 +180,6 @@ int q6dsp_clock_dev_probe(struct platform_device *pdev)
 			return ret;
 	}
 
-	ret = devm_of_clk_add_hw_provider(dev, q6dsp_of_clk_hw_get, cc);
-	if (ret)
-		return ret;
-
-	dev_set_drvdata(dev, cc);
-
-	return 0;
+	return devm_of_clk_add_hw_provider(dev, q6dsp_of_clk_hw_get, cc);
 }
 EXPORT_SYMBOL_GPL(q6dsp_clock_dev_probe);
