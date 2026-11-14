@@ -3615,6 +3615,143 @@ static void xiaomi_mca_test_unknown_debounce(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->icl, 3000);
 }
 
+/* Five-second observations from the first MiPPS session, 84% through the
+ * last good sample before autonomous pump shutdown. The physical trace
+ * ends at 87%; the explicitly marked tail below tests software handover.
+ */
+static void xiaomi_mca_test_mipps_tail_replay(struct kunit *test)
+{
+	static const struct {
+		int soc0, soc1, mv0, mv1, ma0, ma1, bus_mv, bus_ma;
+	} recorded[] = {
+		{ 84, 84, 4321, 4320, 524, 519, 8778, 670 }, /* 21:53:28 */
+		{ 84, 84, 4351, 4349, 659, 653, 8868, 985 }, /* 21:53:33 */
+		{ 84, 84, 4376, 4374, 844, 839, 8958, 1235 }, /* 21:53:38 */
+		{ 84, 84, 4402, 4399, 1065, 1058, 9056, 1547 }, /* 21:53:43 */
+		{ 84, 84, 4430, 4427, 1311, 1302, 9150, 1857 }, /* 21:53:48 */
+		{ 84, 84, 4455, 4452, 1578, 1566, 9255, 2177 }, /* 21:53:53 */
+		{ 84, 84, 4477, 4473, 1853, 1838, 9333, 2575 }, /* 21:53:58 */
+		{ 84, 84, 4481, 4477, 2066, 2052, 9322, 2675 }, /* 21:54:03 */
+		{ 84, 84, 4472, 4468, 2171, 2157, 9300, 2572 }, /* 21:54:08 */
+		{ 84, 84, 4465, 4462, 2207, 2193, 9281, 2570 }, /* 21:54:13 */
+		{ 84, 84, 4465, 4462, 2189, 2177, 9258, 2495 }, /* 21:54:18 */
+		{ 84, 84, 4466, 4461, 2188, 2169, 9281, 2527 }, /* 21:54:23 */
+		{ 84, 84, 4466, 4462, 2165, 2147, 9277, 2570 }, /* 21:54:28 */
+		{ 84, 84, 4467, 4464, 2147, 2131, 9281, 2590 }, /* 21:54:33 */
+		{ 84, 84, 4467, 4464, 2133, 2120, 9277, 2585 }, /* 21:54:38 */
+		{ 85, 85, 4466, 4464, 2117, 2104, 9266, 2427 }, /* 21:54:43 */
+		{ 85, 85, 4467, 4465, 2100, 2087, 9266, 2415 }, /* 21:54:48 */
+		{ 85, 85, 4467, 4464, 2085, 2073, 9262, 2402 }, /* 21:54:53 */
+		{ 85, 85, 4467, 4465, 2071, 2058, 9285, 2580 }, /* 21:54:58 */
+		{ 85, 85, 4468, 4465, 2061, 2048, 9270, 2452 }, /* 21:55:03 */
+		{ 85, 85, 4469, 4467, 2053, 2040, 9307, 2622 }, /* 21:55:08 */
+		{ 85, 85, 4468, 4466, 2044, 2031, 9277, 2485 }, /* 21:55:13 */
+		{ 85, 85, 4470, 4467, 2038, 2027, 9273, 2475 }, /* 21:55:18 */
+		{ 85, 85, 4469, 4466, 2028, 2016, 9288, 2610 }, /* 21:55:23 */
+		{ 85, 85, 4469, 4467, 2022, 2007, 9266, 2420 }, /* 21:55:28 */
+		{ 85, 85, 4469, 4467, 2013, 1998, 9273, 2420 }, /* 21:55:33 */
+		{ 85, 85, 4470, 4467, 2006, 1991, 9288, 2557 }, /* 21:55:38 */
+		{ 85, 85, 4470, 4468, 2000, 1985, 9262, 2480 }, /* 21:55:43 */
+		{ 85, 85, 4470, 4468, 1993, 1979, 9273, 2487 }, /* 21:55:48 */
+		{ 86, 85, 4470, 4468, 1988, 1973, 9277, 2425 }, /* 21:55:53 */
+		{ 86, 86, 4471, 4468, 1983, 1966, 9285, 2480 }, /* 21:55:58 */
+		{ 86, 86, 4471, 4468, 1977, 1960, 9281, 2495 }, /* 21:56:03 */
+		{ 86, 86, 4471, 4469, 1971, 1955, 9285, 2460 }, /* 21:56:08 */
+		{ 86, 86, 4471, 4469, 1966, 1950, 9270, 2510 }, /* 21:56:13 */
+		{ 86, 86, 4471, 4469, 1962, 1945, 9277, 2512 }, /* 21:56:18 */
+		{ 86, 86, 4472, 4470, 1958, 1941, 9285, 2445 }, /* 21:56:23 */
+		{ 86, 86, 4472, 4470, 1954, 1937, 9288, 2492 }, /* 21:56:28 */
+		{ 86, 86, 4472, 4470, 1949, 1932, 9273, 2537 }, /* 21:56:33 */
+		{ 86, 86, 4472, 4470, 1944, 1928, 9277, 2492 }, /* 21:56:38 */
+		{ 86, 86, 4474, 4471, 1943, 1925, 9281, 2572 }, /* 21:56:43 */
+		{ 86, 86, 4473, 4471, 1938, 1920, 9285, 2492 }, /* 21:56:48 */
+		{ 86, 86, 4473, 4471, 1933, 1915, 9288, 2467 }, /* 21:56:53 */
+		{ 86, 86, 4473, 4471, 1928, 1910, 9288, 2507 }, /* 21:56:58 */
+		{ 86, 86, 4473, 4471, 1923, 1905, 9292, 2535 }, /* 21:57:03 */
+		{ 86, 86, 4472, 4472, 1917, 1901, 9292, 2487 }, /* 21:57:08 */
+		{ 86, 86, 4473, 4470, 1912, 1896, 9285, 2530 }, /* 21:57:13 */
+		{ 87, 86, 4504, 4503, 2012, 2005, 9412, 2740 }, /* 21:57:18 */
+	};
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	int n, before;
+
+	full_charge = charge_policy = cp_charge = hv_charge = true;
+	mca_register_ucsi_peer(test, f);
+	mca_test_stage(test, f);
+	f->type = mca->real_type = mca->cp_type = MCA_TYPE_PD_PPS;
+	mca->cp_ma = 5000;
+	mca->cp_max_mv = 10000;
+	mca->cp_mv = 8940;
+	mca->cp_ibus_ma = mca->cp_ibus_hot = 3800;
+	mca->icl_set_ma = mca->fcc_set_ma = 500;
+	mca->cp_ibat_trip = 12000;
+	guard(mutex)(&mca->lock);
+	for (n = 0; n < ARRAY_SIZE(recorded); n++) {
+		f->cells[0].capacity = recorded[n].soc0;
+		f->cells[1].capacity = recorded[n].soc1;
+		f->cells[0].voltage = recorded[n].mv0 * 1000;
+		f->cells[1].voltage = recorded[n].mv1 * 1000;
+		f->cells[0].current_ua = recorded[n].ma0 * 1000;
+		f->cells[1].current_ua = recorded[n].ma1 * 1000;
+		mca->vbus_uv = f->vbus = recorded[n].bus_mv * 1000;
+		f->stage_mv = recorded[n].bus_mv;
+		f->stage_ma = recorded[n].bus_ma;
+		KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+		xiaomi_mca_cp_step(mca);
+		KUNIT_ASSERT_EQ_MSG(test, mca->cp, MCA_CP_ON, "row %d", n);
+		KUNIT_EXPECT_EQ(test, mca->cp_exits, 0);
+	}
+	KUNIT_ASSERT_TRUE(test, mca->ffc_active);
+	KUNIT_EXPECT_LT(test, mca->cp_mv, 10000);
+
+	/* Constructed future observations, not measurements of a charged pack. */
+	f->cells[0].capacity = f->cells[1].capacity = 95;
+	f->cells[0].voltage = f->cells[1].voltage = 4540000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 2000000;
+	before = mca->cp_mv;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	xiaomi_mca_cp_step(mca);
+	KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_LT(test, mca->cp_mv, before);
+	f->cells[0].voltage = f->cells[1].voltage = 4535000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 1500000;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	xiaomi_mca_cp_step(mca);
+	KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_OFF);
+	KUNIT_EXPECT_EQ(test, mca->cp_exits, 1);
+	KUNIT_EXPECT_EQ(test, mca->cp_retry_ms, 0);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
+
+	f->type = mca->real_type = MCA_TYPE_PD;
+	mca->vbus_uv = f->vbus = 9000000;
+	mca->hv = MCA_HV_ON;
+	mca->hv_pps = false;
+	f->pdos[1] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(9000), cpu_to_le32(9000), cpu_to_le32(3000) };
+	f->ucsi_online = 1;
+	f->ucsi_type = POWER_SUPPLY_USB_TYPE_PD;
+	f->ucsi_status = POWER_SUPPLY_STATUS_CHARGING;
+	f->ucsi_mv = 9000;
+	f->ucsi_rp_ua = 3000000;
+	f->charging_enabled = 0;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	xiaomi_mca_apply_policy(mca);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+	KUNIT_EXPECT_EQ(test, f->icl, 2500);
+	KUNIT_EXPECT_EQ(test, f->fcc, 4000);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5480);
+	f->cells[0].capacity = f->cells[1].capacity = 100;
+	f->cells[0].voltage = f->cells[1].voltage = 4539000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 1175000;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_done);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
+	xiaomi_mca_cp_try_start(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
+}
+
 static void xiaomi_mca_test_ffc_handoff(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3859,6 +3996,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_qc_regulation),
 	KUNIT_CASE(xiaomi_mca_test_measured_buck_share),
 	KUNIT_CASE(xiaomi_mca_test_taper_handoff),
+	KUNIT_CASE(xiaomi_mca_test_mipps_tail_replay),
 	KUNIT_CASE(xiaomi_mca_test_buck_enable_readback),
 	KUNIT_CASE(xiaomi_mca_test_ffc_cutoff_in_pump),
 	KUNIT_CASE(xiaomi_mca_test_tail_current_transfer),
