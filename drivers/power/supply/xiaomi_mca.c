@@ -175,6 +175,7 @@ struct xiaomi_mca_pdo {
  * Command n (1-8) goes to property 0x21003 + n - 1, as in the stock
  * adsp_pd_protocol_request_vdm_cmd().
  */
+#define MCA_PROP_VDM_VSAFE0V	0x2100b
 #define MCA_PROP_VDM_BASE	0x21003
 #define MCA_PROP_VDM_VERSION	0x21003
 #define MCA_PROP_VDM_VOLTAGE	0x21004
@@ -2961,6 +2962,38 @@ static bool xiaomi_mca_connector_trip(struct mca_connector *c, const int temp[2]
 			   (c->temp[hot] >= 35000 && rising[hot]));
 }
 
+static void xiaomi_mca_connector_stop(struct xiaomi_mca *mca)
+{
+	u32 vbus, dummy = 0, type = MCA_TYPE_UNKNOWN;
+	int ret, i;
+
+	mca->charge_blocked = true;
+	ret = xiaomi_mca_charge_stop(mca);
+	if (ret)
+		dev_warn_ratelimited(mca->dev, "connector charge stop failed: %d\n", ret);
+	/* Both OTG source selectors in the Piano configuration are zero. */
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_ENABLE, 0);
+	if (ret)
+		dev_warn_ratelimited(mca->dev, "connector boost stop failed: %d\n", ret);
+
+	/* Piano connector_antiburn_ensure_vbus_sense5V: give the adapter
+	 * five 200 ms response intervals. An unresponsive adapter must not
+	 * prevent the board's independent hardware cutoff.
+	 */
+	for (i = 0; i < 5; i++) {
+		if (!xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus) && vbus < 6000000)
+			break;
+		if (!i)
+			xiaomi_mca_read_type(mca, &type);
+		if (xiaomi_mca_is_pd(type))
+			xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, MCA_PROP_VDM_VSAFE0V,
+						 &dummy, 0);
+		else if (xiaomi_mca_is_qc(type))
+			xiaomi_mca_write_u32(mca, MCA_PROP_QC_VOLT, 5000);
+		msleep(200);
+	}
+}
+
 static bool xiaomi_mca_connector_poll(struct xiaomi_mca *mca)
 {
 	struct mca_connector *c = &mca->connector;
@@ -2991,34 +3024,22 @@ static bool xiaomi_mca_connector_poll(struct xiaomi_mca *mca)
 		board = xiaomi_mca_connector_board(mca);
 	hot = xiaomi_mca_connector_trip(c, temp, ktime_get(), powered, board);
 	if (hot) {
-		u32 type, vbus, dummy = 0;
-
 		c->tripped = true;
-		mca->charge_blocked = true;
-		ret = xiaomi_mca_charge_stop(mca);
-		if (ret)
-			dev_warn_ratelimited(mca->dev, "connector charge stop failed: %d\n", ret);
-		/* Stock OTG/en_src are both zero on Piano. */
-		ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_ENABLE, 0);
-		if (ret)
-			dev_warn_ratelimited(mca->dev, "connector boost stop failed: %d\n", ret);
-		/* Stock sends a zero-length VSAFE0V VDM and checks VBUS before
-		 * operating the MOS on a high voltage supply. Keep the software
-		 * stop in force if the adapter has not yet reduced its output.
-		 */
-		if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus) || vbus >= 6000000) {
-			if (!xiaomi_mca_read_type(mca, &type) && xiaomi_mca_is_pd(type))
-				xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, 0x2100b, &dummy, 0);
-			else if (xiaomi_mca_is_qc(mca->real_type))
-				xiaomi_mca_write_u32(mca, MCA_PROP_QC_VOLT, 5000);
-			return true;
-		}
+		xiaomi_mca_connector_stop(mca);
 	}
 	if (hot || c->tripped) {
 		ret = gpiod_set_value_cansleep(c->cutoff, hot);
 		if (ret) {
 			dev_err_ratelimited(mca->dev, "connector cutoff failed: %d\n", ret);
 			return true;
+		}
+		if (hot) {
+			u32 vbus;
+
+			msleep(50);
+			ret = xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus);
+			if (ret || vbus >= 4100000)
+				dev_err_ratelimited(mca->dev, "connector VBUS cutoff unconfirmed\n");
 		}
 		c->tripped = hot;
 	}

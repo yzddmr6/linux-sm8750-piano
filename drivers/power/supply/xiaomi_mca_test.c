@@ -2582,6 +2582,30 @@ static void xiaomi_mca_test_threshold_stop_failure_sleep(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->mca.voltage_written);
 }
 
+static void xiaomi_mca_test_connector_stop(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	guard(mutex)(&mca->lock);
+	mca_test_stage(test, f);
+	mca->piano_otg = true;
+	mca->connector.tripped = true;
+	mca->otg_requested = true;
+	f->vbus = 5000000;
+	xiaomi_mca_connector_stop(mca);
+	KUNIT_EXPECT_FALSE(test, f->stage_on);
+	KUNIT_EXPECT_TRUE(test, mca->charge_disabled);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
+	KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_PEN_BOOST_ENABLE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->last_data), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_enable(mca, true), -EBUSY);
+	mca->otg_requested = false;
+	mca->connector.tripped = false;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+}
+
 static void xiaomi_mca_test_connector(struct kunit *test)
 {
 	static const struct {
@@ -3786,6 +3810,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_vbus_error_not_detach),
 	KUNIT_CASE(xiaomi_mca_test_threshold_interface),
 	KUNIT_CASE(xiaomi_mca_test_connector),
+	KUNIT_CASE(xiaomi_mca_test_connector_stop),
 	KUNIT_CASE(xiaomi_mca_test_wake_policy),
 	KUNIT_CASE(xiaomi_mca_test_wired_wake_transitions),
 	KUNIT_CASE(xiaomi_mca_test_wired_wake_reconnect),
