@@ -4240,7 +4240,7 @@ static void xiaomi_mca_test_mipps_tail_replay(struct kunit *test)
 	f->cells[0].voltage = f->cells[1].voltage = 4542000;
 	f->cells[0].current_ua = f->cells[1].current_ua = 1100000;
 	f->cells[0].charge_now = f->cells[1].charge_now = 4554000;
-	for (int n = 0; n < 5; n++) {
+	for (int n = 0; n < 6; n++) {
 		mca->term_at = jiffies - MCA_POLL_INTERVAL;
 		KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 		KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
@@ -4655,9 +4655,9 @@ static void xiaomi_mca_test_software_full_samples(struct kunit *test)
 	int n;
 
 	mca->cell_zone = 18;
-	for (n = 1; n <= 5; n++) {
+	for (n = 1; n <= 6; n++) {
 		mca->term_at = jiffies - MCA_POLL_INTERVAL;
-		KUNIT_EXPECT_EQ(test, xiaomi_mca_software_full(mca, 4472, 450, 225), n == 5);
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_software_full(mca, 4472, 450, 225), n == 6);
 	}
 	mca->term_count = 0;
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4472, 450, 225));
@@ -4803,7 +4803,7 @@ static void xiaomi_mca_test_stock_entry_matrix(struct kunit *test)
 	for (type = 0; type < ARRAY_SIZE(types); type++)
 	 for (t = 0; t < ARRAY_SIZE(temps); t++)
 	  for (soc = 0; soc < ARRAY_SIZE(socs); soc++) {
-		bool pump = type >= 3;
+		bool pump = type >= 3 && socs[soc] < 91;
 
 		mca->cp = MCA_CP_OFF;
 		mca->hv = MCA_HV_ON;
@@ -4903,9 +4903,52 @@ static void xiaomi_mca_test_warm_termination_is_not_full(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mca->fw_recharges, 0); /* thermal recovery, not full */
 }
 
+static void xiaomi_mca_test_real_full_v5(struct kunit *test)
+{
+	/* 01:21..01:36, normal: each cell 4467..4470 mV, 130..169 mA. */
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	static const int samples[][3] = {
+		{ 4467, 335, 169 },
+		{ 4468, 328, 165 },
+		{ 4468, 322, 162 },
+		{ 4468, 318, 160 },
+		{ 4468, 310, 156 },
+		{ 4468, 305, 154 },
+	};
+	int i;
+
+	mca->cell_zone = 18;
+	for (i = 0; i < 6; i++) {
+		mca->term_at = jiffies - MCA_POLL_INTERVAL;
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_software_full(mca,
+			samples[i][0], samples[i][1], samples[i][2]), i == 5);
+	}
+	mca->term_count = 0;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4457, 260, 130));
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4470, 450, 256));
+	mca->ffc_active = true;
+	for (i = 0; i < 6; i++) {
+		mca->term_at = jiffies - MCA_POLL_INTERVAL;
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_software_full(mca, 4540, 2200, 1100), i == 5);
+	}
+	mca->term_count = 0;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4535, 2200, 1100));
+	for (i = 0; i < 2; i++) {
+		f->cells[i].capacity = 100;
+		f->cells[i].voltage = 4410000;
+	}
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_cp_soc_ready(mca));
+	f->cells[0].capacity = f->cells[1].capacity = 90;
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_cp_soc_ready(mca));
+	f->cells[1].capacity = 91;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_cp_soc_ready(mca));
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_warm_termination_is_not_full),
 	KUNIT_CASE(xiaomi_mca_test_provider_late_start),
+	KUNIT_CASE(xiaomi_mca_test_real_full_v5),
 	KUNIT_CASE(xiaomi_mca_test_stock_entry_matrix),
 	KUNIT_CASE(xiaomi_mca_test_stock_cc_cv_stages),
 #ifdef MCA_CHARGE_EXPERIMENT

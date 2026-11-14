@@ -3448,15 +3448,18 @@ static void xiaomi_mca_buck_cv(struct xiaomi_mca *mca, int vbat, int ibat)
 
 static bool xiaomi_mca_software_full(struct xiaomi_mca *mca, int vmin, int ibat, int imax)
 {
-	/* Whole-pack counterpart of Piano fg_comp termination. Require both
-	 * cells near the endpoint; a high cell cannot declare its peer full.
-	 * Piano fg_comp 0x5118..0x5144 uses 110%/115% current,
-	 * DT vterm_delta=8 mV; 0x5298..0x52f8 counts five observations.
+	/* Piano fg_comp parallel_force_fw_report_full, .text 0x5610..0x5650:
+	 * base-flip-same, neither cell isolated: normal JEITA-23 mV and
+	 * per-cell iterm+30 mA; FFC JEITA-15 mV and iterm*115%. Six samples
+	 * (0x5428/0x5580). This is separate from single_termination's 8 mV.
+	 * Require BOTH connected cells; never infer a peer's full state.
 	 */
+	u32 iterm = xiaomi_mca_cell_iterm(mca) / 2;
+	u32 threshold = mca->ffc_active ? iterm * 115 / 100 : iterm + 30;
+	int endpoint = xiaomi_mca_cell_fv(mca) - (mca->ffc_active ? 15 : 23);
+
 	if (xiaomi_mca_cp_active(mca) || mca->term_hot || mca->cell_zone < 18 ||
-	    vmin < (int)xiaomi_mca_cell_fv(mca) - 8 || ibat < 0 ||
-	    max(ibat, 2 * imax) >= xiaomi_mca_cell_iterm(mca) *
-		(xiaomi_mca_cell_iterm(mca) >= 1000 ? 110 : 115) / 100) {
+	    vmin <= endpoint || ibat < 0 || imax >= threshold) {
 		mca->term_count = 0;
 		return false;
 	}
@@ -3464,7 +3467,7 @@ static bool xiaomi_mca_software_full(struct xiaomi_mca *mca, int vmin, int ibat,
 		mca->term_at = jiffies;
 		mca->term_count++;
 	}
-	return mca->term_count >= 5;
+	return mca->term_count >= 6;
 }
 
 static int xiaomi_mca_fw_recharge(struct xiaomi_mca *mca)
@@ -3837,6 +3840,34 @@ static u32 xiaomi_mca_cp_ibat_limit(struct xiaomi_mca *mca, int vbat, int ibat)
 	return ma;
 }
 
+/* Piano quickchg start_charging .text 0x9a30..0x9a3c rejects SOC >=91.
+ * Use the native FCC-weighted UI SOC, requiring both gauges.
+ * This is an entry gate only; it never stops an already running pump.
+ */
+static bool xiaomi_mca_cp_soc_ready(struct xiaomi_mca *mca)
+{
+	union power_supply_propval val, full;
+	u32 soc[2], fcc[2], weight;
+	int n, ret;
+
+	for (n = 0; n < ARRAY_SIZE(xiaomi_mca_supplied_to); n++) {
+		struct power_supply *psy = power_supply_get_by_name(xiaomi_mca_supplied_to[n]);
+
+		if (!psy)
+			return false;
+		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val);
+		ret = ret ?: power_supply_get_property(psy, POWER_SUPPLY_PROP_CHARGE_FULL, &full);
+		power_supply_put(psy);
+		if (ret || val.intval < 0 || val.intval > 100 || full.intval < 1000)
+			return false;
+		soc[n] = val.intval;
+		fcc[n] = full.intval / 1000;
+	}
+	/* Piano strategy_fg_get_parallel_rsoc 0x5048..0x508c. */
+	weight = div_u64((u64)fcc[0] * 100, fcc[0] + fcc[1]);
+	return (soc[0] * weight + soc[1] * (100 - weight) + 50) / 100 < 91;
+}
+
 /* Called from the poll at 9 V on the buck charger, or right after the auth */
 static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 {
@@ -3853,7 +3884,8 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	     (!xiaomi_mca_is_pd(mca->real_type) || !xiaomi_mca_cp_after_auth(mca))))
 		return;
 
-	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, NULL))
+	if (!xiaomi_mca_cp_soc_ready(mca) ||
+	    xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, NULL))
 		return;
 	xiaomi_mca_select_profile(mca, tcool, tbat);
 	/* Piano DT min_vbat/max_vbat, independent of the current CV row. */
