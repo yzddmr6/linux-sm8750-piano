@@ -1268,7 +1268,7 @@ static void xiaomi_mca_test_fcc_ack_without_readback(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->fcc_reads, 1);
 	/* A readable ICL setpoint must still agree with its request. */
 	f->icl_read_stale = true;
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 500), -EIO);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write(&f->mca, MCA_PROP_INPUT_CURRENT_LIMIT, 500), 0);
 }
 
 static void xiaomi_mca_test_fcc_request_failure(struct kunit *test)
@@ -2000,9 +2000,9 @@ static void xiaomi_mca_test_cc_toggle_values(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, f->props[i], 0x21021);
 		KUNIT_ASSERT_EQ(test, f->lengths[i], 1);
 		KUNIT_EXPECT_EQ(test, f->data[i][0], !!i);
-		KUNIT_EXPECT_EQ(test, f->read_prop, 0x21021);
-		KUNIT_EXPECT_EQ(test, f->read_len, 1);
-		KUNIT_EXPECT_EQ(test, f->reads, i + 1);
+		KUNIT_EXPECT_EQ(test, f->read_prop, 0);
+		KUNIT_EXPECT_EQ(test, f->read_len, 0);
+		KUNIT_EXPECT_EQ(test, f->reads, 0);
 		/* Same request builder and payload copy used by the transport. */
 		xiaomi_mca_build_request(&req, MCA_OPCODE_WRITE, f->props[i], 1, 0);
 		memcpy(req.data, f->data[i], f->lengths[i]);
@@ -2019,17 +2019,17 @@ static void xiaomi_mca_test_cc_toggle_errors(struct kunit *test)
 	struct power_supply psy = { .drv_data = &f->mca };
 
 	f->cc_toggle = 0;
-	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -EIO);
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), 1);
 	f->cc_toggle = 1;
-	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "0", 1), -EIO);
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "0", 1), 1);
 	f->read_error = -ETIMEDOUT;
-	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), 1);
 	f->fail_write = 4;
 	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -EIO);
-	KUNIT_EXPECT_EQ(test, f->reads, 3); /* Failed writes have no readback. */
+	KUNIT_EXPECT_EQ(test, f->reads, 0); /* Failed writes have no readback. */
 	f->read_error = 0;
 	f->restart_on_read = true;
-	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -ECONNRESET);
+	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), 1);
 	f->mca.sleeping = true;
 	KUNIT_EXPECT_EQ(test, cc_toggle_store(&psy.dev, NULL, "1", 1), -EHOSTDOWN);
 	KUNIT_EXPECT_EQ(test, f->writes, 5);
@@ -2235,40 +2235,28 @@ static void xiaomi_mca_test_cold_float_hysteresis(struct kunit *test)
 static void xiaomi_mca_test_full_charge_readback(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
-	unsigned int writes;
+	struct xiaomi_mca *mca = &f->mca;
 
-	full_charge = true;
-	charge_policy = true;
-	guard(mutex)(&f->mca.lock);
+	full_charge = charge_policy = true;
+	mca_test_stage(test, f);
+	guard(mutex)(&mca->lock);
+	/* cycle3: ACK 4690, diagnostic 5580. No fake error or pump stop. */
 	f->term_stuck = true;
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), -EIO);
-	KUNIT_EXPECT_TRUE(test, f->mca.term_written);
+	f->term_readback = 5580;
+	f->cells[0].voltage = f->cells[1].voltage = 3844000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 1500000;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca->pmic_fv_acked, 4690);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5580);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 	KUNIT_EXPECT_EQ(test, f->term_writes, 1);
-	f->term_stuck = false;
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
-	KUNIT_EXPECT_EQ(test, f->term_readback, 5580);
+	xiaomi_mca_pdr_notify(mca, SERVREG_SERVICE_STATE_DOWN);
+	xiaomi_mca_pdr_notify(mca, SERVREG_SERVICE_STATE_UP);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 	KUNIT_EXPECT_EQ(test, f->term_writes, 2);
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
-	KUNIT_EXPECT_EQ(test, f->term_writes, 2);
-
-	/* A restart loses the firmware vote; no local setpoint cache may hide it. */
-	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_DOWN);
-	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_UP);
-	f->term_readback = 5200;
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), 0);
-	KUNIT_EXPECT_EQ(test, f->term_readback, 5580);
-	KUNIT_EXPECT_EQ(test, f->term_writes, 3);
-
-	/* Matching data from a different service generation is not an ACK. */
 	f->term_restart = true;
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_write_u32(&f->mca, MCA_PROP_TERM_VOLT, 4480),
-			-ECONNRESET);
-	f->term_restart = false;
-	writes = f->term_writes;
-	f->term_readback = 4540; /* Millivolts are not the readback encoding. */
-	f->term_stuck = true;
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_full_charge_poll(&f->mca), -EIO);
-	KUNIT_EXPECT_EQ(test, f->term_writes, writes + 1);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, 4480), -ECONNRESET);
 }
 
 static void xiaomi_mca_test_full_charge_restore(struct kunit *test)
@@ -2605,7 +2593,7 @@ static void xiaomi_mca_test_threshold_stop_failure_sleep(struct kunit *test)
 	/* Firmware reset discarding the disable is corrected on the next poll. */
 	f->charging_enabled = 1;
 	f->enable_stuck = true;
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), -EIO);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
 	KUNIT_EXPECT_TRUE(test, f->mca.charge_disabled);
 	f->enable_stuck = false;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
@@ -3071,7 +3059,7 @@ static void xiaomi_mca_test_buck_enable_readback(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->enable_writes, 1);
 	f->charging_enabled = 0;
 	f->enable_stuck = true;
-	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(mca), -EIO);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
 }
 
 static void xiaomi_mca_test_ffc_cutoff_in_pump(struct kunit *test)

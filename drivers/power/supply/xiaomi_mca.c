@@ -686,6 +686,7 @@ struct xiaomi_mca {
 	u8 fw_recharge; /* 0 idle, 1 disable pending, 2 enable pending, 3 resumed */
 	u32 fw_recharges;
 	int pmic_pack_mv, pmic_fv_raw, pmic_iterm_raw;
+	u32 pmic_fv_acked, pmic_fv_generation;
 	int pmic_pack_tbat;
 	bool pmic_pack_tbat_valid;
 	bool cp_normal_cv;
@@ -1268,7 +1269,7 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 				 const void *data, size_t len)
 {
 	u8 buf[MCA_VDM_LEN];
-	u32 type, raw, vbus, value, checked, readback, generation;
+	u32 type, raw, vbus, value, checked, generation;
 	int ret;
 
 	if (len > sizeof(buf) || !xiaomi_mca_write_allowed(prop, data, len))
@@ -1278,8 +1279,6 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	    mca->cp_input_suspended && !mca->cp_restoring)
 		return -EBUSY;
 	if (prop == MCA_PROP_CHARGING_ENABLED) {
-		u8 enabled;
-
 		/* Stock qcom_subpmic_enable_charging sends one byte, not u32. */
 		scoped_guard(spinlock_irqsave, &mca->rx_lock)
 			generation = mca->service_generation;
@@ -1287,14 +1286,11 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
 		if (ret)
 			return ret;
-		ret = xiaomi_mca_read_blob(mca, prop, &enabled, sizeof(enabled));
-		if (ret)
-			return ret;
 		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
 			if (generation != mca->service_generation || !mca->service_up)
 				return -ECONNRESET;
 		}
-		return enabled == *(const u8 *)data ? 0 : -EIO;
+		return 0;
 	}
 	if (prop == MCA_PROP_RESTART_AICL ||
 	    ((prop == MCA_PROP_INPUT_CURRENT_LIMIT || prop == MCA_PROP_CHARGE_CURRENT) &&
@@ -1341,15 +1337,12 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
 		if (ret)
 			return ret;
-		ret = xiaomi_mca_read(mca, prop, &readback);
-		if (ret)
-			return ret;
 		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
 			if (generation != mca->service_generation || !mca->service_up)
 				return -ECONNRESET;
 		}
-		if (readback != 2 * get_unaligned_le32(data) - 3600)
-			return -EIO;
+		mca->pmic_fv_acked = value;
+		mca->pmic_fv_generation = generation;
 		mca->ffc_voted = value > MCA_TERM_COLD_MV;
 		return 0;
 	}
@@ -1380,14 +1373,11 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
 		if (ret)
 			return ret;
-		ret = xiaomi_mca_read_blob(mca, prop, buf, len);
-		if (ret)
-			return ret;
 		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
 			if (generation != mca->service_generation || !mca->service_up)
 				return -ECONNRESET;
 		}
-		return buf[0] == *(const u8 *)data ? 0 : -EIO;
+		return 0;
 	}
 	if (prop == MCA_PROP_CP_STATE || prop == MCA_PROP_OTG_CFG || prop == MCA_PROP_CID_CFG ||
 	    prop == MCA_PROP_PEN_BOOST_ENABLE || prop == MCA_PROP_PEN_BOOST_VOLTAGE) {
@@ -1426,10 +1416,7 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		    get_unaligned_le32(data) == MCA_ICL_DEFAULT_MA) {
 			memcpy(buf, data, len);
 			ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
-			ret = ret ?: xiaomi_mca_read(mca, prop, &readback);
-			if (ret)
-				return ret;
-			return readback == MCA_ICL_DEFAULT_MA ? 0 : -EIO;
+			return ret;
 		}
 		if (!probe)
 			return -EOPNOTSUPP;
@@ -1523,22 +1510,12 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	xiaomi_mca_invalidate(mca);
 	if (ret)
 		return ret;
-	/*
-	 * ICL has a readable setpoint. FCC is a request to the charger firmware:
-	 * the vendor set_ichg interface only writes it, and this unit reports
-	 * zero on reads even after an acknowledged write. Do not manufacture a
-	 * transport failure by comparing that value with the requested current.
-	 * The matching firmware reply still has to acknowledge every write;
-	 * actual charging is measured separately through the fuel gauges.
+	/* Stock proxy setters return the matching WRITE response. Effective
+	 * votes, quantization and autonomous firmware state are telemetry,
+	 * not an echo of the command. Never synthesize EIO from a getter.
 	 */
-	if (prop == MCA_PROP_INPUT_CURRENT_LIMIT) {
+	if (prop == MCA_PROP_INPUT_CURRENT_LIMIT)
 		mca->cp_pause_applied = false;
-		ret = xiaomi_mca_read(mca, prop, &readback);
-		if (ret)
-			return ret;
-		if (readback != get_unaligned_le32(data))
-			return -EIO;
-	}
 	return 0;
 }
 
@@ -2733,20 +2710,18 @@ static u32 xiaomi_mca_pmic_fv(struct xiaomi_mca *mca)
 
 static int xiaomi_mca_apply_pmic_pair(struct xiaomi_mca *mca, u32 target, u32 iterm)
 {
-	u32 readback;
 	int ret;
 
 	mca->pmic_fv_target = target;
 	ret = xiaomi_mca_set_iterm(mca, iterm);
 	if (ret)
 		return ret;
-	/* Read every poll: detach or an ADSP restart can discard the vote. */
-	ret = xiaomi_mca_read(mca, MCA_PROP_TERM_VOLT, &readback);
-	if (!ret && readback == 2 * target - 3600) {
-		mca->term_written = true;
-		mca->ffc_voted = target > MCA_TERM_COLD_MV;
+	/* Cache the acknowledged vote, not the diagnostic FV getter. PDR
+	 * invalidates it even when the requested value has not changed.
+	 */
+	if (mca->term_written && mca->pmic_fv_acked == target &&
+	    mca->pmic_fv_generation == READ_ONCE(mca->service_generation))
 		return 0;
-	}
 	return xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, target);
 }
 
@@ -5197,7 +5172,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			if (!full_charge || !charge_policy)
 				xiaomi_mca_cp_stop(mca, "float voltage not confirmed");
 			else
-				xiaomi_mca_charge_stop(mca);
+				xiaomi_mca_cp_stop(mca, "float voltage write failed");
 			goto out;
 		}
 		ret = xiaomi_mca_charge_limit_poll(mca);
