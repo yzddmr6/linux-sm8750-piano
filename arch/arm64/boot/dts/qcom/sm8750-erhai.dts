@@ -1687,10 +1687,10 @@
 	status = "okay";
 
 	pps_cp_primary: charger@6f {
-		io-channels = <&pmk8550_vadc 0x74c>, <&pmk8550_vadc 0x747>;
-		io-channel-names = "battery-connector", "usb-connector";
 		compatible = "southchip,sc8547a";
 		reg = <0x6f>;
+		io-channels = <&pmk8550_vadc 0x74c>, <&pmk8550_vadc 0x747>;
+		io-channel-names = "battery-connector", "usb-connector";
 		interrupt-parent = <&tlmm>;
 		interrupts = <163 IRQ_TYPE_EDGE_FALLING>;
 		pinctrl-names = "default";

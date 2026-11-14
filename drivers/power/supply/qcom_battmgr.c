@@ -1801,7 +1801,7 @@ read_source:
 	/* Process the PHY evidence before the wake and routing decisions.
 	 * Do not transfer evidence across a replacement Type-C partner.
 	 */
-	status = (struct erhai_probe_status){};
+	status = (struct erhai_probe_status){ .wired_online = online && !detached };
 	if (online && !detached && battmgr->pps_ops)
 		battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
 	scoped_guard(spinlock_irqsave, &battmgr->notify_lock) {
@@ -1886,7 +1886,8 @@ read_source:
 		      qcom_battmgr_usb_idle(battmgr)));
 	tail = qcom_battmgr_tail_owned(battmgr);
 	dedicated |= serial_source;
-	can_probe = !status.connector_blocked && dedicated && !READ_ONCE(battmgr->pps_suspended) &&
+	can_probe = dedicated && !status.connector_blocked &&
+		    !READ_ONCE(battmgr->pps_suspended) &&
 		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
 		    !battmgr->charge_policy_hold && !battmgr->charge_error;
 	qcom_battmgr_note_delivery(battmgr, status.delivering);
@@ -2002,7 +2003,8 @@ read_source:
 	/* The Type-C partner's PD capabilities are stronger evidence than
 	 * an incomplete BC1.2 classification. PPS also checks its APDO.
 	 */
-	prefer_pps = !status.connector_blocked && !tail && !test_bit(PD_EVENT_TAIL, &battmgr->pd_events) && !READ_ONCE(battmgr->pps_suspended) &&
+	prefer_pps = !status.connector_blocked && !tail &&
+		     !test_bit(PD_EVENT_TAIL, &battmgr->pd_events) && !READ_ONCE(battmgr->pps_suspended) &&
 		     battmgr->pps_ops && battmgr->pps_ops->enabled() &&
 		     src.sink && !READ_ONCE(battmgr->otg_request);
 	if (prefer_pps && !battmgr->charge_inhibited && !battmgr->charge_policy_hold &&

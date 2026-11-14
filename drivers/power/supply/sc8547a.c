@@ -33,7 +33,6 @@
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/iio/consumer.h>
-#include <linux/iio/types.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
@@ -728,12 +727,20 @@ static int sc8547_set_chg_enable(struct sc8547a_device *sc, bool enable)
 	u8 stale;
 	int ret;
 
+	if (enable && (!sc8547_master_dev ||
+		       !sc8547_btb_allows(&sc8547_master_dev->btb)))
+		return -EAGAIN;
+	if (enable && !sc->is_slave && !sc->monitor_pump_faults && sc->btb.hot_count) {
+		/* A new session must pass the entry checks even on a warm replug. */
+		sc->btb.admitted = false;
+		sc->btb.hot_count = 0;
+		mod_delayed_work(system_freezable_wq, &sc->btb.work, 0);
+		return -EAGAIN;
+	}
 	/* IRQ and charge operations serialize on sc8547_pps_lock. REG0F
 	 * can hold reset/idle flags. Drain it immediately before CHG_EN,
 	 * never on a watchdog refresh of an already enabled converter.
 	 */
-	if (enable && (!sc8547_master_dev || !sc8547_btb_allows(&sc8547_master_dev->btb)))
-		return -EAGAIN;
 	if (enable && !sc->monitor_pump_faults) {
 		ret = sc8547_read_byte(sc, SC8547_REG_0F, &stale);
 		if (ret)
@@ -3078,9 +3085,10 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 	sc = sc8547_master_dev;
 	if (!sc)
 		return;
-	if (!sc->btb.online) {
+	if (status->wired_online && !sc->btb.online) {
 		sc->btb.online = true;
-		mod_delayed_work(system_freezable_wq, &sc->btb.work, 0);
+		mod_delayed_work(system_freezable_wq, &sc->btb.work,
+				 sc->btb.tripped ? msecs_to_jiffies(SC8547_BTB_TRIP_MS) : 0);
 	}
 	status->connector_blocked = !sc8547_btb_allows(&sc->btb);
 	if (status->connector_blocked)
@@ -3103,16 +3111,29 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 }
 EXPORT_SYMBOL_GPL(sc8547a_probe_status);
 
+/* Invalidate in-flight conversions before unplug or sleep. Keep a thermal
+ * trip across suspend so waking up cannot bypass the 10 s recheck.
+ */
+static void sc8547_btb_offline(struct sc8547_btb *b)
+{
+	b->online = false;
+	b->valid = false;
+	b->admitted = false;
+	b->battery_err = b->usb_err = -ENODATA;
+	b->sampled_at = 0;
+	b->hot_count = 0;
+	b->attachment++;
+	cancel_delayed_work(&b->work);
+}
+
 void sc8547a_detached(void)
 {
 	guard(mutex)(&sc8547_pps_lock);
 	if (sc8547_master_dev) {
 		struct sc8547_btb *b = &sc8547_master_dev->btb;
 
-		b->online = b->valid = b->admitted = b->tripped = false;
-		b->hot_count = 0;
-		b->attachment++;
-		cancel_delayed_work(&b->work);
+		sc8547_btb_offline(b);
+		b->tripped = false;
 		sc8547_master_dev->responded = 0;
 		sc8547_master_dev->rehandshakes = sc8547_master_dev->recoveries_answered = 0;
 		sc8547_master_dev->missed_asks = 0;
@@ -3825,6 +3846,7 @@ static int sc8547a_suspend(struct device *dev)
 	if (pps_slave_engaged && sc8547_pps_slave_off())
 		return -EIO;
 	if (!sc->is_slave) {
+		sc8547_btb_offline(&sc->btb);
 		sc->auto_state = SC_AUTO_OFF;
 		sc->fastchg_deliver = false;
 		sc->fastchg_enable = false;

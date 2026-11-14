@@ -28,6 +28,7 @@ struct erhai_probe_status {
 	unsigned int protected;
 	unsigned int delivering;
 	bool first_ufcs_timeout;
+	bool wired_online; /* Input from the current USB_ONLINE sample. */
 	bool connector_blocked;
 };
 
