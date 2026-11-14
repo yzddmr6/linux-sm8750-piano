@@ -62,6 +62,8 @@
 #define MCA_PROP_CHGR_STATUS		0x2001
 #define MCA_PROP_CHARGING_ENABLED	0x2003
 #define MCA_PROP_CHARGE_CURRENT		0x2005
+#define MCA_PROP_TERM_CURRENT		0x2006
+#define MCA_PROP_PACK_VBAT		0x2026
 #define MCA_PROP_TERM_VOLT		0x2007
 #define MCA_PROP_INPUT_CURRENT_LIMIT	0x2008
 #define MCA_PROP_AICL_ENABLED		0x2012
@@ -2869,8 +2871,6 @@ static int xiaomi_mca_charge_enable(struct xiaomi_mca *mca, bool enable)
 
 	if (enable && mca->connector.tripped)
 		return -EBUSY;
-	if (enable && !mca->charge_disabled)
-		return 0;
 	/* Retain ownership after a lost disable acknowledgment. */
 	if (!enable)
 		mca->charge_disabled = true;
@@ -3351,7 +3351,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 
 	if (mca->cp == MCA_CP_COOLDOWN && time_after_eq(jiffies, mca->cp_retry_at))
 		mca->cp = MCA_CP_OFF;
-	if (mca->cp_fault)
+	if (mca->cp_fault || mca->ffc_done)
 		return;
 	if (!cp_charge || !hv_charge || !charge_current ||
 	    (!xiaomi_mca_is_pd(mca->real_type) && !xiaomi_mca_is_qc_pump(mca->real_type)) ||
@@ -3585,6 +3585,11 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		return;
 	}
 	cv = xiaomi_mca_cp_vbat_max(mca);
+	if (mca->ffc_done) {
+		mca->cp_recharge_cv = MCA_TERM_FFC_MV;
+		xiaomi_mca_cp_stop(mca, "taper complete");
+		return;
+	}
 	taper = vbat >= cv - 9;	/* pps_taper_vol_hys */
 	/* The pump CV setpoint is below the cell table's terminal voltage.
 	 * Regulate through that gap, while retaining a hard cell ceiling.
@@ -5010,6 +5015,8 @@ static const struct {
 	{ "charging_enabled", MCA_PROP_CHARGING_ENABLED },
 	{ "charge_current_ma", MCA_PROP_CHARGE_CURRENT },
 	{ "term_voltage_raw", MCA_PROP_TERM_VOLT },
+	{ "term_current_raw", MCA_PROP_TERM_CURRENT },
+	{ "pack_voltage_mv", MCA_PROP_PACK_VBAT },
 	{ "input_current_limit_ma", MCA_PROP_INPUT_CURRENT_LIMIT },
 	{ "aicl_enabled", MCA_PROP_AICL_ENABLED },
 	{ "aicl_status", MCA_PROP_AICL_STATUS },

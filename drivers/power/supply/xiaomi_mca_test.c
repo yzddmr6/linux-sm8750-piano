@@ -3027,6 +3027,53 @@ static void xiaomi_mca_test_tail_current_transfer(struct kunit *test)
 	xiaomi_mca_cp_stop(mca, "test complete");
 }
 
+static void xiaomi_mca_test_buck_enable_readback(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	guard(mutex)(&mca->lock);
+	f->charging_enabled = 0;
+	KUNIT_ASSERT_FALSE(test, mca->charge_disabled);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+	KUNIT_EXPECT_EQ(test, f->enable_writes, 1);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	KUNIT_EXPECT_EQ(test, f->enable_writes, 1);
+	f->charging_enabled = 0;
+	f->enable_stuck = true;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(mca), -EIO);
+}
+
+static void xiaomi_mca_test_ffc_cutoff_in_pump(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	full_charge = charge_policy = cp_charge = hv_charge = true;
+	mca_test_stage(test, f);
+	mca->ffc_active = true;
+	mca->ffc_attach = 0;
+	mca->ffc_type = f->type;
+	mca->cp_ma = 5000;
+	f->cells[0].voltage = f->cells[1].voltage = 4539000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 1175000;
+	guard(mutex)(&mca->lock);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_ASSERT_TRUE(test, mca->ffc_done);
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
+	KUNIT_EXPECT_STREQ(test, mca->cp_last_exit, "taper complete");
+	KUNIT_EXPECT_EQ(test, mca->cp_retry_ms, 0);
+	KUNIT_EXPECT_EQ(test, mca->cp_recharge_cv, 4540);
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
+	/* Relaxation above the original recharge threshold cannot rearm FFC. */
+	f->cells[0].voltage = f->cells[1].voltage = 4400000;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	xiaomi_mca_cp_try_start(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
+}
+
 static void xiaomi_mca_test_taper_handoff(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3811,6 +3858,8 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_qc_regulation),
 	KUNIT_CASE(xiaomi_mca_test_measured_buck_share),
 	KUNIT_CASE(xiaomi_mca_test_taper_handoff),
+	KUNIT_CASE(xiaomi_mca_test_buck_enable_readback),
+	KUNIT_CASE(xiaomi_mca_test_ffc_cutoff_in_pump),
 	KUNIT_CASE(xiaomi_mca_test_tail_current_transfer),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_values),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_errors),
