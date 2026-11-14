@@ -140,6 +140,7 @@ struct sc8541 {
 	struct mutex lock;		/* enabled, register sequences */
 	struct delayed_work watch;	/* kick timeout, or the check after a stop */
 	bool enabled;
+	bool seen_switching;
 	bool removing;
 	bool wd_owned;
 	unsigned int wd_saved;
@@ -216,6 +217,7 @@ static void sc8541_disable_locked(struct sc8541 *sc)
 	if (sc->enabled)
 		dev_info(sc->dev, "switching off\n");
 	sc->enabled = false;
+	sc->seen_switching = false;
 	mod_delayed_work(system_dfl_wq, &sc->watch,
 			 msecs_to_jiffies(SC8541_GUARD_MS));
 }
@@ -537,22 +539,43 @@ out:
 }
 EXPORT_SYMBOL_GPL(sc8541_otg_configure);
 
+/* Keep the evidence from a running stage before the consumer disarms it.
+ * The stock interrupt handler samples status and flags at 0x13..0x1c.
+ * Read the latches once per falling edge, including on a userspace poll.
+ */
+static int sc8541_online(struct sc8541 *sc, int *online)
+{
+	unsigned int ctrl;
+	u8 fault[10];
+	int ret;
+
+	guard(mutex)(&sc->lock);
+	ret = regmap_read(sc->regmap, SC8541_CTRL2, &ctrl);
+	if (ret)
+		return ret;
+	*online = !!(ctrl & SC8541_CHG_EN);
+	if (sc->enabled && sc->seen_switching && !*online) {
+		ret = regmap_bulk_read(sc->regmap, 0x13, fault, sizeof(fault));
+		if (ret)
+			dev_warn(sc->dev, "stage off: status/flags read failed: %d\n", ret);
+		else
+			dev_warn(sc->dev, "stage off: status[13..17]=%5ph flags[18..1c]=%5ph\n",
+				 fault, fault + 5);
+	}
+	sc->seen_switching = sc->enabled && *online;
+	return 0;
+}
+
 static int sc8541_get_property(struct power_supply *psy,
 			       enum power_supply_property psp,
 			       union power_supply_propval *val)
 {
 	struct sc8541 *sc = power_supply_get_drvdata(psy);
-	unsigned int reg;
 	int ret;
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_ONLINE:
-		ret = regmap_read(sc->regmap, SC8541_CTRL2, &reg);
-		if (ret)
-			return ret;
-		/* the chip clears CHG_EN itself when a protection trips */
-		val->intval = !!(reg & SC8541_CHG_EN);
-		return 0;
+		return sc8541_online(sc, &val->intval);
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 		val->intval = sc->busocp_ma * 1000;
 		return 0;
