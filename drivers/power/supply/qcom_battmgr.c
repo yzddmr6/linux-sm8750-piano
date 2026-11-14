@@ -155,6 +155,7 @@ enum qcom_battmgr_variant {
 #define USB_MOISTURE_DET_EN		8
 #define USB_MOISTURE_DET_STS		9
 #define USB_OPLUS_RERUN_AICL		67
+#define USB_OPLUS_CID_STATUS		21 /* oplus_hal_adsp.h: USB_CID_STATUS */
 #define USB_REAL_TYPE			11
 /* OPLUS firmware: VBUS boost control */
 #define USB_OPLUS_OTG_AP_ENABLE		17
@@ -567,6 +568,7 @@ struct qcom_battmgr {
 	bool tail_owned;
 	unsigned int recharge_samples;
 	unsigned long recharge_at;
+	unsigned long serial_tail_check_at;
 	u32 charge_detected_type;
 	const char *fixed_exit;
 	unsigned int serial_failures, ufcs_failures;
@@ -1434,10 +1436,11 @@ static ssize_t charge_contract_show(struct device *dev, struct device_attribute 
 			 b->pd_state == PD_ACTIVE && !b->qc_contract ? PD_FIXED_MV : 0,
 			 b->pd_state == PD_ACTIVE ? b->pd_input_limit_ua : 0);
 
-	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d detected_type=%u serial_source=%d serial_icl_vote=%d serial_buck_suspended=%d fixed_exit=%s ",
+	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d detected_type=%u serial_source=%d serial_icl_vote=%d serial_buck_suspended=%d buck_tail=%d fixed_exit=%s ",
 			     b->pd_state == PD_ACTIVE && b->qc_contract ? PD_FIXED_MV : 0,
 			     b->serial_probe, b->charge_detected_type, !!(b->retry_evidence & ERHAI_SERIAL),
-			     b->serial_icl_vote, b->serial_buck_suspended, b->fixed_exit ?: "none");
+			     b->serial_icl_vote, b->serial_buck_suspended,
+			     b->tail_owned || test_bit(PD_EVENT_TAIL, &b->pd_events), b->fixed_exit ?: "none");
 	if (b->serial_icl_vote)
 		len += sysfs_emit_at(buf, len, "fallback_vote_ua=%u fallback_icl_ua=%d fallback_input_ua=%d fallback_max_ua=%d fallback_age_ms=%lld ",
 				     ERHAI_SERIAL_5V_UA, b->serial_icl_ua, b->serial_input_ua,
@@ -1674,6 +1677,9 @@ void erhai_charge_tail_complete(unsigned int route)
 {
 	guard(mutex)(&erhai_bridge_lock);
 	if (erhai_battmgr) {
+		if (route == ERHAI_SERIAL)
+			WRITE_ONCE(erhai_battmgr->serial_tail_check_at,
+				   jiffies + msecs_to_jiffies(3000));
 		WRITE_ONCE(erhai_battmgr->tail_route, route);
 		set_bit(PD_EVENT_TAIL, &erhai_battmgr->pd_events);
 	}
@@ -1818,6 +1824,33 @@ sample:
 	return 0;
 }
 
+/* A SUPERVOOC reset interrupts VBUS and can unregister the UCSI partner
+ * without anyone removing the cable. Stock AP VOOC PHY, FAST_NOTIFY_FULL
+ * and check_chg_out_work_func: recheck the source after 3 s, below 2.5 V.
+ * Use the board's CID detector (oplus_chg_8350_get_hw_detect) as well.
+ * Unknown CID is not a detach; an unsupported CID falls back to the AP
+ * PHY's voltage check. Stop contracts immediately in either case.
+ */
+static bool qcom_battmgr_keep_serial_tail(struct qcom_battmgr *b)
+{
+	u32 cid, uv;
+	int ret;
+
+	if (READ_ONCE(b->tail_route) != ERHAI_SERIAL ||
+	    !(b->tail_owned || test_bit(PD_EVENT_TAIL, &b->pd_events)))
+		return false;
+	if (time_before(jiffies, READ_ONCE(b->serial_tail_check_at)))
+		return true;
+	ret = qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_OPLUS_CID_STATUS, &cid);
+	if (ret && ret != -EOPNOTSUPP)
+		return true;
+	if (!ret && cid)
+		return true;
+	if (qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &uv))
+		return true;
+	return uv >= 2500000;
+}
+
 static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
@@ -1885,21 +1918,33 @@ read_source:
 						serial_source ? POWER_SUPPLY_USB_TYPE_DCP : type));
 	}
 	if (detached || !online) {
+		bool keep_tail;
+
 		ret = qcom_battmgr_pps_stop(battmgr, false);
-		if (battmgr->pps_ops)
-			battmgr->pps_ops->detached(battmgr->pps_data);
-		test_and_clear_bit(PD_EVENT_TAIL, &battmgr->pd_events);
-		battmgr->tail_owned = false;
+		/* Check after requesting PHY stop: its last sample may have
+		 * announced CV while the removal notification was in flight.
+		 */
+		keep_tail = qcom_battmgr_keep_serial_tail(battmgr);
+		if (!keep_tail) {
+			if (battmgr->pps_ops)
+				battmgr->pps_ops->detached(battmgr->pps_data);
+			test_and_clear_bit(PD_EVENT_TAIL, &battmgr->pd_events);
+			battmgr->tail_owned = false;
+			WRITE_ONCE(battmgr->serial_tail_check_at, 0);
+			WRITE_ONCE(battmgr->tail_route, 0);
+		}
+		battmgr->recharge_samples = 0;
 		battmgr->stable_seen = false;
 		battmgr->missing_routes = battmgr->retry_pending = 0;
 		battmgr->retry_stopping = false;
-		battmgr->retry_once = battmgr->retry_evidence = 0;
+		battmgr->retry_once = 0;
+		battmgr->retry_evidence = keep_tail ? ERHAI_SERIAL : 0;
+		serial_source = keep_tail;
 		battmgr->serial_retry_state = (struct erhai_route_retry){};
 		battmgr->ufcs_retry_state = (struct erhai_route_retry){};
 		battmgr->pps_retry_state = (struct erhai_route_retry){};
 		battmgr->fixed_retry_state = (struct erhai_route_retry){};
 		battmgr->restore_route = battmgr->suspend_route = 0;
-		WRITE_ONCE(battmgr->tail_route, 0);
 		test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events);
 		test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events);
 		battmgr->serial_failures = battmgr->ufcs_failures = 0;
@@ -1922,7 +1967,7 @@ read_source:
 		battmgr->pd_logged = false;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 		if (!online)
-			return 0;
+			return keep_tail ? PD_POLL_MS : 0;
 	}
 
 	power_supply_for_each_psy(&src, qcom_battmgr_pd_source_match);
@@ -3424,6 +3469,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->usb.usb_type = val;
 			break;
 		case USB_REAL_TYPE:
+		case USB_OPLUS_CID_STATUS:
 		case 26: /* OPLUS serial fast-charge classification */
 		case USB_OPLUS_PPS_TYPE:
 		case USB_OPLUS_PPS_MAX_CURR:
