@@ -1920,7 +1920,8 @@ static int qcom_battmgr_buck_apply(struct qcom_battmgr *b)
 	int ret, hint, para, region, ffc = 0;
 	u32 fcc;
 
-	if (buck->temp_region >= 7 && b->buck_sample.mv > buck->fv_mv - 100 &&
+	if (buck->temp_region >= 7 &&
+	    b->buck_sample.mv > buck->fv_mv - ERHAI_BUCK_WARM_FV_MARGIN_MV &&
 	    b->buck_fv_applied != buck->fv_mv)
 		enable = false;
 
@@ -1936,7 +1937,8 @@ static int qcom_battmgr_buck_apply(struct qcom_battmgr *b)
 	/* oplus_comm_check_allow_set_fv keeps the PMIC power path above
 	 * a warm cell. Output remains disabled while it exceeds warm FV.
 	 */
-	if (buck->temp_region < 7 || b->buck_sample.mv <= buck->fv_mv - 100) {
+	if (buck->temp_region < 7 ||
+	    b->buck_sample.mv <= buck->fv_mv - ERHAI_BUCK_WARM_FV_MARGIN_MV) {
 		ret = qcom_battmgr_buck_write(b, BATT_VOLT_MAX, buck->fv_mv,
 					    &b->buck_fv_applied);
 		if (ret)

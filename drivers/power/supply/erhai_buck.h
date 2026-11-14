@@ -10,6 +10,9 @@
  * check_sw_full, check_hw_full and check_rechg (OnePlus cc463675855a).
  * Currents here use the power_supply convention: positive charges.
  */
+/* oplus_chg_comm.c VBAT_COLD_WARM_COMP, used by check_allow_set_fv. */
+#define ERHAI_BUCK_WARM_FV_MARGIN_MV 10
+
 enum erhai_buck_phase {
 	ERHAI_BUCK_OFF,
 	ERHAI_BUCK_NORMAL,
