@@ -411,7 +411,6 @@ MODULE_PARM_DESC(mipps_auth,
  * the programmed 8 A battery OCP even on a higher-current contract.
  */
 #define MCA_CP_STAGE_IBUS_MA	(8000 / 2 - MCA_CP_BAND_MA)
-#define MCA_CP_PAR_HYS_MA	300
 #define MCA_CP_PAR_FCC_MAX_MA	4000
 #define MCA_CP_PPS_MAX_MA	6000	/* current limit asked of the source */
 #define MCA_CP_STD_PPS_MAX_MA	5000
@@ -636,6 +635,9 @@ struct xiaomi_mca {
 	struct mca_connector connector;
 	/* A policy tick uses one observation for FV, buck and pump control. */
 	const struct xiaomi_mca_cells *poll_cells;
+	u32 poll_pack_temp;
+	int poll_pack_error;
+	bool poll_pack_valid;
 	struct device *dev;
 	struct pmic_glink_client *client;
 	struct power_supply *psy;
@@ -746,7 +748,6 @@ struct xiaomi_mca {
 	u32 auth_retry_ms;
 	int qc_align_mv;
 	unsigned int qc_stalls;
-	bool cp_die_hot;
 	bool cp_fault;
 	int cp_polls;		/* while opening: tries; then: polls */
 	int cp_low;		/* consecutive polls below MCA_CP_LOW_IBUS_MA */
@@ -772,6 +773,10 @@ struct xiaomi_mca {
 	bool policy_active;
 	u32 adapter_svid;
 	u32 retcode;
+	u32 failed_opcode, failed_property, failed_seq, failed_retcode;
+	int failed_errno;
+	bool failed_reply;
+	u64 failed_ns;
 
 	/* orders the fields below against the GLINK callbacks */
 	spinlock_t rx_lock;
@@ -988,6 +993,27 @@ static int xiaomi_mca_usb_propval(enum xiaomi_mca_usb_index index, u32 value)
 	}
 }
 
+/* Called under rx_lock. Preserve the last failed transaction even after
+ * successful telemetry overwrites the ordinary last request/reply buffer.
+ * A nonzero vendor result is mapped to -EIO, not itself a Linux errno.
+ */
+static void xiaomi_mca_record_error(struct xiaomi_mca *mca, u32 opcode, u32 property,
+				   u32 sequence, int error, bool reply, u32 firmware_result)
+{
+	mca->failed_opcode = opcode;
+	mca->failed_property = property;
+	mca->failed_seq = sequence;
+	mca->failed_retcode = firmware_result;
+	mca->failed_errno = error;
+	mca->failed_reply = reply;
+	mca->failed_ns = ktime_get_boottime_ns();
+	if (mca->dev)
+		dev_err_ratelimited(mca->dev,
+			"MCA %s failed: prop=%#x seq=%u errno=%d reply=%u firmware_ret=%#x service=%u attach=%u\n",
+			opcode == MCA_OPCODE_WRITE ? "write" : "read", property, sequence,
+			error, reply, firmware_result, mca->service_generation, mca->attach_generation);
+}
+
 static int xiaomi_mca_transfer_data(struct xiaomi_mca *mca, u32 opcode, u32 property,
 				    void *data, size_t len)
 {
@@ -1008,8 +1034,10 @@ static int xiaomi_mca_transfer_data(struct xiaomi_mca *mca, u32 opcode, u32 prop
 	reinit_completion(&mca->ack);
 
 	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
-		if (!mca->service_up)
+		if (!mca->service_up) {
+			xiaomi_mca_record_error(mca, opcode, property, mca->seq, -ENODATA, false, 0);
 			return -ENODATA;
+		}
 
 		mca->pending = true;
 		mca->answered = false;
@@ -1028,13 +1056,14 @@ static int xiaomi_mca_transfer_data(struct xiaomi_mca *mca, u32 opcode, u32 prop
 
 	guard(spinlock_irqsave)(&mca->rx_lock);
 	mca->pending = false;
-	if (ret)
+	if (ret) {
+		xiaomi_mca_record_error(mca, opcode, property, mca->seq, ret, false, 0);
 		return ret;
+	}
 
 	if (!mca->answered) {
 		mca->stats.timeouts++;
-		dev_err_ratelimited(mca->dev, "no reply to the %s of %#x\n",
-				    opcode == MCA_OPCODE_WRITE ? "write" : "read", property);
+		xiaomi_mca_record_error(mca, opcode, property, mca->seq, -ETIMEDOUT, false, 0);
 		return -ETIMEDOUT;
 	}
 
@@ -1063,6 +1092,29 @@ static int xiaomi_mca_read(struct xiaomi_mca *mca, u32 property, u32 *value)
 	*value = 0;
 
 	return xiaomi_mca_transfer(mca, MCA_OPCODE_READ, property, value);
+}
+
+/* One coherent temperature observation per policy tick, shared by FV,
+ * enable/hold and CP regulation. A later GLINK miss cannot reinterpret the
+ * same tick as a different JEITA zone or spuriously finish the CP session.
+ */
+static int xiaomi_mca_pack_temperature(struct xiaomi_mca *mca, u32 *temp)
+{
+	int ret;
+
+	if (mca->poll_cells && mca->poll_pack_valid) {
+		if (!mca->poll_pack_error)
+			*temp = mca->poll_pack_temp;
+		return mca->poll_pack_error;
+	}
+	ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, temp);
+	if (mca->poll_cells) {
+		mca->poll_pack_valid = true;
+		mca->poll_pack_error = ret;
+		if (!ret)
+			mca->poll_pack_temp = *temp;
+	}
+	return ret;
 }
 
 static void xiaomi_mca_invalidate(struct xiaomi_mca *mca)
@@ -1185,7 +1237,7 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 			val == 1243 || val == 1250 || val == 1650 || val == 1657);
 	case MCA_PROP_CHARGE_CURRENT:
 		return len == sizeof(u32) &&
-		       (!val || (val >= MCA_FCC_MIN_MA && val <= MCA_CP_PAR_FCC_MAX_MA));
+		       (val >= MCA_FCC_MIN_MA && val <= MCA_CP_PAR_FCC_MAX_MA);
 	case MCA_PROP_AICL_ENABLE:
 	case MCA_PROP_RERUN_AICL:
 	case MCA_PROP_RESTART_AICL:
@@ -1652,7 +1704,7 @@ static void xiaomi_mca_mipps_authenticate(struct xiaomi_mca *mca)
 		return;
 
 	mca->auth_attach_generation = attachment;
-	mca->ffc_active = false;
+	/* FFC remains latched across this transport/source transition. */
 	mca->auth_ok = false;
 	mca->mipps_attempted = true;
 	ret = xiaomi_mca_write_u32(mca, MCA_PROP_VERIFY_PROCESS, 1);
@@ -2601,7 +2653,8 @@ static void xiaomi_mca_select_profile(struct xiaomi_mca *mca, int tcool, int twa
 
 	if (profile != mca->cp_profile) {
 		mca->cp_profile = profile;
-		mca->cp_stage = 0;
+		mca->cp_stage = mca->cp_taper_count = mca->term_count = 0;
+		mca->buck_cv_steps = mca->buck_cv_fcc = 0;
 	}
 }
 
@@ -2620,13 +2673,15 @@ static bool xiaomi_mca_ffc_conditions(struct xiaomi_mca *mca, int tcool, int twa
 		mca->ffc_done = false;
 		mca->ffc_attach = READ_ONCE(mca->attach_generation);
 	}
-	if (!full_charge || mca->ffc_done || mca->charging_done)
+	if (!full_charge || mca->ffc_done)
 		return false;
 	/* Piano quickchg/fg FFC is a session flag. Temperature selects the
 	 * permitted cell table independently; it does not finish the session.
 	 */
 	if (mca->ffc_active)
 		return true;
+	if (mca->charging_done)
+		return false;
 	if (mca->cell_zone < 18 || tcool < 18 || twarm >= 48 ||
 	    xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE) != 1 ||
 	    xiaomi_mca_read_type(mca, &type) || type == MCA_TYPE_SDP || type == MCA_TYPE_CDP ||
@@ -2755,7 +2810,7 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 		mca->ffc_active = false;
 		return xiaomi_mca_restore_term_volt(mca);
 	}
-	pack_ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &temp);
+	pack_ret = xiaomi_mca_pack_temperature(mca, &temp);
 	ret = xiaomi_mca_gauges(mca, &vbat, &ibat, &cold, &hot, &vmin, &imax, NULL);
 	ret = ret ?: pack_ret;
 	mca->fv_derated = !!ret;
@@ -3424,7 +3479,7 @@ static void xiaomi_mca_buck_cv(struct xiaomi_mca *mca, int vbat, int ibat)
 		mca->buck_cv_steps = min(mca->buck_cv_steps + 1, 5U);
 }
 
-static bool xiaomi_mca_software_full(struct xiaomi_mca *mca, int vmin, int ibat)
+static bool xiaomi_mca_software_full(struct xiaomi_mca *mca, int vmin, int ibat, int imax)
 {
 	/* Whole-pack counterpart of Piano fg_comp termination. Require both
 	 * cells near the endpoint; a high cell cannot declare its peer full.
@@ -3433,7 +3488,7 @@ static bool xiaomi_mca_software_full(struct xiaomi_mca *mca, int vmin, int ibat)
 	 */
 	if (xiaomi_mca_cp_active(mca) || mca->term_hot || mca->cell_zone < 18 ||
 	    vmin < (int)xiaomi_mca_cell_fv(mca) - 8 || ibat < 0 ||
-	    ibat >= xiaomi_mca_cell_iterm(mca) *
+	    max(ibat, 2 * imax) >= xiaomi_mca_cell_iterm(mca) *
 		(xiaomi_mca_cell_iterm(mca) >= 1000 ? 110 : 115) / 100) {
 		mca->term_count = 0;
 		return false;
@@ -3466,7 +3521,7 @@ static int xiaomi_mca_fw_recharge(struct xiaomi_mca *mca)
 	/* Status 5 is ignored throughout CP. Outside CP it is the stock
 	 * FG term_recharge vote, not permission to silently leave buck idle.
 	 */
-	if (!mca->charging_done && (status == 5 || xiaomi_mca_software_full(mca, vmin, ibat))) {
+	if (!mca->charging_done && (status == 5 || xiaomi_mca_software_full(mca, vmin, ibat, imax))) {
 		mca->charging_done = true;
 		mca->fw_recharge = 1;
 		mca->term_count = 0;
@@ -3493,6 +3548,10 @@ static int xiaomi_mca_fw_recharge(struct xiaomi_mca *mca)
 		ret = xiaomi_mca_apply_pmic_pair(mca, xiaomi_mca_pmic_fv(mca), xiaomi_mca_pmic_iterm(mca));
 		if (ret)
 			return ret;
+		if (vbat > xiaomi_mca_cell_fv(mca)) {
+			mca->voltage_hold = true;
+			return 0;
+		}
 		enable = 1;
 		ret = xiaomi_mca_write_blob(mca, MCA_PROP_CHARGING_ENABLED, &enable, 1);
 		if (!ret) {
@@ -3581,7 +3640,7 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 				mca->charge_hold = false;
 		}
 	}
-	pack_ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack);
+	pack_ret = xiaomi_mca_pack_temperature(mca, &tpack);
 	cell_ret = xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, NULL);
 	if (!pack_ret) {
 		tbat = max_t(int, tbat, (s32)tpack);
@@ -3609,6 +3668,7 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		int err = ret ?: -ENODATA;
 
 		mca->charge_blocked = true;
+		mca->term_count = mca->cp_taper_count = 0;
 		mca->gauge_failures = min(mca->gauge_failures + 1, 3U);
 		if (mca->charge_hold || mca->charge_hot || mca->charge_cold ||
 		    (mca->term_hot && vbat > MCA_TERM_HOT_MV)) {
@@ -3819,7 +3879,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 
 	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, NULL))
 		return;
-	if (xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack))
+	if (xiaomi_mca_pack_temperature(mca, &tpack))
 		return;
 	xiaomi_mca_select_profile(mca, min(tcool, tpack), max(tbat, tpack));
 	/* Piano DT min_vbat/max_vbat, independent of the current CV row. */
@@ -3860,27 +3920,15 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		 */
 		if (mca->cp_ibus_cap && time_after_eq(jiffies, mca->cp_cap_retry))
 			mca->cp_ibus_cap = 0;
-		xiaomi_mca_cp_session_done(mca, "opening current unavailable");
+		mca->cp_last_exit = "opening current unavailable"; /* no CP session started */
 		return;
 	}
 
 	mca->cp_psy = power_supply_get_by_name("sc8541");
 	if (!mca->cp_psy) {
 		dev_warn_ratelimited(mca->dev, "SC8541 unavailable, using buck charging\n");
-		xiaomi_mca_cp_session_done(mca, "pump unavailable");
+		mca->cp_last_exit = "pump unavailable"; /* no CP session started */
 		return;
-	}
-	if (mca->cp_die_hot) {
-		int tdie;
-
-		if (xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_TEMP, &tdie) ||
-		    tdie >= MCA_CP_TDIE_HOT) {
-			power_supply_put(mca->cp_psy);
-			mca->cp_psy = NULL;
-			xiaomi_mca_cp_session_done(mca, "stage temperature");
-			return;
-		}
-		mca->cp_die_hot = false;
 	}
 	/* it must be off before the source is asked for anything */
 	if (xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &ret) || ret ||
@@ -3889,7 +3937,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		dev_warn(mca->dev, "switched-capacitor stage not ready\n");
 		power_supply_put(mca->cp_psy);
 		mca->cp_psy = NULL;
-		xiaomi_mca_cp_session_done(mca, "pump not ready");
+		mca->cp_last_exit = "pump not ready"; /* no CP session started */
 		return;
 	}
 
@@ -3940,7 +3988,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 }
 
 /* Piano cur_max_threshold, ibus_threshold and pmih_fcc_value. */
-static u32 xiaomi_mca_parallel_fcc(int ibat_max, int ibus, u32 current_fcc)
+static u32 xiaomi_mca_parallel_fcc(int ibat_max, int ibus)
 {
 	static const struct { int ibat, ibus, fcc; } rows[] = {
 		{ 10000, 5200, 4000 }, { 8000, 4200, 3000 }, { 5000, 2700, 2000 },
@@ -3948,9 +3996,7 @@ static u32 xiaomi_mca_parallel_fcc(int ibat_max, int ibus, u32 current_fcc)
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(rows); i++) {
-		int hyst = current_fcc >= rows[i].fcc ? MCA_CP_PAR_HYS_MA : 0;
-
-		if (ibat_max > rows[i].ibat && ibus > rows[i].ibus - hyst)
+		if (ibat_max > rows[i].ibat && ibus > rows[i].ibus)
 			return rows[i].fcc;
 	}
 	return 1000;
@@ -4033,7 +4079,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_stop(mca, "read failed");
 		return;
 	}
-	if (xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tpack)) {
+	if (xiaomi_mca_pack_temperature(mca, &tpack)) {
 		xiaomi_mca_cp_stop(mca, "pack temperature unavailable");
 		return;
 	}
@@ -4165,7 +4211,6 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		return;
 	}
 	if (tdie >= MCA_CP_TDIE_MAX) {
-		mca->cp_die_hot = true;
 		xiaomi_mca_cp_stop(mca, "stage temperature");
 		return;
 	}
@@ -4212,7 +4257,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 
 		/* only from a source that feeds both at that bus current */
 		ibus_all = ibus + buck_ma;
-		fcc = xiaomi_mca_parallel_fcc(ibat_max, ibus_all, mca->fcc_set_ma);
+		fcc = xiaomi_mca_parallel_fcc(ibat_max, ibus_all);
 		icl = fcc / 2 + (fcc > 1000 ? 500 : 0);
 		/* The stock vbat_threshold ends parallel boosting near CV. */
 		if (vbat >= 4480)
@@ -4812,6 +4857,9 @@ static void xiaomi_mca_callback(const void *data, size_t len, void *priv)
 	memcpy(mca->reply, data, mca->reply_len);
 	mca->retcode = len == sizeof(struct xiaomi_mca_reply) ?
 		le32_to_cpu(((const struct xiaomi_mca_reply *)data)->retcode) : 0;
+	if (ret)
+		xiaomi_mca_record_error(mca, mca->pending_opcode, mca->pending_property,
+			mca->pending_seq, ret, len == sizeof(struct xiaomi_mca_reply), mca->retcode);
 	mca->result = ret;
 	mca->value = value;
 	mca->answered = true;
@@ -4930,7 +4978,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca, u32 *sampled_type)
 		/* away longer than a reset takes: another attach */
 		if (time_after(jiffies, mca->cp_off_at +
 				msecs_to_jiffies(MCA_CP_DROP_FORGET_MS))) {
-			mca->ffc_active = false;
+			/* FFC remains latched across this transport/source transition. */
 			mca->auth_ok = false;
 			mca->mipps_attempted = false;
 		}
@@ -4961,7 +5009,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca, u32 *sampled_type)
 				}
 		if (!xiaomi_mca_auth_pending(mca) ||
 		    power_supply_for_each_psy(mca, xiaomi_mca_ucsi_status) < MCA_UCSI_CONNECTED) {
-			mca->ffc_active = false;
+			/* FFC remains latched across this transport/source transition. */
 			mca->auth_ok = false;
 			mca->mipps_attempted = false;
 		}
@@ -5084,7 +5132,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->icl_set_ma = 0;
 			mca->fcc_set_ma = 0;
 			mca->fcc_written = false;
-			mca->ffc_active = false;
+			/* FFC remains latched across this transport/source transition. */
 			mca->auth_ok = false;
 			mca->mipps_attempted = false;
 			mca->auth_cleanup = false;
@@ -5133,6 +5181,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		if (charge_policy || READ_ONCE(mca->charge_end) < 100 || mca->charge_disabled) {
 			xiaomi_mca_sample_cells(mca, &cells);
 			mca->poll_cells = &cells;
+			mca->poll_pack_valid = false;
 		}
 		ret = xiaomi_mca_full_charge_poll(mca);
 		if (ret) {
@@ -5602,6 +5651,11 @@ static int xiaomi_mca_stats_show(struct seq_file *s, void *unused)
 	seq_printf(s, "unmatched_messages %llu\n", stats.unmatched);
 	seq_printf(s, "notifications %llu\n", stats.notifications);
 
+	scoped_guard(spinlock_irqsave, &mca->rx_lock)
+		seq_printf(s, "last_error_ns %llu\nlast_error_opcode %u\nlast_error_property %#x\nlast_error_seq %u\nlast_error_errno %d\nlast_error_reply %u\nlast_error_firmware_ret %#x\n",
+			mca->failed_ns, mca->failed_opcode, mca->failed_property,
+			mca->failed_seq, mca->failed_errno, mca->failed_reply, mca->failed_retcode);
+
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(xiaomi_mca_stats);
@@ -5755,7 +5809,7 @@ static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca, u32 fixed_ma)
 	}
 
 	if (mca->fcc_written) {
-		ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &tbat);
+		ret = xiaomi_mca_pack_temperature(mca, &tbat);
 		if (ret)
 			return ret;
 		fcc = xiaomi_mca_fcc_thermal(mca, fcc, min((s32)tbat, mca->coolest_temp));

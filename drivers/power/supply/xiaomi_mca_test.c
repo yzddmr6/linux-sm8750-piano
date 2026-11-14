@@ -510,6 +510,7 @@ struct mca_policy_fixture {
 	u8 last_data[MCA_VDM_LEN];
 	unsigned int writes;
 	unsigned int fcc_reads;
+	unsigned int pack_reads;
 	bool fcc_read_zero;
 	bool icl_read_stale;
 	u32 term_readback, term_current, pack_vbat;
@@ -733,6 +734,7 @@ static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 		value = f->pack_vbat;
 		break;
 	case MCA_PROP_PACK_TBAT:
+		f->pack_reads++;
 		if (f->pack_error)
 			return f->pack_error;
 		value = f->tbat;
@@ -1168,7 +1170,7 @@ static void xiaomi_mca_test_source_limits(struct kunit *test)
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(rows); i++)
-		KUNIT_EXPECT_EQ(test, xiaomi_mca_parallel_fcc(rows[i].ibat, rows[i].ibus, 500),
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_parallel_fcc(rows[i].ibat, rows[i].ibus),
 				rows[i].fcc);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_capability_ma(6700, true), 6000U);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_capability_ma(6700, false), 5000U);
@@ -4231,6 +4233,29 @@ static void xiaomi_mca_test_mipps_tail_replay(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5580);
 	xiaomi_mca_cp_try_start(mca);
 	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_DONE);
+	/* Synthetic continuation of the recorded 84..87% prefix: buck CV,
+	 * AP full vote at the cell endpoint, then the board's raw97 recharge.
+	 */
+	f->chgr_status = 4;
+	f->cells[0].voltage = f->cells[1].voltage = 4542000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 1100000;
+	f->cells[0].charge_now = f->cells[1].charge_now = 4554000;
+	for (int n = 0; n < 5; n++) {
+		mca->term_at = jiffies - MCA_POLL_INTERVAL;
+		KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+		KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	}
+	KUNIT_EXPECT_TRUE(test, mca->charging_done);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
+	f->cells[0].voltage = f->cells[1].voltage = 4450000;
+	f->cells[0].charge_now = f->cells[1].charge_now = 4462000;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	KUNIT_EXPECT_FALSE(test, mca->charging_done);
+	KUNIT_EXPECT_FALSE(test, mca->ffc_active);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_DONE);
+
 }
 
 static void xiaomi_mca_test_ffc_handoff(struct kunit *test)
@@ -4500,7 +4525,11 @@ static void xiaomi_mca_test_822s_read_failure(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
 	struct xiaomi_mca *mca = &f->mca;
+	static const struct { int uptime, mv, ma, soc; } samples[] = {
+		{ 822, 4460, 550, 95 }, { 684, 4464, 380, 97 },
+	};
 	u32 writes;
+	int n;
 
 	full_charge = charge_policy = charge_current = hv_charge = true;
 	f->type = mca->real_type = MCA_TYPE_PD;
@@ -4514,6 +4543,11 @@ static void xiaomi_mca_test_822s_read_failure(struct kunit *test)
 	f->pack_vbat = 4469;
 	mca->cp = MCA_CP_DONE;
 	guard(mutex)(&mca->lock);
+	for (n = 0; n < ARRAY_SIZE(samples); n++) {
+	f->cells[0].voltage = f->cells[1].voltage = samples[n].mv * 1000;
+	f->cells[0].current_ua = f->cells[1].current_ua = samples[n].ma * 1000;
+	f->cells[0].capacity = f->cells[1].capacity = samples[n].soc;
+	f->vbus = mca->vbus_uv = 9000000;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 	KUNIT_ASSERT_EQ(test, f->term_readback, 5360);
 	writes = f->term_writes;
@@ -4541,6 +4575,7 @@ static void xiaomi_mca_test_822s_read_failure(struct kunit *test)
 	f->chgr_status = 4;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
 	KUNIT_EXPECT_FALSE(test, mca->recover_5v);
+	}
 }
 
 static void xiaomi_mca_test_full_recharge_matrix(struct kunit *test)
@@ -4619,14 +4654,19 @@ static void xiaomi_mca_test_software_full_samples(struct kunit *test)
 	mca->cell_zone = 18;
 	for (n = 1; n <= 5; n++) {
 		mca->term_at = jiffies - MCA_POLL_INTERVAL;
-		KUNIT_EXPECT_EQ(test, xiaomi_mca_software_full(mca, 4472, 450), n == 5);
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_software_full(mca, 4472, 450, 225), n == 5);
 	}
 	mca->term_count = 0;
-	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4472, 450));
-	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4472, 450));
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4472, 450, 225));
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4472, 450, 225));
 	KUNIT_EXPECT_EQ(test, mca->term_count, 1); /* no repeated use of a sample */
-	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4368, 0)); /* unequal/low cell */
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4368, 0, 0)); /* unequal/low cell */
 	KUNIT_EXPECT_EQ(test, mca->term_count, 0);
+	/* Opposing cell currents must not masquerade as a tapered pack. */
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_software_full(mca, 4472, 100, 3000));
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_weighted_soc((u32[]){4714, 4016},
+		(u32[]){4900, 4100}), 9701U);
+
 }
 
 #ifdef MCA_CHARGE_EXPERIMENT
@@ -4668,11 +4708,170 @@ static void xiaomi_mca_test_experiment(struct kunit *test)
 }
 #endif
 
+static void xiaomi_mca_test_cycle_latch_and_sample(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	struct xiaomi_mca_cells cells;
+	u32 reads;
+
+	full_charge = charge_policy = true;
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_sample_cells(mca, &cells);
+	mca->poll_cells = &cells;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_ASSERT_TRUE(test, mca->ffc_active);
+	reads = f->pack_reads;
+	f->pack_error = -EIO;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	KUNIT_EXPECT_EQ(test, f->pack_reads, reads); /* same tick, no extra read */
+	f->pack_error = 0;
+	mca->poll_cells = NULL;
+	mca->charging_done = true;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_active); /* only recharge clears FFC */
+	KUNIT_EXPECT_EQ(test, f->term_readback, 5580);
+	f->cells[0].voltage = f->cells[1].voltage = 4500000;
+	f->cells[0].charge_now = f->cells[1].charge_now = 4400000;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	KUNIT_EXPECT_FALSE(test, mca->ffc_active);
+	KUNIT_EXPECT_TRUE(test, mca->voltage_hold);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0); /* no normal restart above FV */
+}
+
+static void xiaomi_mca_test_firmware_error_identity(struct kunit *test)
+{
+	struct xiaomi_mca *mca = kunit_kzalloc(test, sizeof(*mca), GFP_KERNEL);
+	struct xiaomi_mca_test_frame frame = {
+		"failed pack temperature", PMIC_GLINK_REQ_RESP, MCA_OPCODE_READ,
+		{ MCA_PROP_PACK_TBAT, 0x21, 7, 0 },
+	};
+
+	KUNIT_ASSERT_NOT_NULL(test, mca);
+	spin_lock_init(&mca->rx_lock);
+	init_completion(&mca->ack);
+	mca->pending = true;
+	mca->pending_opcode = MCA_OPCODE_READ;
+	mca->pending_property = MCA_PROP_PACK_TBAT;
+	mca->pending_seq = 7;
+	xiaomi_mca_callback(mca_test_reply(test, &frame), sizeof(struct xiaomi_mca_reply), mca);
+	KUNIT_EXPECT_EQ(test, mca->failed_property, (u32)MCA_PROP_PACK_TBAT);
+	KUNIT_EXPECT_EQ(test, mca->failed_retcode, 0x21U);
+	KUNIT_EXPECT_EQ(test, mca->failed_errno, -EIO);
+	KUNIT_EXPECT_EQ(test, mca->stats.errors, 1);
+	frame.payload[0] = MCA_PROP_PACK_VBAT;
+	frame.payload[1] = 0;
+	frame.payload[2] = 8;
+	frame.payload[3] = 4469;
+	mca->pending = true;
+	mca->pending_property = MCA_PROP_PACK_VBAT;
+	mca->pending_seq = 8;
+	xiaomi_mca_callback(mca_test_reply(test, &frame), sizeof(struct xiaomi_mca_reply), mca);
+	KUNIT_EXPECT_EQ(test, mca->failed_property, (u32)MCA_PROP_PACK_TBAT);
+	KUNIT_EXPECT_EQ(test, mca->failed_retcode, 0x21U); /* later success cannot erase evidence */
+}
+
+
+static void xiaomi_mca_test_stock_entry_matrix(struct kunit *test)
+{
+	static const u32 types[] = { MCA_TYPE_SDP, MCA_TYPE_CDP, MCA_TYPE_DCP,
+		MCA_TYPE_PD_PPS, MCA_TYPE_PD_VERIFY, MCA_TYPE_HVDCP_3_B, MCA_TYPE_HVDCP_3P5 };
+	static const int temps[] = { 10, 25, 50 };
+	static const int socs[] = { 84, 98 };
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	int type, t, soc;
+
+	full_charge = charge_policy = charge_current = cp_charge = hv_charge = true;
+	mca_test_named_stage(test, f, "sc8541");
+	power_supply_put(mca->cp_psy);
+	mca->cp_psy = NULL;
+	f->stage_on = false;
+	f->pdos[1] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(5000), cpu_to_le32(10000), cpu_to_le32(5000) };
+	guard(mutex)(&mca->lock);
+	for (type = 0; type < ARRAY_SIZE(types); type++)
+	 for (t = 0; t < ARRAY_SIZE(temps); t++)
+	  for (soc = 0; soc < ARRAY_SIZE(socs); soc++) {
+		bool pump = type >= 3;
+
+		mca->cp = MCA_CP_OFF;
+		mca->hv = MCA_HV_ON;
+		mca->cp_fault = mca->charging_done = false;
+		mca->ffc_active = mca->ffc_done = mca->term_hot = mca->zone_valid = false;
+		f->type = mca->real_type = types[type];
+		f->vbus = mca->vbus_uv = 9000000;
+		f->tbat = temps[t];
+		f->cells[0].temp = f->cells[1].temp = temps[t] * 10;
+		f->cells[0].capacity = f->cells[1].capacity = socs[soc];
+		f->cells[0].voltage = f->cells[1].voltage = (temps[t] >= 48 ? 3900 : 4000) * 1000;
+		KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+		xiaomi_mca_cp_try_start(mca);
+		KUNIT_EXPECT_EQ_MSG(test, mca->cp, pump ? MCA_CP_OPENING : MCA_CP_OFF,
+			"source=%u SOC=%d temp=%d", types[type], socs[soc], temps[t]);
+		if (pump) {
+			KUNIT_EXPECT_EQ(test, f->icl, 0);
+			KUNIT_EXPECT_NE(test, f->fcc, 0);
+			KUNIT_ASSERT_EQ(test, xiaomi_mca_cp_stop(mca, "matrix handoff"), 0);
+			KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_DONE);
+		}
+	  }
+}
+
+static void xiaomi_mca_test_stock_cc_cv_stages(struct kunit *test)
+{
+	struct xiaomi_mca *mca = kunit_kzalloc(test, sizeof(*mca), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, mca);
+	mca->cp_profile = MCA_PROFILE_FFC;
+	mca->cp_ma = 6000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4144, 12000), 10650); /* skip first CV */
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4300, 10000), 10650); /* hold CV */
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4300, 9040), 9040);   /* next CC */
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4475, 8000), 9040);   /* hold CV */
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4475, 7230), 7230);
+	KUNIT_EXPECT_EQ(test, mca->cp_stage, 3U);
+}
+
+static void xiaomi_mca_test_provider_late_start(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	full_charge = charge_policy = charge_current = cp_charge = hv_charge = true;
+	f->type = mca->real_type = MCA_TYPE_PD_PPS;
+	f->vbus = mca->vbus_uv = 9000000;
+	mca->hv = MCA_HV_ON;
+	f->pdos[1] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(5000), cpu_to_le32(11000), cpu_to_le32(5000) };
+	guard(mutex)(&mca->lock);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	xiaomi_mca_cp_try_start(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
+	KUNIT_EXPECT_PTR_EQ(test, mca->cp_psy, NULL);
+	mca_test_named_stage(test, f, "sc8541");
+	power_supply_put(mca->cp_psy);
+	mca->cp_psy = NULL;
+	mca->cp = MCA_CP_OFF;
+	f->stage_on = false;
+	xiaomi_mca_cp_try_start(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OPENING);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_cp_stop(mca, "test complete"), 0);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_DONE);
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_provider_late_start),
+	KUNIT_CASE(xiaomi_mca_test_stock_entry_matrix),
+	KUNIT_CASE(xiaomi_mca_test_stock_cc_cv_stages),
 #ifdef MCA_CHARGE_EXPERIMENT
 	KUNIT_CASE(xiaomi_mca_test_experiment),
 #endif
 
+
+
+	KUNIT_CASE(xiaomi_mca_test_firmware_error_identity),
+	KUNIT_CASE(xiaomi_mca_test_cycle_latch_and_sample),
 	KUNIT_CASE(xiaomi_mca_test_stock_handoff_order),
 	KUNIT_CASE(xiaomi_mca_test_822s_read_failure),
 	KUNIT_CASE(xiaomi_mca_test_full_recharge_matrix),
