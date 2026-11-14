@@ -3105,8 +3105,10 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 #endif
 	status->responded = sc->responded;
 	status->first_ufcs_timeout = sc->first_ufcs_timeout;
-	if (sc->auto_state == SC_AUTO_DELIVER && sc->fastchg_deliver)
+	if (sc->auto_state == SC_AUTO_DELIVER && sc->fastchg_deliver) {
 		status->delivering = ERHAI_SERIAL;
+		status->serial_pumping = sc->cp_enabled;
+	}
 	if (sc->auto_protection)
 		status->protected |= ERHAI_SERIAL;
 }

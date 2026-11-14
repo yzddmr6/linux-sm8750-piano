@@ -585,6 +585,7 @@ struct qcom_battmgr {
 	bool serial_blocked;
 	bool aicl_done;
 	bool serial_icl_vote;
+	bool serial_buck_suspended;
 	int serial_icl_ua, serial_input_ua, serial_max_ua;
 	unsigned long serial_sample_at;
 	bool pd_logged;
@@ -1243,12 +1244,46 @@ static bool qcom_battmgr_pps_running(struct qcom_battmgr *battmgr)
 	return battmgr->pps_ops && battmgr->pps_ops->active(battmgr->pps_data);
 }
 
+/* 24926 AP VOOC PHY votes WIRED_CHARGE_SUSPEND in direct charge.
+ * The ADSP HAL maps that vote to USB ICL 0 and its release to U32_MAX.
+ * The charge lock serializes it with the 5 V fallback and PD/PPS votes.
+ */
+static int qcom_battmgr_serial_buck(struct qcom_battmgr *b, bool suspend)
+{
+	int ret;
+
+	if (suspend == b->serial_buck_suspended)
+		return 0;
+	/* Even on a missing ACK the firmware may have accepted a suspend. */
+	b->serial_buck_suspended = true;
+	ret = qcom_battmgr_set_property(b, BATTMGR_USB_PROPERTY_SET, USB_INPUT_CURR_LIMIT,
+					suspend ? 0 : U32_MAX);
+	if (!ret) {
+		b->serial_buck_suspended = suspend;
+		b->serial_icl_vote = false;
+		b->aicl_done = false;
+	}
+	return ret;
+}
+
+static int qcom_battmgr_serial_stop(struct qcom_battmgr *b)
+{
+	if (b->pps_ops) {
+		int ret = b->pps_ops->serial_session(false);
+
+		if (ret)
+			return ret;
+	}
+	return qcom_battmgr_serial_buck(b, false);
+}
+
 static int qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr, bool upgrading)
 {
-	if (!battmgr->pps_ops)
-		return 0;
-	return battmgr->pps_ops->serial_session(false) ?:
-		battmgr->pps_ops->stop(battmgr->pps_data, upgrading);
+	int ret = qcom_battmgr_serial_stop(battmgr);
+
+	if (ret || !battmgr->pps_ops)
+		return ret;
+	return battmgr->pps_ops->stop(battmgr->pps_data, upgrading);
 }
 
 /* Match only the Type-C supply belonging to this PMIC GLINK instance. */
@@ -1399,10 +1434,10 @@ static ssize_t charge_contract_show(struct device *dev, struct device_attribute 
 			 b->pd_state == PD_ACTIVE && !b->qc_contract ? PD_FIXED_MV : 0,
 			 b->pd_state == PD_ACTIVE ? b->pd_input_limit_ua : 0);
 
-	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d detected_type=%u serial_source=%d serial_icl_vote=%d fixed_exit=%s ",
+	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d detected_type=%u serial_source=%d serial_icl_vote=%d serial_buck_suspended=%d fixed_exit=%s ",
 			     b->pd_state == PD_ACTIVE && b->qc_contract ? PD_FIXED_MV : 0,
 			     b->serial_probe, b->charge_detected_type, !!(b->retry_evidence & ERHAI_SERIAL),
-			     b->serial_icl_vote, b->fixed_exit ?: "none");
+			     b->serial_icl_vote, b->serial_buck_suspended, b->fixed_exit ?: "none");
 	if (b->serial_icl_vote)
 		len += sysfs_emit_at(buf, len, "fallback_vote_ua=%u fallback_icl_ua=%d fallback_input_ua=%d fallback_max_ua=%d fallback_age_ms=%lld ",
 				     ERHAI_SERIAL_5V_UA, b->serial_icl_ua, b->serial_input_ua,
@@ -1792,6 +1827,8 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus, ua, real_type;
 	int ret;
 
+	if (!battmgr->pps_ops && qcom_battmgr_serial_buck(battmgr, false))
+		return PD_POLL_MS;
 	if (test_and_clear_bit(PD_EVENT_SERVICE_RESET, &battmgr->pd_events)) {
 		battmgr->pd_restore_fcc = false;
 		battmgr->aicl_done = false;
@@ -1989,21 +2026,20 @@ read_source:
 			battmgr->retry_once &= ~ERHAI_SERIAL;
 			battmgr->restore_route &= ~ERHAI_SERIAL;
 			ret = battmgr->pps_ops->serial_session(true);
+			battmgr->serial_blocked = ret == -EPERM;
+			if (!ret)
+				ret = qcom_battmgr_serial_buck(battmgr, status.serial_pumping);
 			if (!ret) {
-				if (status.delivering == ERHAI_SERIAL &&
-				    qcom_battmgr_serial_icl(battmgr, false))
-					return PD_POLL_MS;
 				battmgr->serial_probe = true;
 				battmgr->aicl_done = false;
 				return PD_POLL_MS;
 			}
 			/* Keep the reservation until the entire retry ladder is done. */
-			battmgr->serial_blocked = ret == -EPERM;
 			battmgr->serial_backoff = true;
 			battmgr->serial_retry = qcom_battmgr_probe_retry(&battmgr->serial_failures);
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 		}
-		if (battmgr->pps_ops->serial_session(false))
+		if (qcom_battmgr_serial_stop(battmgr))
 			return PD_POLL_MS;
 		battmgr->serial_probe = false;
 	}
