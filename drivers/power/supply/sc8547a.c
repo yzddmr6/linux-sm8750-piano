@@ -2706,7 +2706,8 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 	 */
 	cp_mv = sc8547_get_vbat(sc);
 	sc->cell_vbat_mv = cell_mv;
-	if (cp_mv <= 0 || !sc8547_auto_update_curve(sc, soc, temp_ddc, cp_mv, 0, true)) {
+	if (cell_mv <= SC8547_CELL_MIN_VALID_MV || cp_mv <= 0 ||
+	    !sc8547_auto_update_curve(sc, soc, temp_ddc, cp_mv, 0, true)) {
 		sc8547_auto_decline(sc, "outside-cell-curve");
 		return;
 	}
@@ -2923,7 +2924,8 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc8547_auto_finish(sc, "adc-limit-or-io");
 			goto reschedule;
 		}
-		if (gret || cpbat <= 0 || vbus <= 0 || cibus < 0 || slave_ma < 0 ||
+		if (gret || gvbat <= SC8547_CELL_MIN_VALID_MV || cpbat <= 0 ||
+		    vbus <= 0 || cibus < 0 || slave_ma < 0 ||
 		    (!gret && gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp))) ||
 		    !sc8547_auto_update_curve(sc, gsoc, gtemp, cvbat, cibus_total, false)) {
 			if (!gret && gtemp >= 0 && gtemp < 510 && gvbat > 0 &&
