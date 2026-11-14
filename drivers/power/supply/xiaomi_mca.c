@@ -10,7 +10,7 @@
  * firmware return code.
  *
  * Standard power_supply telemetry and ICL/FCC writes retain their units,
- * checked replies/readback and unknown-source refusal. The board charging
+ * matched firmware acknowledgements and unknown-source refusal. The board charging
  * policy defaults on: source-bounded 9 V/PPS, battery-temperature FCC,
  * in-kernel MiPPS, SC8541 direct charging and temperature-bounded float voltage.
  * Optional battery thresholds use the stock charge-enable command. Firmware
@@ -1483,7 +1483,7 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 			u32 floor = xiaomi_mca_5v_floor(raw);
 
 			/* Arm before sending: the source may fall out before the
-			 * acknowledgement or setpoint readback comes back.
+			 * acknowledgement comes back.
 			 */
 			if (vbus >= MCA_VBUS_ONLINE_UV && vbus < MCA_HV_VBUS_5V_MAX_UV &&
 			    (xiaomi_mca_probe_5v(type) || type == MCA_TYPE_C || xiaomi_mca_is_pd(type)) &&
@@ -2919,11 +2919,14 @@ static int xiaomi_mca_cp_set_buck(struct xiaomi_mca *mca, u32 icl_ma,
 
 static void xiaomi_mca_cp_session_done(struct xiaomi_mca *mca, const char *reason)
 {
-	/* Piano quickchg stop completes this attachment's direct-charge
-	 * session. Buck remains available; only a new attach starts CP again.
+	/* Piano stop_charging .text 0x4848..0x4858 preserves CHARGE_DONE
+	 * only; all other exits return to NO_CHARGING for pre_charge_check.
+	 * taper_done_no_retry belongs to normal taper, not transport faults.
+	 * Existing OVP/OCP/authentication latches remain attachment-scoped.
 	 */
 	mca->cp_last_exit = reason;
-	mca->cp = MCA_CP_DONE;
+	mca->cp = mca->cp_fault || mca->auth_lost || !strcmp(reason, "taper complete") ?
+		MCA_CP_DONE : MCA_CP_OFF;
 }
 
 static int xiaomi_mca_cp_input_suspend(struct xiaomi_mca *mca, bool suspend)
