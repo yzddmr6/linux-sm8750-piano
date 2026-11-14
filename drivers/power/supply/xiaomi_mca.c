@@ -5103,6 +5103,17 @@ out:
 	return 0;
 }
 
+/* A reconnect can be reported after prepare() has drained the worker.
+ * The noirq admission check uses the same cached state, without GLINK I/O.
+ */
+static int xiaomi_mca_check_sleep(struct device *dev)
+{
+	struct xiaomi_mca *mca = dev_get_drvdata(dev);
+
+	guard(spinlock_irqsave)(&mca->rx_lock);
+	return mca->charge_awake || mca->input_pending ? -EBUSY : 0;
+}
+
 /*
  * All prepare callbacks precede supplier suspend, and all supplier resumes
  * finish before complete. A freezable queue alone cannot hand back the
@@ -5116,26 +5127,19 @@ static int xiaomi_mca_prepare(struct device *dev)
 	/* Direct requests can bypass wakeup_count. Leave an active worker
 	 * running, especially while it is servicing the pump watchdog.
 	 */
-	scoped_guard(spinlock_irqsave, &mca->rx_lock)
-		if (mca->charge_awake || mca->input_pending)
-			return -EBUSY;
-
+	ret = xiaomi_mca_check_sleep(dev);
+	if (ret)
+		return ret;
 	disable_delayed_work_sync(&mca->poll_work);
 	scoped_guard(mutex, &mca->lock) {
-		scoped_guard(spinlock_irqsave, &mca->rx_lock)
-			ret = (mca->charge_awake || mca->input_pending) ? -EBUSY : 0;
+		ret = xiaomi_mca_check_sleep(dev);
 		if (!ret) {
 			ret = xiaomi_mca_quiesce(mca);
 			if (ret)
 				dev_err(dev, "cannot quiesce charging for system sleep: %d\n", ret);
 		}
-		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
-			if (!ret && (mca->charge_awake || mca->input_pending))
-				ret = -EBUSY;
-			if (!ret)
-				mca->sleeping = true;
-		}
 		if (!ret) {
+			mca->sleeping = true;
 			mca->last_valid = false;
 			xiaomi_mca_invalidate(mca);
 		}
@@ -5167,6 +5171,7 @@ static void xiaomi_mca_complete(struct device *dev)
 
 static const struct dev_pm_ops xiaomi_mca_pm_ops = {
 	.prepare = xiaomi_mca_prepare,
+	.suspend_noirq = xiaomi_mca_check_sleep,
 	.complete = xiaomi_mca_complete,
 };
 

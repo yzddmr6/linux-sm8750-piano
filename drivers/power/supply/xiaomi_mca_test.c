@@ -3088,10 +3088,15 @@ static void xiaomi_mca_test_wired_wake_reconnect(struct kunit *test)
 	f->type = MCA_TYPE_CDP;
 	mca_test_wired_tick(f);
 	KUNIT_EXPECT_FALSE(test, mca->charge_awake);
+	/* A complete replug after prepare must be caught before platform sleep. */
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_prepare(mca->dev), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_pm_ops.suspend_noirq(mca->dev), 0);
 	old = mca->input_generation;
 	xiaomi_mca_ucsi_update(mca, MCA_UCSI_OFFLINE);
 	xiaomi_mca_ucsi_update(mca, MCA_UCSI_CONNECTED);
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_apply_wired_sample(mca, old, 0, MCA_TYPE_CDP));
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_pm_ops.suspend_noirq(mca->dev), -EBUSY);
+	xiaomi_mca_complete(mca->dev);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_prepare(mca->dev), -EBUSY);
 	f->type = MCA_TYPE_UNKNOWN;
 	mca_test_wired_tick(f);
