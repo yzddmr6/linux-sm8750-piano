@@ -2736,8 +2736,9 @@ static void sc8547_attach_work(struct work_struct *work)
 		int faults = sc8547_take_faults();
 		int vsys = sc8547_get_output_mv(sc, SC8547_REG_19);
 
-		/* 24924 non-bidirectional, single-pack GET_BATT_VOL cable
-		 * compensation from the AP PHY. Use the sum of both REG13s.
+		/* 24926 has no external_gauge_support. In the stock AP PHY
+		 * GET_BATT_VOL uses REG1B for gauge_vbatt and both REG13s
+		 * for cp_ichg. The pack gauge still owns the cell curve.
 		 */
 		sc->master_ibus_ma = cibus < 0 ? -1 : cibus;
 		sc->slave_ibus_ma = slave_ma < 0 ? -1 : slave_ma;
@@ -2749,8 +2750,8 @@ static void sc8547_attach_work(struct work_struct *work)
 		sc->slave_enabled = sc8547_slave_enabled();
 		sc->master_enabled = sc8547_read_byte(sc, SC8547_REG_07, &r7) ?
 			-1 : !!(r7 & SC8547_CHG_EN_MASK);
-		if (!gret && gvbat > 0 && vsys > 0 && vbus > 0 && cibus >= 0 && slave_ma >= 0)
-			sc->adapter_vbat_mv = vbus / 2 - (vsys - gvbat) / 4 -
+		if (cpbat > 0 && vsys > 0 && vbus > 0 && cibus >= 0 && slave_ma >= 0)
+			sc->adapter_vbat_mv = vbus / 2 - (vsys - cpbat) / 4 -
 					      cibus_total * 75 / 1000;
 		else
 			sc->adapter_vbat_mv = 0;
@@ -3104,8 +3105,10 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 #endif
 	status->responded = sc->responded;
 	status->first_ufcs_timeout = sc->first_ufcs_timeout;
-	if (sc->auto_state == SC_AUTO_DELIVER && sc->fastchg_deliver)
+	if (sc->auto_state == SC_AUTO_DELIVER && sc->fastchg_deliver) {
 		status->delivering = ERHAI_SERIAL;
+		status->serial_pumping = sc->cp_enabled;
+	}
 	if (sc->auto_protection)
 		status->protected |= ERHAI_SERIAL;
 }

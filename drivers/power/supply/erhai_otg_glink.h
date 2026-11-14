@@ -30,6 +30,7 @@ struct erhai_probe_status {
 	bool first_ufcs_timeout;
 	bool wired_online; /* Input from the current USB_ONLINE sample. */
 	bool connector_blocked;
+	bool serial_pumping;
 };
 
 /* All callbacks run under battmgr's charge_lock, including suspend/teardown. */
