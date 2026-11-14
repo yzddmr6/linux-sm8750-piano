@@ -4629,7 +4629,50 @@ static void xiaomi_mca_test_software_full_samples(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mca->term_count, 0);
 }
 
+#ifdef MCA_CHARGE_EXPERIMENT
+static void xiaomi_mca_test_experiment(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	INIT_DELAYED_WORK(&mca->poll_work, mca_test_idle_poll);
+	f->cells[0].capacity = f->cells[1].capacity = 50;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_experiment_low(3500, 9, 0));
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_experiment_low(3499, 50, 0));
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_experiment_low(4000, 8, 0));
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_experiment_low(4000, 50, -EIO));
+	f->cells[1].voltage = 3499000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_experiment_command(mca, "discharge"), -ERANGE);
+	f->cells[1].voltage = 4000000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_experiment_command(mca, "resume"), -EINVAL);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_experiment_command(mca, "enable 0"), -EPERM);
+	mca_test_stage(test, f);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_experiment_command(mca, "observe"), -EBUSY);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_experiment_command(mca, "discharge"), 0);
+	KUNIT_EXPECT_TRUE(test, mca->experiment);
+	KUNIT_EXPECT_FALSE(test, f->stage_on);
+	KUNIT_EXPECT_EQ(test, f->icl, 0);
+	KUNIT_EXPECT_NE(test, f->fcc, 0); /* only the factory ICL vote */
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_experiment_command(mca, "resume"), 0);
+	cancel_delayed_work_sync(&mca->poll_work);
+	KUNIT_EXPECT_FALSE(test, mca->experiment);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
+	KUNIT_EXPECT_EQ(test, f->icl, 500);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_experiment_command(mca, "observe"), 0);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_experiment_command(mca, "enable 0"), 0);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_experiment_command(mca, "enable 1"), 0);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+	mca->otg_active = true;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_experiment_command(mca, "icl 500"), -EBUSY);
+}
+#endif
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+#ifdef MCA_CHARGE_EXPERIMENT
+	KUNIT_CASE(xiaomi_mca_test_experiment),
+#endif
+
 	KUNIT_CASE(xiaomi_mca_test_stock_handoff_order),
 	KUNIT_CASE(xiaomi_mca_test_822s_read_failure),
 	KUNIT_CASE(xiaomi_mca_test_full_recharge_matrix),

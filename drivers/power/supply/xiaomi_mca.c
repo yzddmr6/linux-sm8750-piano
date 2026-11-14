@@ -630,6 +630,9 @@ struct mca_connector {
 };
 
 struct xiaomi_mca {
+#ifdef MCA_CHARGE_EXPERIMENT
+	bool experiment;
+#endif
 	struct mca_connector connector;
 	/* A policy tick uses one observation for FV, buck and pump control. */
 	const struct xiaomi_mca_cells *poll_cells;
@@ -790,6 +793,20 @@ struct xiaomi_mca {
 	size_t reply_len;
 	struct xiaomi_mca_stats stats;
 };
+
+static bool xiaomi_mca_experiment_active(struct xiaomi_mca *mca)
+{
+#ifdef MCA_CHARGE_EXPERIMENT
+	return mca->experiment;
+#else
+	return false;
+#endif
+}
+
+#ifdef MCA_CHARGE_EXPERIMENT
+static int xiaomi_mca_experiment_command(struct xiaomi_mca *mca, const char *command);
+static int xiaomi_mca_experiment_battery(struct xiaomi_mca *mca);
+#endif
 
 /* The poll mutex keeps the saved attachment fixed throughout an exchange. */
 static bool xiaomi_mca_auth_current(struct xiaomi_mca *mca, u32 generation)
@@ -1259,8 +1276,8 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		 * Direct HIZ and restart-AICL likewise have no proxy getter.
 		 */
 		if (prop == MCA_PROP_INPUT_CURRENT_LIMIT || prop == MCA_PROP_CHARGE_CURRENT) {
-			if (!mca->cp_input_suspended ||
-			    (mca->cp != MCA_CP_OPENING && mca->cp != MCA_CP_ON && mca->cp != MCA_CP_STOPPING))
+			if (!xiaomi_mca_experiment_active(mca) && (!mca->cp_input_suspended ||
+			    (mca->cp != MCA_CP_OPENING && mca->cp != MCA_CP_ON && mca->cp != MCA_CP_STOPPING)))
 				return -EPERM;
 			if (prop == MCA_PROP_INPUT_CURRENT_LIMIT)
 				mca->icl_written = true;
@@ -5098,6 +5115,21 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		if (xiaomi_mca_clear_auth(mca))
 			goto out;
 		xiaomi_mca_process_notifications(mca);
+#ifdef MCA_CHARGE_EXPERIMENT
+		if (mca->experiment) {
+			if (!xiaomi_mca_experiment_battery(mca))
+				goto out;
+			dev_info(mca->dev, "laboratory discharge ended: battery floor or unreadable gauge\n");
+			mca->experiment = false;
+			mca->cp = MCA_CP_OFF;
+			mca->ffc_active = mca->ffc_done = mca->charging_done = false;
+			mca->mipps_attempted = mca->auth_ok = false;
+			mca->buck_resume_pending = true;
+			mca->icl_set_ma = mca->fcc_set_ma = 0;
+			mca->hv = MCA_HV_OFF;
+			mca->hv_retry = jiffies;
+		}
+#endif
 		if (charge_policy || READ_ONCE(mca->charge_end) < 100 || mca->charge_disabled) {
 			xiaomi_mca_sample_cells(mca, &cells);
 			mca->poll_cells = &cells;
@@ -6038,6 +6070,134 @@ static int xiaomi_mca_connector_init(struct xiaomi_mca *mca)
 	return PTR_ERR_OR_ZERO(c->cutoff);
 }
 
+#ifdef MCA_CHARGE_EXPERIMENT
+/* Only the experiment module defines this macro; no product switch. */
+static bool xiaomi_mca_experiment_low(int millivolts, int percent, int error)
+{
+	/* End the intentional discharge before cell undervoltage protection.
+	 * Both the voltage and SOC floors are mandatory, independent signals.
+	 */
+	return error || millivolts < 3500 || percent <= 8;
+}
+
+static int xiaomi_mca_experiment_battery(struct xiaomi_mca *mca)
+{
+	int vbat, ibat, cold, hot, vmin, imax, soc = 100, n, ret;
+	union power_supply_propval val;
+
+	ret = xiaomi_mca_gauges(mca, &vbat, &ibat, &cold, &hot, &vmin, &imax, NULL);
+	for (n = 0; !ret && n < ARRAY_SIZE(xiaomi_mca_supplied_to); n++) {
+		struct power_supply *psy = power_supply_get_by_name(xiaomi_mca_supplied_to[n]);
+
+		if (!psy)
+			return -ENODEV;
+		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_CAPACITY, &val);
+		power_supply_put(psy);
+		if (!ret && (val.intval < 0 || val.intval > 100))
+			ret = -ENODATA;
+		if (!ret)
+			soc = min(soc, val.intval);
+	}
+	return xiaomi_mca_experiment_low(vmin, soc, ret) ? (ret ?: -ERANGE) : 0;
+}
+
+static int xiaomi_mca_experiment_command(struct xiaomi_mca *mca, const char *command)
+{
+	unsigned int value;
+	int ret = 0, vbat, ibat, cold, hot, vmin, imax;
+	u8 enable;
+
+	guard(mutex)(&mca->lock);
+	if (mca->sleeping || !mca->service_up)
+		return -EHOSTDOWN;
+	if (!strcmp(command, "resume")) {
+		if (!mca->experiment || xiaomi_mca_cp_active(mca))
+			return -EINVAL;
+		/* The experiment is a deliberate new run on the existing cable. */
+		/* Clear the experiment first. Normal policy keeps reconciling the
+		 * positive votes even if one firmware acknowledgement is lost.
+		 */
+		mca->experiment = false;
+		mca->cp = MCA_CP_OFF;
+		mca->ffc_active = mca->ffc_done = mca->charging_done = false;
+		mca->term_count = mca->buck_cv_steps = mca->buck_cv_fcc = 0;
+		mca->mipps_attempted = mca->auth_ok = false;
+		mca->buck_resume_pending = true;
+		mca->hv = MCA_HV_OFF;
+		mca->hv_retry = jiffies;
+		mca->icl_set_ma = mca->fcc_set_ma = 0;
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, 500);
+		ret = ret ?: xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, 500);
+		mod_delayed_work(system_wq, &mca->poll_work, 0);
+		return ret;
+	}
+	if (mca->otg_active || mca->otg_requested || mca->pen_on || mca->pen_dirty ||
+	    mca->connector.tripped || xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE) != 1)
+		return -EBUSY;
+	if (!strcmp(command, "discharge")) {
+		ret = xiaomi_mca_experiment_battery(mca);
+		if (ret)
+			return ret;
+		ret = xiaomi_mca_cp_stop(mca, "laboratory discharge");
+		if (ret)
+			return ret;
+		mca->experiment = true;
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, 0);
+		if (ret) {
+			mca->experiment = false;
+			mca->buck_resume_pending = true;
+		}
+	} else if (!strcmp(command, "observe")) {
+		/* Freeze ordinary buck policy without changing the state under
+		 * measurement. FFC needs AP termination, so cannot be frozen.
+		 */
+		if (xiaomi_mca_cp_active(mca) || mca->ffc_active)
+			return -EBUSY;
+		mca->experiment = true;
+	} else {
+		if (!mca->experiment || xiaomi_mca_cp_active(mca))
+			return -EPERM;
+		if (sscanf(command, "icl %u", &value) == 1) {
+			ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, value);
+		} else if (sscanf(command, "enable %u", &value) == 1 && value <= 1) {
+			if (value) {
+				ret = xiaomi_mca_gauges(mca, &vbat, &ibat, &cold, &hot, &vmin, &imax, NULL);
+				if (ret)
+					return ret;
+				if (cold < 8 || hot >= 48 || vbat > MCA_TERM_FULL_MV || mca->charge_hold)
+					return -ERANGE;
+			}
+			enable = value;
+			ret = xiaomi_mca_write_blob(mca, MCA_PROP_CHARGING_ENABLED, &enable, 1);
+		} else {
+			return -EINVAL;
+		}
+	}
+	return ret;
+}
+
+static ssize_t xiaomi_mca_experiment_write(struct file *file, const char __user *buf,
+					 size_t count, loff_t *pos)
+{
+	char command[40];
+	int ret;
+
+	if (!count || count >= sizeof(command))
+		return -EINVAL;
+	if (copy_from_user(command, buf, count))
+		return -EFAULT;
+	command[count] = 0;
+	ret = xiaomi_mca_experiment_command(file->private_data, strim(command));
+	return ret ?: count;
+}
+
+static const struct file_operations xiaomi_mca_experiment_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.write = xiaomi_mca_experiment_write,
+};
+#endif
+
 static int xiaomi_mca_probe(struct auxiliary_device *adev,
 			    const struct auxiliary_device_id *id)
 {
@@ -6119,6 +6279,11 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 		return ret;
 
 	mca->debugfs = debugfs_create_dir(dev_name(dev), NULL);
+#ifdef MCA_CHARGE_EXPERIMENT
+	debugfs_create_file("charge_experiment", 0200, mca->debugfs, mca,
+			    &xiaomi_mca_experiment_fops);
+#endif
+
 	debugfs_create_file("status", 0400, mca->debugfs, mca, &xiaomi_mca_status_fops);
 	debugfs_create_file("stats", 0400, mca->debugfs, mca, &xiaomi_mca_stats_fops);
 	debugfs_create_file("frames", 0400, mca->debugfs, mca, &xiaomi_mca_frames_fops);
