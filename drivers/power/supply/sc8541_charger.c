@@ -430,6 +430,16 @@ static int sc8541_otg_locked(struct sc8541 *sc, enum sc8541_otg_action action)
 		return -ENODEV;
 	if (sc->enabled || sc->wd_owned)
 		return -EBUSY;
+	/* Piano quickchg stop: mode reset precedes buck votes, ADC off follows
+	 * them. Forward/reverse ownership is mutually exclusive throughout.
+	 */
+	if (action == SC8541_CHARGE_MODE_RESET || action == SC8541_CHARGE_ADC_OFF) {
+		if (sc->otg_owned || sc->pen_owned)
+			return -EBUSY;
+		if (action == SC8541_CHARGE_MODE_RESET)
+			return sc8541_otg_restore_mode(sc);
+		return sc8541_write_check(sc, SC8541_ADC_CTRL1, SC8541_ADC_EN, 0);
+	}
 	if (action == SC8541_PEN_ISOLATE) {
 		if (sc->otg_owned)
 			return -EBUSY;
