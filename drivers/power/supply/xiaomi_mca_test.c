@@ -3050,8 +3050,9 @@ static void xiaomi_mca_test_taper_handoff(struct kunit *test)
 	KUNIT_EXPECT_LT(test, mca->cp_mv, 9500);
 	f->cells[0].current_ua = f->cells[1].current_ua = 1500000;
 	xiaomi_mca_cp_step(mca);
-	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
 	KUNIT_EXPECT_EQ(test, mca->cp_recharge_cv, 4540);
+	KUNIT_EXPECT_EQ(test, mca->cp_retry_ms, 0);
 	KUNIT_EXPECT_FALSE(test, mca->cp_fault);
 }
 
@@ -3574,7 +3575,7 @@ static void xiaomi_mca_test_ffc_handoff(struct kunit *test)
 	mca_register_ucsi_peer(test, f);
 	full_charge = charge_policy = hv_charge = cp_charge = true;
 	mca_test_stage(test, f);
-	f->tbat = 35;
+	f->tbat = 25;
 	f->type = mca->cp_type = MCA_TYPE_PD_PPS;
 	f->vbus = 9700000;
 	f->pdos[1] = (struct xiaomi_mca_pdo) {
@@ -3584,10 +3585,11 @@ static void xiaomi_mca_test_ffc_handoff(struct kunit *test)
 	guard(mutex)(&mca->lock);
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 	KUNIT_ASSERT_TRUE(test, mca->ffc_active);
-	/* A brief excursion beyond CV hands off to buck at > warm iterm. */
-	f->cells[0].voltage = 4541000;
+	/* Handoff above warm-zone iterm, at the stock PPS taper threshold. */
+	f->cells[0].voltage = 4539000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 1500000;
 	xiaomi_mca_cp_step(mca);
-	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
 	f->type = MCA_TYPE_PD;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
@@ -3614,7 +3616,7 @@ static void xiaomi_mca_test_ffc_handoff(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
 
 	/* The cell endpoint wins even while contract telemetry is absent. */
-	f->cells[1].current_ua = 1164000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 1175000;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 	KUNIT_EXPECT_TRUE(test, mca->ffc_done);
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);

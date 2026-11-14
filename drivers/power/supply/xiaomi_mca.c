@@ -356,6 +356,7 @@ MODULE_PARM_DESC(mipps_auth,
 #define MCA_CP_POLL_MS		500
 #define MCA_CP_VBAT_MIN_MV	3450	/* stock min_vbat */
 #define MCA_CP_VBAT_MAX_MV	4473	/* normal_volt_para18_35/35_48 */
+#define MCA_CP_TAPER_FCC_MA	3000
 #define MCA_CP_VBAT_HYS_MV	13	/* pps_taper_vol_hys + quick_chg_fv_hys */
 #define MCA_CP_CELL_OCP_MA	7000	/* lower of stock ocp_threshold 9/7 A */
 /* stock normal_volt_para18_35: 8 A, 7.23 A from 4150 mV */
@@ -2783,7 +2784,13 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	mca->cp_stop_reason = NULL;
 	dev_info(mca->dev, "direct charging stopped: %s\n", why);
 
-	xiaomi_mca_cp_backoff(mca, why);
+	if (!strcmp(why, "taper complete")) {
+		mca->cp = MCA_CP_OFF;
+		mca->cp_last_exit = why;
+		mca->cp_retry_ms = 0;
+	} else {
+		xiaomi_mca_cp_backoff(mca, why);
+	}
 	mca->cp_target_ma = 0;
 	mca->hv = MCA_HV_OFF;
 	mca->hv_retry = jiffies;
@@ -3519,12 +3526,12 @@ static bool xiaomi_mca_cp_bus_trip(struct xiaomi_mca *mca, int ibus)
 static int xiaomi_mca_cp_cv_request(u32 type, int previous, int requested, int vbat, int cv)
 {
 	int step = type == MCA_TYPE_HVDCP_3_B ? 200 : MCA_CP_REG_STEP_MV;
-	int headroom = cv - 9 - vbat;
+	int headroom = cv - vbat;
 
-	if (headroom <= 0)
-		return min(requested, previous - clamp(roundup(-2 * headroom, step),
+	if (headroom <= 3) /* stock fv_hys_delta_mv */
+		return min(requested, previous - clamp(roundup(2 * (3 - headroom), step),
 						       step, MCA_CP_REG_MAX_STEP_MV));
-	if (requested > previous && 2 * headroom < max(step, requested - previous))
+	if (requested > previous && 2 * (headroom - 9) < max(step, requested - previous))
 		return previous;
 	return requested;
 }
@@ -3579,10 +3586,18 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	}
 	cv = xiaomi_mca_cp_vbat_max(mca);
 	taper = vbat >= cv - 9;	/* pps_taper_vol_hys */
-	if (vmin < MCA_CP_VBAT_MIN_MV || vbat > cv + (mca->ffc_active ? 0 : 4) ||
-	    (taper && (mca->cp != MCA_CP_ON || ibat <= 3000))) {
-		mca->cp_recharge_cv = taper ? cv : 0;
-		xiaomi_mca_cp_stop(mca, "battery voltage reached");
+	/* The pump CV setpoint is below the cell table's terminal voltage.
+	 * Regulate through that gap, while retaining a hard cell ceiling.
+	 */
+	if (vmin < MCA_CP_VBAT_MIN_MV ||
+	    vbat >= (!full_charge ? MCA_TERM_DEFAULT_MV : mca->ffc_active ? 4550 : mca->term_hot ? MCA_TERM_HOT_MV :
+		     mca->cold_fv ? MCA_TERM_COLD_MV : MCA_TERM_FULL_MV)) {
+		xiaomi_mca_cp_stop(mca, "cell voltage outside envelope");
+		return;
+	}
+	if (taper && (mca->cp != MCA_CP_ON || ibat <= MCA_CP_TAPER_FCC_MA)) {
+		mca->cp_recharge_cv = cv;
+		xiaomi_mca_cp_stop(mca, "taper complete");
 		return;
 	}
 	if (mca->cell_zone < MCA_CP_TBAT_MIN ||
@@ -3762,7 +3777,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		if (over > 0)
 			mv -= clamp(over / MCA_CP_REG_STEP_MA * MCA_CP_REG_STEP_MV,
 				    MCA_CP_REG_STEP_MV, MCA_CP_REG_MAX_STEP_MV);
-		else if (taper || (ibat > ibat_max && mca->cp_ibat_trip <= ibat_max))
+		else if (ibat > ibat_max && mca->cp_ibat_trip <= ibat_max)
 			mv -= MCA_CP_REG_STEP_MV;
 		else if (ibus + band <= target && ibat + 2 * band <= ibat_max)
 			mv += MCA_CP_REG_STEP_MV;
