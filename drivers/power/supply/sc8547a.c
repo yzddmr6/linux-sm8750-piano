@@ -512,7 +512,8 @@ struct sc8547a_device {
 	enum sc8547_auto_state	auto_state;
 	unsigned long		auto_identify_deadline;
 	const struct erhai_charge_curve *auto_curve;
-	int curve_temp, curve_sample_temp, warm_boundary;
+	int curve_temp, curve_sample_temp;
+	int curve_temp_bounds[6];
 	unsigned int thermal_ma;
 	unsigned int curve_ma;	/* selected CC/CV table */
 	int			auto_curve_idx;	/* current row (descends only) */
@@ -2266,27 +2267,52 @@ static u8 sc8547_adapter_cap(u8 model)
 	return 0;
 }
 
-/* oplus_chg_vooc query_temp_range / rang_rise/drop_update: the
- * initial warm boundary is 44 C. Only after crossing it does the reverse
- * transition acquire 2 C hysteresis. Keep that boundary across re-arms.
+/* oplus_chg_vooc query_temp_range / rang_rise/drop_update. Apply
+ * hysteresis to the reverse transition only, retaining it across a
+ * temperature re-arm. VOOC_TEMP_RANGE_THD is 10, THD_HIGH is 20;
+ * these are not the common buck's BATT_TEMP_HYST.
  */
-static int sc8547_curve_temperature(struct sc8547a_device *sc, int temp, bool entering)
+#define SC8547_TEMP_RANGE_HYST_DDC 10
+#define SC8547_TEMP_RANGE_HIGH_DDC 20
+static int sc8547_curve_temperature(struct sc8547a_device *sc, int temp,
+				    int soc, bool entering)
 {
-	if (!sc->warm_boundary)
-		sc->warm_boundary = 440;
-	if (entering)
-		return temp >= sc->warm_boundary ? max(temp, 440) : min(temp, 439);
-	if (sc->curve_temp >= 440 && temp < sc->warm_boundary) {
-		sc->warm_boundary = 460;
-		return min(temp, 439);
+	static const int bounds[] = { 50, 120, 160, 210, 350, 440 };
+	unsigned int region, previous;
+	int low, high, margin;
+
+	if (!sc->curve_temp_bounds[0])
+		memcpy(sc->curve_temp_bounds, bounds, sizeof(bounds));
+	for (region = 0; region < ARRAY_SIZE(bounds); region++)
+		if ((entering ? temp : sc->curve_temp) <
+		    (entering ? sc->curve_temp_bounds[region] : bounds[region]))
+			break;
+	previous = region;
+	low = region ? sc->curve_temp_bounds[region - 1] : 0;
+	high = region < ARRAY_SIZE(bounds) ? sc->curve_temp_bounds[region] : 510;
+	if (!entering && temp > high && region < ARRAY_SIZE(bounds)) {
+		/* NORMAL_LOW and high-SOC LITTLE_COOL transitions keep the
+		 * other dynamic boundaries; the remaining rise paths reset.
+		 */
+		if (region < 2 || region == 5 || (region < 4 && soc <= 90))
+			memcpy(sc->curve_temp_bounds, bounds, sizeof(bounds));
+		margin = region == 2 && soc <= 90 ? SC8547_TEMP_RANGE_HIGH_DDC :
+			 SC8547_TEMP_RANGE_HYST_DDC;
+		sc->curve_temp_bounds[region] = bounds[region] - margin;
+		region++;
+	} else if (!entering && temp < low && region) {
+		memcpy(sc->curve_temp_bounds, bounds, sizeof(bounds));
+		region--;
+		sc->curve_temp_bounds[region] = bounds[region] + SC8547_TEMP_RANGE_HYST_DDC;
 	}
-	if (sc->curve_temp < 440 && temp > sc->warm_boundary) {
-		sc->warm_boundary = 420;
-		return max(temp, 440);
-	}
-	if (sc->curve_temp >= 440 || temp >= 440)
+	if (!entering && region == previous)
 		return sc->curve_temp;
-	return erhai_curve_temp(sc->curve_temp, temp);
+	/* The tables use fixed region endpoints; the AP sends the region
+	 * index selected with the dynamic thresholds to the stock PHY.
+	 */
+	low = region ? bounds[region - 1] : 0;
+	high = region < ARRAY_SIZE(bounds) ? bounds[region] - 1 : 509;
+	return min(max(temp, low), high);
 }
 
 /* oplus_chg_vooc rang_rise/drop_update and fastchg_range_switch.
@@ -2324,7 +2350,7 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 
 	raw = erhai_curve_select(svooc_curves, soc, temp);
 	sc->curve_sample_temp = temp;
-	sc->curve_temp = sc8547_curve_temperature(sc, temp, entering || !sc->auto_curve);
+	sc->curve_temp = sc8547_curve_temperature(sc, temp, soc, entering || !sc->auto_curve);
 	curve = erhai_curve_select(svooc_curves, soc, sc->curve_temp);
 	/* vooc_high_temp (entry) and over_high_temp (running). */
 	if (!raw || !curve || mv <= SC8547_CELL_MIN_VALID_MV ||
@@ -3091,7 +3117,7 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u frame_gap_us=%u max_gap_us=%u "
 		"exits=%u last_exit=%s\n",
 		sc->curve_temp, sc->curve_sample_temp, sc->curve_ma / 100, sc->thermal_ma / 100,
-		sc->auto_curve_idx, sc->warm_boundary,
+		sc->auto_curve_idx, sc->curve_temp_bounds[5],
 		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1,
 		sc->allow_sent, sc->pre_allow_buck_ua, sc->first_request,
 		sc->fastchg_deliver ? sc->fastchg_curr_code : 0, sc->serial_request, sc->serial_request * 100,
@@ -3312,7 +3338,7 @@ int sc8547a_serial_session(bool enable)
 		if (sc->ufcs_owner || !sc8547_slave_dev || sc->irq <= 0 || pps_cp_engaged || pps_adc_hold)
 			return -EAGAIN;
 		sc->auto_state = SC_AUTO_IDENTIFY;
-		sc->warm_boundary = 440;
+		memset(sc->curve_temp_bounds, 0, sizeof(sc->curve_temp_bounds));
 		sc->fastchg_auto = true;
 		sc->serial_quiesced = false;
 		sc->adc_over_count = 0;
