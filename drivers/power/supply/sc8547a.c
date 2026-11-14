@@ -2034,7 +2034,8 @@ static int sc8547_read_gauge(struct sc8547a_device *sc, int *soc, int *temp_ddc,
 /* SUPERVOOC model IDs and rated watts from OnePlusOSS sm8750,
  * cc463675855a, oplus_chg_vooc.c adapter_id_table (GPL-2.0-only).
  * Use the 11 V SUPERVOOC rating
- * (100 mA per step) and the live connector current limit together. Unknown models stay on the ordinary charging path.
+ * (100 mA per step). The serial master checks the circuit resistance
+ * and regulates its output; the ADSP 5 V DCP ICL is unrelated.
  */
 static u8 sc8547_adapter_cap(u8 model)
 {
@@ -2369,7 +2370,7 @@ static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
  */
 static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 {
-	int soc, temp_ddc, cell_mv, ret, ua;
+	int soc, temp_ddc, cell_mv, ret;
 
 	if (!sc->adapter_check_ok || !sc->model_received) {
 		if (time_before(jiffies, sc->auto_identify_deadline))
@@ -2380,9 +2381,7 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 		return;
 	}
 
-	ua = erhai_otg_adsp_usb_prop(4); /* USB_CURR_MAX, microamps */
-	sc->adapter_cap = min_t(int, sc8547_adapter_cap(sc->adapter_model_ver),
-				max(ua, 0) / 100000);
+	sc->adapter_cap = sc8547_adapter_cap(sc->adapter_model_ver);
 	if (sc->adapter_type != SC_ADAPTER_SVOOC || !sc->adapter_cap) {
 		sc8547_auto_decline(sc, "not an SVOOC adapter");
 		return;
