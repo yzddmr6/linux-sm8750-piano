@@ -78,6 +78,20 @@ properties:
     description: Charge pump cooperating with the Xiaomi MCA firmware for OTG.
     $ref: /schemas/types.yaml#/definitions/phandle
 
+  xiaomi,connector-cutoff-gpios:
+    description: Active-high wired connector protection MOS control on Piano.
+    maxItems: 1
+
+  io-channels:
+    items:
+      - description: First wired connector thermistor
+      - description: Second wired connector thermistor
+
+  io-channel-names:
+    items:
+      - const: connector
+      - const: connector2
+
   charge-pumps:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     minItems: 2
@@ -143,10 +157,36 @@ allOf:
         properties:
           compatible:
             contains:
+              const: xiaomi,piano-pmic-glink
+    then:
+      properties:
+        xiaomi,connector-cutoff-gpios: false
+        io-channels: false
+        io-channel-names: false
+
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
               const: oneplus,pad2pro-pmic-glink
     then:
       properties:
-        charge-pumps: false
+        xiaomi,connector-cutoff-gpios:
+    description: Active-high wired connector protection MOS control on Piano.
+    maxItems: 1
+
+  io-channels:
+    items:
+      - description: First wired connector thermistor
+      - description: Second wired connector thermistor
+
+  io-channel-names:
+    items:
+      - const: connector
+      - const: connector2
+
+  charge-pumps: false
 
 additionalProperties: false
 

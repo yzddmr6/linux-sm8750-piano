@@ -2582,6 +2582,40 @@ static void xiaomi_mca_test_threshold_stop_failure_sleep(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->mca.voltage_written);
 }
 
+static void xiaomi_mca_test_connector(struct kunit *test)
+{
+	static const struct {
+		int prev[2], temp[2];
+		bool active, wired, otg, trip;
+	} cases[] = {
+		{ { 30000, 30000 }, { 65000, 30000 }, false, true, false, true },
+		{ { 30000, 60000 }, { 30000, 60000 }, false, false, true, true },
+		{ { 59999, 30000 }, { 59999, 30000 }, false, true, false, false },
+		{ { 31000, 29000 }, { 35000, 30000 }, false, true, false, true },
+		{ { 31001, 31000 }, { 35000, 35000 }, false, true, false, false },
+		{ { 42000, 30000 }, { 42000, 36000 }, false, true, false, false },
+		{ { 31000, 31000 }, { 34999, 32000 }, false, true, false, false },
+		{ { 30000, 30000 }, { 70000, 30000 }, false, false, false, false },
+		{ { 55000, 54500 }, { 55000, 54500 }, true, true, false, true },
+		{ { 55000, 54500 }, { 54999, 54500 }, true, true, false, false },
+		{ { 55000, 54500 }, { INT_MIN, 54000 }, true, false, false, true },
+		{ { 50000, INT_MIN }, { INT_MIN, 65000 }, false, true, false, true },
+		{ { INT_MIN, 30000 }, { 45000, 31000 }, false, true, false, false },
+		{ { 48000, 44000 }, { 53000, 44000 }, true, false, true, true },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct mca_connector c = { .sampled = ms_to_ktime(1000),
+					   .tripped = cases[i].active };
+
+		memcpy(c.temp, cases[i].prev, sizeof(c.temp));
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_connector_trip(&c, cases[i].temp,
+				    ms_to_ktime(2000), cases[i].wired || cases[i].otg),
+				    cases[i].trip, "case %d", i);
+	}
+}
+
 static void xiaomi_mca_test_wake_policy(struct kunit *test)
 {
 	/* USB_REAL_TYPE names in Piano firmware order, including its unnamed
@@ -3745,6 +3779,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_auth_stop_failure),
 	KUNIT_CASE(xiaomi_mca_test_vbus_error_not_detach),
 	KUNIT_CASE(xiaomi_mca_test_threshold_interface),
+	KUNIT_CASE(xiaomi_mca_test_connector),
 	KUNIT_CASE(xiaomi_mca_test_wake_policy),
 	KUNIT_CASE(xiaomi_mca_test_wired_wake_transitions),
 	KUNIT_CASE(xiaomi_mca_test_wired_wake_reconnect),
