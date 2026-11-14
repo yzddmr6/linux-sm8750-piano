@@ -4071,6 +4071,24 @@ static int xiaomi_mca_cp_cv_request(u32 type, int previous, int requested, int v
 	return requested;
 }
 
+/* Piano select_stage 0x57ac..0x5804 requires reaching the intermediate
+ * table voltage. Regulation 0x6dd4..0x6f78 allows a 20 mV CC increment
+ * up to that voltage, then CV decreases at the target, not target-3/-9.
+ * The final taper headroom is a separate endpoint, never an earlier row.
+ */
+static int xiaomi_mca_cp_row_cv_request(struct xiaomi_mca *mca, int previous,
+				       int requested, int vbat, int cv)
+{
+	int step = mca->cp_type == MCA_TYPE_HVDCP_3_B ? 200 : MCA_CP_REG_STEP_MV;
+
+	if (mca->cp_stage + 1 == xiaomi_mca_profile_counts[mca->cp_profile])
+		return xiaomi_mca_cp_cv_request(mca->cp_type, previous, requested, vbat, cv);
+	if (vbat >= cv)
+		return min(requested, previous - clamp(roundup(2 * (vbat - cv), step),
+						      step, MCA_CP_REG_MAX_STEP_MV));
+	return requested;
+}
+
 static bool xiaomi_mca_cp_taper_complete(struct xiaomi_mca *mca, bool near_cv, int ibat)
 {
 	bool last = mca->cp_stage + 1 == xiaomi_mca_profile_counts[mca->cp_profile];
@@ -4346,7 +4364,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	}
 
 	mv = clamp_t(u32, mv, 2 * vbat, 2 * vbat + MCA_CP_REQ_MAX_DELTA_MV);
-	mv = xiaomi_mca_cp_cv_request(mca->cp_type, previous, mv, vbat, cv);
+	mv = xiaomi_mca_cp_row_cv_request(mca, previous, mv, vbat, cv);
 	if (xiaomi_mca_cp_request(mca, mv)) {
 		xiaomi_mca_cp_learn_drop(mca);
 		xiaomi_mca_cp_stop(mca, "request refused");

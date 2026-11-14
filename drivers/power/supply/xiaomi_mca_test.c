@@ -5039,9 +5039,43 @@ static void xiaomi_mca_test_stock_failure_budget(struct kunit *test)
 	}
 }
 
+static void xiaomi_mca_test_cycle4_intermediate_cv(struct kunit *test)
+{
+	struct xiaomi_mca *mca = kunit_kzalloc(test, sizeof(*mca), GFP_KERNEL);
+	static const struct { int stage, mv, ma, cv; } rows[] = {
+		{ 1, 4294, 9380, 4300 }, { 1, 4295, 7367, 4300 },
+		{ 1, 4296, 5055, 4300 }, { 2, 4469, 6422, 4475 },
+		{ 2, 4466, 4093, 4475 },
+	};
+	int n;
+
+	KUNIT_ASSERT_NOT_NULL(test, mca);
+	mca->cp_profile = MCA_PROFILE_FFC;
+	mca->cp_ma = 6000;
+	mca->cp_type = MCA_TYPE_PD_PPS;
+	for (n = 0; n < ARRAY_SIZE(rows); n++) {
+		mca->cp_stage = rows[n].stage;
+		xiaomi_mca_cp_ibat_limit(mca, rows[n].mv, rows[n].ma);
+		KUNIT_EXPECT_EQ(test, mca->cp_stage, rows[n].stage);
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_row_cv_request(mca, 9100, 9120,
+			rows[n].mv, rows[n].cv), 9120);
+		/* Once voltage actually reaches the row, native current condition applies. */
+		xiaomi_mca_cp_ibat_limit(mca, rows[n].cv, rows[n].ma);
+		KUNIT_EXPECT_EQ(test, mca->cp_stage,
+			rows[n].stage + (rows[n].ma <= (rows[n].stage == 1 ? 9040 : 7230)));
+	}
+	mca->cp_stage = 3;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_row_cv_request(mca, 9600, 9620, 4538, 4540),
+		xiaomi_mca_cp_cv_request(mca->cp_type, 9600, 9620, 4538, 4540));
+	mca->cp_stage = 0;
+	xiaomi_mca_cp_ibat_limit(mca, 3900, 11000);
+	KUNIT_EXPECT_EQ(test, mca->cp_stage, 0);
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_warm_termination_is_not_full),
 	KUNIT_CASE(xiaomi_mca_test_provider_late_start),
+	KUNIT_CASE(xiaomi_mca_test_cycle4_intermediate_cv),
 	KUNIT_CASE(xiaomi_mca_test_stock_failure_budget),
 	KUNIT_CASE(xiaomi_mca_test_exit_retry_class),
 	KUNIT_CASE(xiaomi_mca_test_real_full_v5),
