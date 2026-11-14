@@ -76,16 +76,12 @@
 #define SC8541_BUSOCP_STEP_MA	250
 
 /*
- * Protections programmed before switching starts. Battery OVP/alarm stay
- * below stock's 4800/4600 mV, with room for MCA's normal 4473 mV cutoff
- * and its optional 4540 mV cutoff. The former 4300/4250 mV protections
- * would stop the normal stock profile prematurely. The bus limits fit
- * a 2:1 stage fed from an 11 V PPS source; the
- * bus over-current limit can be raised for sources that offer more than
- * 3 A, up to the stock value.
+ * Piano stock DT bat-ovp-threshold / bat-ovp-alarm-threshold.
+ * These protect the pump's local battery node. MCA regulates the two
+ * gauge voltages to their temperature-dependent cell envelope.
  */
-#define SC8541_BATOVP_MV	4600
-#define SC8541_BATOVP_ALM_MV	4550
+#define SC8541_BATOVP_MV	4800
+#define SC8541_BATOVP_ALM_MV	4600
 #define SC8541_BUSOVP_MV	11000
 #define SC8541_BUSOVP_ALM_MV	10500
 #define SC8541_BUSOCP_MA	3500
