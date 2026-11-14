@@ -155,6 +155,7 @@ static const __le32 xiaomi_mca_piano_otg_cfg[] = {
  * This firmware uses 0x20/0x10, unlike the Onyx enum (1/2).
  */
 #define MCA_PROP_AICL_ENABLE	0x2012	/* u8 */
+#define MCA_PROP_RESTART_AICL		0x2014
 #define MCA_PROP_RERUN_AICL	0x2013	/* u8 */
 #define MCA_PROP_QC_PULSE	0x201d
 #define MCA_QC_UP		0x20
@@ -669,7 +670,8 @@ struct xiaomi_mca {
 	bool cp_parallel_done;
 	bool cp_cv_seen;
 	int cp_cv_peak, cp_cv_previous;
-	bool cp_input_suspended; /* may have taken effect before a lost ACK */
+	bool cp_input_suspended; /* owns the stock zero ICL/FCC votes */
+	bool cp_pause_applied, cp_restoring, legacy_hiz_cleared, buck_resume_pending;
 	unsigned int cp_fv_polls;
 	u32 cp_fv_base, pmic_fv_target;
 	u32 iterm_set_ma;
@@ -1081,7 +1083,8 @@ static int xiaomi_mca_restore_icl(struct xiaomi_mca *mca)
 
 	lockdep_assert_held(&mca->lock);
 
-	if (!mca->icl_written)
+	/* A type/source vote cannot override the active CP zero vote. */
+	if (!mca->icl_written || mca->cp_input_suspended)
 		return 0;
 
 	ret = xiaomi_mca_write(mca, MCA_PROP_INPUT_CURRENT_LIMIT, MCA_ICL_DEFAULT_MA);
@@ -1145,16 +1148,18 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 	case MCA_PROP_CID_CFG:
 		return len == sizeof(u32) && val == MCA_PIANO_CID_CFG;
 	case MCA_PROP_CHARGING_ENABLED:
-	case MCA_PROP_INPUT_SUSPEND:
 	case MCA_PROP_CP_STATE:
 	case MCA_PROP_CC_TOGGLE:
 		return len == 1 && *(const u8 *)data <= 1;
 	case MCA_PROP_OTG_CFG:
 		return len == sizeof(xiaomi_mca_piano_otg_cfg) &&
 		       !memcmp(data, xiaomi_mca_piano_otg_cfg, len);
+	case MCA_PROP_INPUT_SUSPEND:
+		/* Clear a legacy direct-HIZ write; never assert it for CP. */
+		return len == 1 && !*(const u8 *)data;
 	case MCA_PROP_INPUT_CURRENT_LIMIT:
 		return len == sizeof(u32) &&
-		       val >= MCA_ICL_MIN_MA && val <= MCA_ICL_5V_MAX_MA;
+		       (!val || (val >= MCA_ICL_MIN_MA && val <= MCA_ICL_5V_MAX_MA));
 	case MCA_PROP_TERM_VOLT:
 		/* Dynamic FV is checked against the policy's exact target below. */
 		return len == sizeof(u32) && val >= MCA_TERM_HOT_MV;
@@ -1164,9 +1169,10 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 			val == 1243 || val == 1250 || val == 1650 || val == 1657);
 	case MCA_PROP_CHARGE_CURRENT:
 		return len == sizeof(u32) &&
-		       val >= MCA_FCC_MIN_MA && val <= MCA_CP_PAR_FCC_MAX_MA;
+		       (!val || (val >= MCA_FCC_MIN_MA && val <= MCA_CP_PAR_FCC_MAX_MA));
 	case MCA_PROP_AICL_ENABLE:
 	case MCA_PROP_RERUN_AICL:
+	case MCA_PROP_RESTART_AICL:
 		return len == 1 && *(const u8 *)data == 1;
 	case MCA_PROP_QC_PULSE:
 		return cp_charge && len == sizeof(u32) && (val == MCA_QC_UP || val == MCA_QC_DOWN);
@@ -1224,7 +1230,10 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	if (len > sizeof(buf) || !xiaomi_mca_write_allowed(prop, data, len))
 		return -EPERM;
 	lockdep_assert_held(&mca->lock);
-	if (prop == MCA_PROP_CHARGING_ENABLED || prop == MCA_PROP_INPUT_SUSPEND) {
+	if (prop == MCA_PROP_INPUT_CURRENT_LIMIT && get_unaligned_le32(data) &&
+	    mca->cp_input_suspended && !mca->cp_restoring)
+		return -EBUSY;
+	if (prop == MCA_PROP_CHARGING_ENABLED) {
 		u8 enabled;
 
 		/* Stock qcom_subpmic_enable_charging sends one byte, not u32. */
@@ -1242,6 +1251,34 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 				return -ECONNRESET;
 		}
 		return enabled == *(const u8 *)data ? 0 : -EIO;
+	}
+	if (prop == MCA_PROP_INPUT_SUSPEND || prop == MCA_PROP_RESTART_AICL ||
+	    ((prop == MCA_PROP_INPUT_CURRENT_LIMIT || prop == MCA_PROP_CHARGE_CURRENT) &&
+	     !get_unaligned_le32(data))) {
+		/* The stock input_suspend voter resolves to ICL=0, not set_hiz.
+		 * Zero is a command; stock does not compare a readable setpoint.
+		 * Direct HIZ and restart-AICL likewise have no proxy getter.
+		 */
+		if (prop == MCA_PROP_INPUT_CURRENT_LIMIT || prop == MCA_PROP_CHARGE_CURRENT) {
+			if (!mca->cp_input_suspended ||
+			    (mca->cp != MCA_CP_OPENING && mca->cp != MCA_CP_ON && mca->cp != MCA_CP_STOPPING))
+				return -EPERM;
+			if (prop == MCA_PROP_INPUT_CURRENT_LIMIT)
+				mca->icl_written = true;
+			else
+				mca->fcc_written = true;
+		}
+		scoped_guard(spinlock_irqsave, &mca->rx_lock)
+			generation = mca->service_generation;
+		memcpy(buf, data, len);
+		ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
+		if (ret)
+			return ret;
+		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+			if (generation != mca->service_generation || !mca->service_up)
+				return -ECONNRESET;
+		}
+		return 0;
 	}
 	if (prop == MCA_PROP_TERM_VOLT) {
 		value = get_unaligned_le32(data);
@@ -1451,6 +1488,7 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 	 * actual charging is measured separately through the fuel gauges.
 	 */
 	if (prop == MCA_PROP_INPUT_CURRENT_LIMIT) {
+		mca->cp_pause_applied = false;
 		ret = xiaomi_mca_read(mca, prop, &readback);
 		if (ret)
 			return ret;
@@ -1757,7 +1795,11 @@ static void xiaomi_mca_reset_icl(struct xiaomi_mca *mca)
 /* The ADSP keeps the charge current too; put the fallback value back */
 static int xiaomi_mca_reset_fcc(struct xiaomi_mca *mca)
 {
-	int ret = xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, MCA_FCC_DEFAULT_MA);
+	int ret;
+
+	if (mca->cp_input_suspended)
+		return 0;
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, MCA_FCC_DEFAULT_MA);
 
 	if (!ret) {
 		mca->fcc_set_ma = 0;
@@ -2296,6 +2338,32 @@ static int xiaomi_mca_aicl(struct xiaomi_mca *mca, bool rerun)
 	return xiaomi_mca_write_blob(mca, MCA_PROP_AICL_ENABLE, &enabled, sizeof(enabled));
 }
 
+static int xiaomi_mca_restart_aicl(struct xiaomi_mca *mca)
+{
+	u8 restart = 1;
+
+	return xiaomi_mca_write_blob(mca, MCA_PROP_RESTART_AICL, &restart, 1);
+}
+
+static int xiaomi_mca_clear_legacy_hiz(struct xiaomi_mca *mca)
+{
+	u8 clear = 0;
+	int ret;
+
+	if (mca->legacy_hiz_cleared)
+		return 0;
+	/* The old direct-HIZ getter returned zero even while input was off.
+	 * Unconditionally withdraw our old request; an ACK is the contract.
+	 */
+	ret = xiaomi_mca_write_blob(mca, MCA_PROP_INPUT_SUSPEND, &clear, 1);
+	if (!ret) {
+		mca->legacy_hiz_cleared = true;
+		mca->buck_resume_pending = true;
+		mca->icl_set_ma = mca->fcc_set_ma = 0;
+	}
+	return ret;
+}
+
 /*
  * charge_policy: raise the input current limit to what the detected charger
  * type allows, never above what a PD source advertises at the voltage in
@@ -2350,8 +2418,12 @@ static void xiaomi_mca_apply_policy(struct xiaomi_mca *mca)
 			return;
 		}
 	}
+	if (mca->buck_resume_pending)
+		mca->icl_set_ma = mca->fcc_set_ma = 0;
 	if (charge_current)
 		xiaomi_mca_apply_fcc(mca, min(tbat, mca->coolest_temp), target);
+	if (mca->buck_resume_pending && charge_current && !mca->fcc_set_ma)
+		return;
 	if (target == mca->icl_set_ma)
 		return;
 
@@ -2373,6 +2445,16 @@ static void xiaomi_mca_apply_policy(struct xiaomi_mca *mca)
 		 xiaomi_mca_type_name(mca->real_type) ?: "Unknown", target,
 		 hv_ma ? "9 V" : "5 V", tbat);
 	mca->icl_set_ma = target;
+	if (mca->buck_resume_pending) {
+		u8 enabled = 1;
+
+		ret = xiaomi_mca_write_blob(mca, MCA_PROP_CHARGING_ENABLED, &enabled, 1);
+		ret = ret ?: xiaomi_mca_restart_aicl(mca);
+		if (!ret)
+			mca->buck_resume_pending = false;
+		else
+			dev_warn_ratelimited(mca->dev, "buck resume votes not complete: %d\n", ret);
+	}
 }
 
 static char *xiaomi_mca_supplied_to[] = { "bq27z561-0", "bq27z561-1" };
@@ -2846,12 +2928,20 @@ static int xiaomi_mca_cp_request(struct xiaomi_mca *mca, u32 mv)
  * Turn the stage off and go back to the buck charger: the next poll asks
  * the source for 9 V again and puts the buck limits back.
  */
+static int xiaomi_mca_cp_input_suspend(struct xiaomi_mca *mca, bool suspend);
+
 /* Buck charger share while direct charging */
 static int xiaomi_mca_cp_set_buck(struct xiaomi_mca *mca, u32 icl_ma,
 				 u32 fcc_ma)
 {
 	int ret;
 
+	if (mca->cp_input_suspended) {
+		/* Desired parallel votes; the effective stock vote stays zero. */
+		mca->icl_set_ma = icl_ma;
+		mca->fcc_set_ma = fcc_ma;
+		return xiaomi_mca_cp_input_suspend(mca, true);
+	}
 	ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, icl_ma);
 	ret = ret ?: xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, fcc_ma);
 	if (ret) {
@@ -2878,18 +2968,38 @@ static void xiaomi_mca_cp_backoff(struct xiaomi_mca *mca, const char *reason)
 
 static int xiaomi_mca_cp_input_suspend(struct xiaomi_mca *mca, bool suspend)
 {
-	u8 value = suspend, readback;
+	u32 online;
 	int ret;
 
-	if (!suspend && !mca->cp_input_suspended)
-		return 0;
-	if (suspend)
+	if (suspend) {
+		if (!mca->cp_input_suspended)
+			mca->cp_pause_applied = false;
 		mca->cp_input_suspended = true;
-	ret = xiaomi_mca_read_blob(mca, MCA_PROP_INPUT_SUSPEND, &readback, 1);
-	if (ret || readback != value)
-		ret = xiaomi_mca_write_blob(mca, MCA_PROP_INPUT_SUSPEND, &value, 1);
-	if (!ret && !suspend)
+		if (mca->cp_pause_applied)
+			return 0;
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT, 0);
+		ret = ret ?: xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, 0);
+		if (!ret)
+			mca->cp_pause_applied = true;
+		return ret;
+	}
+	if (!mca->cp_input_suspended)
+		return 0;
+	online = xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE);
+	mca->cp_restoring = true;
+	mca->icl_written = mca->fcc_written = true;
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT,
+			online == 1 ?
+			(mca->icl_set_ma ?: MCA_CP_BUCK_MA) : MCA_ICL_DEFAULT_MA);
+	ret = ret ?: xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT,
+					mca->fcc_set_ma ?: MCA_CP_BUCK_MA);
+	if (!ret && online == 1)
+		ret = xiaomi_mca_restart_aicl(mca);
+	mca->cp_restoring = false;
+	if (!ret) {
 		mca->cp_input_suspended = false;
+		mca->cp_pause_applied = false;
+	}
 	return ret;
 }
 
@@ -2935,6 +3045,7 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	if (ret)
 		return ret;
 	mca->icl_set_ma = 0;
+	mca->buck_resume_pending = true;
 	mca->cp_parallel_done = false;
 	power_supply_put(mca->cp_psy);
 	mca->cp_psy = NULL;
@@ -3463,6 +3574,10 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		stop_ret = xiaomi_mca_charge_stop(mca);
 		return ret ?: stop_ret;
 	}
+	/* Restore the host's legacy HIZ vote only after protection permits it. */
+	ret = xiaomi_mca_clear_legacy_hiz(mca);
+	if (ret)
+		return ret;
 	/* Firmware termination/recharge never overrides SOC/thermal stops. */
 	return xiaomi_mca_fw_recharge(mca);
 }
@@ -3721,10 +3836,21 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	 * Only eligible parallel charging releases this vote later.
 	 */
 	ret = xiaomi_mca_cp_input_suspend(mca, true);
-	ret = ret ?: xiaomi_mca_cp_set_buck(mca, MCA_CP_BUCK_MA, MCA_CP_BUCK_MA);
-	ret = ret ?: xiaomi_mca_cp_request(mca, start_mv);
 	if (ret) {
-		xiaomi_mca_cp_stop(mca, "start refused");
+		dev_err(mca->dev, "pump start: buck zero votes rejected: %d\n", ret);
+		xiaomi_mca_cp_stop(mca, "buck pause refused");
+		return;
+	}
+	ret = xiaomi_mca_cp_set_buck(mca, MCA_CP_BUCK_MA, MCA_CP_BUCK_MA);
+	if (ret) {
+		dev_err(mca->dev, "pump start: buck share rejected: %d\n", ret);
+		xiaomi_mca_cp_stop(mca, "buck share refused");
+		return;
+	}
+	ret = xiaomi_mca_cp_request(mca, start_mv);
+	if (ret) {
+		dev_err(mca->dev, "pump start: adapter request rejected: %d\n", ret);
+		xiaomi_mca_cp_stop(mca, "adapter request refused");
 		return;
 	}
 
@@ -4900,6 +5026,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->auth_cleanup = false;
 			mca->online = false;
 			mca->iterm_set_ma = 0;
+			mca->legacy_hiz_cleared = false;
 			mca->fw_recharge = 0;
 			mca->policy_generation = generation;
 		}
