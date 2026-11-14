@@ -1890,6 +1890,13 @@ read_source:
 		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
 		    !battmgr->charge_policy_hold && !battmgr->charge_error;
 	qcom_battmgr_note_delivery(battmgr, status.delivering);
+	if (status.delivering == ERHAI_SERIAL) {
+		battmgr->serial_failures = 0;
+		battmgr->serial_backoff = false;
+	} else if (status.delivering == ERHAI_UFCS) {
+		battmgr->ufcs_failures = 0;
+		battmgr->ufcs_backoff = false;
+	}
 	if (status.delivering && status.delivering == battmgr->restore_route)
 		battmgr->restore_route = 0;
 	ufcs_active = battmgr->pps_ops && battmgr->pps_ops->ufcs_active(battmgr->pps_data);
