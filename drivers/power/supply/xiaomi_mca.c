@@ -38,6 +38,7 @@
 #include <linux/pm.h>
 #include <linux/pm_wakeup.h>
 #include <linux/power_supply.h>
+#include <linux/power/bq27xxx_battery.h>
 #include <linux/property.h>
 #include <linux/random.h>
 #include <linux/seq_file.h>
@@ -676,6 +677,8 @@ struct xiaomi_mca {
 	u8 cp_stop_phase;
 	u8 cp_total_errors, cp_chip_errors;
 	bool charging_done, voltage_hold, recover_5v;
+	u8 fg_mode_known, fg_fast_mask, fg_full_mask;
+	int fg_mode_error;
 	unsigned int term_count, buck_cv_steps;
 	u32 buck_cv_fcc;
 	unsigned long buck_cv_at, term_at;
@@ -2726,10 +2729,122 @@ static int xiaomi_mca_apply_pmic_pair(struct xiaomi_mca *mca, u32 target, u32 it
 	return xiaomi_mca_write_u32(mca, MCA_PROP_TERM_VOLT, target);
 }
 
+static int xiaomi_mca_gauge_mac_write(struct bq27xxx_device_info *di, u16 cmd)
+{
+	u8 data[4] = { cmd & 0xff, cmd >> 8, cmd == 0x3e, 0 };
+	u8 tail[2] = { (u8)~(data[0] + data[1] + data[2]), 6 };
+	int ret;
+
+	ret = di->bus.write_bulk(di, 0x3e, data, cmd == 0x31 ? 2 : 4);
+	if (!ret && cmd != 0x31)
+		ret = di->bus.write_bulk(di, 0x60, tail, 2);
+	return ret;
+}
+
+/* Piano bq27z561 .text 0xdb68..0xdc98 and 0xf908..0xf990. These are
+ * volatile vendor MAC commands, not data-flash writes. Use the registered
+ * gauge executor and its lock: the built-in bq27xxx owner remains intact.
+ */
+static int xiaomi_mca_gauge_command(struct xiaomi_mca *mca, unsigned int index, u16 cmd)
+{
+	struct power_supply *psy;
+	struct bq27xxx_device_info *di;
+	struct device *parent;
+	int ret = -ENODEV;
+
+#if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(xiaomi_mca_gauge_command, mca, index, cmd);
+#endif
+	if (index >= ARRAY_SIZE(xiaomi_mca_supplied_to) ||
+	    (cmd != 0x31 && cmd != 0x3e && cmd != 0x3f) ||
+	    !of_machine_is_compatible("xiaomi,piano"))
+		return -EINVAL;
+	psy = power_supply_get_by_name(xiaomi_mca_supplied_to[index]);
+	if (!psy)
+		return -ENODEV;
+	parent = psy->dev.parent;
+	if (!parent)
+		goto put;
+	device_lock(parent);
+	if (!parent->driver || strcmp(parent->driver->name, "bq27xxx-battery"))
+		goto unlock;
+	di = power_supply_get_drvdata(psy);
+	if (!di || di->chip != BQ27Z561 || di->bat != psy || !di->bus.write_bulk)
+		goto unlock;
+	mutex_lock(&di->lock);
+	if (di->removed || di->suspended) {
+		ret = -EAGAIN;
+	} else {
+		ret = xiaomi_mca_gauge_mac_write(di, cmd);
+		/* Read actual flags/SOC on the next property access, never write
+		 * a fabricated 100 into the driver's cache.
+		 */
+		if (!ret)
+			di->last_update = jiffies - 6 * HZ;
+	}
+	mutex_unlock(&di->lock);
+unlock:
+	device_unlock(parent);
+	if (!ret)
+		power_supply_changed(psy);
+put:
+	power_supply_put(psy);
+	if (ret)
+		dev_warn_ratelimited(mca->dev, "gauge %u MAC %#x failed: %d\n", index, cmd, ret);
+	return ret;
+}
+
+static int xiaomi_mca_gauge_mode(struct xiaomi_mca *mca, bool fast)
+{
+	int n, ret;
+
+	mca->fg_mode_error = 0;
+	for (n = 0; n < 2; n++) {
+		if ((mca->fg_mode_known & BIT(n)) && !!(mca->fg_fast_mask & BIT(n)) == fast)
+			continue;
+		ret = xiaomi_mca_gauge_command(mca, n, fast ? 0x3e : 0x3f);
+		if (ret) {
+			mca->fg_mode_error = ret;
+			return ret;
+		}
+		mca->fg_mode_known |= BIT(n);
+		if (fast)
+			mca->fg_fast_mask |= BIT(n);
+		else
+			mca->fg_fast_mask &= ~BIT(n);
+	}
+	return 0;
+}
+
+static bool xiaomi_mca_gauges_full(struct xiaomi_mca *mca)
+{
+	union power_supply_propval val;
+	int n, ret;
+
+#if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(xiaomi_mca_gauges_full, mca);
+#endif
+	for (n = 0; n < 2; n++) {
+		struct power_supply *psy = power_supply_get_by_name(xiaomi_mca_supplied_to[n]);
+
+		if (!psy)
+			return false;
+		/* BQ27Z561 STATUS=FULL is Flags.FC, not capacity==100. */
+		ret = power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &val);
+		power_supply_put(psy);
+		if (ret || val.intval != POWER_SUPPLY_STATUS_FULL)
+			return false;
+	}
+	return true;
+}
+
 static int xiaomi_mca_restore_term_volt(struct xiaomi_mca *mca)
 {
 	int ret;
 
+	ret = mca->fg_mode_known ? xiaomi_mca_gauge_mode(mca, false) : 0;
+	if (ret)
+		return ret;
 	if (!mca->term_written && !mca->iterm_written)
 		return 0;
 
@@ -2780,7 +2895,14 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 	else if (hot < MCA_TERM_COOL_DEGC)
 		mca->term_hot = false;
 	xiaomi_mca_update_zones(mca, cold, hot);
-	mca->ffc_active = xiaomi_mca_ffc_conditions(mca, cold, hot, vbat, vmin, ibat);
+	{
+		bool fast = xiaomi_mca_ffc_conditions(mca, cold, hot, vbat, vmin, ibat);
+
+		ret = xiaomi_mca_gauge_mode(mca, fast);
+		if (ret)
+			return ret;
+		mca->ffc_active = fast;
+	}
 	xiaomi_mca_select_profile(mca, cold, hot);
 	xiaomi_mca_adjust_pmic_fv(mca);
 	return xiaomi_mca_apply_pmic_pair(mca, xiaomi_mca_pmic_fv(mca), xiaomi_mca_pmic_iterm(mca));
@@ -3519,10 +3641,32 @@ static int xiaomi_mca_fw_recharge(struct xiaomi_mca *mca)
 	/* Status 5 is ignored throughout CP. Outside CP it is the stock
 	 * FG term_recharge vote, not permission to silently leave buck idle.
 	 */
-	if (!mca->charging_done && (status == 5 || xiaomi_mca_software_full(mca, vmin, ibat, imax))) {
+	if (!mca->charging_done && (status == 5 || mca->fg_full_mask == 3 ||
+	    xiaomi_mca_software_full(mca, vmin, ibat, imax))) {
+		if (status != 5) {
+			int n;
+
+			/* Native parallel_force_fw_report_full -> gauge MAC 0x31.
+			 * The old path declared full directly and immediately used
+			 * pre-termination RM/FCC to recharge. Let the gauges report
+			 * their real FC state before ending this cycle.
+			 */
+			for (n = 0; n < 2; n++) {
+				if (mca->fg_full_mask & BIT(n))
+					continue;
+				ret = xiaomi_mca_gauge_command(mca, n, 0x31);
+				if (ret)
+					return ret;
+				mca->fg_full_mask |= BIT(n);
+			}
+			if (!xiaomi_mca_gauges_full(mca))
+				return 0;
+		}
 		mca->charging_done = true;
 		mca->fw_recharge = 1;
 		mca->term_count = 0;
+		if (status != 5)
+			return xiaomi_mca_charge_enable(mca, false);
 	}
 	if (mca->charging_done) {
 		/* fg_comp 0x5d04, then 0x1e18..0x1e44 / raw SOC <=9700. */
@@ -3540,8 +3684,12 @@ static int xiaomi_mca_fw_recharge(struct xiaomi_mca *mca)
 			}
 			return ret;
 		}
+		ret = xiaomi_mca_gauge_mode(mca, false);
+		if (ret)
+			return ret;
 		mca->ffc_active = false;
 		mca->ffc_done = true;
+		mca->fg_full_mask = 0;
 		mca->buck_cv_steps = mca->buck_cv_fcc = 0;
 		ret = xiaomi_mca_apply_pmic_pair(mca, xiaomi_mca_pmic_fv(mca), xiaomi_mca_pmic_iterm(mca));
 		if (ret)
@@ -4959,6 +5107,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca, u32 *sampled_type)
 		mca->cp_fault = false;
 		mca->cp_exits = 0;
 		mca->cp_total_errors = mca->cp_chip_errors = 0;
+		mca->fg_full_mask = 0;
 		mca->fw_recharge = 0;
 		mca->fw_recharges = 0;
 		mca->cp_last_exit = NULL;
@@ -5220,6 +5369,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->experiment = false;
 			mca->cp = MCA_CP_OFF;
 			mca->ffc_active = mca->ffc_done = mca->charging_done = false;
+			mca->fg_full_mask = 0;
 			mca->mipps_attempted = mca->auth_ok = false;
 			mca->buck_resume_pending = true;
 			mca->icl_set_ma = mca->fcc_set_ma = 0;
@@ -5237,7 +5387,8 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			if (!full_charge || !charge_policy)
 				xiaomi_mca_cp_stop(mca, "float voltage not confirmed");
 			else
-				xiaomi_mca_cp_stop(mca, "float voltage write failed");
+				xiaomi_mca_cp_stop(mca, mca->fg_mode_error ?
+				"gauge mode write failed" : "float voltage write failed");
 			goto out;
 		}
 		ret = xiaomi_mca_charge_limit_poll(mca);
@@ -5590,7 +5741,7 @@ static ssize_t charge_profile_show(struct device *dev,
 		snprintf(t[2], sizeof(t[2]), "%d", mca->pmic_pack_tbat);
 	else
 		strscpy(t[2], "unavailable", sizeof(t[2]));
-	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u aicl_cap_ma=%u hv_exit=%s last_exit=%s conn_mc=%s conn2_mc=%s antiburn=%u pmic_chgr_status=%u pmic_fv_raw=%d pmic_fv_target=%u pmic_iterm_raw=%d pmic_pack_mv=%d buck_suspended=%u fw_recharge=%u fw_recharges=%u full=%u voltage_hold=%u recovery_5v=%u taper_count=%u stop_phase=%u sw_cv_steps=%u sw_cv_fcc=%u gauge_errors=%u pmic_pack_tbat=%s cp_total_errors=%u cp_chip_errors=%u\n",
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u aicl_cap_ma=%u hv_exit=%s last_exit=%s conn_mc=%s conn2_mc=%s antiburn=%u pmic_chgr_status=%u pmic_fv_raw=%d pmic_fv_target=%u pmic_iterm_raw=%d pmic_pack_mv=%d buck_suspended=%u fw_recharge=%u fw_recharges=%u full=%u voltage_hold=%u recovery_5v=%u taper_count=%u stop_phase=%u sw_cv_steps=%u sw_cv_fcc=%u gauge_errors=%u pmic_pack_tbat=%s cp_total_errors=%u cp_chip_errors=%u fg_fast_mask=%u fg_full_mask=%u\n",
 		 xiaomi_mca_profile_names[mca->cp_profile],
 		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
 		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma, mca->hv, mca->hv_pps,
@@ -5602,7 +5753,7 @@ static ssize_t charge_profile_show(struct device *dev,
 			mca->pmic_fv_raw, mca->pmic_fv_target, mca->pmic_iterm_raw,
 			mca->pmic_pack_mv, mca->cp_input_suspended, mca->fw_recharge, mca->fw_recharges,
 			mca->charging_done, mca->voltage_hold, mca->recover_5v, mca->cp_taper_count,
-			mca->cp_stop_phase, mca->buck_cv_steps, mca->buck_cv_fcc, mca->gauge_failures, t[2], mca->cp_total_errors, mca->cp_chip_errors);
+			mca->cp_stop_phase, mca->buck_cv_steps, mca->buck_cv_fcc, mca->gauge_failures, t[2], mca->cp_total_errors, mca->cp_chip_errors, mca->fg_fast_mask, mca->fg_full_mask);
 }
 static DEVICE_ATTR_RO(charge_profile);
 
@@ -6227,6 +6378,7 @@ static int xiaomi_mca_experiment_command(struct xiaomi_mca *mca, const char *com
 		mca->experiment = false;
 		mca->cp = MCA_CP_OFF;
 		mca->ffc_active = mca->ffc_done = mca->charging_done = false;
+		mca->fg_full_mask = 0;
 		mca->term_count = mca->buck_cv_steps = mca->buck_cv_fcc = 0;
 		mca->mipps_attempted = mca->auth_ok = false;
 		mca->buck_resume_pending = true;
@@ -6246,6 +6398,7 @@ static int xiaomi_mca_experiment_command(struct xiaomi_mca *mca, const char *com
 		if (ret)
 			return ret;
 		ret = xiaomi_mca_cp_stop(mca, "laboratory discharge");
+		ret = ret ?: xiaomi_mca_gauge_mode(mca, false);
 		if (ret)
 			return ret;
 		mca->experiment = true;
