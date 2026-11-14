@@ -2553,6 +2553,15 @@ static int sc8547_serial_arm_ucp(struct sc8547a_device *sc)
 	return ret;
 }
 
+/* A late frame can arrive between monitor polls. It belongs to a broken
+ * exchange and must not refresh the watchdog for the old contract.
+ */
+static bool sc8547_serial_timed_out(struct sc8547a_device *sc, unsigned long now)
+{
+	return sc->auto_state == SC_AUTO_DELIVER && sc->frame_seen &&
+	       time_after_eq(now, sc->last_frame + msecs_to_jiffies(SC8547_COMMU_TIMEOUT_MS));
+}
+
 static void sc8547_attach_work(struct work_struct *work)
 {
 	struct sc8547a_device *sc =
@@ -2663,7 +2672,7 @@ static void sc8547_attach_work(struct work_struct *work)
 		/* RX_DONE frames are clocked by the source. CHG_EN can remain
 		 * set indefinitely with no source current while UCP is masked.
 		 */
-		if (time_after_eq(sampled_at, sc->last_frame + msecs_to_jiffies(SC8547_COMMU_TIMEOUT_MS))) {
+		if (sc8547_serial_timed_out(sc, sampled_at)) {
 			sc8547_auto_reservo(sc, "frame-timeout");
 			goto reschedule;
 		}
@@ -2961,6 +2970,11 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
 	if (!(sc->vooc_flag & VOOC_RXDATA_DONE_FLAG))
 		return false;
 
+	if (sc8547_serial_timed_out(sc, jiffies)) {
+		/* The monitor checks latched OCP/OVP and CV before rearming. */
+		mod_delayed_work(system_wq, &sc->attach_work, 0);
+		return true;
+	}
 	if (vooc_get_mesg_from_adapter(sc)) {
 		sc->rx_errors++;
 		dev_dbg(sc->dev, "VOOC frame decode failed (rx 0x%02x)\n",
