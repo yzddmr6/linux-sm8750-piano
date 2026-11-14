@@ -1593,7 +1593,6 @@
 		power-source = <0>;
 	};
 
-
 	pm8550_therm_default: therm-default-state {
 		pins = "gpio2", "gpio3", "gpio4";
 		function = "normal";

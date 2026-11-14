@@ -161,12 +161,16 @@ required:
 
 allOf:
   - if:
-      not:
-        properties:
-          compatible:
-            contains:
-              const: xiaomi,piano-pmic-glink
+      properties:
+        compatible:
+          contains:
+            const: xiaomi,piano-pmic-glink
     then:
+      required:
+        - xiaomi,connector-cutoff-gpios
+        - io-channels
+        - io-channel-names
+    else:
       properties:
         xiaomi,connector-cutoff-gpios: false
         io-channels: false
@@ -180,29 +184,7 @@ allOf:
               const: oneplus,pad2pro-pmic-glink
     then:
       properties:
-        xiaomi,connector-cutoff-gpios:
-    description: Active-high wired connector protection MOS control on Piano.
-    maxItems: 1
-
-  io-channels:
-    items:
-      - description: First wired connector thermistor
-      - description: Second wired connector thermistor
-      - description: Quiet area board thermistor
-      - description: Charger board thermistor
-      - description: Wi-Fi area board thermistor
-      - description: CPU area board thermistor
-
-  io-channel-names:
-    items:
-      - const: connector
-      - const: connector2
-      - const: quiet
-      - const: charger
-      - const: wifi
-      - const: cpu
-
-  charge-pumps: false
+        charge-pumps: false
 
 additionalProperties: false
 
