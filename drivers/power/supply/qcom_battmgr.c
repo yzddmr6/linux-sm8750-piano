@@ -585,6 +585,8 @@ struct qcom_battmgr {
 	bool serial_blocked;
 	bool aicl_done;
 	bool serial_icl_vote;
+	int serial_icl_ua, serial_input_ua, serial_max_ua;
+	unsigned long serial_sample_at;
 	bool pd_logged;
 	u32 pd_input_limit_ua;
 	u32 pd_saved_fcc_ua;
@@ -1401,6 +1403,11 @@ static ssize_t charge_contract_show(struct device *dev, struct device_attribute 
 			     b->pd_state == PD_ACTIVE && b->qc_contract ? PD_FIXED_MV : 0,
 			     b->serial_probe, b->charge_detected_type, !!(b->retry_evidence & ERHAI_SERIAL),
 			     b->serial_icl_vote, b->fixed_exit ?: "none");
+	if (b->serial_icl_vote)
+		len += sysfs_emit_at(buf, len, "fallback_vote_ua=%u fallback_icl_ua=%d fallback_input_ua=%d fallback_max_ua=%d fallback_age_ms=%lld ",
+				     ERHAI_SERIAL_5V_UA, b->serial_icl_ua, b->serial_input_ua,
+				     b->serial_max_ua, b->serial_sample_at ?
+				     (long long)jiffies_to_msecs(jiffies - b->serial_sample_at) : -1LL);
 	if (b->pps_ops)
 		return b->pps_ops->describe(b->pps_data, buf, len);
 	return len + sysfs_emit_at(buf, len, "state=idle\n");
@@ -1721,6 +1728,17 @@ static unsigned int qcom_battmgr_retry_routes(struct qcom_battmgr *b,
 	return routes;
 }
 
+/* Sample on the 5 V fallback path. Contract readers and the pump watchdog
+ * never wait for these GLINK transactions.
+ */
+static int erhai_usb_readback(struct qcom_battmgr *b, unsigned int prop)
+{
+	u32 value;
+	int ret = qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, prop, &value);
+
+	return ret ? ret : (int)value;
+}
+
 /* The crossbar returning D+/D- to the PMIC can turn a known brick into
  * an apparent SDP. Give its 5 V buck path the board's charger vote and
  * run hardware AICL. Release the attachment-scoped vote on unplug.
@@ -1732,10 +1750,14 @@ static int qcom_battmgr_serial_icl(struct qcom_battmgr *b, bool enable)
 
 	if (enable) {
 		if (b->aicl_done && b->serial_icl_vote)
-			return 0;
+			goto sample;
 		ret = qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &vbus);
 		if (ret || vbus < 4000000 || vbus > 5500000)
 			return ret ?: -EAGAIN;
+		if (!b->serial_icl_vote) {
+			b->serial_sample_at = 0;
+			b->serial_icl_ua = b->serial_input_ua = b->serial_max_ua = -ENODATA;
+		}
 		b->serial_icl_vote = true; /* A missed write ACK may have applied the vote. */
 	} else if (!b->serial_icl_vote) {
 		return 0;
@@ -1751,7 +1773,14 @@ static int qcom_battmgr_serial_icl(struct qcom_battmgr *b, bool enable)
 	}
 	ret = qcom_battmgr_set_property(b, BATTMGR_USB_PROPERTY_SET, USB_OPLUS_RERUN_AICL, 0);
 	b->aicl_done = !ret;
-	return ret;
+	if (ret)
+		return ret;
+sample:
+	b->serial_icl_ua = erhai_usb_readback(b, USB_INPUT_CURR_LIMIT);
+	b->serial_input_ua = erhai_usb_readback(b, USB_CURR_NOW);
+	b->serial_max_ua = erhai_usb_readback(b, USB_CURR_MAX);
+	b->serial_sample_at = jiffies;
+	return 0;
 }
 
 static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
