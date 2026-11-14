@@ -3763,6 +3763,40 @@ static void xiaomi_mca_test_pmic_handover(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->fcc, 500);
 }
 
+static void xiaomi_mca_test_pmic_suspend_threshold(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	full_charge = charge_policy = cp_charge = hv_charge = true;
+	mca_test_stage(test, f);
+	f->type = mca->real_type = mca->cp_type = MCA_TYPE_PD_PPS;
+	mca->cp_ma = 5000;
+	mca->cp_mv = 9700;
+	mca->cp_max_mv = 10000;
+	mca->cp_ibus_ma = mca->cp_ibus_hot = 3800;
+	f->vbus = mca->vbus_uv = 9500000;
+	f->stage_mv = 9500;
+	f->stage_ma = 2700;
+	f->cells[0].current_ua = f->cells[1].current_ua = 2000000;
+	f->cells[0].voltage = f->cells[1].voltage = 4470000;
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_cp_step(mca);
+	KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_EQ(test, f->input_suspend, 0);
+	KUNIT_EXPECT_EQ(test, mca->fcc_set_ma, 500);
+	mca->ffc_active = true;
+	f->cells[0].voltage = f->cells[1].voltage = 4480000;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_EQ(test, f->input_suspend, 1);
+	f->cells[0].voltage = f->cells[1].voltage = 4470000;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, f->input_suspend, 1);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_stop(mca, "test complete"), 0);
+	KUNIT_EXPECT_EQ(test, f->input_suspend, 0);
+}
+
 static void xiaomi_mca_test_pmic_suspend_failure(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3801,6 +3835,27 @@ static void xiaomi_mca_test_pmic_cell_ceiling(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, mca->ffc_done);
 	KUNIT_EXPECT_EQ(test, f->term_readback, 5360);
 	KUNIT_EXPECT_EQ(test, f->term_current, 246);
+}
+
+static void xiaomi_mca_test_pmic_disabled_snapshot(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	mca->last = (struct xiaomi_mca_state) { .online = 1, .chgr_status = 3 };
+	mca->last_valid = true;
+	mca->pmic_pack_mv = 4400;
+	f->pack_vbat = 4588;
+	f->term_current = 1250;
+	f->term_readback = 5580;
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_pmic_telemetry(mca, 7);
+	KUNIT_EXPECT_EQ(test, mca->pmic_pack_mv, 4588);
+	KUNIT_EXPECT_EQ(test, mca->pmic_iterm_raw, 1250);
+	KUNIT_EXPECT_EQ(test, mca->pmic_fv_raw, 5580);
+	f->pack_vbat_error = -EIO;
+	xiaomi_mca_pmic_telemetry(mca, 7);
+	KUNIT_EXPECT_EQ(test, mca->pmic_pack_mv, -1);
 }
 
 static void xiaomi_mca_test_pmic_disabled_transition(struct kunit *test)
@@ -4196,8 +4251,10 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_pmic_temperature_votes),
 	KUNIT_CASE(xiaomi_mca_test_pmic_handover),
 	KUNIT_CASE(xiaomi_mca_test_pmic_suspend_failure),
+	KUNIT_CASE(xiaomi_mca_test_pmic_suspend_threshold),
 	KUNIT_CASE(xiaomi_mca_test_pmic_cell_ceiling),
 	KUNIT_CASE(xiaomi_mca_test_pmic_disabled_transition),
+	KUNIT_CASE(xiaomi_mca_test_pmic_disabled_snapshot),
 	KUNIT_CASE(xiaomi_mca_test_mipps_tail_replay),
 	KUNIT_CASE(xiaomi_mca_test_buck_enable_readback),
 	KUNIT_CASE(xiaomi_mca_test_ffc_cutoff_in_pump),

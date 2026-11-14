@@ -3898,7 +3898,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		fcc = xiaomi_mca_parallel_fcc(ibat_max, ibus_all, mca->fcc_set_ma);
 		icl = fcc / 2 + (fcc > 1000 ? 500 : 0);
 		/* The stock vbat_threshold ends parallel boosting near CV. */
-		if (vbat >= 4480 || taper)
+		if (vbat >= 4480)
 			mca->cp_parallel_done = true;
 		if (mca->cp_parallel_done) {
 			/* Stock wire_qc suspends the buck input at vbat_threshold;
@@ -3908,6 +3908,9 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 				xiaomi_mca_cp_stop(mca, "buck input suspend failed");
 				return;
 			}
+			fcc = icl = MCA_CP_BUCK_MA;
+		} else if (taper) {
+			/* Normal CV can begin below the stock HIZ threshold. */
 			fcc = icl = MCA_CP_BUCK_MA;
 		}
 		budget = (int)xiaomi_mca_cp_src_ma(mca) - 200;
@@ -4717,6 +4720,8 @@ static void xiaomi_mca_pmic_telemetry(struct xiaomi_mca *mca, u32 status)
 	if (!mca->last_valid || !mca->last.online ||
 	    !xiaomi_mca_pmic_disabled(mca->last.chgr_status, status))
 		return;
+	/* An earlier protection path may have skipped full_charge_poll. */
+	mca->pmic_pack_mv = xiaomi_mca_read(mca, MCA_PROP_PACK_VBAT, &value) ? -1 : (int)value;
 	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &cold, &hot, &vmin, &imax, NULL))
 		vbat = -1;
 	dev_warn(mca->dev, "PMIC charging disabled: status %u->7 FV raw=%d target=%u pack=%d cell_max=%d mV iterm=%d input_suspended=%u cp=%u\n",
