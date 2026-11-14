@@ -5492,22 +5492,9 @@ static int xiaomi_mca_connector_init(struct xiaomi_mca *mca)
 		if (IS_ERR(c->ntc[i]))
 			return PTR_ERR(c->ntc[i]);
 	}
-	c->cutoff = devm_gpiod_get(dev, "xiaomi,connector-cutoff", GPIOD_ASIS);
-	if (IS_ERR(c->cutoff))
-		return PTR_ERR(c->cutoff);
-	/* Preserve an asserted cutoff across a driver reload. Only a valid
-	 * cool sample may reopen the port. Stock probe uses raw low normally.
-	 */
-	i = gpiod_get_direction(c->cutoff);
-	if (!i)
-		i = gpiod_get_value_cansleep(c->cutoff);
-	else if (i > 0)
-		i = 0;
-	if (i < 0 && i != -EINVAL)
-		return i;
-	/* pmic_gpio_get returns -EINVAL for a disabled pad. */
-	c->tripped = i > 0;
-	return gpiod_direction_output(c->cutoff, c->tripped);
+	/* Piano GPIO9 is active high. Stock drives raw low at probe. */
+	c->cutoff = devm_gpiod_get(dev, "xiaomi,connector-cutoff", GPIOD_OUT_LOW);
+	return PTR_ERR_OR_ZERO(c->cutoff);
 }
 
 static int xiaomi_mca_probe(struct auxiliary_device *adev,
