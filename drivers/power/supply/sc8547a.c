@@ -502,6 +502,9 @@ struct sc8547a_device {
 	unsigned long load_since;
 	bool load_seen;
 	bool serial_ucp_armed;
+	u8 change_polls;
+	u8 notified_code;
+	int adapter_vbat_mv;
 	u8 serial_request;	/* most recent successfully written ASK_CURRENT reply */
 	unsigned int		auto_taper_cnt;
 	int			auto_step_cnt;	/* advance debounce counter */
@@ -721,20 +724,25 @@ static int sc8547_get_ibus(struct sc8547a_device *sc)
 	       SC8547_IBUS_ADC_LSB_NUM / SC8547_IBUS_ADC_LSB_DEN;
 }
 
-/* Returns mV, or negative errno. */
-static int sc8547_get_vbat(struct sc8547a_device *sc)
+/* REG19/1B share the 1.25 mV ADC scale (oplus_sc8547a.c update_data). */
+static int sc8547_get_output_mv(struct sc8547a_device *sc, u8 reg)
 {
 	u8 buf[2];
 	int ret;
 
 	if (sc8547_waiting_for_off())
 		return -EAGAIN;
-	ret = i2c_smbus_read_i2c_block_data(sc->client, SC8547_REG_1B, 2, buf);
+	ret = i2c_smbus_read_i2c_block_data(sc->client, reg, 2, buf);
 
 	if (ret != sizeof(buf))
 		return ret < 0 ? ret : -EIO;
 	return ((buf[0] << 8) | buf[1]) *
 	       SC8547_VBAT_ADC_LSB_NUM / SC8547_VBAT_ADC_LSB_DEN;
+}
+
+static int sc8547_get_vbat(struct sc8547a_device *sc)
+{
+	return sc8547_get_output_mv(sc, SC8547_REG_1B);
 }
 
 /* --------------------- VOOC serial-protocol primitives ---------------- */
@@ -1863,17 +1871,33 @@ static void vooc_handle_ask_current_level(struct sc8547a_device *sc)
 	vooc_write_mesg_mask(TX1_DET_BIT1_MASK, &sc->voocphy_tx_buff[1], (cur >> 0) & 1);
 }
 
-/*
- * GET_BATT_VOL: report the measured pack voltage so the adapter can run its
- * curve. We report the CP's own Vbat ADC directly (coded (mV-3404)/10). The
- * vendor applies an IR-drop compensation formula here; reporting the raw
- * measurement is conservative (slightly under-reports under load) and safe.
+/* Oplus AP VOOC PHY, non_vooc20_handle_get_batt_vol_cmd: during CC
+ * the master polls battery voltage. A seven-bit all-ones reply asks it
+ * to poll ASK_CURRENT_LEVEL again. Give the vendor's five indications
+ * per changed target, including changes as the second pump picks up.
  */
+#define SC8547_CHANGE_CUR_POLLS	5
+
 static void vooc_handle_get_batt_vol(struct sc8547a_device *sc)
 {
-	int vbat = sc8547_get_vbat(sc);
+	int vbat;
 	u8 v, l, h;
 
+	if (sc->cp_enabled && sc->fastchg_deliver &&
+	    sc->fastchg_curr_code != sc->serial_request) {
+		if (sc->notified_code != sc->fastchg_curr_code) {
+			sc->notified_code = sc->fastchg_curr_code;
+			sc->change_polls = 0;
+		}
+		if (sc->change_polls <= SC8547_CHANGE_CUR_POLLS)
+			sc->change_polls++;
+		if (sc->change_polls <= SC8547_CHANGE_CUR_POLLS) {
+			vooc_write_mesg_mask(TX0_DET_BIT3_TO_BIT7_MASK, &sc->voocphy_tx_buff[0], 0x1f);
+			vooc_write_mesg_mask(TX1_DET_BIT0_TO_BIT1_MASK, &sc->voocphy_tx_buff[1], 3);
+			return;
+		}
+	}
+	vbat = sc->cp_enabled && sc->adapter_vbat_mv > 0 ? sc->adapter_vbat_mv : sc8547_get_vbat(sc);
 	if (vbat < 0)
 		vbat = VBATT_BASE_FOR_ADAPTER;
 
@@ -1962,8 +1986,10 @@ static bool vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 	sc->vooc_move_head = false;
 	if (sc8547_set_txbuff(sc, (sc->voocphy_tx_buff[0] << 8) | sc->voocphy_tx_buff[1]))
 		return false;
-	if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL)
+	if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL) {
 		sc->serial_request = sc->fastchg_deliver ? sc->fastchg_curr_code : 0;
+		sc->change_polls = 0;
+	}
 	return valid;
 }
 
@@ -2189,6 +2215,9 @@ static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
 	/* delivery-phase state (gates fastchg_deliver / fastchg_curr_code persist) */
 	sc->cp_enabled = false;
 	sc->serial_request = 0;
+	sc->notified_code = 0;
+	sc->change_polls = 0;
+	sc->adapter_vbat_mv = 0;
 	sc->serial_ucp_armed = false;
 	sc->low_ibus_count = 0;
 	sc->load_seen = false;
@@ -2519,6 +2548,16 @@ static void sc8547_attach_work(struct work_struct *work)
 		int margin = vbus - 2 * cpbat;
 		u8 r6 = 0, r7 = 0;
 		int faults = sc8547_take_faults();
+		int vsys = sc8547_get_output_mv(sc, SC8547_REG_19);
+
+		/* 24924 non-bidirectional, single-pack GET_BATT_VOL cable
+		 * compensation from the AP PHY. Use the sum of both REG13s.
+		 */
+		if (!gret && gvbat > 0 && vsys > 0 && vbus > 0 && cibus >= 0 && slave_ma >= 0)
+			sc->adapter_vbat_mv = vbus / 2 - (vsys - gvbat) / 4 -
+					      cibus_total * 75 / 1000;
+		else
+			sc->adapter_vbat_mv = 0;
 
 		if (faults > 0) {
 			sc->auto_protection = true;
@@ -2563,6 +2602,12 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc->fastchg_curr_code = max_t(int, SC8547_CURR_CODE_MIN, sc->fastchg_curr_code - 1);
 		if (!sc->cp_enabled)
 			goto reschedule;
+		if (sc->change_polls > SC8547_CHANGE_CUR_POLLS &&
+		    sc->notified_code == sc->fastchg_curr_code &&
+		    sc->serial_request > sc->fastchg_curr_code) {
+			sc8547_auto_reservo(sc, "current-change-unanswered");
+			goto reschedule;
+		}
 
 		if (sc8547_read_byte(sc, SC8547_REG_06, &r6) ||
 		    sc8547_read_byte(sc, SC8547_REG_07, &r7)) {
