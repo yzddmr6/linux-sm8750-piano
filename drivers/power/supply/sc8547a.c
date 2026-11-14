@@ -224,6 +224,8 @@ static const char * const sc8547_gauge_names[] = {
 #define VOOC_CMD_ASK_CURRENT_LEVEL	0x03
 #define VOOC_CMD_ASK_FASTCHG_ORNOT	0x04
 #define VOOC_CMD_TELL_MODEL		0x05
+#define VOOC_CMD_TELL_USB_BAD		0x09
+#define VOOC_CMD_ASK_AP_STATUS		0x0a
 #define VOOC_CMD_IDENTIFICATION		0x0C
 #define VOOC_CMD_ASK_BAT_MODEL		0x0D
 #define VOOC_CMD_RECEIVE_DATA_0E	0x0E
@@ -373,6 +375,10 @@ MODULE_PARM_DESC(slave_drop_ticks,
  * refills the budget, so healthy periodic resets never exhaust it.
  */
 #define SC8547_AUTO_RESERVO_MAX		4	/* consecutive quick resets before give-up */
+/* Oplus AP VOOC PHY: VOOC_COMMU_EVENT_TIME and VOOCPHY_UCP_SS_IBUS_MIN. */
+#define SC8547_COMMU_TIMEOUT_MS		200
+#define SC8547_UCP_ARM_MA		600
+#define SC8547_LOW_IBUS_MA		300	/* same ADC floor as the serial taper check */
 #define SC8547_AUTO_SUSTAINED_MS	5000	/* CC held this long -> reset is keep-alive */
 #define SC8547_AUTO_DETACH_DEBOUNCE_MS	2500	/* longer absence window while delivering */
 
@@ -491,12 +497,17 @@ struct sc8547a_device {
 	bool monitor_pump_faults;
 	u8 pump_faults;
 	unsigned int adc_over_count;
+	unsigned int low_ibus_count;
+	unsigned long last_frame;
+	unsigned long load_since;
+	bool load_seen;
+	bool serial_ucp_armed;
+	u8 serial_request;	/* most recent successfully written ASK_CURRENT reply */
 	unsigned int		auto_taper_cnt;
 	int			auto_step_cnt;	/* advance debounce counter */
 	int			auto_reservo_cnt;	/* consecutive adapter-reset re-servos */
 	int			auto_ident_retries;	/* identify re-arms on this plug */
 	bool			vooc_saw_any;	/* any decodable VOOC frame this attempt */
-	unsigned long		auto_deliver_since;	/* jiffies of last (re)escalation */
 	/* --- dual-CP slave load-sharing state --- */
 	unsigned long		slave_on_since;	/* jiffies the slave last engaged (0 = n/a) */
 	unsigned int		slave_low_cnt;	/* consecutive low-total ticks since then */
@@ -847,7 +858,7 @@ static int sc8547_svooc_hw_setting(struct sc8547a_device *sc)
 		err = ret;
 	/*
 	 * Disable IBUS under-current protection + soft-start timeout for the SVOOC
-	 * phase (vendor set_sstimeout_ucp_enable(false)). At CP-enable the current
+	 * pickup (vendor set_sstimeout_ucp_enable(false)). At CP-enable the current
 	 * is near zero (Vbus only ~2*Vbat+150mV) and ramps only as the adapter then
 	 * raises Vbus; with UCP (5ms) armed the converter trips off immediately,
 	 * REG_07 self-clears, the adapter sees no load and aborts comm. OCP/OVP and
@@ -1226,6 +1237,7 @@ static int sc8547_slave_hw_setting(struct sc8547a_device *master)
 
 	if (!sc)
 		return -ENODEV;
+	sc->serial_ucp_armed = false;
 	ret = sc8547_write_byte(sc, SC8547_REG_02, 0x01);		/* VAC_OVP 12V */
 	if (ret)
 		return ret;
@@ -1254,7 +1266,7 @@ static int sc8547_slave_hw_setting(struct sc8547a_device *master)
 	 * Same as the master: at parallel CP-close the slave current is near zero
 	 * and only ramps as Vbus rises, so an armed IBUS-UCP (5 ms) or soft-start
 	 * timeout trips the slave off instantly and it never shares load (reads ~0).
-	 * Disable both; OCP/OVP still bound it.
+	 * Mask both during pickup. Restore them once this leg carries load.
 	 */
 	ret = sc8547_update_bits(sc, SC8547_REG_05, SC8547_IBUS_UCP_DIS_MASK,
 			   SC8547_IBUS_UCP_DIS_MASK);
@@ -1880,8 +1892,11 @@ static void vooc_handle_get_batt_vol(struct sc8547a_device *sc)
 }
 
 /* Build + physically send the reply for the current RX frame. */
-static void vooc_reply_adapter_mesg(struct sc8547a_device *sc)
+static bool vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 {
+	bool valid = true;
+	u8 cmd;
+
 	/* clear the payload bits, then stamp the invert head */
 	vooc_write_mesg_mask(TX0_DET_BIT3_TO_BIT7_MASK, &sc->voocphy_tx_buff[0], 0);
 	vooc_write_mesg_mask(TX1_DET_BIT0_TO_BIT1_MASK, &sc->voocphy_tx_buff[1], 0);
@@ -1894,7 +1909,8 @@ static void vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 	    sc->fastchg_ask_cmd != VOOC_CMD_TELL_MODEL_PROCESS)
 		sc->fastchg_ask_cmd = sc->adapter_mesg;
 
-	switch (sc->fastchg_ask_cmd) {
+	cmd = sc->fastchg_ask_cmd;
+	switch (cmd) {
 	case VOOC_CMD_ASK_FASTCHG_ORNOT:
 		vooc_handle_ask_fastchg_ornot(sc);
 		break;
@@ -1925,7 +1941,12 @@ static void vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 	case VOOC_CMD_GET_BATT_VOL:
 		vooc_handle_get_batt_vol(sc);
 		break;
+	case VOOC_CMD_TELL_USB_BAD:
+	case VOOC_CMD_ASK_AP_STATUS:
+		/* The vendor replies with the empty payload for both. */
+		break;
 	default:
+		valid = false;
 		break;
 	}
 
@@ -1939,7 +1960,11 @@ static void vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 
 	vooc_convert_tx_bit0_to_bit9(sc, sc->vooc_move_head);
 	sc->vooc_move_head = false;
-	sc8547_set_txbuff(sc, (sc->voocphy_tx_buff[0] << 8) | sc->voocphy_tx_buff[1]);
+	if (sc8547_set_txbuff(sc, (sc->voocphy_tx_buff[0] << 8) | sc->voocphy_tx_buff[1]))
+		return false;
+	if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL)
+		sc->serial_request = sc->fastchg_deliver ? sc->fastchg_curr_code : 0;
+	return valid;
 }
 
 /*
@@ -2163,6 +2188,10 @@ static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
 	sc->vooc_saw_any = false;
 	/* delivery-phase state (gates fastchg_deliver / fastchg_curr_code persist) */
 	sc->cp_enabled = false;
+	sc->serial_request = 0;
+	sc->serial_ucp_armed = false;
+	sc->low_ibus_count = 0;
+	sc->load_seen = false;
 	sc->hw_profile_set = false;
 	sc->vooc_vbus_status = SC_VBUS_LOW;
 }
@@ -2180,6 +2209,8 @@ static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
 static void sc8547_vooc_arm_hw(struct sc8547a_device *sc)
 {
 	int ret;
+
+	sc->serial_quiesced = false;
 
 	sc8547_vooc_reset_state(sc);
 	ret = wcd939x_usbss_dpdm_switch_fast_charge(true);
@@ -2253,11 +2284,15 @@ static void sc8547_auto_finish(struct sc8547a_device *sc, const char *why)
  * that follows a sustained CC period refills the retry budget; a burst of quick
  * collapses without progress exhausts it and hands back to normal charge.
  */
-static void sc8547_auto_reservo(struct sc8547a_device *sc)
+static void sc8547_auto_reservo(struct sc8547a_device *sc, const char *why)
 {
-	if (time_after(jiffies, sc->auto_deliver_since +
-		       msecs_to_jiffies(SC8547_AUTO_SUSTAINED_MS)))
-		sc->auto_reservo_cnt = 0;	/* sustained CC: legit keep-alive reset */
+	/* Stop both legs before touching the crossbar, resetting or feeding.
+	 * A lost ACK is fenced by the existing pump-off watchdog path.
+	 */
+	if (sc8547_serial_off(sc)) {
+		sc8547_auto_finish(sc, "pump stop pending");
+		return;
+	}
 
 	if (sc->auto_reservo_cnt >= SC8547_AUTO_RESERVO_MAX) {
 		sc8547_auto_finish(sc, "adapter reset budget exhausted");
@@ -2265,7 +2300,9 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc)
 	}
 	sc->auto_reservo_cnt++;
 
-	sc8547_slave_cp_enable(sc, false);	/* drop parallel CP before re-arm */
+	dev_info(sc->dev, "SVOOC re-handshake %d/%d: %s, request=%u last_rx=0x%02x flags=0x%02x\n",
+		 sc->auto_reservo_cnt, SC8547_AUTO_RESERVO_MAX, why, sc->serial_request,
+		 sc->voocphy_rx_buff, sc->vooc_flag);
 	sc->fastchg_enable = false;
 	sc->fastchg_deliver = false;
 	sc8547_vooc_arm_hw(sc);
@@ -2274,9 +2311,6 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc)
 	sc->auto_state = SC_AUTO_IDENTIFY;
 	sc->auto_identify_deadline = jiffies +
 		msecs_to_jiffies(SC8547_AUTO_IDENTIFY_MS);
-	dev_info(sc->dev,
-		 "auto fast-charge: adapter reset — re-handshaking (retry %d/%d)\n",
-		 sc->auto_reservo_cnt, SC8547_AUTO_RESERVO_MAX);
 }
 
 /*
@@ -2412,7 +2446,6 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 	sc->fastchg_deliver = true;
 	sc->fastchg_auto = false;	/* one-shot per arm consumed */
 	sc->auto_state = SC_AUTO_DELIVER;
-	sc->auto_deliver_since = jiffies;	/* for re-servo sustained-CC refill */
 	dev_info(sc->dev,
 		 "auto fast-charge: SVOOC identified (soc %d%% temp %d.%d C cell %d mV cp %d mV) — deliver curve[%d] code %u\n",
 		 soc, temp_ddc / 10, temp_ddc % 10, cell_mv, sc8547_get_vbat(sc), sc->auto_curve_idx,
@@ -2422,13 +2455,32 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc)
 #define SC8547_ATTACH_SETTLE_MS	300
 #define SC8547_ATTACH_POLL_MS	250
 
+/* Restore stock REG05 UCP and REG08 soft-start timeout after pickup.
+ * The slave starts with its own ADC near zero; arm it on its own load.
+ */
+static int sc8547_serial_arm_ucp(struct sc8547a_device *sc)
+{
+	int ret;
+
+	if (sc->serial_ucp_armed)
+		return 0;
+	ret = sc8547_update_bits(sc, SC8547_REG_05, SC8547_IBUS_UCP_DIS_MASK, 0);
+	ret = ret ?: sc8547_update_bits(sc, SC8547_REG_08, SC8547_SS_TIMEOUT_SET_MASK,
+					SC8547_SS_TIMEOUT_81920MS << SC8547_SS_TIMEOUT_SET_SHIFT);
+	if (!ret)
+		sc->serial_ucp_armed = true;
+	return ret;
+}
+
 static void sc8547_attach_work(struct work_struct *work)
 {
 	struct sc8547a_device *sc =
 		container_of(work, struct sc8547a_device, attach_work.work);
+	unsigned long sampled_at;
 	int vbus;
 
 	guard(mutex)(&sc8547_pps_lock);
+	sampled_at = jiffies; /* The IRQ shares this mutex with the ADC/gauge reads. */
 	if (!sc->vooc_started)
 		return;
 
@@ -2482,6 +2534,16 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc8547_auto_finish(sc, "ADC limit or status unavailable");
 			goto reschedule;
 		}
+		/* RX_DONE frames are clocked by the source. CHG_EN can remain
+		 * set indefinitely with no source current while UCP is masked.
+		 */
+		if (time_after_eq(sampled_at, sc->last_frame + msecs_to_jiffies(SC8547_COMMU_TIMEOUT_MS))) {
+			sc8547_auto_reservo(sc, "frame-timeout");
+			goto reschedule;
+		}
+		/* A discharging cell below CV cannot be completing a charge taper. */
+		if (ibat <= 0)
+			sc->auto_taper_cnt = 0;
 		if (gret || cpbat <= 0 || vbus <= 0 || cibus < 0 || slave_ma < 0 ||
 		    !sc8547_auto_update_curve(sc, gsoc, gtemp, cvbat, cibus_total, false)) {
 			if (!gret && gtemp >= 0 && gtemp < 510 && gvbat > 0 &&
@@ -2508,6 +2570,32 @@ static void sc8547_attach_work(struct work_struct *work)
 			goto reschedule;
 		}
 
+		if (sc->vooc_vbus_status == SC_VBUS_NORMAL && cibus_total > SC8547_UCP_ARM_MA &&
+		    (sc8547_serial_arm_ucp(sc) || (slave_ma > SC8547_UCP_ARM_MA &&
+		    sc8547_serial_arm_ucp(sc8547_slave_dev)))) {
+			sc8547_auto_finish(sc, "UCP restore failed");
+			goto reschedule;
+		}
+		if (cibus_total >= SC8547_LOW_IBUS_MA) {
+			sc->low_ibus_count = 0;
+			if (!sc->load_seen) {
+				sc->load_since = jiffies;
+				sc->load_seen = true;
+			}
+			if (time_after_eq(jiffies, sc->load_since + msecs_to_jiffies(SC8547_AUTO_SUSTAINED_MS)))
+				sc->auto_reservo_cnt = 0;
+		} else {
+			sc->load_seen = false;
+			if (!sc->serial_request)
+				sc->low_ibus_count = 0;
+			else if (++sc->low_ibus_count >= SC8547_AUTO_STEP_DEBOUNCE) {
+				dev_info(sc->dev, "SVOOC current lost: code=%u master=%d slave=%d mA vbus=%d cp_vbat=%d reg06=%02x reg07=%02x\n",
+					 sc->serial_request, cibus, slave_ma, vbus, cpbat, r6, r7);
+				sc8547_auto_reservo(sc, "no-load");
+				goto reschedule;
+			}
+		}
+
 		if (!(r7 & SC8547_CHG_EN_MASK)) {
 			/*
 			 * CHG_EN self-cleared in hardware (VBUS_ERRORLO / UCP
@@ -2523,26 +2611,8 @@ static void sc8547_attach_work(struct work_struct *work)
 					 "fastchg: CHG_EN self-cleared, re-enabled (vbus %d mV vbat %d mV margin %d mV REG06=0x%02x)\n",
 					 vbus, cvbat, margin, r6);
 			} else {
-				sc8547_slave_cp_enable(sc, false);
-				sc8547_set_chg_enable(sc, false);
-				sc->cp_enabled = false;
-				if (sc->auto_state == SC_AUTO_DELIVER) {
-					/*
-					 * CHG_EN self-cleared below the CV ceiling (the
-					 * >=CV case finished in the hard backstop above):
-					 * the SVOOC adapter dropped its output for a
-					 * link reset. Re-servo (re-handshake) instead of
-					 * ending, bounded by the retry budget.
-					 */
-					dev_info(sc->dev,
-						 "auto: link drop (vbus %d mV vbat %d mV margin %d mV) — re-servo\n",
-						 vbus, cvbat, margin);
-					sc8547_auto_reservo(sc);
-					goto reschedule;
-				}
-				dev_warn(sc->dev,
-					 "fastchg: CHG_EN self-cleared, margin %d mV too thin (vbat %d mV) — CP stopped\n",
-					 margin, cvbat);
+				sc8547_auto_reservo(sc, "converter-window");
+				goto reschedule;
 			}
 		} else {
 			bool slave_on = sc8547_slave_is_on();
@@ -2717,13 +2787,19 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
 	if (!(sc->vooc_flag & VOOC_RXDATA_DONE_FLAG))
 		return false;
 
+	if (sc->vooc_flag & VOOC_TXDATA_WR_FAIL_FLAG)
+		return true;
 	if (vooc_get_mesg_from_adapter(sc)) {
 		dev_dbg(sc->dev, "VOOC frame decode failed (rx 0x%02x)\n",
 			sc->voocphy_rx_buff);
 		return false;
 	}
 
-	vooc_reply_adapter_mesg(sc);
+	if (vooc_reply_adapter_mesg(sc)) {
+		sc->last_frame = jiffies;
+		if (sc->fastchg_ask_cmd == VOOC_CMD_TELL_USB_BAD)
+			sc8547_auto_finish(sc, "adapter-reported-bad-connection");
+	}
 	dev_dbg(sc->dev, "VOOC mesg=0x%02x ask=0x%02x tx=%02x%02x\n",
 		sc->adapter_mesg, sc->fastchg_ask_cmd,
 		sc->voocphy_tx_buff[0], sc->voocphy_tx_buff[1]);
