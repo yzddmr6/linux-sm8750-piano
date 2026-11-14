@@ -2664,6 +2664,48 @@ static void xiaomi_mca_test_wake_termination(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
 }
 
+static void xiaomi_mca_test_wake_live_contract(struct kunit *test)
+{
+	static const u32 hosts[] = { MCA_TYPE_SDP, MCA_TYPE_CDP, MCA_TYPE_FLOAT };
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca_cells cells = { .ibat = 1500 };
+	int n;
+
+	guard(mutex)(&f->mca.lock);
+	f->mca.online = true;
+	f->chgr_status = MCA_CHGR_TERMINATED;
+	for (n = 0; n < ARRAY_SIZE(hosts); n++) {
+		f->type = hosts[n];
+		f->mca.cp = MCA_CP_OPENING;
+		xiaomi_mca_charge_wake_poll(&f->mca);
+		KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+		f->mca.cp = MCA_CP_ON;
+		xiaomi_mca_charge_wake_poll(&f->mca);
+		KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+		f->mca.cp = MCA_CP_OFF;
+		f->mca.hv_pps = false;
+		f->mca.hv = MCA_HV_ON;
+		xiaomi_mca_charge_wake_poll(&f->mca);
+		KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
+		f->mca.hv_pps = true;
+		xiaomi_mca_charge_wake_poll(&f->mca);
+		KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+	}
+	f->type = MCA_TYPE_PD;
+	f->mca.hv_pps = false;
+	f->mca.hv = MCA_HV_REQUESTED;
+	xiaomi_mca_charge_wake_poll(&f->mca);
+	KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+	f->mca.hv = MCA_HV_ON;
+	f->mca.poll_cells = &cells;
+	xiaomi_mca_charge_wake_poll(&f->mca);
+	KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+	cells.ibat = 0;
+	xiaomi_mca_charge_wake_poll(&f->mca);
+	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
+	f->mca.poll_cells = NULL;
+}
+
 static void xiaomi_mca_test_wake_thermal_stop(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3884,6 +3926,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_vbus_error_not_detach),
 	KUNIT_CASE(xiaomi_mca_test_threshold_interface),
 	KUNIT_CASE(xiaomi_mca_test_wake_policy),
+	KUNIT_CASE(xiaomi_mca_test_wake_live_contract),
 	KUNIT_CASE(xiaomi_mca_test_wake_thermal_stop),
 	KUNIT_CASE(xiaomi_mca_test_wake_termination),
 	KUNIT_CASE(xiaomi_mca_test_charger_wakeup_prepare),

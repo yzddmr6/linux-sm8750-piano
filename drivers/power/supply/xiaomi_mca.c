@@ -2870,10 +2870,18 @@ static bool xiaomi_mca_charge_wake_sample(struct xiaomi_mca *mca,
 	enum xiaomi_mca_wake_source source = xiaomi_mca_wake_source(type);
 	bool attached = mca->online &&
 		mca->policy_attach_generation == READ_ONCE(mca->attach_generation);
-	bool pumping = attached && xiaomi_mca_cp_active(mca);
-	bool fast = attached && (pumping || mca->hv == MCA_HV_REQUESTED || mca->hv == MCA_HV_ON ||
+	bool direct = attached && (xiaomi_mca_cp_active(mca) || xiaomi_mca_auth_pending(mca) ||
+				   (mca->hv_pps && mca->hv != MCA_HV_OFF &&
+				    mca->hv != MCA_HV_COOLDOWN));
+	bool negotiating = attached && mca->hv == MCA_HV_REQUESTED;
+	/* A fixed PDO remains selected even after buck EOC. Only simultaneous
+	 * battery charge current proves that such a contract is still delivering.
+	 */
+	bool delivering = attached && mca->hv == MCA_HV_ON && mca->poll_cells &&
+			  !mca->poll_cells->status && mca->poll_cells->ibat > 0;
+	bool fast = attached && (direct || negotiating || mca->hv == MCA_HV_ON ||
 			(!mca->cp_fault && mca->cp == MCA_CP_COOLDOWN) ||
-			mca->hv == MCA_HV_COOLDOWN || xiaomi_mca_auth_pending(mca));
+			mca->hv == MCA_HV_COOLDOWN);
 	bool thermal = mca->charge_hot || mca->charge_cold;
 	bool online = s->online == 1 && !mca->charge_hold && (!mca->charge_disabled || thermal);
 	bool done, limited, eligible;
@@ -2889,11 +2897,16 @@ static bool xiaomi_mca_charge_wake_sample(struct xiaomi_mca *mca,
 	if (generation != mca->service_generation || !mca->service_up)
 		return false;
 	/* Stock checks buck termination only after direct charging has stopped. */
-	done = !pumping && (s->chgr_status == MCA_CHGR_TERMINATED ||
+	done = !direct && !negotiating && !delivering && (s->chgr_status == MCA_CHGR_TERMINATED ||
 		(mca->charge_terminated && (s->chgr_status == U32_MAX ||
 					   s->chgr_status == MCA_CHGR_PAUSED ||
 					   s->chgr_status == MCA_CHGR_DISABLED)));
 	limited = mca->charge_end < 100 && (!mca->charge_blocked || thermal);
+	/* BC1.2 labels describe the port, not an already running direct route.
+	 * A host's fixed PDO alone needs no AP keepalive.
+	 */
+	if (direct && source == MCA_WAKE_WEAK)
+		source = MCA_WAKE_CHARGER;
 	/* A thermal stop drops measured current on an unclassified charger.
 	 * Retain its observed qualification until temperature recovers.
 	 */
