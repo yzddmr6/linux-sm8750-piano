@@ -1963,7 +1963,7 @@ static void sc8547_request_missed(struct sc8547a_device *sc, u8 code)
 	sc->missed_predata = sc->ask_predata;
 	sc->measure_missed_slot = true;
 	sc->missed_peak_ibus_ma = -1;
-	sc->serial_request = 0;
+	/* A missed replacement did not supersede the last confirmed ASK. */
 	sc->request_pending = false;
 	sc->retry_current = true;
 	sc->change_polls = 0;
