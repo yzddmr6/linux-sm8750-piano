@@ -25,6 +25,16 @@ properties:
   interrupts:
     maxItems: 1
 
+  io-channels:
+    items:
+      - description: Battery connector thermistor
+      - description: USB connector thermistor
+
+  io-channel-names:
+    items:
+      - const: battery-connector
+      - const: usb-connector
+
   southchip,secondary:
     type: boolean
     description: Use the secondary pump switching configuration.
@@ -69,6 +79,8 @@ allOf:
     then:
       required:
         - interrupts
+        - io-channels
+        - io-channel-names
 
 additionalProperties: false
 
@@ -85,6 +97,8 @@ examples:
             reg = <0x6f>;
             interrupt-parent = <&gpio>;
             interrupts = <163 IRQ_TYPE_EDGE_FALLING>;
+            io-channels = <&adc 0x74c>, <&adc 0x747>;
+            io-channel-names = "battery-connector", "usb-connector";
             southchip,battery-overvoltage-microvolt = <4850000>;
             southchip,ac-overvoltage-microvolt = <12000000>;
             southchip,input-overvoltage-microvolt = <10000000>;

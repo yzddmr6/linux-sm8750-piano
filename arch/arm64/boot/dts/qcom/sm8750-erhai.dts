@@ -1689,6 +1689,8 @@
 	pps_cp_primary: charger@6f {
 		compatible = "southchip,sc8547a";
 		reg = <0x6f>;
+		io-channels = <&pmk8550_vadc 0x74c>, <&pmk8550_vadc 0x747>;
+		io-channel-names = "battery-connector", "usb-connector";
 		interrupt-parent = <&tlmm>;
 		interrupts = <163 IRQ_TYPE_EDGE_FALLING>;
 		pinctrl-names = "default";
@@ -1945,6 +1947,25 @@
 		qcom,ratiometric;
 		qcom,hw-settle-time = <200>;
 		qcom,adc-tm;
+	};
+
+	/* Erhai 24924 PMIH010x (SID 7), stock connector NTC inputs. */
+	channel@747 {
+		reg = <0x747>;
+		label = "usb_con_therm_adc";
+		qcom,adc5-gen4;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
+	};
+
+	channel@74c {
+		reg = <0x74c>;
+		label = "batt_con_therm_adc";
+		qcom,adc5-gen4;
+		qcom,ratiometric;
+		qcom,hw-settle-time = <200>;
+		qcom,pre-scaling = <1 1>;
 	};
 };
 

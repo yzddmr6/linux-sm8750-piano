@@ -32,6 +32,8 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/iio/consumer.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
@@ -248,6 +250,7 @@ static const char * const sc8547_gauge_names[] = {
 
 /* RX status flags (high byte of the REG_2E word). */
 #define VOOC_RXDATA_DONE_FLAG		BIT(1)
+#define VOOC_TXDATA_DONE_FLAG		BIT(0)
 #define VOOC_TXDATA_WR_FAIL_FLAG	BIT(3)
 #define VOOC_FIRST_FRAME		0xA8
 
@@ -422,7 +425,26 @@ enum sc8547_auto_state {
 	SC_AUTO_DONE,		/* curve exit reached; handed back to normal charge */
 };
 
+/* 24924 AP VOOC PHY: 3 entry checks 10 ms apart, 10 hot samples
+ * 800 ms apart in delivery, then monitor a trip every 10 s.
+ */
+#define SC8547_BTB_HOT_MC	80000
+#define SC8547_BTB_RUN_MS	800
+#define SC8547_BTB_TRIP_MS	10000
+
+struct sc8547_btb {
+	struct iio_channel *battery, *usb;
+	struct delayed_work work;
+	unsigned int attachment;
+	bool online, valid, admitted, tripped;
+	unsigned int hot_count;
+	int battery_mc, usb_mc;
+	int battery_err, usb_err;
+	unsigned long sampled_at;
+};
+
 struct sc8547a_device {
+	struct sc8547_btb btb;
 #if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
 	struct sc8547a_ufcs_phy ufcs_phy;
 	struct ufcs_dev *ufcs;
@@ -498,7 +520,13 @@ struct sc8547a_device {
 	u8 pump_faults;
 	unsigned int adc_over_count;
 	unsigned int low_ibus_count;
-	unsigned long last_frame;
+	u64 irq_arrived_ns;	/* hard IRQ timestamp; IRQF_ONESHOT */
+	bool irq_pending;
+	u64 last_frame_ns;
+	unsigned int frame_gap_us, max_frame_gap_us;
+	unsigned int recoveries_answered;
+	bool awaiting_rehandshake;
+	unsigned long watchdog_fed_at;
 	bool frame_seen;
 	int master_ibus_ma, slave_ibus_ma;
 	int master_enabled, slave_enabled;
@@ -506,7 +534,7 @@ struct sc8547a_device {
 	int serial_ibat_ma, serial_reg06;
 	unsigned int rehandshakes, serial_exits;
 	unsigned int rx_errors, tx_errors;
-	u8 model_frames[2];
+	u8 model_frames[2], model_flags[2];
 	const char *serial_last_exit;
 	const char *serial_last_retry;
 	unsigned long load_since;
@@ -515,7 +543,21 @@ struct sc8547a_device {
 	u8 change_polls;
 	u8 notified_code;
 	int adapter_vbat_mv;
-	u8 serial_request;	/* most recent successfully written ASK_CURRENT reply */
+	u8 serial_request;	/* ASK_CURRENT retired without TXDATA_WR_FAIL */
+	u8 pending_request;
+	bool request_pending;
+	bool asked_current;
+	bool retry_current;
+	unsigned int adjust_failures;
+	unsigned int above_request_count;
+	unsigned long next_current_sample;
+	bool gauge_reading;
+	u16 serial_predata, ask_predata;
+	unsigned int missed_asks;
+	u8 missed_request;
+	u16 missed_predata;
+	bool measure_missed_slot;
+	int missed_peak_ibus_ma;
 	unsigned int		auto_taper_cnt;
 	int			auto_step_cnt;	/* advance debounce counter */
 	int			auto_reservo_cnt;	/* consecutive adapter-reset re-servos */
@@ -675,11 +717,26 @@ static bool sc8547_check_device_id(struct sc8547a_device *sc)
 	return val == SC8547A_DEVICE_ID;
 }
 
+static bool sc8547_btb_allows(const struct sc8547_btb *btb)
+{
+	return btb->online && btb->admitted && btb->valid && !btb->tripped;
+}
+
 static int sc8547_set_chg_enable(struct sc8547a_device *sc, bool enable)
 {
 	u8 stale;
 	int ret;
 
+	if (enable && (!sc8547_master_dev ||
+		       !sc8547_btb_allows(&sc8547_master_dev->btb)))
+		return -EAGAIN;
+	if (enable && !sc->is_slave && !sc->monitor_pump_faults && sc->btb.hot_count) {
+		/* A new session must pass the entry checks even on a warm replug. */
+		sc->btb.admitted = false;
+		sc->btb.hot_count = 0;
+		mod_delayed_work(system_freezable_wq, &sc->btb.work, 0);
+		return -EAGAIN;
+	}
 	/* IRQ and charge operations serialize on sc8547_pps_lock. REG0F
 	 * can hold reset/idle flags. Drain it immediately before CHG_EN,
 	 * never on a watchdog refresh of an already enabled converter.
@@ -764,7 +821,11 @@ static int sc8547_get_vbat(struct sc8547a_device *sc)
  * predata note above. Written raw, matching the vendor. */
 static int sc8547_set_predata(struct sc8547a_device *sc, u16 val)
 {
-	return sc8547_write_word(sc, SC8547_REG_31, val);
+	int ret = sc8547_write_word(sc, SC8547_REG_31, val);
+
+	if (!ret)
+		sc->serial_predata = val;
+	return ret;
 }
 
 static int sc8547_set_txbuff(struct sc8547a_device *sc, u16 val)
@@ -1314,21 +1375,25 @@ static int sc8547_slave_cp_enable(struct sc8547a_device *master, bool on)
 	return sc8547_set_chg_enable(sc, on);
 }
 
-/*
- * Keep the slave alive + measurable while it is enabled (mirror of the master's
- * REG_09=0x13 feed): the slave arms a 1000 ms watchdog at CP-close and its ADC
- * self-clears, so without a periodic refresh it would eventually disable itself
- * and its ibus would read 0. Call wherever the master watchdog is fed. NOTE: this
- * does NOT by itself make the slave share current — two SC8547 in parallel do not
- * auto-split; the vendor engages the slave as overload relief and runs an active
- * current-balance loop (oplus_switching / ibus_check deviation), not yet ported.
+/* Keep both converters alive before a blocking gauge read. During that
+ * read, the serial master's regular IRQs continue servicing the pair.
+ * Feed a slave with an unknown enable readback as well; REG09 cannot
+ * assert CHG_EN. Never feed a pump waiting for its stop watchdog.
  */
-static void sc8547_slave_feed_wd(void)
+static int sc8547_serial_feed(struct sc8547a_device *sc)
 {
-	if (!sc8547_slave_dev)
-		return;
-	sc8547_write_byte(sc8547_slave_dev, SC8547_REG_09, 0x13);
-	sc8547_write_byte(sc8547_slave_dev, SC8547_REG_11, 0x80);	/* keep ADC on */
+	int master, slave = 0;
+
+	if (!sc->cp_enabled || sc->auto_state != SC_AUTO_DELIVER || pump_stopping)
+		return 0;
+	master = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+	if (sc8547_slave_dev && (sc8547_slave_dev->monitor_pump_faults || sc->slave_enabled)) {
+		slave = sc8547_write_byte(sc8547_slave_dev, SC8547_REG_09, 0x13);
+		slave = slave ?: sc8547_set_adc_enable(sc8547_slave_dev, true);
+	}
+	if (!master && !slave)
+		sc->watchdog_fed_at = jiffies;
+	return master ?: slave;
 }
 
 /* Slave bus current (mA); 0 when no slave or its ADC/CP is idle. */
@@ -1552,7 +1617,6 @@ static int vooc_get_mesg_from_adapter(struct sc8547a_device *sc)
 	 * need delay"): any decodable VOOC frame marks a live VOOC adapter even
 	 * if the check-commu exchange has not completed yet. */
 	sc->vooc_saw_any = true;
-	sc->responded |= ERHAI_SERIAL;
 	return 0;
 }
 
@@ -1695,6 +1759,7 @@ static void vooc_handle_tell_model_process(struct sc8547a_device *sc)
 {
 	if (sc->adapter_model_count == 2) {
 		sc->model_frames[0] = sc->voocphy_rx_buff;
+		sc->model_flags[0] = sc->vooc_flag;
 		sc->adapter_model_ver = sc->adapter_mesg << 4;
 		vooc_write_mesg_mask(TX0_DET_BIT5_MASK, &sc->voocphy_tx_buff[0],
 				     VOOC_BIT_ACTIVE);
@@ -1702,12 +1767,13 @@ static void vooc_handle_tell_model_process(struct sc8547a_device *sc)
 		vooc_write_mesg_mask(TX0_DET_BIT5_MASK, &sc->voocphy_tx_buff[0],
 				     VOOC_BIT_ACTIVE);
 		sc->model_frames[1] = sc->voocphy_rx_buff;
+		sc->model_flags[1] = sc->vooc_flag;
 		sc->adapter_model_ver |= sc->adapter_mesg;
 		sc->adapter_model_ver &= 0x7F;
 		sc->model_received = true;
-		dev_info(sc->dev, "adapter model 0x%02x from frames %02x/%02x (rx_err=%u tx_err=%u)\n",
+		dev_info(sc->dev, "adapter model 0x%02x from frames %02x/%02x flags=%02x/%02x (rx_err=%u tx_err=%u)\n",
 			 sc->adapter_model_ver, sc->model_frames[0], sc->model_frames[1],
-			 sc->rx_errors, sc->tx_errors);
+			 sc->model_flags[0], sc->model_flags[1], sc->rx_errors, sc->tx_errors);
 		sc->fastchg_ask_cmd = VOOC_CMD_UNKNOWN;
 	}
 }
@@ -1887,6 +1953,25 @@ static void vooc_handle_ask_current_level(struct sc8547a_device *sc)
 	vooc_write_mesg_mask(TX1_DET_BIT1_MASK, &sc->voocphy_tx_buff[1], (cur >> 0) & 1);
 }
 
+/* The SC8547A reports a missed reply on a subsequent IRQ. A successful
+ * SMBus TXBUF write alone cannot establish what the adapter clocked out.
+ */
+static void sc8547_request_missed(struct sc8547a_device *sc, u8 code)
+{
+	sc->missed_asks++;
+	sc->missed_request = code;
+	sc->missed_predata = sc->ask_predata;
+	sc->measure_missed_slot = true;
+	sc->missed_peak_ibus_ma = -1;
+	/* A missed replacement did not supersede the last confirmed ASK. */
+	sc->request_pending = false;
+	sc->retry_current = true;
+	sc->change_polls = 0;
+	sc->adjust_failures++;
+	dev_info_ratelimited(sc->dev, "SVOOC missed ASK_CURRENT code=%u predata=0x%04x flags=0x%02x total=%u\n",
+			     code, sc->missed_predata, sc->vooc_flag, sc->missed_asks);
+}
+
 /* Oplus AP VOOC PHY, non_vooc20_handle_get_batt_vol_cmd: during CC
  * the master polls battery voltage. A seven-bit all-ones reply asks it
  * to poll ASK_CURRENT_LEVEL again. Give the vendor's five indications
@@ -1900,14 +1985,14 @@ static void vooc_handle_get_batt_vol(struct sc8547a_device *sc)
 	u8 v, l, h;
 
 	if (sc->cp_enabled && sc->fastchg_deliver &&
-	    sc->fastchg_curr_code != sc->serial_request) {
+	    (sc->retry_current || sc->fastchg_curr_code != sc->serial_request)) {
 		if (sc->notified_code != sc->fastchg_curr_code) {
 			sc->notified_code = sc->fastchg_curr_code;
 			sc->change_polls = 0;
 		}
 		if (sc->change_polls <= SC8547_CHANGE_CUR_POLLS)
 			sc->change_polls++;
-		if (sc->change_polls <= SC8547_CHANGE_CUR_POLLS) {
+		if (sc->change_polls <= SC8547_CHANGE_CUR_POLLS && sc->adjust_failures <= 3) {
 			vooc_write_mesg_mask(TX0_DET_BIT3_TO_BIT7_MASK, &sc->voocphy_tx_buff[0], 0x1f);
 			vooc_write_mesg_mask(TX1_DET_BIT0_TO_BIT1_MASK, &sc->voocphy_tx_buff[1], 3);
 			return;
@@ -1931,7 +2016,7 @@ static void vooc_handle_get_batt_vol(struct sc8547a_device *sc)
 	vooc_write_mesg_mask(TX1_DET_BIT0_TO_BIT1_MASK, &sc->voocphy_tx_buff[1], h);
 }
 
-/* Build + physically send the reply for the current RX frame. */
+/* Return whether RX was a supported command. TX completion has its own status. */
 static bool vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 {
 	bool valid = true;
@@ -2005,14 +2090,20 @@ static bool vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 	 * handler misses its slot (oplus_voocphy_set_txbuff, GET_BATT_VOL).
 	 */
 	reply = (sc->voocphy_tx_buff[0] << 8) | sc->voocphy_tx_buff[1];
+	if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL) {
+		sc->asked_current = sc->fastchg_deliver;
+		sc->ask_predata = sc->serial_predata;
+	}
 	if (sc8547_set_txbuff(sc, reply) ||
 	    (cmd == VOOC_CMD_GET_BATT_VOL && sc8547_set_predata(sc, reply))) {
 		sc->tx_errors++;
-		return false;
+		if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL)
+			sc8547_request_missed(sc, sc->fastchg_curr_code);
+		return valid;
 	}
 	if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL) {
-		sc->serial_request = sc->fastchg_deliver ? sc->fastchg_curr_code : 0;
-		sc->change_polls = 0;
+		sc->pending_request = sc->fastchg_deliver ? sc->fastchg_curr_code : 0;
+		sc->request_pending = true;
 	}
 	return valid;
 }
@@ -2226,11 +2317,20 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 static void sc8547_serial_clear_sample(struct sc8547a_device *sc)
 {
 	sc->frame_seen = false;
+	memset(sc->model_frames, 0, sizeof(sc->model_frames));
+	memset(sc->model_flags, 0, sizeof(sc->model_flags));
+	sc->frame_gap_us = sc->max_frame_gap_us = 0;
+	sc->voocphy_rx_buff = sc->vooc_flag = 0;
 	sc->master_ibus_ma = sc->slave_ibus_ma = -1;
 	sc->master_enabled = sc->slave_enabled = -1;
 	sc->serial_vbus_mv = sc->serial_reg06 = -1;
 	sc->serial_ibat_ma = 0;
-	sc->serial_request = 0;
+	sc->serial_request = sc->pending_request = 0;
+	sc->request_pending = sc->asked_current = sc->retry_current = false;
+	sc->measure_missed_slot = false;
+	sc->adjust_failures = sc->above_request_count = 0;
+	sc->next_current_sample = jiffies;
+	sc->serial_predata = sc->ask_predata = 0;
 }
 
 static void sc8547_serial_end(struct sc8547a_device *sc, const char *why)
@@ -2242,6 +2342,7 @@ static void sc8547_serial_end(struct sc8547a_device *sc, const char *why)
 		 sc->master_enabled, sc->slave_enabled, sc->serial_vbus_mv,
 		 sc->rehandshakes, sc->voocphy_rx_buff, sc->vooc_flag);
 	sc->serial_request = 0;
+	sc->request_pending = sc->measure_missed_slot = false;
 	sc->master_ibus_ma = sc->slave_ibus_ma = -1;
 	sc->master_enabled = sc->slave_enabled = sc->serial_quiesced ? 0 : -1;
 }
@@ -2369,6 +2470,11 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc, const char *why)
 	/* Stop both legs before touching the crossbar, resetting or feeding.
 	 * A lost ACK is fenced by the existing pump-off watchdog path.
 	 */
+	if (sc->auto_protection || sc8547_take_faults() > 0) {
+		sc->auto_protection = true;
+		sc8547_auto_finish(sc, "hw-ovp-ocp");
+		return;
+	}
 	sc->serial_last_retry = why;
 	if (sc8547_serial_off(sc)) {
 		sc8547_auto_finish(sc, "pump-stop-pending");
@@ -2380,13 +2486,15 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc, const char *why)
 		return;
 	}
 	sc->auto_reservo_cnt++;
+	sc->auto_ident_retries = 0; /* This recovery owns a fresh set of identify windows. */
 	sc->rehandshakes++;
+	sc->awaiting_rehandshake = true;
 
 	dev_info(sc->dev, "SVOOC re-handshake %d/%d: %s, request=%u ibus=%d/%d mA en=%d/%d vbus=%d mV rx_age=%u ms last_rx=0x%02x flags=0x%02x reg06=%d pack_ma=%d\n",
 		 sc->auto_reservo_cnt, SC8547_AUTO_RESERVO_MAX, why, sc->serial_request,
 		 sc->master_ibus_ma, sc->slave_ibus_ma, sc->master_enabled, sc->slave_enabled,
-		 sc->serial_vbus_mv, jiffies_to_msecs(jiffies - sc->last_frame), sc->voocphy_rx_buff,
-		 sc->vooc_flag, sc->serial_reg06, sc->serial_ibat_ma);
+		 sc->serial_vbus_mv, (unsigned int)div_u64(ktime_get_ns() - sc->last_frame_ns, NSEC_PER_MSEC),
+		 sc->voocphy_rx_buff, sc->vooc_flag, sc->serial_reg06, sc->serial_ibat_ma);
 	sc->fastchg_enable = false;
 	sc->fastchg_deliver = false;
 	sc8547_vooc_arm_hw(sc);
@@ -2410,64 +2518,26 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc, const char *why)
  */
 static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
 {
-	bool adsp_vooc = false;
-	bool real_vooc = false;
-	int ft = -ENODEV;
-	int rt = -ENODEV;
+	int ft, rt;
 
 	if (sc->auto_ident_retries >= identify_retries)
 		return false;
 
-	if (adsp_classify) {
+	/* A new arm clears the frame decoder, not the charger's identity.
+	 * Consult the PMIC only for an as-yet unidentified, silent source.
+	 */
+	if (!(sc->responded & ERHAI_SERIAL) && !sc->vooc_saw_any && adsp_classify) {
 		ft = erhai_otg_adsp_usb_prop(adsp_fastchg_type_prop);
-		adsp_vooc = ft >= 0 && (ft & 0x7f) >= adsp_fastchg_svooc_min;
-		if (ft >= 0)
-			dev_info(sc->dev,
-				 "slow adapter: ADSP fast-chg type %d (%s)\n",
-				 ft & 0x7f,
-				 adsp_vooc ? "VOOC-class" : "not VOOC");
-	}
-
-	/*
-	 * erhai: the ADSP never runs a VOOC session, so prop26 stays 0 and
-	 * adsp_vooc alone starves the ladder.  But the ADSP still classifies
-	 * the brick on its own DPDM leg — USB_REAL_TYPE in the VOOC family
-	 * (9 on this board; PPS heads read 8) — and that verdict must count
-	 * as evidence, or the serial ladder gets a single 4 s window and
-	 * identify_retries is dead weight (vooc-debug 调试笔记 §5).
-	 */
-	if (adsp_classify) {
 		rt = erhai_otg_adsp_usb_prop(adsp_real_type_prop);
-		real_vooc = rt == adsp_vooc_real_type;
-		if (rt >= 0)
-			dev_info(sc->dev,
-				 "slow adapter: USB real_type %d (%s)\n",
-				 rt, real_vooc ? "VOOC family" : "not VOOC");
+		if ((ft >= 0 && (ft & 0x7f) >= adsp_fastchg_svooc_min) ||
+		    rt == adsp_vooc_real_type)
+			sc->responded |= ERHAI_SERIAL;
 	}
-
-	/*
-	 * Only keep the ladder alive on VOOC evidence: an ADSP VOOC-family
-	 * verdict (Android's is_pd_svooc_adapter / sid_power), the ADSP
-	 * real_type VOOC family, or actual VOOC serial frames.  A plain
-	 * PD/5 V charger has neither and declines on the FIRST window —
-	 * identical to the old single-shot behaviour, so D+/D- and normal
-	 * charging are not held hostage by the retry loop.
-	 */
-	if (adsp_vooc || real_vooc)
-		sc->responded |= ERHAI_SERIAL;
-	if (!adsp_vooc && !real_vooc && !sc->vooc_saw_any) {
-		dev_info(sc->dev,
-			 "no VOOC evidence (adsp %d, real %d, frames %d) — declining\n",
-			 ft, rt, sc->vooc_saw_any);
+	if (!(sc->responded & ERHAI_SERIAL) && !sc->vooc_saw_any)
 		return false;
-	}
 
-	dev_info(sc->dev, "slow adapter%s: re-arming identify %d/%u\n",
-		 adsp_vooc ? " (ADSP VOOC)" :
-		 (real_vooc ? " (real_type VOOC)" :
-		 (sc->vooc_saw_any ? " (serial frames)" : "")),
-		 sc->auto_ident_retries + 1, identify_retries);
-
+	dev_info(sc->dev, "SVOOC re-arming identify %u/%u (responded=%u frames=%d)\n",
+		 sc->auto_ident_retries + 1, identify_retries, sc->responded, sc->vooc_saw_any);
 	sc->auto_ident_retries++;
 	sc8547_vooc_arm_hw(sc);		/* re-init PHY + resend handshake */
 	if (sc->auto_state == SC_AUTO_DECLINED)	/* DP alt-mode owns the switch */
@@ -2527,6 +2597,12 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 	sc->fastchg_deliver = true;
 	sc->fastchg_auto = false;	/* one-shot per arm consumed */
 	sc->auto_state = SC_AUTO_DELIVER;
+	if (sc->awaiting_rehandshake) {
+		sc->recoveries_answered++;
+		sc->awaiting_rehandshake = false;
+		dev_info(sc->dev, "SVOOC re-handshake answered: model=0x%02x window=%u\n",
+			 sc->adapter_model_ver, sc->auto_ident_retries);
+	}
 	dev_info(sc->dev,
 		 "auto fast-charge: SVOOC identified (soc %d%% temp %d.%d C cell %d mV cp %d mV) — deliver curve[%d] code %u\n",
 		 soc, temp_ddc / 10, temp_ddc % 10, cell_mv, sc8547_get_vbat(sc), sc->auto_curve_idx,
@@ -2553,26 +2629,61 @@ static int sc8547_serial_arm_ucp(struct sc8547a_device *sc)
 	return ret;
 }
 
+/* 24924 copycat_vooc_support, non-bidirectional CP: compare gauge
+ * charge current / 2 against the transmitted ASK_CURRENT value. See
+ * oplus_ap_voocphy.c:3392-3396, 5782-5806 and VOOC_CURR_EVENT_TIME.
+ */
+#define SC8547_REQUEST_MARGIN_MA	400
+#define SC8547_OVER_REQUEST_SAMPLES	10
+
+static bool sc8547_current_in_range(struct sc8547a_device *sc, int ibat_ma)
+{
+	int bus_ma = ibat_ma / 2;
+
+	if (time_before(jiffies, sc->next_current_sample))
+		return true;
+	sc->next_current_sample = jiffies + msecs_to_jiffies(1000);
+	if (!sc->cp_enabled || !sc->serial_request || bus_ma <= 1500 ||
+	    bus_ma <= sc->serial_request * 100 + SC8547_REQUEST_MARGIN_MA) {
+		sc->above_request_count = 0;
+		return true;
+	}
+	/* Vendor count starts at ten, prompts at three remaining, reloads
+	 * ten and exits on the following excessive sample with zero left.
+	 */
+	if (++sc->above_request_count == SC8547_OVER_REQUEST_SAMPLES - 3) {
+		sc->retry_current = true;
+		sc->change_polls = sc->adjust_failures = 0;
+		dev_info(sc->dev, "SVOOC over confirmed code %u: pack %d mA; asking again\n",
+			 sc->serial_request, ibat_ma);
+	}
+	return sc->above_request_count < 2 * SC8547_OVER_REQUEST_SAMPLES - 2;
+}
+
 /* A late frame can arrive between monitor polls. It belongs to a broken
  * exchange and must not refresh the watchdog for the old contract.
  */
-static bool sc8547_serial_timed_out(struct sc8547a_device *sc, unsigned long now)
+static bool sc8547_serial_timed_out(struct sc8547a_device *sc, u64 now_ns)
 {
 	return sc->auto_state == SC_AUTO_DELIVER && sc->frame_seen &&
-	       time_after_eq(now, sc->last_frame + msecs_to_jiffies(SC8547_COMMU_TIMEOUT_MS));
+	       now_ns >= sc->last_frame_ns + SC8547_COMMU_TIMEOUT_MS * NSEC_PER_MSEC;
 }
 
 static void sc8547_attach_work(struct work_struct *work)
 {
 	struct sc8547a_device *sc =
 		container_of(work, struct sc8547a_device, attach_work.work);
-	unsigned long sampled_at;
+	u64 sampled_at;
 	int gsoc = -1, gtemp = 0, gvbat = -1, ibat = 0;
 	int gret = -ENODATA, vbus;
 
 	guard(mutex)(&sc8547_pps_lock);
 	if (!sc->vooc_started)
 		return;
+	if (sc8547_serial_feed(sc)) {
+		sc8547_auto_reservo(sc, "watchdog-feed-io");
+		goto reschedule;
+	}
 	/* A pack/gauge GLINK round trip can outlast a PHY reply slot. The
 	 * gauge belongs to the pack, so it can be read outside the port
 	 * lock. Recheck ownership before touching either converter.
@@ -2580,14 +2691,16 @@ static void sc8547_attach_work(struct work_struct *work)
 	if (sc->auto_state == SC_AUTO_DELIVER ||
 	    (sc->auto_armed && sc->auto_state == SC_AUTO_IDENTIFY &&
 	     sc->adapter_check_ok && sc->model_received)) {
+		sc->gauge_reading = true;
 		mutex_unlock(&sc8547_pps_lock);
 		gret = sc8547_read_gauge(sc, &gsoc, &gtemp, &gvbat, &ibat);
 		mutex_lock(&sc8547_pps_lock);
+		sc->gauge_reading = false;
 		if (!sc->vooc_started || !sc->auto_armed ||
 		    (sc->auto_state != SC_AUTO_IDENTIFY && sc->auto_state != SC_AUTO_DELIVER))
 			return;
 	}
-	sampled_at = jiffies;
+	sampled_at = ktime_get_ns();
 
 	vbus = sc8547_get_vbus(sc);
 	if (!sc->auto_armed) {
@@ -2628,6 +2741,8 @@ static void sc8547_attach_work(struct work_struct *work)
 		 */
 		sc->master_ibus_ma = cibus < 0 ? -1 : cibus;
 		sc->slave_ibus_ma = slave_ma < 0 ? -1 : slave_ma;
+		if (sc->measure_missed_slot && cibus >= 0 && slave_ma >= 0)
+			sc->missed_peak_ibus_ma = max(sc->missed_peak_ibus_ma, cibus_total);
 		sc->serial_vbus_mv = vbus > 0 ? vbus : -1;
 		sc->serial_ibat_ma = gret ? 0 : ibat;
 		sc->serial_reg06 = sc8547_read_byte(sc, SC8547_REG_06, &r6) ? -1 : r6;
@@ -2672,7 +2787,13 @@ static void sc8547_attach_work(struct work_struct *work)
 		/* RX_DONE frames are clocked by the source. CHG_EN can remain
 		 * set indefinitely with no source current while UCP is masked.
 		 */
-		if (sc8547_serial_timed_out(sc, sampled_at)) {
+		/* A pending IRQ may be a frame that arrived before the deadline.
+		 * Its thread checks the captured edge against the previous valid
+		 * one; a non-frame IRQ never refreshes that deadline.
+		 */
+		if (sc8547_serial_timed_out(sc, sampled_at) &&
+		    !(smp_load_acquire(&sc->irq_pending) &&
+		      !sc8547_serial_timed_out(sc, READ_ONCE(sc->irq_arrived_ns)))) {
 			sc8547_auto_reservo(sc, "frame-timeout");
 			goto reschedule;
 		}
@@ -2686,7 +2807,11 @@ static void sc8547_attach_work(struct work_struct *work)
 					     (4000 + share_ma) / 100);
 		if (sc->adc_over_count)
 			sc->fastchg_curr_code = max_t(int, SC8547_CURR_CODE_MIN, sc->fastchg_curr_code - 1);
-		if (cibus_total >= SC8547_LOW_IBUS_MA) {
+		if (!sc8547_current_in_range(sc, ibat)) {
+			sc8547_auto_reservo(sc, "above-request");
+			goto reschedule;
+		}
+		if (cibus_total >= SC8547_LOW_IBUS_MA && !sc->above_request_count && sc->serial_request) {
 			sc->low_ibus_count = 0;
 			if (!sc->load_seen) {
 				sc->load_since = jiffies;
@@ -2696,7 +2821,7 @@ static void sc8547_attach_work(struct work_struct *work)
 				sc->auto_reservo_cnt = 0;
 		} else {
 			sc->load_seen = false;
-			if (!sc->serial_request)
+			if (!sc->asked_current || cibus_total >= SC8547_LOW_IBUS_MA)
 				sc->low_ibus_count = 0;
 			else if (++sc->low_ibus_count >= SC8547_AUTO_STEP_DEBOUNCE) {
 				dev_info(sc->dev, "SVOOC current lost: code=%u master=%d slave=%d mA vbus=%d cp_vbat=%d en=%d/%d\n",
@@ -2708,22 +2833,16 @@ static void sc8547_attach_work(struct work_struct *work)
 
 		if (!sc->cp_enabled)
 			goto reschedule;
-		if (sc->change_polls > SC8547_CHANGE_CUR_POLLS &&
-		    sc->notified_code == sc->fastchg_curr_code &&
-		    sc->serial_request > sc->fastchg_curr_code) {
-			sc8547_auto_reservo(sc, "current-change-unanswered");
-			goto reschedule;
-		}
 
-		if (sc->master_enabled < 0 || sc->serial_reg06 < 0) {
-			sc8547_auto_finish(sc, "pump-status-io");
+		if (sc->master_enabled < 0 || sc->slave_enabled < 0 || sc->serial_reg06 < 0) {
+			sc8547_auto_reservo(sc, "pump-status-io");
 			goto reschedule;
 		}
 
 		if (sc->vooc_vbus_status == SC_VBUS_NORMAL && cibus_total > SC8547_UCP_ARM_MA &&
 		    (sc8547_serial_arm_ucp(sc) || (slave_ma > SC8547_UCP_ARM_MA &&
 		    sc8547_serial_arm_ucp(sc8547_slave_dev)))) {
-			sc8547_auto_finish(sc, "ucp-restore-io");
+			sc8547_auto_reservo(sc, "ucp-restore-io");
 			goto reschedule;
 		}
 
@@ -2751,7 +2870,6 @@ static void sc8547_attach_work(struct work_struct *work)
 		} else {
 			bool slave_on = sc->slave_enabled > 0;
 
-			sc8547_write_byte(sc, SC8547_REG_09, 0x13);	/* feed watchdog */
 
 			/*
 			 * Dual-CP load-sharing (the vendor's threshold engage). Once
@@ -2765,12 +2883,12 @@ static void sc8547_attach_work(struct work_struct *work)
 			 */
 			if (!sc->slave_enabled && sc->vooc_vbus_status == SC_VBUS_NORMAL &&
 			    cibus >= SC8547_SLAVE_ENGAGE_IBUS_MA) {
-				sc8547_slave_cp_enable(sc, true);
-				sc->slave_on_since = jiffies;
-				sc->slave_low_cnt = 0;
-				dev_info(sc->dev,
-					 "dual-CP: engaging slave under load (master %d mA vbus %d mV vbat %d mV)\n",
-					 cibus, vbus, cvbat);
+				if (!sc8547_slave_cp_enable(sc, true)) {
+					sc->slave_on_since = jiffies;
+					sc->slave_low_cnt = 0;
+					dev_info_ratelimited(sc->dev, "dual-CP: requested slave under %d mA master load\n",
+							     cibus);
+				}
 			} else if (slave_on && slave_settle_ms &&
 				   jiffies - sc->slave_on_since <
 					   msecs_to_jiffies(slave_settle_ms)) {
@@ -2780,16 +2898,13 @@ static void sc8547_attach_work(struct work_struct *work)
 				 * ADC may still read its idle ~20 mA).  Feed
 				 * it; never judge the drop inside this window.
 				 */
-				sc8547_slave_feed_wd();
 				dev_dbg(sc->dev,
 					"dual-CP: slave settling (%u ms on, total %d mA)\n",
 					jiffies_to_msecs(jiffies - sc->slave_on_since),
 					cibus_total);
 			} else if (slave_on &&
 				   cibus_total < SC8547_SLAVE_DISENGAGE_IBUS_MA) {
-				if (++sc->slave_low_cnt < slave_drop_ticks) {
-					sc8547_slave_feed_wd();
-				} else {
+				if (++sc->slave_low_cnt >= slave_drop_ticks) {
 					sc8547_slave_cp_enable(sc, false);
 					sc->slave_low_cnt = 0;
 					dev_info(sc->dev,
@@ -2799,7 +2914,6 @@ static void sc8547_attach_work(struct work_struct *work)
 				}
 			} else if (slave_on) {
 				sc->slave_low_cnt = 0;
-				sc8547_slave_feed_wd();			/* keep the slave alive */
 			}
 
 			dev_dbg(sc->dev, "fastchg: vbus %d mV vbat %d mV ibus %d mA (master %d slave %d) margin %d mV REG06=0x%02x REG07=0x%02x slave_on=%d\n",
@@ -2829,29 +2943,136 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 	*active = sc && sc->vooc_started && sc->auto_state != SC_AUTO_OFF;
 	if (!sc)
 		return off;
-	off += sysfs_emit_at(buf, off, "svooc_last_exit=%s svooc_last_retry=%s rehandshakes=%u ",
+	off += sysfs_emit_at(buf, off, "btb_batt_mc=%d btb_usb_mc=%d btb_valid=%d btb_hot=%d "
+			     "btb_samples=%u btb_age_ms=%lld btb_err=%d/%d ",
+			     sc->btb.online && !sc->btb.battery_err ? sc->btb.battery_mc : INT_MIN,
+			     sc->btb.online && !sc->btb.usb_err ? sc->btb.usb_mc : INT_MIN,
+			     sc->btb.valid, sc->btb.tripped, sc->btb.hot_count,
+			     sc->btb.online && sc->btb.sampled_at ?
+				(long long)jiffies_to_msecs(jiffies - sc->btb.sampled_at) : -1LL,
+			     sc->btb.battery_err, sc->btb.usb_err);
+	off += sysfs_emit_at(buf, off, "svooc_last_exit=%s svooc_last_retry=%s rehandshakes=%u rehandshakes_answered=%u missed_asks=%u missed_code=%u missed_predata=0x%04x missed_peak_ibus_ma=%d ",
 			     sc->serial_last_exit ?: "none", sc->serial_last_retry ?: "none",
-			     sc->rehandshakes);
+			     sc->rehandshakes, sc->recoveries_answered, sc->missed_asks, sc->missed_request, sc->missed_predata,
+			     sc->missed_asks ? sc->missed_peak_ibus_ma : -1);
 	if (!*active)
 		return off;
 
-	age = sc->frame_seen ? (long long)jiffies_to_msecs(jiffies - sc->last_frame) : -1;
+	age = sc->frame_seen ? (long long)(unsigned int)div_u64(ktime_get_ns() - sc->last_frame_ns, NSEC_PER_MSEC) : -1;
 	ibus = sc->master_ibus_ma < 0 || sc->slave_ibus_ma < 0 ? -1 :
 		sc->master_ibus_ma + sc->slave_ibus_ma;
 	pump = sc->master_enabled > 0 || sc->slave_enabled > 0 ? 1 :
 		sc->master_enabled < 0 || sc->slave_enabled < 0 ? -1 : 0;
 	return off + sysfs_emit_at(buf, off,
 		"protocol=supervooc state=%s model=%d target_code=%u request_code=%u request_ma=%u "
+		"pending_code=%d predata=0x%04x above_samples=%u model_rx=0x%02x%02x model_flags=0x%02x%02x "
 		"vbus_mv=%d pump=%d pump_ibus_ma=%d master_ibus_ma=%d slave_ibus_ma=%d "
-		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u "
+		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u frame_gap_us=%u max_gap_us=%u "
 		"exits=%u last_exit=%s\n",
 		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1,
 		sc->fastchg_deliver ? sc->fastchg_curr_code : 0, sc->serial_request, sc->serial_request * 100,
+		sc->request_pending ? sc->pending_request : -1, sc->serial_predata, sc->above_request_count,
+		sc->model_frames[0], sc->model_frames[1], sc->model_flags[0], sc->model_flags[1],
 		sc->serial_vbus_mv, pump, ibus, sc->master_ibus_ma, sc->slave_ibus_ma,
 		sc->master_enabled, max(sc->slave_enabled, -1), age, sc->voocphy_rx_buff,
-		sc->vooc_flag, sc->serial_reg06, sc->rx_errors, sc->tx_errors, sc->serial_exits, sc->serial_last_exit ?: "none");
+		sc->vooc_flag, sc->serial_reg06, sc->rx_errors, sc->tx_errors, sc->frame_gap_us, sc->max_frame_gap_us,
+		sc->serial_exits, sc->serial_last_exit ?: "none");
 }
 EXPORT_SYMBOL_GPL(sc8547a_serial_describe);
+
+/* Clipped table endpoints include open/short circuit. The ADC5 Gen4
+ * 100k table (adcmap7_100k) uses these exact processed values.
+ */
+static int sc8547_btb_read(struct iio_channel *channel, int *mc)
+{
+	int ret = iio_read_channel_processed(channel, mc);
+
+	if (ret < 0)
+		return ret;
+	if (*mc <= -40960 || *mc >= 130048)
+		return -ERANGE;
+	return 0;
+}
+
+/* A bad conversion withdraws pump permission immediately. It cannot
+ * manufacture either an ambient temperature or a confirmed thermal trip.
+ */
+static unsigned int sc8547_btb_sample(struct sc8547_btb *b, int battery_err,
+				      int battery_mc, int usb_err, int usb_mc)
+{
+	bool hot;
+
+	b->sampled_at = jiffies;
+	b->battery_err = battery_err;
+	b->usb_err = usb_err;
+	b->battery_mc = battery_err ? INT_MIN : battery_mc;
+	b->usb_mc = usb_err ? INT_MIN : usb_mc;
+	b->valid = !battery_err && !usb_err;
+	if (!b->valid) {
+		b->admitted = false;
+		b->hot_count = 0;
+		return b->tripped ? SC8547_BTB_TRIP_MS : SC8547_BTB_RUN_MS;
+	}
+	hot = battery_mc >= SC8547_BTB_HOT_MC || usb_mc >= SC8547_BTB_HOT_MC;
+	if (!hot) {
+		b->hot_count = 0;
+		b->tripped = false;
+		b->admitted = true;
+		return SC8547_BTB_RUN_MS;
+	}
+	if (b->tripped)
+		return SC8547_BTB_TRIP_MS;
+	if (++b->hot_count >= (b->admitted ? 10 : 3)) {
+		b->tripped = true;
+		b->admitted = false;
+		return SC8547_BTB_TRIP_MS;
+	}
+	return b->admitted ? SC8547_BTB_RUN_MS : 10;
+}
+
+static void sc8547_btb_work(struct work_struct *work)
+{
+	struct sc8547a_device *sc = container_of(to_delayed_work(work), struct sc8547a_device,
+						 btb.work);
+	struct sc8547_btb *b = &sc->btb;
+	unsigned int attachment, delay;
+	unsigned long due, started = jiffies;
+	int battery = 0, usb = 0, battery_err, usb_err;
+	bool allowed, tripped, changed;
+
+	scoped_guard(mutex, &sc8547_pps_lock) {
+		if (!b->online)
+			return;
+		attachment = b->attachment;
+	}
+	/* ADC conversions can sleep. Keep both PHY and watchdog locks free. */
+	battery_err = sc8547_btb_read(b->battery, &battery);
+	usb_err = sc8547_btb_read(b->usb, &usb);
+	scoped_guard(mutex, &sc8547_pps_lock) {
+		if (!b->online || b->attachment != attachment)
+			return;
+		allowed = sc8547_btb_allows(b);
+		tripped = b->tripped;
+		delay = sc8547_btb_sample(b, battery_err, battery, usb_err, usb);
+		changed = allowed != sc8547_btb_allows(b) || tripped != b->tripped;
+		if (!sc8547_btb_allows(b)) {
+			if (sc->vooc_started && (sc->auto_state == SC_AUTO_IDENTIFY ||
+						 sc->auto_state == SC_AUTO_DELIVER))
+				sc8547_auto_finish(sc, b->tripped ? "connector-hot" : "connector-adc");
+			else if (pps_cp_engaged || pps_slave_engaged)
+				sc8547_pps_disengage();
+		}
+		if (changed)
+			dev_info(sc->dev, "connector protection: battery=%d usb=%d mC errors=%d/%d hot=%d admitted=%d\n",
+				 b->battery_mc, b->usb_mc, battery_err, usb_err, b->tripped,
+				 sc8547_btb_allows(b));
+		due = started + msecs_to_jiffies(delay);
+		mod_delayed_work(system_freezable_wq, &b->work,
+				 time_after(due, jiffies) ? due - jiffies : 0);
+	}
+	if (changed)
+		erhai_charge_recheck();
+}
 
 /* Called by the battery manager under its charge policy lock. Stop is
  * synchronous with both frame handling and the pump watchdog worker.
@@ -2864,6 +3085,14 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 	sc = sc8547_master_dev;
 	if (!sc)
 		return;
+	if (status->wired_online && !sc->btb.online) {
+		sc->btb.online = true;
+		mod_delayed_work(system_freezable_wq, &sc->btb.work,
+				 sc->btb.tripped ? msecs_to_jiffies(SC8547_BTB_TRIP_MS) : 0);
+	}
+	status->connector_blocked = !sc8547_btb_allows(&sc->btb);
+	if (status->connector_blocked)
+		status->protected |= ERHAI_SERIAL | ERHAI_UFCS | ERHAI_PPS;
 	status->ready |= ERHAI_PPS;
 	if (sc->irq <= 0)
 		return;
@@ -2882,12 +3111,32 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 }
 EXPORT_SYMBOL_GPL(sc8547a_probe_status);
 
+/* Invalidate in-flight conversions before unplug or sleep. Keep a thermal
+ * trip across suspend so waking up cannot bypass the 10 s recheck.
+ */
+static void sc8547_btb_offline(struct sc8547_btb *b)
+{
+	b->online = false;
+	b->valid = false;
+	b->admitted = false;
+	b->battery_err = b->usb_err = -ENODATA;
+	b->sampled_at = 0;
+	b->hot_count = 0;
+	b->attachment++;
+	cancel_delayed_work(&b->work);
+}
+
 void sc8547a_detached(void)
 {
 	guard(mutex)(&sc8547_pps_lock);
 	if (sc8547_master_dev) {
+		struct sc8547_btb *b = &sc8547_master_dev->btb;
+
+		sc8547_btb_offline(b);
+		b->tripped = false;
 		sc8547_master_dev->responded = 0;
-		sc8547_master_dev->rehandshakes = 0;
+		sc8547_master_dev->rehandshakes = sc8547_master_dev->recoveries_answered = 0;
+		sc8547_master_dev->missed_asks = 0;
 		sc8547_master_dev->rx_errors = sc8547_master_dev->tx_errors = 0;
 		sc8547_master_dev->ufcs_handshake_tried = false;
 		sc8547_master_dev->first_ufcs_timeout = false;
@@ -2908,6 +3157,8 @@ int sc8547a_serial_session(bool enable)
 	sc = sc8547_master_dev;
 	if (!sc || !serial_enable)
 		return enable ? -EOPNOTSUPP : 0;
+	if (enable && !sc8547_btb_allows(&sc->btb))
+		return -EAGAIN;
 	if (enable && sc->auto_protection)
 		return -EPERM;
 	if (enable == sc->vooc_started) {
@@ -2924,6 +3175,7 @@ int sc8547a_serial_session(bool enable)
 		sc->adc_over_count = 0;
 		sc->auto_armed = false;
 		sc->auto_ident_retries = 0;
+		sc->awaiting_rehandshake = false;
 		sc8547_serial_clear_sample(sc);
 		sc->model_received = false;
 		sc->auto_reservo_cnt = 0;
@@ -2953,9 +3205,10 @@ int sc8547a_serial_session(bool enable)
 EXPORT_SYMBOL_GPL(sc8547a_serial_session);
 
 /* IRQ-time frame processing. Returns true if a frame was handled. */
-static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
+static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 {
 	int word = sc8547_get_adapter_info(sc);
+	bool valid_rx;
 
 	if (word < 0)
 		return false;
@@ -2965,12 +3218,23 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
 
 	if (sc->vooc_flag & VOOC_TXDATA_WR_FAIL_FLAG) {
 		sc->tx_errors++;
-		return true;
+		if (sc->request_pending || sc->pre_ask_cmd == VOOC_CMD_ASK_CURRENT_LEVEL) {
+			sc8547_request_missed(sc, sc->pending_request);
+			sc->pre_ask_cmd = VOOC_CMD_UNKNOWN;
+		}
+	} else if (sc->request_pending &&
+		   (sc->vooc_flag & (VOOC_TXDATA_DONE_FLAG | VOOC_RXDATA_DONE_FLAG))) {
+		if (sc->serial_request != sc->pending_request)
+			sc->above_request_count = 0;
+		sc->serial_request = sc->pending_request;
+		sc->request_pending = sc->retry_current = false;
+		sc->measure_missed_slot = false;
+		sc->adjust_failures = sc->change_polls = 0;
 	}
 	if (!(sc->vooc_flag & VOOC_RXDATA_DONE_FLAG))
-		return false;
+		return !!(sc->vooc_flag & (VOOC_TXDATA_DONE_FLAG | VOOC_TXDATA_WR_FAIL_FLAG));
 
-	if (sc8547_serial_timed_out(sc, jiffies)) {
+	if (sc8547_serial_timed_out(sc, arrived_ns)) {
 		/* The monitor checks latched OCP/OVP and CV before rearming. */
 		mod_delayed_work(system_wq, &sc->attach_work, 0);
 		return true;
@@ -2982,16 +3246,52 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
 		return false;
 	}
 
-	if (vooc_reply_adapter_mesg(sc)) {
+	valid_rx = vooc_reply_adapter_mesg(sc);
+	if (sc->fastchg_ask_cmd == VOOC_CMD_TELL_USB_BAD) {
+		/* The peer has withdrawn permission even if our reply missed. */
+		sc8547_auto_finish(sc, "adapter-reported-bad-connection");
+		return true;
+	}
+	if (valid_rx) {
+		if (sc->adapter_type == SC_ADAPTER_SVOOC)
+			sc->responded |= ERHAI_SERIAL;
+		/* A combined RX/WR_FAIL IRQ still needs its normal reply.
+		 * For an ASK on that IRQ REG31 may already have won the slot.
+		 */
+		if (sc->request_pending && (sc->vooc_flag & VOOC_TXDATA_WR_FAIL_FLAG))
+			sc8547_request_missed(sc, sc->pending_request);
+		if (sc->frame_seen) {
+			sc->frame_gap_us = div_u64(arrived_ns - sc->last_frame_ns, NSEC_PER_USEC);
+			sc->max_frame_gap_us = max(sc->max_frame_gap_us, sc->frame_gap_us);
+		}
 		sc->frame_seen = true;
-		sc->last_frame = jiffies;
-		if (sc->fastchg_ask_cmd == VOOC_CMD_TELL_USB_BAD)
-			sc8547_auto_finish(sc, "adapter-reported-bad-connection");
+		sc->last_frame_ns = arrived_ns;
+		if (sc->gauge_reading && sc->cp_enabled &&
+		    time_after_eq(jiffies, sc->watchdog_fed_at + msecs_to_jiffies(SC8547_ATTACH_POLL_MS))) {
+			int master, slave;
+
+			if (sc8547_serial_feed(sc)) {
+				sc8547_auto_reservo(sc, "watchdog-feed-io");
+				return true;
+			}
+			master = sc8547_get_ibus(sc);
+			slave = sc8547_slave_ibus();
+			if (master < 0 || slave < 0) {
+				sc8547_auto_reservo(sc, "pump-adc-io");
+				return true;
+			}
+			sc->master_ibus_ma = master;
+			sc->slave_ibus_ma = slave;
+			if (sc->measure_missed_slot)
+				sc->missed_peak_ibus_ma = max(sc->missed_peak_ibus_ma, master + slave);
+			/* This IRQ has no fresh gauge sample for the 1 s contract check. */
+		}
 	}
 	dev_dbg(sc->dev, "VOOC mesg=0x%02x ask=0x%02x tx=%02x%02x\n",
 		sc->adapter_mesg, sc->fastchg_ask_cmd,
 		sc->voocphy_tx_buff[0], sc->voocphy_tx_buff[1]);
-	sc->pre_ask_cmd = sc->fastchg_ask_cmd;
+	sc->pre_ask_cmd = sc->fastchg_ask_cmd == VOOC_CMD_ASK_CURRENT_LEVEL && !sc->request_pending ?
+		VOOC_CMD_UNKNOWN : sc->fastchg_ask_cmd;
 	return true;
 }
 
@@ -3148,6 +3448,8 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	if (!sc || !sc->ufcs)
 		return -EOPNOTSUPP;
 	scoped_guard(mutex, &sc8547_pps_lock) {
+		if (!sc8547_btb_allows(&sc->btb))
+			return -EAGAIN;
 		if (sc->vooc_started || pps_cp_engaged || pps_adc_hold || sc->ufcs_owner)
 			return -EBUSY;
 		sc->ufcs_owner = true;
@@ -3296,13 +3598,23 @@ EXPORT_SYMBOL_GPL(sc8547a_ufcs_monitor);
 
 /* ------------------------------- IRQ ---------------------------------- */
 
+static irqreturn_t sc8547_irq_arrival(int irq, void *data)
+{
+	struct sc8547a_device *sc = data;
+
+	WRITE_ONCE(sc->irq_arrived_ns, ktime_get_ns());
+	smp_store_release(&sc->irq_pending, true);
+	return IRQ_WAKE_THREAD;
+}
+
 static irqreturn_t sc8547_irq_handler(int irq, void *data)
 {
 	struct sc8547a_device *sc = data;
 	u8 state = 0;
 
-	/* When the PHY is armed, an IRQ is an adapter VOOC frame. */
+	/* IRQF_ONESHOT keeps this edge stable until the thread finishes. */
 	guard(mutex)(&sc8547_pps_lock);
+	WRITE_ONCE(sc->irq_pending, false);
 	if (sc8547_waiting_for_off())
 		return IRQ_HANDLED;
 	sc8547_collect_faults(sc);
@@ -3314,7 +3626,7 @@ static irqreturn_t sc8547_irq_handler(int irq, void *data)
 #endif
 	if (sc->vooc_started && sc->auto_armed &&
 	    (sc->auto_state == SC_AUTO_IDENTIFY || sc->auto_state == SC_AUTO_DELIVER)) {
-		if (sc8547_voocphy_isr(sc))
+		if (sc8547_voocphy_isr(sc, READ_ONCE(sc->irq_arrived_ns)))
 			return IRQ_HANDLED;
 	}
 
@@ -3443,6 +3755,16 @@ static int sc8547a_probe(struct i2c_client *client)
 	if (!device_property_read_u32(sc->dev, "southchip,input-overvoltage-microvolt",
 				      &threshold) && threshold != 10000000)
 		return -EINVAL;
+	if (!sc->is_slave) {
+		sc->btb.battery = devm_iio_channel_get(sc->dev, "battery-connector");
+		if (IS_ERR(sc->btb.battery))
+			return dev_err_probe(sc->dev, PTR_ERR(sc->btb.battery), "battery connector ADC\n");
+		sc->btb.usb = devm_iio_channel_get(sc->dev, "usb-connector");
+		if (IS_ERR(sc->btb.usb))
+			return dev_err_probe(sc->dev, PTR_ERR(sc->btb.usb), "USB connector ADC\n");
+		sc->btb.battery_err = sc->btb.usb_err = -ENODATA;
+		INIT_DELAYED_WORK(&sc->btb.work, sc8547_btb_work);
+	}
 	mutex_init(&sc->i2c_lock);
 	INIT_DELAYED_WORK(&sc->attach_work, sc8547_attach_work);
 	i2c_set_clientdata(client, sc);
@@ -3460,7 +3782,7 @@ static int sc8547a_probe(struct i2c_client *client)
 		return dev_err_probe(sc->dev, ret, "UFCS PHY registration failed\n");
 
 	if (sc->irq > 0) {
-		ret = devm_request_threaded_irq(sc->dev, sc->irq, NULL,
+		ret = devm_request_threaded_irq(sc->dev, sc->irq, sc8547_irq_arrival,
 						sc8547_irq_handler,
 						IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 						dev_name(sc->dev), sc);
@@ -3488,6 +3810,8 @@ static void sc8547a_remove(struct i2c_client *client)
 {
 	struct sc8547a_device *sc = i2c_get_clientdata(client);
 
+	if (!sc->is_slave)
+		disable_delayed_work_sync(&sc->btb.work);
 	sc8547a_serial_session(false);
 	cancel_delayed_work_sync(&sc->attach_work);
 	debugfs_remove_recursive(sc->debug_root);
@@ -3522,6 +3846,7 @@ static int sc8547a_suspend(struct device *dev)
 	if (pps_slave_engaged && sc8547_pps_slave_off())
 		return -EIO;
 	if (!sc->is_slave) {
+		sc8547_btb_offline(&sc->btb);
 		sc->auto_state = SC_AUTO_OFF;
 		sc->fastchg_deliver = false;
 		sc->fastchg_enable = false;
