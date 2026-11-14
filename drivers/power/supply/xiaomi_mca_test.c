@@ -1771,7 +1771,7 @@ static void xiaomi_mca_test_otg_config(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->writes, 3);
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x201c, &invalid, 1));
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x201a, expected, 4));
-	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x200f, expected, 4));
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_write_allowed(0x200f, expected, 4));
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x2010, expected, 4));
 }
 

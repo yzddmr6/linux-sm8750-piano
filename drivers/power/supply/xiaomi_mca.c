@@ -2920,11 +2920,13 @@ static bool xiaomi_mca_connector_trip(struct mca_connector *c, const int temp[2]
 	bool slope = c->sampled && elapsed > 0 && c->temp[i] != INT_MIN &&
 		     temp[i] != INT_MIN && (s64)temp[i] - c->temp[i] >= 4 * elapsed;
 
+	bool can_recover = c->sampled && c->temp[0] != INT_MIN && c->temp[1] != INT_MIN &&
+			   temp[0] != INT_MIN && temp[1] != INT_MIN && elapsed > 0;
+
 	c->sampled = now;
 	memcpy(c->temp, temp, sizeof(c->temp));
 	if (c->tripped)
-		return temp[0] == INT_MIN || temp[1] == INT_MIN || temp[i] >= 55000 ||
-		       !elapsed || slope;
+		return !can_recover || temp[i] >= 55000 || slope;
 	return powered && (temp[i] >= 60000 || (temp[i] >= 35000 && slope));
 }
 
@@ -2961,12 +2963,12 @@ static bool xiaomi_mca_connector_poll(struct xiaomi_mca *mca)
 		ret = xiaomi_mca_charge_stop(mca);
 		if (ret)
 			dev_warn_ratelimited(mca->dev, "connector charge stop failed: %d\n", ret);
-		/* Stock boost source and enable source are both zero on Piano. */
-		if (otg || mca->otg_active || READ_ONCE(mca->otg_requested) || !mca->online) {
-			ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_ENABLE, 0);
-			if (ret)
-				dev_warn_ratelimited(mca->dev, "connector boost stop failed: %d\n", ret);
-		}
+		/* Stock OTG/en_src are both zero. Disabling the wired boost is
+		 * idempotent, including when its plugin status failed to read.
+		 */
+		ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_ENABLE, 0);
+		if (ret)
+			dev_warn_ratelimited(mca->dev, "connector boost stop failed: %d\n", ret);
 	}
 	if (hot || c->tripped) {
 		ret = gpiod_set_value_cansleep(c->cutoff, hot);
@@ -5547,6 +5549,7 @@ module_auxiliary_driver(xiaomi_mca_driver);
 
 MODULE_DESCRIPTION("Xiaomi MCA charger firmware interface over PMIC GLINK");
 MODULE_LICENSE("GPL");
+MODULE_IMPORT_NS("IIO_CONSUMER");
 
 #if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
 #include "xiaomi_mca_test.c"
