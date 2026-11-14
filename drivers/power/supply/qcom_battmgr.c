@@ -861,7 +861,7 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 {
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 	enum qcom_battmgr_unit unit = battmgr->unit;
-	u32 current;
+	u32 raw_ua;
 	int ret;
 
 	if (!battmgr->service_up)
@@ -882,10 +882,10 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 		val->intval = battmgr->status.status;
 		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
 			ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
-						BATT_CURR_NOW, &current);
+						BATT_CURR_NOW, &raw_ua);
 			if (ret)
 				return ret;
-			val->intval = erhai_battery_status(val->intval, -(s32)current);
+			val->intval = erhai_battery_status(val->intval, -(s32)raw_ua);
 		}
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
