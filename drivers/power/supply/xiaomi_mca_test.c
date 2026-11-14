@@ -3014,8 +3014,20 @@ static void xiaomi_mca_test_tail_current_transfer(struct kunit *test)
 	guard(mutex)(&mca->lock);
 	xiaomi_mca_cp_step(mca);
 	KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_ON);
-	KUNIT_EXPECT_EQ(test, mca->cp_taper_ibus, 2740);
+	KUNIT_EXPECT_TRUE(test, mca->cp_parallel_done);
 	KUNIT_EXPECT_EQ(test, mca->fcc_set_ma, 500);
+	/* Removing the buck share must not impose a new pump current cap.
+	 * Voltage headroom still permits a step at 4504 mV.
+	 */
+	previous = mca->cp_mv;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_GT(test, mca->cp_mv, previous);
+	/* The parallel decision stays made when the gauge relaxes. */
+	f->cells[0].voltage = f->cells[1].voltage = 4470000;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, mca->fcc_set_ma, 500);
+	/* Near CV, the same current deficit must not push the voltage up. */
+	f->cells[0].voltage = f->cells[1].voltage = 4529000;
 	previous = mca->cp_mv;
 	xiaomi_mca_cp_step(mca);
 	KUNIT_EXPECT_LE(test, mca->cp_mv, previous);

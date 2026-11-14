@@ -664,7 +664,7 @@ struct xiaomi_mca {
 
 	struct delayed_work poll_work;
 	bool term_written;	/* restore even after a lost write acknowledgment */
-	int cp_taper_ibus;
+	bool cp_parallel_done;
 	bool cp_normal_cv;
 	bool term_hot;		/* float-voltage thermal hysteresis */
 	bool fv_derated;	/* pack temperature unavailable */
@@ -3448,7 +3448,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_stage = 0;
 	mca->cp_target_ma = 0;
 	mca->cp_recharge_cv = 0;
-	mca->cp_taper_ibus = 0;
+	mca->cp_parallel_done = false;
 	mca->cp = MCA_CP_OPENING;
 	/* Confirm the new FV before asking the source to open this session. */
 	ret = xiaomi_mca_full_charge_poll(mca);
@@ -3745,16 +3745,10 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		fcc = xiaomi_mca_parallel_fcc(ibat_max, ibus_all, mca->fcc_set_ma);
 		icl = fcc / 2 + (fcc > 1000 ? 500 : 0);
 		/* The stock vbat_threshold ends parallel boosting near CV. */
-		if (!mca->cp_taper_ibus && (vbat >= 4480 || taper)) {
-			/* The buck stops contributing near CV. Do not transfer
-			 * its former current budget into the pump on that edge.
-			 */
-			mca->cp_taper_ibus = max(ibus, MCA_CP_OPEN_IBUS_MA);
-		}
-		if (mca->cp_taper_ibus) {
+		if (vbat >= 4480 || taper)
+			mca->cp_parallel_done = true;
+		if (mca->cp_parallel_done)
 			fcc = icl = MCA_CP_BUCK_MA;
-			target = min(target, mca->cp_taper_ibus);
-		}
 		budget = (int)xiaomi_mca_cp_src_ma(mca) - 200;
 		/* While raising a vote, allow for the load step before its ADC
 		 * sample is available. Steady regulation uses measured draw.
