@@ -198,6 +198,8 @@ enum qcom_battmgr_variant {
 #define PD_DEFAULT_MV			5000
 /* PM8550: top HAL usb_icl[] step, also used for the PPS buck path. */
 #define PD_INPUT_MAX_UA			3000000
+/* 24924 common.dtsi input-power-mw: 10 W for VOOC/DCP at 5 V. */
+#define ERHAI_SERIAL_5V_UA		2000000
 #define PD_TRANSITION_UA			500000
 #define PD_VBUS_RISEN_UV			7500000
 #define PD_VBUS_MAX_UV			11000000
@@ -582,6 +584,7 @@ struct qcom_battmgr {
 	bool serial_backoff;
 	bool serial_blocked;
 	bool aicl_done;
+	bool serial_icl_vote;
 	bool pd_logged;
 	u32 pd_input_limit_ua;
 	u32 pd_saved_fcc_ua;
@@ -1394,9 +1397,10 @@ static ssize_t charge_contract_show(struct device *dev, struct device_attribute 
 			 b->pd_state == PD_ACTIVE && !b->qc_contract ? PD_FIXED_MV : 0,
 			 b->pd_state == PD_ACTIVE ? b->pd_input_limit_ua : 0);
 
-	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d detected_type=%u fixed_exit=%s ",
+	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d detected_type=%u serial_source=%d serial_icl_vote=%d fixed_exit=%s ",
 			     b->pd_state == PD_ACTIVE && b->qc_contract ? PD_FIXED_MV : 0,
-			     b->serial_probe, b->charge_detected_type, b->fixed_exit ?: "none");
+			     b->serial_probe, b->charge_detected_type, !!(b->retry_evidence & ERHAI_SERIAL),
+			     b->serial_icl_vote, b->fixed_exit ?: "none");
 	if (b->pps_ops)
 		return b->pps_ops->describe(b->pps_data, buf, len);
 	return len + sysfs_emit_at(buf, len, "state=idle\n");
@@ -1717,12 +1721,45 @@ static unsigned int qcom_battmgr_retry_routes(struct qcom_battmgr *b,
 	return routes;
 }
 
+/* The crossbar returning D+/D- to the PMIC can turn a known brick into
+ * an apparent SDP. Give its 5 V buck path the board's charger vote and
+ * run hardware AICL. Release the attachment-scoped vote on unplug.
+ */
+static int qcom_battmgr_serial_icl(struct qcom_battmgr *b, bool enable)
+{
+	u32 vbus;
+	int ret;
+
+	if (enable) {
+		if (b->aicl_done && b->serial_icl_vote)
+			return 0;
+		ret = qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &vbus);
+		if (ret || vbus < 4000000 || vbus > 5500000)
+			return ret ?: -EAGAIN;
+		b->serial_icl_vote = true; /* A missed write ACK may have applied the vote. */
+	} else if (!b->serial_icl_vote) {
+		return 0;
+	}
+	ret = qcom_battmgr_set_property(b, BATTMGR_USB_PROPERTY_SET, USB_INPUT_CURR_LIMIT,
+					enable ? ERHAI_SERIAL_5V_UA : U32_MAX);
+	if (ret)
+		return ret;
+	if (!enable) {
+		b->serial_icl_vote = false;
+		b->aicl_done = false;
+		return 0;
+	}
+	ret = qcom_battmgr_set_property(b, BATTMGR_USB_PROPERTY_SET, USB_OPLUS_RERUN_AICL, 0);
+	b->aicl_done = !ret;
+	return ret;
+}
+
 static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
 	struct erhai_probe_status status = {};
 	bool stable, ufcs_active, tail, probe_idle, prefer_pps, dedicated, can_probe;
-	bool detached, qc, try_qc, caps_changed, current_changed = false;
+	bool serial_source, detached, qc, try_qc, caps_changed, current_changed = false;
 	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus, ua, real_type;
 	int ret;
 
@@ -1752,11 +1789,21 @@ read_source:
 	if (online && qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 					       USB_ADAP_TYPE, &type))
 		type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	/* Process the PHY evidence before the wake and routing decisions.
+	 * Do not transfer evidence across a replacement Type-C partner.
+	 */
+	status = (struct erhai_probe_status){};
+	if (online && !detached && battmgr->pps_ops)
+		battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
 	scoped_guard(spinlock_irqsave, &battmgr->notify_lock) {
 		if (test_bit(PD_EVENT_DETACH, &battmgr->pd_events))
 			goto read_source;
+		if (online && !detached)
+			battmgr->retry_evidence |= (status.responded | status.delivering) & ERHAI_SERIAL;
+		serial_source = !detached && (battmgr->retry_evidence & ERHAI_SERIAL);
 		qcom_battmgr_charge_wake_locked(battmgr,
-			erhai_should_stay_awake(online == 1, battmgr->otg_request, type));
+			erhai_should_stay_awake(online == 1, battmgr->otg_request,
+						serial_source ? POWER_SUPPLY_USB_TYPE_DCP : type));
 	}
 	if (detached || !online) {
 		ret = qcom_battmgr_pps_stop(battmgr, false);
@@ -1787,7 +1834,8 @@ read_source:
 		battmgr->pd_partner_checked = false;
 		battmgr->pd_charge_only = false;
 		if (ret || (qcom_battmgr_pd_stop(battmgr, !online, "charger removed") &&
-			    (battmgr->pd_restore_fcc || battmgr->pd_restore))) {
+			    (battmgr->pd_restore_fcc || battmgr->pd_restore)) ||
+		    qcom_battmgr_serial_icl(battmgr, false)) {
 			set_bit(PD_EVENT_DETACH, &battmgr->pd_events);
 			return PD_POLL_MS;
 		}
@@ -1806,8 +1854,9 @@ read_source:
 		/* Classification is optional. The power contract has its own readback. */
 		real_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 	}
-	if (type != battmgr->charge_detected_type) {
+	if (type != battmgr->charge_detected_type)
 		battmgr->aicl_done = false;
+	if (!serial_source && type != battmgr->charge_detected_type) {
 		battmgr->serial_failures = battmgr->ufcs_failures = 0;
 		battmgr->serial_backoff = battmgr->ufcs_backoff = false;
 	}
@@ -1830,11 +1879,10 @@ read_source:
 		     ((type == POWER_SUPPLY_USB_TYPE_UNKNOWN || type == POWER_SUPPLY_USB_TYPE_C) &&
 		      qcom_battmgr_usb_idle(battmgr)));
 	tail = qcom_battmgr_tail_owned(battmgr);
+	dedicated |= serial_source;
 	can_probe = dedicated && !READ_ONCE(battmgr->pps_suspended) &&
 		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
 		    !battmgr->charge_policy_hold && !battmgr->charge_error;
-	if (battmgr->pps_ops)
-		battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
 	qcom_battmgr_note_delivery(battmgr, status.delivering);
 	if (status.delivering && status.delivering == battmgr->restore_route)
 		battmgr->restore_route = 0;
@@ -1899,7 +1947,11 @@ read_source:
 			battmgr->restore_route &= ~ERHAI_SERIAL;
 			ret = battmgr->pps_ops->serial_session(true);
 			if (!ret) {
+				if (status.delivering == ERHAI_SERIAL &&
+				    qcom_battmgr_serial_icl(battmgr, false))
+					return PD_POLL_MS;
 				battmgr->serial_probe = true;
+				battmgr->aicl_done = false;
 				return PD_POLL_MS;
 			}
 			/* Keep the reservation until the entire retry ladder is done. */
@@ -1923,6 +1975,8 @@ read_source:
 		battmgr->retry_pending = 0;
 		battmgr->retry_once &= ~ERHAI_UFCS;
 		battmgr->restore_route &= ~ERHAI_UFCS;
+		if (qcom_battmgr_serial_icl(battmgr, false))
+			return PD_POLL_MS;
 		delay = battmgr->pps_ops->ufcs_update(battmgr->pps_data);
 		if (battmgr->pps_ops->ufcs_active(battmgr->pps_data))
 			return delay ?: PD_POLL_MS;
@@ -1956,7 +2010,8 @@ read_source:
 		     !qcom_battmgr_retry_slot(&battmgr->pps_retry_state, battmgr->stable_since,
 					     battmgr->restore_route == ERHAI_PPS)))
 			goto fixed_contract;
-		if (qcom_battmgr_pd_stop(battmgr, false, "PPS handover"))
+		if (qcom_battmgr_serial_icl(battmgr, false) ||
+		    qcom_battmgr_pd_stop(battmgr, false, "PPS handover"))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
 		battmgr->restore_route &= ~ERHAI_PPS;
@@ -2033,13 +2088,17 @@ fixed_contract:
 		/* Stock ADSP implements USB_SET_RERUN_AICL. Let its PMIC
 		 * regulate a weak port within the negotiated Type-C/BC limit.
 		 */
-		if (!battmgr->aicl_done && !READ_ONCE(battmgr->otg_request) &&
+		if (serial_source && !READ_ONCE(battmgr->otg_request)) {
+			if (qcom_battmgr_serial_icl(battmgr, true))
+				return PD_POLL_MS;
+		} else if (!battmgr->aicl_done && !READ_ONCE(battmgr->otg_request) &&
 		    !qcom_battmgr_set_property(battmgr, BATTMGR_USB_PROPERTY_SET,
 					       USB_OPLUS_RERUN_AICL, 0))
 			battmgr->aicl_done = true;
 		return CHARGE_CTRL_POLL_MS;
 	}
-	battmgr->aicl_done = false;
+	if (!battmgr->serial_icl_vote)
+		battmgr->aicl_done = false;
 	if (battmgr->qc_contract != qc) {
 		if (qcom_battmgr_pd_stop(battmgr, false, "source protocol changed"))
 			return PD_POLL_MS;
@@ -2085,7 +2144,9 @@ fixed_contract:
 		}
 		if (ret || !ua) {
 			dev_info(battmgr->dev, "PD: no verified 9 V fixed PDO (error %d)\n", ret);
-			qcom_battmgr_pd_stop(battmgr, false, "source capabilities");
+			if (qcom_battmgr_pd_stop(battmgr, false, "source capabilities") ||
+			    (serial_source && qcom_battmgr_serial_icl(battmgr, true)))
+				return PD_POLL_MS;
 			qcom_battmgr_pd_log(battmgr, type);
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 			return CHARGE_CTRL_POLL_MS;
@@ -2096,6 +2157,8 @@ fixed_contract:
 
 	switch (battmgr->pd_state) {
 	case PD_IDLE:
+		if (qcom_battmgr_serial_icl(battmgr, false))
+			return PD_POLL_MS;
 		if (!caps_changed)
 			return CHARGE_CTRL_POLL_MS;
 		ret = qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,

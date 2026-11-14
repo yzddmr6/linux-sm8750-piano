@@ -1552,7 +1552,6 @@ static int vooc_get_mesg_from_adapter(struct sc8547a_device *sc)
 	 * need delay"): any decodable VOOC frame marks a live VOOC adapter even
 	 * if the check-commu exchange has not completed yet. */
 	sc->vooc_saw_any = true;
-	sc->responded |= ERHAI_SERIAL;
 	return 0;
 }
 
@@ -2455,7 +2454,7 @@ static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
 	 */
 	if (adsp_vooc || real_vooc)
 		sc->responded |= ERHAI_SERIAL;
-	if (!adsp_vooc && !real_vooc && !sc->vooc_saw_any) {
+	if (!(sc->responded & ERHAI_SERIAL) && !sc->vooc_saw_any) {
 		dev_info(sc->dev,
 			 "no VOOC evidence (adsp %d, real %d, frames %d) — declining\n",
 			 ft, rt, sc->vooc_saw_any);
@@ -2465,7 +2464,7 @@ static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
 	dev_info(sc->dev, "slow adapter%s: re-arming identify %d/%u\n",
 		 adsp_vooc ? " (ADSP VOOC)" :
 		 (real_vooc ? " (real_type VOOC)" :
-		 (sc->vooc_saw_any ? " (serial frames)" : "")),
+		 (sc->vooc_saw_any ? " (serial frames)" : " (previous response)")),
 		 sc->auto_ident_retries + 1, identify_retries);
 
 	sc->auto_ident_retries++;
@@ -2983,6 +2982,8 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
 	}
 
 	if (vooc_reply_adapter_mesg(sc)) {
+		if (sc->adapter_type == SC_ADAPTER_SVOOC)
+			sc->responded |= ERHAI_SERIAL;
 		sc->frame_seen = true;
 		sc->last_frame = jiffies;
 		if (sc->fastchg_ask_cmd == VOOC_CMD_TELL_USB_BAD)
