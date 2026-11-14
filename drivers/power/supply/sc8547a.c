@@ -512,7 +512,7 @@ struct sc8547a_device {
 	enum sc8547_auto_state	auto_state;
 	unsigned long		auto_identify_deadline;
 	const struct erhai_charge_curve *auto_curve;
-	int curve_temp, curve_sample_temp;
+	int curve_temp, curve_sample_temp, curve_entry_temp;
 	int curve_temp_bounds[6];
 	unsigned int thermal_ma;
 	unsigned int curve_ma;	/* selected CC/CV table */
@@ -2343,22 +2343,27 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 {
 	const struct erhai_charge_curve *curve;
 	const struct erhai_charge_step *step;
-	const struct erhai_charge_curve *raw;
+	const struct erhai_charge_curve *raw, *thermal;
 	unsigned int limit;
-	int last_temp = sc->curve_temp;
 	bool new_table;
 
 	raw = erhai_curve_select(svooc_curves, soc, temp);
 	sc->curve_sample_temp = temp;
 	sc->curve_temp = sc8547_curve_temperature(sc, temp, soc, entering || !sc->auto_curve);
-	curve = erhai_curve_select(svooc_curves, soc, sc->curve_temp);
+	if (entering || !sc->auto_curve)
+		sc->curve_entry_temp = sc->curve_temp;
+	/* current_max follows the handshake's voltage curve; changing
+	 * temperature votes must not replace it with a colder CC ceiling.
+	 * Retain the existing monotonic SOC-bin adjustment separately.
+	 */
+	curve = erhai_curve_select(svooc_curves, soc, sc->curve_entry_temp);
+	thermal = erhai_curve_select(svooc_curves, soc, sc->curve_temp);
 	/* vooc_high_temp (entry) and over_high_temp (running). */
-	if (!raw || !curve || mv <= SC8547_CELL_MIN_VALID_MV ||
+	if (!raw || !curve || !thermal || mv <= SC8547_CELL_MIN_VALID_MV ||
 	    mv >= min(erhai_cell_cv(temp), erhai_cell_cv(sc->curve_temp)))
 		return false;
 
-	new_table = entering || !sc->auto_curve || sc->auto_curve->steps != curve->steps ||
-		    last_temp != sc->curve_temp;
+	new_table = entering || !sc->auto_curve || sc->auto_curve->steps != curve->steps;
 	if (new_table) {
 		sc->auto_curve = curve;
 		sc->auto_curve_idx = erhai_curve_start(curve, mv, true);
@@ -2391,8 +2396,11 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 	 */
 	limit = curve->steps[sc->auto_curve_idx].ma;
 	sc->curve_ma = entering ? limit : min(sc->curve_ma, limit);
-	sc->thermal_ma = raw->steps != curve->steps ?
-		raw->steps[erhai_curve_start(raw, mv, true)].ma : curve->steps[0].ma;
+	sc->thermal_ma = thermal->steps != curve->steps ?
+		thermal->steps[erhai_curve_start(thermal, mv, true)].ma : curve->steps[0].ma;
+	if (raw->steps != curve->steps)
+		sc->thermal_ma = min_t(unsigned int, sc->thermal_ma,
+			raw->steps[erhai_curve_start(raw, mv, true)].ma);
 	limit = min(sc->curve_ma, sc->thermal_ma) / 100;
 	limit = min_t(unsigned int, limit, sc->adapter_cap);
 	/* A source can remember the first ASK_CURRENT as the session ceiling.
@@ -3110,13 +3118,13 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 	pump = sc->master_enabled > 0 || sc->slave_enabled > 0 ? 1 :
 		sc->master_enabled < 0 || sc->slave_enabled < 0 ? -1 : 0;
 	return off + sysfs_emit_at(buf, off,
-		"curve_temp=%d sample_temp=%d curve_code=%u thermal_code=%u curve_idx=%u warm_boundary=%d "
+		"curve_temp=%d sample_temp=%d entry_temp=%d curve_code=%u thermal_code=%u curve_idx=%u warm_boundary=%d "
 		"protocol=supervooc state=%s model=%d allow_sent=%d pre_allow_buck_ua=%d first_request_code=%u target_code=%u request_code=%u request_ma=%u "
 		"pending_code=%d predata=0x%04x above_samples=%u model_rx=0x%02x%02x model_flags=0x%02x%02x "
 		"vbus_mv=%d pump=%d pump_ibus_ma=%d master_ibus_ma=%d slave_ibus_ma=%d "
 		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u frame_gap_us=%u max_gap_us=%u "
 		"exits=%u last_exit=%s\n",
-		sc->curve_temp, sc->curve_sample_temp, sc->curve_ma / 100, sc->thermal_ma / 100,
+		sc->curve_temp, sc->curve_sample_temp, sc->curve_entry_temp, sc->curve_ma / 100, sc->thermal_ma / 100,
 		sc->auto_curve_idx, sc->curve_temp_bounds[5],
 		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1,
 		sc->allow_sent, sc->pre_allow_buck_ua, sc->first_request,
