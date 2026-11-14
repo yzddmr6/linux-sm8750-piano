@@ -1981,7 +1981,7 @@ static void vooc_handle_get_batt_vol(struct sc8547a_device *sc)
 	vooc_write_mesg_mask(TX1_DET_BIT0_TO_BIT1_MASK, &sc->voocphy_tx_buff[1], h);
 }
 
-/* Build + physically send the reply for the current RX frame. */
+/* Return whether RX was a supported command. TX completion has its own status. */
 static bool vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 {
 	bool valid = true;
@@ -2064,7 +2064,7 @@ static bool vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 		sc->tx_errors++;
 		if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL)
 			sc8547_request_missed(sc, sc->fastchg_curr_code);
-		return false;
+		return valid;
 	}
 	if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL) {
 		sc->pending_request = sc->fastchg_deliver ? sc->fastchg_curr_code : 0;
@@ -2285,6 +2285,7 @@ static void sc8547_serial_clear_sample(struct sc8547a_device *sc)
 	memset(sc->model_frames, 0, sizeof(sc->model_frames));
 	memset(sc->model_flags, 0, sizeof(sc->model_flags));
 	sc->frame_gap_us = sc->max_frame_gap_us = 0;
+	sc->voocphy_rx_buff = sc->vooc_flag = 0;
 	sc->master_ibus_ma = sc->slave_ibus_ma = -1;
 	sc->master_enabled = sc->slave_enabled = -1;
 	sc->serial_vbus_mv = sc->serial_reg06 = -1;
@@ -3043,7 +3044,7 @@ EXPORT_SYMBOL_GPL(sc8547a_serial_session);
 static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 {
 	int word = sc8547_get_adapter_info(sc);
-	bool replied;
+	bool valid_rx;
 
 	if (word < 0)
 		return false;
@@ -3079,13 +3080,13 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 		return false;
 	}
 
-	replied = vooc_reply_adapter_mesg(sc);
+	valid_rx = vooc_reply_adapter_mesg(sc);
 	if (sc->fastchg_ask_cmd == VOOC_CMD_TELL_USB_BAD) {
 		/* The peer has withdrawn permission even if our reply missed. */
 		sc8547_auto_finish(sc, "adapter-reported-bad-connection");
 		return true;
 	}
-	if (replied) {
+	if (valid_rx) {
 		if (sc->adapter_type == SC_ADAPTER_SVOOC)
 			sc->responded |= ERHAI_SERIAL;
 		/* A combined RX/WR_FAIL IRQ still needs its normal reply.
@@ -3115,6 +3116,8 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 			}
 			sc->master_ibus_ma = master;
 			sc->slave_ibus_ma = slave;
+			if (sc->measure_missed_slot)
+				sc->missed_peak_ibus_ma = max(sc->missed_peak_ibus_ma, master + slave);
 			if (!sc8547_current_in_range(sc, master + slave))
 				sc8547_auto_reservo(sc, "above-request");
 		}
