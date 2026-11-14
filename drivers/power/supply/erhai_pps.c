@@ -1514,6 +1514,7 @@ static const struct erhai_pps_ops erhai_pps_ops = {
 	.enabled = erhai_pps_enabled,
 	.probe_status = erhai_probe_status,
 	.serial_session = sc8547a_serial_session,
+	.serial_buck_sample = sc8547a_serial_buck_sample,
 	.active = erhai_pps_active,
 	.available = erhai_pps_available,
 	.recharge = erhai_pps_recharge,

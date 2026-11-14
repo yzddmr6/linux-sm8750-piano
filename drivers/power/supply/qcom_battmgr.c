@@ -2073,7 +2073,9 @@ read_source:
 			ret = battmgr->pps_ops->serial_session(true);
 			battmgr->serial_blocked = ret == -EPERM;
 			if (!ret)
-				ret = qcom_battmgr_serial_buck(battmgr, status.serial_pumping);
+				ret = qcom_battmgr_serial_buck(battmgr, status.serial_needs_buck_off);
+			if (!ret && status.serial_needs_buck_off && !status.serial_buck_ready)
+				battmgr->pps_ops->serial_buck_sample(erhai_usb_readback(battmgr, USB_CURR_NOW));
 			if (!ret) {
 				battmgr->serial_probe = true;
 				battmgr->aicl_done = false;
@@ -2487,6 +2489,19 @@ void erhai_charge_recheck(void)
 		qcom_battmgr_charge_kick(erhai_battmgr);
 }
 EXPORT_SYMBOL_GPL(erhai_charge_recheck);
+
+/* A serial IRQ has already sent the curve. If GLINK is busy the
+ * existing serial-session poll will service its buck handoff.
+ */
+void erhai_charge_try_recheck(void)
+{
+	if (!mutex_trylock(&erhai_bridge_lock))
+		return;
+	if (erhai_battmgr)
+		qcom_battmgr_charge_kick(erhai_battmgr);
+	mutex_unlock(&erhai_bridge_lock);
+}
+EXPORT_SYMBOL_GPL(erhai_charge_try_recheck);
 
 /*
  * A charger came or went: the firmware may have turned charging back on, so

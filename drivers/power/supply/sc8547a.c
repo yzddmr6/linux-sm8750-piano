@@ -461,6 +461,9 @@ struct sc8547a_device {
 	struct mutex		i2c_lock;	/* serialises multi-op RMW */
 	struct dentry		*debug_root;
 	int			irq;
+	bool allow_sent, buck_ready;
+	int pre_allow_buck_ua;
+	unsigned long allow_deadline;
 	u8 first_request; /* First confirmed ASK_CURRENT of this handshake. */
 	u8			ovp_reg;
 	u8			ocp_reg;
@@ -1639,7 +1642,7 @@ static void vooc_handle_ask_fastchg_ornot(struct sc8547a_device *sc)
 	 * on curve_sent: the adapter re-polls ask_fastchg post-curve, and THAT reply
 	 * carries allow=1.
 	 */
-	u8 allow = (sc->fastchg_enable && sc->curve_sent) ? VOOC_BIT_ACTIVE : 0;
+	u8 allow = (sc->fastchg_enable && sc->curve_sent && sc->buck_ready) ? VOOC_BIT_ACTIVE : 0;
 	u8 r_l;
 
 	switch (sc->adapter_type) {
@@ -1828,20 +1831,16 @@ static void vooc_handle_ask_batt_sys_process(struct sc8547a_device *sc)
 	vooc_write_mesg_mask(TX1_DET_BIT0_TO_BIT1_MASK, &sc->voocphy_tx_buff[1], h);
 
 	if (sc->ask_batt_sys == 1) {
+		bool first_curve = !sc->curve_sent;
+
 		sc->fastchg_ask_cmd = VOOC_CMD_UNKNOWN;
-		sc->curve_sent = true;	/* allow-bit may now assert on next ask_fastchg */
-		/*
-		 * Pre-stage the is_vbus_ok reply (vendor set_is_vbus_ok_predata,
-		 * one-shot here) so the first is_vbus_ok frame is answered instantly
-		 * from hardware and the adapter ramps Vbus. Only when delivering — in
-		 * observation mode we must not stage a raise. REG_2C (reactive txbuff)
-		 * for the intervening 0x4/0xa frames is untouched, so REG_31 survives
-		 * to the first is_vbus_ok clock.
+		sc->curve_sent = true;
+		/* The next ASK_FASTCHG can grant permission. Start the ADSP
+		 * transaction now, outside the IRQ, so neither REG31 nor the
+		 * allow reply can authorize a rise with the buck drawing current.
 		 */
-		if (sc->fastchg_deliver)
-			sc8547_set_predata(sc, SC8547_IS_VBUS_OK_PREDATA_SVOOC);
-		dev_info(sc->dev, "battery-sys curve sent%s\n",
-			 sc->fastchg_deliver ? " (is_vbus_ok predata staged)" : "");
+		if (first_curve && sc->fastchg_deliver)
+			sc->allow_deadline = jiffies + msecs_to_jiffies(identify_ms);
 	}
 }
 
@@ -1891,7 +1890,7 @@ static void vooc_handle_is_vbus_ok(struct sc8547a_device *sc)
 		sc->vooc_vbus_status, sc->fastchg_deliver, sc->cp_enabled);
 
 	/* Stage-1 safety: never latch NORMAL unless real delivery is armed. */
-	if (sc->vooc_vbus_status == SC_VBUS_NORMAL && !sc->fastchg_deliver)
+	if (!sc->allow_sent || (sc->vooc_vbus_status == SC_VBUS_NORMAL && !sc->fastchg_deliver))
 		sc->vooc_vbus_status = SC_VBUS_HIGH;
 
 	switch (sc->vooc_vbus_status) {
@@ -2104,6 +2103,14 @@ static bool vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 		if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL)
 			sc8547_request_missed(sc, sc->fastchg_curr_code);
 		return valid;
+	}
+	/* AP VOOC PHY sets IS_VBUS_OK predata after sending allow. */
+	if (cmd == VOOC_CMD_ASK_BATT_SYS_PROCESS && sc->curve_sent && !sc->buck_ready)
+		erhai_charge_try_recheck();
+	if (cmd == VOOC_CMD_ASK_FASTCHG_ORNOT && sc->fastchg_enable &&
+	    sc->curve_sent && sc->buck_ready) {
+		sc->allow_sent = true;
+		sc8547_set_predata(sc, SC8547_IS_VBUS_OK_PREDATA_SVOOC);
 	}
 	if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL) {
 		sc->pending_request = sc->fastchg_deliver ? sc->fastchg_curr_code : 0;
@@ -2366,7 +2373,8 @@ static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
 	sc->model_received = false;
 	sc->adapter_cap = 0;
 	sc->ask_batt_sys = 0;
-	sc->curve_sent = false;
+	sc->curve_sent = sc->allow_sent = sc->buck_ready = false;
+	sc->pre_allow_buck_ua = -ENODATA;
 	sc->vooc_head = SVOOC_INVERT_HEAD;
 	sc->vooc_saw_any = false;
 	/* delivery-phase state (gates fastchg_deliver / fastchg_curr_code persist) */
@@ -2605,6 +2613,10 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 	sc->fastchg_deliver = true;
 	sc->fastchg_auto = false;	/* one-shot per arm consumed */
 	sc->auto_state = SC_AUTO_DELIVER;
+	if (sc->curve_sent) {
+		sc->allow_deadline = jiffies + msecs_to_jiffies(identify_ms);
+		erhai_charge_recheck();
+	}
 	if (sc->awaiting_rehandshake) {
 		sc->recoveries_answered++;
 		sc->awaiting_rehandshake = false;
@@ -2783,6 +2795,10 @@ static void sc8547_attach_work(struct work_struct *work)
 		if (faults > 0) {
 			sc->auto_protection = true;
 			sc8547_auto_finish(sc, "hw-ovp-ocp");
+			goto reschedule;
+		}
+		if (sc->curve_sent && !sc->buck_ready && time_after_eq(jiffies, sc->allow_deadline)) {
+			sc8547_auto_reservo(sc, "buck-still-drawing");
 			goto reschedule;
 		}
 		if (sc->cp_enabled)
@@ -2999,12 +3015,13 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 	pump = sc->master_enabled > 0 || sc->slave_enabled > 0 ? 1 :
 		sc->master_enabled < 0 || sc->slave_enabled < 0 ? -1 : 0;
 	return off + sysfs_emit_at(buf, off,
-		"protocol=supervooc state=%s model=%d first_request_code=%u target_code=%u request_code=%u request_ma=%u "
+		"protocol=supervooc state=%s model=%d allow_sent=%d pre_allow_buck_ua=%d first_request_code=%u target_code=%u request_code=%u request_ma=%u "
 		"pending_code=%d predata=0x%04x above_samples=%u model_rx=0x%02x%02x model_flags=0x%02x%02x "
 		"vbus_mv=%d pump=%d pump_ibus_ma=%d master_ibus_ma=%d slave_ibus_ma=%d "
 		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u frame_gap_us=%u max_gap_us=%u "
 		"exits=%u last_exit=%s\n",
-		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1, sc->first_request,
+		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1,
+		sc->allow_sent, sc->pre_allow_buck_ua, sc->first_request,
 		sc->fastchg_deliver ? sc->fastchg_curr_code : 0, sc->serial_request, sc->serial_request * 100,
 		sc->request_pending ? sc->pending_request : -1, sc->serial_predata, sc->above_request_count,
 		sc->model_frames[0], sc->model_frames[1], sc->model_flags[0], sc->model_flags[1],
@@ -3141,7 +3158,8 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 	status->first_ufcs_timeout = sc->first_ufcs_timeout;
 	if (sc->auto_state == SC_AUTO_DELIVER && sc->fastchg_deliver) {
 		status->delivering = ERHAI_SERIAL;
-		status->serial_pumping = sc->cp_enabled;
+		status->serial_needs_buck_off = sc->curve_sent;
+		status->serial_buck_ready = sc->buck_ready;
 	}
 	if (sc->auto_protection)
 		status->protected |= ERHAI_SERIAL;
@@ -3184,6 +3202,20 @@ void sc8547a_detached(void)
 		sc8547_slave_dev->pump_faults = 0;
 }
 EXPORT_SYMBOL_GPL(sc8547a_detached);
+
+/* Called by battmgr only after the ADSP acknowledged USB ICL=0. */
+void sc8547a_serial_buck_sample(int ua)
+{
+	struct sc8547a_device *sc;
+
+	guard(mutex)(&sc8547_pps_lock);
+	sc = sc8547_master_dev;
+	if (sc && sc->auto_state == SC_AUTO_DELIVER && sc->curve_sent && !sc->buck_ready) {
+		sc->pre_allow_buck_ua = ua;
+		sc->buck_ready = ua == 0;
+	}
+}
+EXPORT_SYMBOL_GPL(sc8547a_serial_buck_sample);
 
 int sc8547a_serial_session(bool enable)
 {

@@ -30,6 +30,7 @@ struct erhai_probe_status;
 void sc8547a_probe_status(struct erhai_probe_status *status);
 void sc8547a_detached(void);
 int sc8547a_serial_session(bool enable);
+void sc8547a_serial_buck_sample(int ua);
 ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active);
 
 /*
