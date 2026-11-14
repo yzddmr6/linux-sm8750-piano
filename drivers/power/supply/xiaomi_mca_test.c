@@ -517,7 +517,7 @@ struct mca_policy_fixture {
 	int pack_error;
 	int vbus_error;
 	u32 usb_online;
-	int online_error;
+	int online_error, status_error;
 	u8 charging_enabled;
 	bool enable_stuck;
 	unsigned int enable_writes;
@@ -532,6 +532,7 @@ struct mca_policy_fixture {
 	int write_error;
 	bool voltage_stuck;
 	int ucsi_rp_ua, ucsi_mv;
+	u32 chgr_status, input_ua;
 	u8 aicl_enabled;
 	u32 fail_aicl_prop;
 	unsigned int aicl_runs;
@@ -674,6 +675,14 @@ static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 		if (f->online_error)
 			return f->online_error;
 		value = f->usb_online;
+		break;
+	case MCA_PROP_CHGR_STATUS:
+		if (f->status_error)
+			return f->status_error;
+		value = f->chgr_status;
+		break;
+	case MCA_PROP_USB_CURRENT_NOW:
+		value = f->input_ua;
 		break;
 	case MCA_PROP_USB_REAL_TYPE:
 		value = f->type;
@@ -2571,6 +2580,87 @@ static void xiaomi_mca_test_threshold_stop_failure_sleep(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->mca.voltage_written);
 }
 
+static int mca_test_limit_and_wake(struct xiaomi_mca *mca)
+{
+	int ret = xiaomi_mca_charge_limit_poll(mca);
+
+	xiaomi_mca_charge_wake_poll(mca);
+	return ret;
+}
+
+static void xiaomi_mca_test_wake_policy(struct kunit *test)
+{
+	enum { MEASURED, WEAK, CHARGER, WIRELESS };
+	static const u8 classes[] = {
+		MEASURED, WEAK, WEAK, CHARGER, WEAK, CHARGER, CHARGER, CHARGER, CHARGER,
+		MEASURED, CHARGER, CHARGER, CHARGER, MEASURED, CHARGER, CHARGER, MEASURED,
+		WIRELESS, WIRELESS, WIRELESS,
+	};
+	static const u64 powers[] = { 0, 7499999999999ULL, 7500000000000ULL, 18000000000000ULL };
+	int type, i, flags;
+
+	BUILD_BUG_ON(ARRAY_SIZE(classes) != MCA_TYPE_MAX);
+	for (type = 0; type < ARRAY_SIZE(classes); type++) {
+		for (i = 0; i < ARRAY_SIZE(powers); i++) {
+			for (flags = 0; flags < 32; flags++) {
+				bool online = flags & 1, otg = flags & 2, done = flags & 4;
+				bool limited = flags & 8, fast = flags & 16;
+				bool expected = online && !otg && !done && classes[type] != WIRELESS &&
+					(limited || classes[type] == CHARGER ||
+					 (classes[type] == MEASURED && (fast || i >= 2)));
+
+				KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_should_stay_awake(
+					xiaomi_mca_wake_source(type), online,
+					otg, done, limited, fast, powers[i]), expected,
+					"type=%d power=%llu flags=%d", type, powers[i], flags);
+			}
+		}
+	}
+}
+
+static void xiaomi_mca_test_wake_termination(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca_notification msg = { .id = cpu_to_le32(MCA_NOTIFY_CHARGE_TYPE) };
+
+	guard(mutex)(&f->mca.lock);
+	f->chgr_status = 4;
+	KUNIT_ASSERT_TRUE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_usb_notification(&msg, sizeof(msg), &f->mca));
+	/* A parallel buck may terminate before the pump hands over. */
+	f->mca.online = true;
+	f->mca.cp = MCA_CP_ON;
+	f->chgr_status = MCA_CHGR_TERMINATED;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+	f->mca.cp = MCA_CP_OFF;
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_usb_notification(&msg, sizeof(msg), &f->mca));
+	f->status_error = -EIO;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
+	f->status_error = 0;
+	f->chgr_status = MCA_CHGR_PAUSED;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	f->chgr_status = MCA_CHGR_DISABLED;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	f->chgr_status = 3;
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_usb_notification(&msg, sizeof(msg), &f->mca));
+	f->type = MCA_TYPE_UNKNOWN;
+	f->input_ua = 1499999;
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
+	f->input_ua = 1500000;
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	f->usb_online = 0;
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_charge_wake_poll(&f->mca));
+	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
+}
+
 static void xiaomi_mca_test_threshold_wakeup_transitions(struct kunit *test)
 {
 	static const struct {
@@ -2599,9 +2689,10 @@ static void xiaomi_mca_test_threshold_wakeup_transitions(struct kunit *test)
 	unsigned long active_count;
 	int n;
 
+	f->type = MCA_TYPE_SDP;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_battery_ext_register(&f->mca), 0);
 	scoped_guard(mutex, &f->mca.lock) {
-		KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
+		KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
 		KUNIT_EXPECT_FALSE(test, f->mca.charge_ws->active);
 		KUNIT_EXPECT_EQ(test, f->enable_writes, 0);
 		f->mca.charge_start = 75;
@@ -2612,13 +2703,13 @@ static void xiaomi_mca_test_threshold_wakeup_transitions(struct kunit *test)
 			f->usb_online = cases[n].online;
 			f->online_error = cases[n].online_error;
 			f->mca.otg_active = cases[n].otg;
-			KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
+			KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
 			KUNIT_EXPECT_EQ_MSG(test, (bool)f->mca.charge_ws->active, cases[n].awake,
 					    "case %d", n);
 			KUNIT_EXPECT_EQ(test, f->mca.charge_awake, cases[n].awake);
 		}
 		active_count = f->mca.charge_ws->active_count;
-		KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
+		KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
 		KUNIT_EXPECT_EQ(test, f->mca.charge_ws->active_count, active_count);
 	}
 	/* Disabling through either supply releases immediately, before poll. */
@@ -2626,17 +2717,17 @@ static void xiaomi_mca_test_threshold_wakeup_transitions(struct kunit *test)
 		POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD, &val), 0);
 	KUNIT_EXPECT_FALSE(test, f->mca.charge_ws->active);
 	scoped_guard(mutex, &f->mca.lock) {
-		KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
+		KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
 		KUNIT_EXPECT_FALSE(test, f->mca.charge_ws->active);
 		f->mca.charge_end = 80;
-		KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
+		KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
 	}
 	KUNIT_ASSERT_TRUE(test, f->mca.charge_ws->active);
 	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_DOWN);
 	KUNIT_EXPECT_FALSE(test, f->mca.charge_ws->active);
 	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_UP);
 	scoped_guard(mutex, &f->mca.lock)
-		KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
+		KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
 	KUNIT_ASSERT_TRUE(test, f->mca.charge_ws->active);
 	xiaomi_mca_stop_poll(&f->mca);
 	KUNIT_EXPECT_FALSE(test, f->mca.charge_ws->active);
@@ -2653,12 +2744,13 @@ static void xiaomi_mca_test_threshold_wakeup_prepare(struct kunit *test)
 	union power_supply_propval val = { .intval = 100 };
 
 	INIT_DELAYED_WORK(&f->mca.poll_work, mca_test_idle_poll);
+	f->type = MCA_TYPE_SDP;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_battery_ext_register(&f->mca), 0);
 	f->mca.charge_start = 75;
 	f->mca.charge_end = 80;
 	f->cells[0].capacity = 70;
 	scoped_guard(mutex, &f->mca.lock)
-		KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
+		KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
 	KUNIT_ASSERT_TRUE(test, f->mca.charge_ws->active);
 	/* A direct suspend request must not bypass the active source. */
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_prepare(f->mca.dev), -EBUSY);
@@ -2679,7 +2771,7 @@ static void xiaomi_mca_test_threshold_wakeup_prepare(struct kunit *test)
 	f->mca.charge_end = 80;
 	f->cells[0].capacity = 80;
 	scoped_guard(mutex, &f->mca.lock)
-		KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
+		KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
 	KUNIT_EXPECT_FALSE(test, f->mca.charge_ws->active);
 	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_prepare(f->mca.dev), 0);
@@ -2693,7 +2785,7 @@ static void xiaomi_mca_test_threshold_wakeup_prepare(struct kunit *test)
 	f->usb_online = 0;
 	f->vbus = 0;
 	scoped_guard(mutex, &f->mca.lock)
-		KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(&f->mca), 0);
+		KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_prepare(f->mca.dev), 0);
 	KUNIT_EXPECT_FALSE(test, f->mca.charge_ws->active);
@@ -3093,6 +3185,67 @@ static struct mca_policy_fixture *mca_auth_fixture(struct kunit *test)
 	mipps_auth = true;
 	kunit_add_action_or_reset(test, mca_auth_cleanup, NULL);
 	return f;
+}
+
+struct mca_wake_events {
+	struct notifier_block nb;
+	struct power_supply *usb;
+	unsigned int count;
+};
+
+static int mca_test_wake_event(struct notifier_block *nb, unsigned long event, void *psy)
+{
+	struct mca_wake_events *events = container_of(nb, struct mca_wake_events, nb);
+
+	if (event == PSY_EVENT_PROP_CHANGED && psy == events->usb)
+		events->count++;
+	return NOTIFY_OK;
+}
+
+static void xiaomi_mca_test_charger_wakeup_prepare(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_auth_fixture(test);
+	struct mca_wake_events events = {
+		.nb.notifier_call = mca_test_wake_event, .usb = f->mca.psy,
+	};
+
+	flush_delayed_work(&f->mca.psy->deferred_register_work);
+	flush_work(&f->mca.psy->changed_work);
+	KUNIT_ASSERT_EQ(test, power_supply_reg_notifier(&events.nb), 0);
+	INIT_DELAYED_WORK(&f->mca.poll_work, mca_test_idle_poll);
+	f->mca.poll_ready = true;
+	f->mca.charge_end = 100;
+	f->type = MCA_TYPE_PD;
+	f->chgr_status = 4;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_prepare(f->mca.dev), -EBUSY);
+	KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+	KUNIT_EXPECT_FALSE(test, f->mca.sleeping);
+	KUNIT_EXPECT_EQ(test, f->voltage_requests, 0);
+	flush_work(&f->mca.psy->changed_work);
+	KUNIT_EXPECT_EQ(test, events.count, 1);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_prepare(f->mca.dev), -EBUSY);
+	flush_work(&f->mca.psy->changed_work);
+	KUNIT_EXPECT_EQ(test, events.count, 1);
+	f->chgr_status = MCA_CHGR_TERMINATED;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_prepare(f->mca.dev), 0);
+	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
+	KUNIT_EXPECT_TRUE(test, f->mca.sleeping);
+	flush_work(&f->mca.psy->changed_work);
+	KUNIT_EXPECT_EQ(test, events.count, 2);
+	xiaomi_mca_complete(f->mca.dev);
+	f->chgr_status = 3;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_prepare(f->mca.dev), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, f->mca.sleeping);
+	flush_work(&f->mca.psy->changed_work);
+	KUNIT_EXPECT_EQ(test, events.count, 3);
+	xiaomi_mca_pdr_notify(&f->mca, SERVREG_SERVICE_STATE_DOWN);
+	flush_work(&f->mca.psy->changed_work);
+	KUNIT_EXPECT_EQ(test, events.count, 4);
+	xiaomi_mca_stop_poll(&f->mca);
+	flush_work(&f->mca.psy->changed_work);
+	KUNIT_EXPECT_EQ(test, events.count, 4);
+	power_supply_unreg_notifier(&events.nb);
+	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
 }
 
 static void xiaomi_mca_test_mipps_exchange(struct kunit *test)
@@ -3704,6 +3857,9 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_auth_stop_failure),
 	KUNIT_CASE(xiaomi_mca_test_vbus_error_not_detach),
 	KUNIT_CASE(xiaomi_mca_test_threshold_interface),
+	KUNIT_CASE(xiaomi_mca_test_wake_policy),
+	KUNIT_CASE(xiaomi_mca_test_wake_termination),
+	KUNIT_CASE(xiaomi_mca_test_charger_wakeup_prepare),
 	KUNIT_CASE(xiaomi_mca_test_threshold_wakeup_transitions),
 	KUNIT_CASE(xiaomi_mca_test_threshold_wakeup_prepare),
 	KUNIT_CASE(xiaomi_mca_test_threshold_hysteresis),
