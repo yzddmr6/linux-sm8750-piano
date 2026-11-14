@@ -2664,6 +2664,29 @@ static void xiaomi_mca_test_wake_termination(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
 }
 
+static void xiaomi_mca_test_wake_thermal_stop(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+
+	guard(mutex)(&f->mca.lock);
+	f->type = MCA_TYPE_DCP;
+	f->cells[0].temp = 550;
+	KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
+	KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
+	f->cells[0].temp = 250;
+	KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
+	KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+	f->cells[0].temp = -100;
+	KUNIT_ASSERT_EQ(test, mca_test_limit_and_wake(&f->mca), 0);
+	KUNIT_EXPECT_TRUE(test, f->mca.charge_awake);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
+	f->usb_online = 0;
+	xiaomi_mca_charge_wake_poll(&f->mca);
+	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
+}
+
 static void xiaomi_mca_test_threshold_wakeup_transitions(struct kunit *test)
 {
 	static const struct {
@@ -2677,14 +2700,14 @@ static void xiaomi_mca_test_threshold_wakeup_transitions(struct kunit *test)
 		{ 70, 250, 1, 0, false, true },
 		{ 70, 250, 1, 0, true, false },  /* reverse power is not charging */
 		{ 70, 250, 1, 0, false, true },
-		{ 70, 550, 1, 0, false, false }, /* hot stop */
-		{ 70, 530, 1, 0, false, false }, /* thermal hysteresis */
+		{ 70, 550, 1, 0, false, true }, /* hot stop */
+		{ 70, 530, 1, 0, false, true }, /* thermal hysteresis */
 		{ 70, 520, 1, 0, false, true },
 		{ 80, 250, 1, 0, false, false }, /* upper threshold */
 		{ 79, 250, 1, 0, false, false }, /* SOC hysteresis */
 		{ 75, 250, 1, 0, false, true },
-		{ 75, -100, 1, 0, false, false }, /* cold stop */
-		{ 75, -80, 1, 0, false, false },
+		{ 75, -100, 1, 0, false, true }, /* cold stop */
+		{ 75, -80, 1, 0, false, true },
 		{ 75, -70, 1, 0, false, true },
 	};
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3861,6 +3884,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_vbus_error_not_detach),
 	KUNIT_CASE(xiaomi_mca_test_threshold_interface),
 	KUNIT_CASE(xiaomi_mca_test_wake_policy),
+	KUNIT_CASE(xiaomi_mca_test_wake_thermal_stop),
 	KUNIT_CASE(xiaomi_mca_test_wake_termination),
 	KUNIT_CASE(xiaomi_mca_test_charger_wakeup_prepare),
 	KUNIT_CASE(xiaomi_mca_test_threshold_wakeup_transitions),

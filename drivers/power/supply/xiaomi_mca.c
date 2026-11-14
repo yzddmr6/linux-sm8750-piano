@@ -2874,8 +2874,8 @@ static bool xiaomi_mca_charge_wake_sample(struct xiaomi_mca *mca,
 	bool fast = attached && (pumping || mca->hv == MCA_HV_REQUESTED || mca->hv == MCA_HV_ON ||
 			(!mca->cp_fault && mca->cp == MCA_CP_COOLDOWN) ||
 			mca->hv == MCA_HV_COOLDOWN || xiaomi_mca_auth_pending(mca));
-	bool online = s->online == 1 && !mca->charge_disabled && !mca->charge_hold &&
-		      !mca->charge_hot && !mca->charge_cold;
+	bool thermal = mca->charge_hot || mca->charge_cold;
+	bool online = s->online == 1 && !mca->charge_hold && (!mca->charge_disabled || thermal);
 	bool done, limited, eligible;
 	u64 input_pw = 0;
 	u32 uv, ua;
@@ -2893,7 +2893,12 @@ static bool xiaomi_mca_charge_wake_sample(struct xiaomi_mca *mca,
 		(mca->charge_terminated && (s->chgr_status == U32_MAX ||
 					   s->chgr_status == MCA_CHGR_PAUSED ||
 					   s->chgr_status == MCA_CHGR_DISABLED)));
-	limited = mca->charge_end < 100 && !mca->charge_blocked;
+	limited = mca->charge_end < 100 && (!mca->charge_blocked || thermal);
+	/* A thermal stop drops measured current on an unclassified charger.
+	 * Retain its observed qualification until temperature recovers.
+	 */
+	if (thermal && source == MCA_WAKE_UNCLASSIFIED && mca->charger_awake)
+		fast = true;
 	mca->charger_awake = xiaomi_mca_should_stay_awake(source, online, mca->otg_active,
 							done, false, fast, input_pw);
 	eligible = xiaomi_mca_should_stay_awake(source, online, mca->otg_active,
