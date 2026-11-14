@@ -847,12 +847,21 @@ out_unlock:
 	return ret;
 }
 
+/* The ADSP charge state can stay latched while the cell supplies the
+ * system. Use the same signed convention as CURRENT_NOW for Erhai.
+ */
+static int erhai_battery_status(int status, int current_ua)
+{
+	return current_ua < 0 ? POWER_SUPPLY_STATUS_DISCHARGING : status;
+}
+
 static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 					 enum power_supply_property psp,
 					 union power_supply_propval *val)
 {
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 	enum qcom_battmgr_unit unit = battmgr->unit;
+	u32 current;
 	int ret;
 
 	if (!battmgr->service_up)
@@ -871,6 +880,13 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = battmgr->status.status;
+		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
+			ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						BATT_CURR_NOW, &current);
+			if (ret)
+				return ret;
+			val->intval = erhai_battery_status(val->intval, -(s32)current);
+		}
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
 		val->intval = battmgr->info.charge_type;
