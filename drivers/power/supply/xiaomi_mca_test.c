@@ -2638,7 +2638,10 @@ static void xiaomi_mca_test_wake_termination(struct kunit *test)
 	f->mca.cp = MCA_CP_OFF;
 	KUNIT_EXPECT_TRUE(test, xiaomi_mca_charge_wake_poll(&f->mca));
 	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_usb_notification(&msg, sizeof(msg), &f->mca));
+	msg.id = cpu_to_le32(MCA_NOTIFY_TYPE_CHANGE);
 	KUNIT_EXPECT_TRUE(test, xiaomi_mca_usb_notification(&msg, sizeof(msg), &f->mca));
+	msg.id = cpu_to_le32(MCA_NOTIFY_CHARGE_TYPE);
 	f->status_error = -EIO;
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_charge_wake_poll(&f->mca));
 	KUNIT_EXPECT_FALSE(test, f->mca.charge_awake);
