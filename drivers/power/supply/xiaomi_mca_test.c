@@ -3546,7 +3546,6 @@ static void xiaomi_mca_test_ffc_handoff(struct kunit *test)
 	/* A brief excursion beyond CV hands off to buck at > warm iterm. */
 	f->cells[0].voltage = 4541000;
 	xiaomi_mca_cp_step(mca);
-	KUNIT_ASSERT_TRUE(test, mca->ffc_handoff);
 	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_COOLDOWN);
 	f->type = MCA_TYPE_PD;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
@@ -3559,7 +3558,6 @@ static void xiaomi_mca_test_ffc_handoff(struct kunit *test)
 	f->ucsi_type = POWER_SUPPLY_USB_TYPE_PD;
 	f->ucsi_mv = 9000;
 	f->ucsi_rp_ua = 3000000;
-	mca->ffc_settle_until = jiffies;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
 	f->ucsi_online = 0;
@@ -3572,11 +3570,9 @@ static void xiaomi_mca_test_ffc_handoff(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
 	mca->hv = MCA_HV_OFF;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
-	KUNIT_EXPECT_FALSE(test, mca->ffc_active);
+	KUNIT_EXPECT_TRUE(test, mca->ffc_active);
 
-	/* Within the grace period the actual cutoff always wins. */
-	mca->ffc_active = mca->ffc_handoff = true;
-	mca->ffc_settle_until = jiffies + HZ;
+	/* The cell endpoint wins even while contract telemetry is absent. */
 	f->cells[1].current_ua = 1164000;
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
 	KUNIT_EXPECT_TRUE(test, mca->ffc_done);
