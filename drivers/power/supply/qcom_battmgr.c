@@ -1886,7 +1886,7 @@ read_source:
 		      qcom_battmgr_usb_idle(battmgr)));
 	tail = qcom_battmgr_tail_owned(battmgr);
 	dedicated |= serial_source;
-	can_probe = dedicated && !READ_ONCE(battmgr->pps_suspended) &&
+	can_probe = !status.connector_blocked && dedicated && !READ_ONCE(battmgr->pps_suspended) &&
 		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
 		    !battmgr->charge_policy_hold && !battmgr->charge_error;
 	qcom_battmgr_note_delivery(battmgr, status.delivering);
@@ -2002,7 +2002,7 @@ read_source:
 	/* The Type-C partner's PD capabilities are stronger evidence than
 	 * an incomplete BC1.2 classification. PPS also checks its APDO.
 	 */
-	prefer_pps = !tail && !test_bit(PD_EVENT_TAIL, &battmgr->pd_events) && !READ_ONCE(battmgr->pps_suspended) &&
+	prefer_pps = !status.connector_blocked && !tail && !test_bit(PD_EVENT_TAIL, &battmgr->pd_events) && !READ_ONCE(battmgr->pps_suspended) &&
 		     battmgr->pps_ops && battmgr->pps_ops->enabled() &&
 		     src.sink && !READ_ONCE(battmgr->otg_request);
 	if (prefer_pps && !battmgr->charge_inhibited && !battmgr->charge_policy_hold &&
@@ -2364,6 +2364,14 @@ static void qcom_battmgr_charge_kick(struct qcom_battmgr *battmgr)
 	    !READ_ONCE(battmgr->removing))
 		mod_delayed_work(system_freezable_wq, &battmgr->charge_work, 0);
 }
+
+void erhai_charge_recheck(void)
+{
+	guard(mutex)(&erhai_bridge_lock);
+	if (erhai_battmgr)
+		qcom_battmgr_charge_kick(erhai_battmgr);
+}
+EXPORT_SYMBOL_GPL(erhai_charge_recheck);
 
 /*
  * A charger came or went: the firmware may have turned charging back on, so

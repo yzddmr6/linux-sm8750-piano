@@ -32,6 +32,8 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/iio/consumer.h>
+#include <linux/iio/types.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
@@ -424,7 +426,26 @@ enum sc8547_auto_state {
 	SC_AUTO_DONE,		/* curve exit reached; handed back to normal charge */
 };
 
+/* 24924 AP VOOC PHY: 3 entry checks 10 ms apart, 10 hot samples
+ * 800 ms apart in delivery, then monitor a trip every 10 s.
+ */
+#define SC8547_BTB_HOT_MC	80000
+#define SC8547_BTB_RUN_MS	800
+#define SC8547_BTB_TRIP_MS	10000
+
+struct sc8547_btb {
+	struct iio_channel *battery, *usb;
+	struct delayed_work work;
+	unsigned int attachment;
+	bool online, valid, admitted, tripped;
+	unsigned int hot_count;
+	int battery_mc, usb_mc;
+	int battery_err, usb_err;
+	unsigned long sampled_at;
+};
+
 struct sc8547a_device {
+	struct sc8547_btb btb;
 #if IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS)
 	struct sc8547a_ufcs_phy ufcs_phy;
 	struct ufcs_dev *ufcs;
@@ -697,6 +718,11 @@ static bool sc8547_check_device_id(struct sc8547a_device *sc)
 	return val == SC8547A_DEVICE_ID;
 }
 
+static bool sc8547_btb_allows(const struct sc8547_btb *btb)
+{
+	return btb->online && btb->admitted && btb->valid && !btb->tripped;
+}
+
 static int sc8547_set_chg_enable(struct sc8547a_device *sc, bool enable)
 {
 	u8 stale;
@@ -706,6 +732,8 @@ static int sc8547_set_chg_enable(struct sc8547a_device *sc, bool enable)
 	 * can hold reset/idle flags. Drain it immediately before CHG_EN,
 	 * never on a watchdog refresh of an already enabled converter.
 	 */
+	if (enable && (!sc8547_master_dev || !sc8547_btb_allows(&sc8547_master_dev->btb)))
+		return -EAGAIN;
 	if (enable && !sc->monitor_pump_faults) {
 		ret = sc8547_read_byte(sc, SC8547_REG_0F, &stale);
 		if (ret)
@@ -2908,6 +2936,14 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 	*active = sc && sc->vooc_started && sc->auto_state != SC_AUTO_OFF;
 	if (!sc)
 		return off;
+	off += sysfs_emit_at(buf, off, "btb_batt_mc=%d btb_usb_mc=%d btb_valid=%d btb_hot=%d "
+			     "btb_samples=%u btb_age_ms=%lld btb_err=%d/%d ",
+			     sc->btb.online && !sc->btb.battery_err ? sc->btb.battery_mc : INT_MIN,
+			     sc->btb.online && !sc->btb.usb_err ? sc->btb.usb_mc : INT_MIN,
+			     sc->btb.valid, sc->btb.tripped, sc->btb.hot_count,
+			     sc->btb.online && sc->btb.sampled_at ?
+				(long long)jiffies_to_msecs(jiffies - sc->btb.sampled_at) : -1LL,
+			     sc->btb.battery_err, sc->btb.usb_err);
 	off += sysfs_emit_at(buf, off, "svooc_last_exit=%s svooc_last_retry=%s rehandshakes=%u rehandshakes_answered=%u missed_asks=%u missed_code=%u missed_predata=0x%04x missed_peak_ibus_ma=%d ",
 			     sc->serial_last_exit ?: "none", sc->serial_last_retry ?: "none",
 			     sc->rehandshakes, sc->recoveries_answered, sc->missed_asks, sc->missed_request, sc->missed_predata,
@@ -2937,6 +2973,100 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 }
 EXPORT_SYMBOL_GPL(sc8547a_serial_describe);
 
+/* Clipped table endpoints include open/short circuit. The ADC5 Gen4
+ * 100k table (adcmap7_100k) uses these exact processed values.
+ */
+static int sc8547_btb_read(struct iio_channel *channel, int *mc)
+{
+	int ret = iio_read_channel_processed(channel, mc);
+
+	if (ret < 0)
+		return ret;
+	if (*mc <= -40960 || *mc >= 130048)
+		return -ERANGE;
+	return 0;
+}
+
+/* A bad conversion withdraws pump permission immediately. It cannot
+ * manufacture either an ambient temperature or a confirmed thermal trip.
+ */
+static unsigned int sc8547_btb_sample(struct sc8547_btb *b, int battery_err,
+				      int battery_mc, int usb_err, int usb_mc)
+{
+	bool hot;
+
+	b->sampled_at = jiffies;
+	b->battery_err = battery_err;
+	b->usb_err = usb_err;
+	b->battery_mc = battery_err ? INT_MIN : battery_mc;
+	b->usb_mc = usb_err ? INT_MIN : usb_mc;
+	b->valid = !battery_err && !usb_err;
+	if (!b->valid) {
+		b->admitted = false;
+		b->hot_count = 0;
+		return b->tripped ? SC8547_BTB_TRIP_MS : SC8547_BTB_RUN_MS;
+	}
+	hot = battery_mc >= SC8547_BTB_HOT_MC || usb_mc >= SC8547_BTB_HOT_MC;
+	if (!hot) {
+		b->hot_count = 0;
+		b->tripped = false;
+		b->admitted = true;
+		return SC8547_BTB_RUN_MS;
+	}
+	if (b->tripped)
+		return SC8547_BTB_TRIP_MS;
+	if (++b->hot_count >= (b->admitted ? 10 : 3)) {
+		b->tripped = true;
+		b->admitted = false;
+		return SC8547_BTB_TRIP_MS;
+	}
+	return b->admitted ? SC8547_BTB_RUN_MS : 10;
+}
+
+static void sc8547_btb_work(struct work_struct *work)
+{
+	struct sc8547a_device *sc = container_of(to_delayed_work(work), struct sc8547a_device,
+						 btb.work);
+	struct sc8547_btb *b = &sc->btb;
+	unsigned int attachment, delay;
+	unsigned long due, started = jiffies;
+	int battery = 0, usb = 0, battery_err, usb_err;
+	bool allowed, tripped, changed;
+
+	scoped_guard(mutex, &sc8547_pps_lock) {
+		if (!b->online)
+			return;
+		attachment = b->attachment;
+	}
+	/* ADC conversions can sleep. Keep both PHY and watchdog locks free. */
+	battery_err = sc8547_btb_read(b->battery, &battery);
+	usb_err = sc8547_btb_read(b->usb, &usb);
+	scoped_guard(mutex, &sc8547_pps_lock) {
+		if (!b->online || b->attachment != attachment)
+			return;
+		allowed = sc8547_btb_allows(b);
+		tripped = b->tripped;
+		delay = sc8547_btb_sample(b, battery_err, battery, usb_err, usb);
+		changed = allowed != sc8547_btb_allows(b) || tripped != b->tripped;
+		if (!sc8547_btb_allows(b)) {
+			if (sc->vooc_started && (sc->auto_state == SC_AUTO_IDENTIFY ||
+						 sc->auto_state == SC_AUTO_DELIVER))
+				sc8547_auto_finish(sc, b->tripped ? "connector-hot" : "connector-adc");
+			else if (pps_cp_engaged || pps_slave_engaged)
+				sc8547_pps_disengage();
+		}
+		if (changed)
+			dev_info(sc->dev, "connector protection: battery=%d usb=%d mC errors=%d/%d hot=%d admitted=%d\n",
+				 b->battery_mc, b->usb_mc, battery_err, usb_err, b->tripped,
+				 sc8547_btb_allows(b));
+		due = started + msecs_to_jiffies(delay);
+		mod_delayed_work(system_freezable_wq, &b->work,
+				 time_after(due, jiffies) ? due - jiffies : 0);
+	}
+	if (changed)
+		erhai_charge_recheck();
+}
+
 /* Called by the battery manager under its charge policy lock. Stop is
  * synchronous with both frame handling and the pump watchdog worker.
  */
@@ -2948,6 +3078,13 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 	sc = sc8547_master_dev;
 	if (!sc)
 		return;
+	if (!sc->btb.online) {
+		sc->btb.online = true;
+		mod_delayed_work(system_freezable_wq, &sc->btb.work, 0);
+	}
+	status->connector_blocked = !sc8547_btb_allows(&sc->btb);
+	if (status->connector_blocked)
+		status->protected |= ERHAI_SERIAL | ERHAI_UFCS | ERHAI_PPS;
 	status->ready |= ERHAI_PPS;
 	if (sc->irq <= 0)
 		return;
@@ -2970,6 +3107,12 @@ void sc8547a_detached(void)
 {
 	guard(mutex)(&sc8547_pps_lock);
 	if (sc8547_master_dev) {
+		struct sc8547_btb *b = &sc8547_master_dev->btb;
+
+		b->online = b->valid = b->admitted = b->tripped = false;
+		b->hot_count = 0;
+		b->attachment++;
+		cancel_delayed_work(&b->work);
 		sc8547_master_dev->responded = 0;
 		sc8547_master_dev->rehandshakes = sc8547_master_dev->recoveries_answered = 0;
 		sc8547_master_dev->missed_asks = 0;
@@ -2993,6 +3136,8 @@ int sc8547a_serial_session(bool enable)
 	sc = sc8547_master_dev;
 	if (!sc || !serial_enable)
 		return enable ? -EOPNOTSUPP : 0;
+	if (enable && !sc8547_btb_allows(&sc->btb))
+		return -EAGAIN;
 	if (enable && sc->auto_protection)
 		return -EPERM;
 	if (enable == sc->vooc_started) {
@@ -3282,6 +3427,8 @@ int sc8547a_ufcs_start(unsigned int min_mv, unsigned int max_mv)
 	if (!sc || !sc->ufcs)
 		return -EOPNOTSUPP;
 	scoped_guard(mutex, &sc8547_pps_lock) {
+		if (!sc8547_btb_allows(&sc->btb))
+			return -EAGAIN;
 		if (sc->vooc_started || pps_cp_engaged || pps_adc_hold || sc->ufcs_owner)
 			return -EBUSY;
 		sc->ufcs_owner = true;
@@ -3587,6 +3734,16 @@ static int sc8547a_probe(struct i2c_client *client)
 	if (!device_property_read_u32(sc->dev, "southchip,input-overvoltage-microvolt",
 				      &threshold) && threshold != 10000000)
 		return -EINVAL;
+	if (!sc->is_slave) {
+		sc->btb.battery = devm_iio_channel_get(sc->dev, "battery-connector");
+		if (IS_ERR(sc->btb.battery))
+			return dev_err_probe(sc->dev, PTR_ERR(sc->btb.battery), "battery connector ADC\n");
+		sc->btb.usb = devm_iio_channel_get(sc->dev, "usb-connector");
+		if (IS_ERR(sc->btb.usb))
+			return dev_err_probe(sc->dev, PTR_ERR(sc->btb.usb), "USB connector ADC\n");
+		sc->btb.battery_err = sc->btb.usb_err = -ENODATA;
+		INIT_DELAYED_WORK(&sc->btb.work, sc8547_btb_work);
+	}
 	mutex_init(&sc->i2c_lock);
 	INIT_DELAYED_WORK(&sc->attach_work, sc8547_attach_work);
 	i2c_set_clientdata(client, sc);
@@ -3632,6 +3789,8 @@ static void sc8547a_remove(struct i2c_client *client)
 {
 	struct sc8547a_device *sc = i2c_get_clientdata(client);
 
+	if (!sc->is_slave)
+		disable_delayed_work_sync(&sc->btb.work);
 	sc8547a_serial_session(false);
 	cancel_delayed_work_sync(&sc->attach_work);
 	debugfs_remove_recursive(sc->debug_root);
