@@ -1787,7 +1787,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
 	struct erhai_probe_status status = {};
-	bool stable, ufcs_active, tail, probe_idle, prefer_pps, dedicated, can_probe;
+	bool stable, ufcs_active, tail, probe_idle, prefer_pps, dedicated, can_probe, can_probe_pumps;
 	bool serial_source, detached, qc, try_qc, caps_changed, current_changed = false;
 	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus, ua, real_type;
 	int ret;
@@ -1915,10 +1915,10 @@ read_source:
 		      qcom_battmgr_usb_idle(battmgr)));
 	tail = qcom_battmgr_tail_owned(battmgr);
 	dedicated |= serial_source;
-	can_probe = dedicated && !status.connector_blocked &&
-		    !READ_ONCE(battmgr->pps_suspended) &&
+	can_probe = dedicated && !READ_ONCE(battmgr->pps_suspended) &&
 		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
 		    !battmgr->charge_policy_hold && !battmgr->charge_error;
+	can_probe_pumps = can_probe && !status.connector_blocked;
 	qcom_battmgr_note_delivery(battmgr, status.delivering);
 	if (status.delivering == ERHAI_SERIAL) {
 		battmgr->serial_failures = 0;
@@ -1931,9 +1931,12 @@ read_source:
 		battmgr->restore_route = 0;
 	ufcs_active = battmgr->pps_ops && battmgr->pps_ops->ufcs_active(battmgr->pps_data);
 	if (dedicated)
-		battmgr->missing_routes |= (ERHAI_SERIAL | ERHAI_UFCS) & ~status.ready;
-	battmgr->retry_once |= battmgr->missing_routes & status.ready;
-	battmgr->missing_routes &= ~status.ready;
+		battmgr->missing_routes |= (ERHAI_SERIAL | ERHAI_UFCS) &
+					  (status.connector_blocked ? ~0U : ~status.ready);
+	if (!status.connector_blocked) {
+		battmgr->retry_once |= battmgr->missing_routes & status.ready;
+		battmgr->missing_routes &= ~status.ready;
+	}
 	if (test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events))
 		battmgr->retry_evidence |= ERHAI_UFCS;
 	stable = battmgr->pd_state == PD_ACTIVE || status.delivering;
@@ -1941,7 +1944,7 @@ read_source:
 		battmgr->stable_seen = true;
 		battmgr->stable_since = jiffies;
 	}
-	if (!can_probe || tail) {
+	if (!can_probe_pumps || tail) {
 		battmgr->retry_pending = 0;
 		battmgr->retry_stopping = false;
 	} else if (stable && !battmgr->retry_pending && !battmgr->serial_probe) {
@@ -1963,7 +1966,7 @@ read_source:
 		if (ret)
 			battmgr->retry_pending = 0;
 	}
-	probe_idle = !tail && can_probe && !battmgr->pd_restore && !battmgr->pd_restore_fcc &&
+	probe_idle = !tail && can_probe_pumps && !battmgr->pd_restore && !battmgr->pd_restore_fcc &&
 		     !qcom_battmgr_pps_running(battmgr) &&
 		     !qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &vbus) &&
 		     vbus >= 4000000 && vbus <= 5500000;
@@ -1981,7 +1984,7 @@ read_source:
 		 */
 		if ((status.ready & ERHAI_SERIAL) &&
 		    (!battmgr->retry_pending || (battmgr->retry_pending & ERHAI_SERIAL)) &&
-		    (probe_idle || (!tail && can_probe && battmgr->serial_probe)) && !battmgr->serial_blocked &&
+		    (probe_idle || (!tail && can_probe_pumps && battmgr->serial_probe)) && !battmgr->serial_blocked &&
 		    ((battmgr->retry_pending & ERHAI_SERIAL) || !battmgr->serial_backoff || time_after_eq(jiffies, battmgr->serial_retry))) {
 			battmgr->retry_once &= ~ERHAI_SERIAL;
 			battmgr->restore_route &= ~ERHAI_SERIAL;
@@ -2004,7 +2007,7 @@ read_source:
 			return PD_POLL_MS;
 		battmgr->serial_probe = false;
 	}
-	if (IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS) && can_probe && battmgr->pps_ops &&
+	if (IS_REACHABLE(CONFIG_OPLUS_UFCS_CLASS) && can_probe_pumps && battmgr->pps_ops &&
 	    (battmgr->pps_ops->ufcs_active(battmgr->pps_data) ||
 	     (probe_idle && (status.ready & ERHAI_UFCS) && !(status.protected & ERHAI_UFCS) &&
 	      (!battmgr->retry_pending || (battmgr->retry_pending & ERHAI_UFCS)) &&
