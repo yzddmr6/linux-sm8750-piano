@@ -522,6 +522,8 @@ struct qcom_battmgr {
 	bool charge_policy_hold;
 	struct wakeup_source *charge_ws;
 	bool charge_awake; /* protected by notify_lock */
+	bool wake_on_recharge; /* filter for the next battery state transition */
+	unsigned int wake_generation; /* discard samples spanning detach/service loss */
 
 	/*
 	 * USB VBUS boost: @otg_request follows the firmware notifications,
@@ -1109,12 +1111,12 @@ static bool qcom_battmgr_charge_limited(struct qcom_battmgr *battmgr)
 	return end && end < CHARGE_CTRL_END_THR_MAX;
 }
 
-/* Stock wired wakelock, restricted to charging with software SOC protection. */
+/* Stock wired wakelock. Publish only transitions, including service teardown. */
 static void qcom_battmgr_charge_wake_locked(struct qcom_battmgr *battmgr, bool awake)
 {
 	lockdep_assert_held(&battmgr->notify_lock);
 	awake = awake && (battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE) &&
-		qcom_battmgr_charge_limited(battmgr) &&
+		battmgr->charge_ws && !battmgr->otg_request &&
 		battmgr->service_up && !battmgr->removing;
 	if (battmgr->charge_awake == awake)
 		return;
@@ -1123,23 +1125,7 @@ static void qcom_battmgr_charge_wake_locked(struct qcom_battmgr *battmgr, bool a
 		__pm_stay_awake(battmgr->charge_ws);
 	else
 		__pm_relax(battmgr->charge_ws);
-}
-
-static void qcom_battmgr_charge_wake_poll(struct qcom_battmgr *battmgr, bool allowed)
-{
-	u32 online, health;
-
-	allowed = allowed && qcom_battmgr_charge_limited(battmgr) &&
-		!READ_ONCE(battmgr->otg_request);
-	/* Never retain a wake lock from cached online or health telemetry. */
-	if (allowed)
-		allowed = !qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-						    USB_ONLINE, &online) && online == 1 &&
-			  !qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
-						    BATT_HEALTH, &health) &&
-			  health == POWER_SUPPLY_HEALTH_GOOD;
-	scoped_guard(spinlock_irqsave, &battmgr->notify_lock)
-		qcom_battmgr_charge_wake_locked(battmgr, allowed);
+	power_supply_changed(battmgr->usb_psy);
 }
 
 static void qcom_battmgr_charge_wake_remove(void *data)
@@ -1186,15 +1172,12 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 			battmgr->charge_inhibited = false;
 			dev_info(battmgr->dev, "charge limit removed, charging resumed\n");
 		}
-		qcom_battmgr_charge_wake_poll(battmgr, false);
 		return;
 	}
 
 	ret = qcom_battmgr_bat_sm8350_update(battmgr, POWER_SUPPLY_PROP_CAPACITY);
-	if (ret) {
-		qcom_battmgr_charge_wake_poll(battmgr, false);
+	if (ret)
 		return;
-	}
 
 	soc = battmgr->status.percent;
 	if (soc >= end)
@@ -1219,9 +1202,6 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 		dev_info(battmgr->dev, "charging resumed at %u%% (start threshold %u%%)\n",
 			 soc, start);
 	}
-
-	/* Keep checking until a stop request succeeds; never sleep past the limit. */
-	qcom_battmgr_charge_wake_poll(battmgr, !battmgr->charge_inhibited);
 }
 
 /* Caller owns @lock until it has consumed the PDO array. */
@@ -1296,7 +1276,12 @@ static void qcom_battmgr_partner_removed(struct device *dev)
 	guard(mutex)(&erhai_bridge_lock);
 	b = erhai_battmgr;
 	if (b && port->parent->parent == b->dev->parent && !READ_ONCE(b->removing)) {
-		set_bit(PD_EVENT_DETACH, &b->pd_events);
+		scoped_guard(spinlock_irqsave, &b->notify_lock) {
+			b->wake_generation++;
+			b->wake_on_recharge = false;
+			qcom_battmgr_charge_wake_locked(b, false);
+			set_bit(PD_EVENT_DETACH, &b->pd_events);
+		}
 		mod_delayed_work(system_freezable_wq, &b->charge_work, 0);
 	}
 }
@@ -2240,6 +2225,109 @@ static void qcom_battmgr_pd_suspend(struct qcom_battmgr *battmgr)
 		dev_info(battmgr->dev, "PD: suspend at 5 V, input limit %u mA\n", ua / 1000);
 }
 
+enum erhai_wake_source {
+	ERHAI_SOURCE_UNCLASSIFIED,
+	ERHAI_SOURCE_HOST,
+	ERHAI_SOURCE_CHARGER,
+};
+
+/* USB_ADAP_TYPE uses the Android ADSP enum (oplus_hal_adsp.c), including
+ * BrickID=9. Plain Type-C alone says nothing about the available power.
+ */
+static enum erhai_wake_source erhai_wake_source(u32 type)
+{
+	switch (type) {
+	case POWER_SUPPLY_USB_TYPE_SDP:
+	case POWER_SUPPLY_USB_TYPE_CDP:
+	case OPLUS_USB_TYPE_PD_SDP:
+		return ERHAI_SOURCE_HOST;
+	case POWER_SUPPLY_USB_TYPE_DCP:
+	case POWER_SUPPLY_USB_TYPE_ACA:
+	case POWER_SUPPLY_USB_TYPE_PD:
+	case POWER_SUPPLY_USB_TYPE_PD_DRP:
+	case POWER_SUPPLY_USB_TYPE_PD_PPS:
+	case OPLUS_USB_TYPE_APPLE_BRICK_ID:
+	case 0x80 ... 0x82: /* QTI HVDCP, HVDCP3 and HVDCP3.5 */
+		return ERHAI_SOURCE_CHARGER;
+	default:
+		return ERHAI_SOURCE_UNCLASSIFIED;
+	}
+}
+
+static bool erhai_should_stay_awake(enum erhai_wake_source source, bool online, bool otg,
+				   bool done, bool limited, bool fast, u64 input_pw)
+{
+	if (!online || otg || done)
+		return false;
+	if (limited)
+		return true;
+	if (source == ERHAI_SOURCE_HOST)
+		return false;
+	return source == ERHAI_SOURCE_CHARGER || fast || input_pw >= 7500000000000ULL;
+}
+
+/* charge_lock serializes this sample with protocol arbitration. The
+ * notifier samples again before taking down a running PHY. Do not infer
+ * termination from SOC=100 or a pump handing CV regulation to the buck.
+ */
+static void qcom_battmgr_charge_wake_poll(struct qcom_battmgr *b)
+{
+	unsigned int generation = READ_ONCE(b->wake_generation);
+	struct erhai_probe_status phy = {};
+	enum erhai_wake_source source = ERHAI_SOURCE_UNCLASSIFIED;
+	u32 online = 0, status = POWER_SUPPLY_STATUS_UNKNOWN, type, real_type;
+	bool otg = READ_ONCE(b->otg_request) || b->otg_vbus;
+	bool limited = false, fast = false, done, qualified;
+	u64 input_pw = 0;
+	u32 uv, ua, health;
+
+	if (!READ_ONCE(b->service_up) || otg || b->charge_inhibited ||
+	    qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_ONLINE, &online) ||
+	    online != 1)
+		goto apply;
+
+	/* A missing status sample is not a termination or recharge event. */
+	if (qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_STATUS, &status) ||
+	    status == POWER_SUPPLY_STATUS_UNKNOWN)
+		status = READ_ONCE(b->wake_on_recharge) ? POWER_SUPPLY_STATUS_FULL :
+			 POWER_SUPPLY_STATUS_UNKNOWN;
+	if (qcom_battmgr_charge_limited(b))
+		limited = !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_HEALTH,
+						     &health) && health == POWER_SUPPLY_HEALTH_GOOD;
+	if (!qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_ADAP_TYPE, &type))
+		source = erhai_wake_source(type);
+	if (source == ERHAI_SOURCE_UNCLASSIFIED &&
+	    !qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_REAL_TYPE, &real_type))
+		source = erhai_wake_source(real_type);
+	if (b->pps_ops)
+		b->pps_ops->probe_status(b->pps_data, &phy);
+
+	fast = b->pd_state == PD_WAIT || b->pd_state == PD_ACTIVE ||
+	       b->serial_probe || qcom_battmgr_pps_running(b) ||
+	       b->retry_pending || phy.delivering || phy.responded || b->retry_evidence ||
+	       b->pd_charge_only || b->pps_retry_state.delivered || b->fixed_retry_state.delivered ||
+	       (phy.first_ufcs_timeout && !b->ufcs_retry_state.attempts &&
+		(phy.ready & ~phy.protected & ERHAI_UFCS));
+	if (source == ERHAI_SOURCE_UNCLASSIFIED && !fast && !limited &&
+	    !qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &uv) &&
+	    !qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_CURR_NOW, &ua) &&
+	    (s32)uv > 0 && (s32)ua > 0)
+		input_pw = (u64)uv * ua; /* measured microvolts times microamps */
+apply:
+	guard(spinlock_irqsave)(&b->notify_lock);
+	if (generation != b->wake_generation || test_bit(PD_EVENT_DETACH, &b->pd_events))
+		return;
+	done = status == POWER_SUPPLY_STATUS_FULL;
+	/* Only a terminated, wired charge session needs the charging-state
+	 * notification to wake the AP for recharge. Ignore routine telemetry.
+	 */
+	qualified = erhai_should_stay_awake(source, online == 1, otg, done, limited, fast, input_pw);
+	b->wake_on_recharge = done && b->service_up && !b->removing && !b->otg_request &&
+			      erhai_should_stay_awake(source, online == 1, otg, false, limited,
+						      fast || b->charge_awake || b->wake_on_recharge, input_pw);
+	qcom_battmgr_charge_wake_locked(b, qualified);
+}
+
 static void qcom_battmgr_charge_worker(struct work_struct *work)
 {
 	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
@@ -2251,6 +2339,13 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 		return;
 
 	mutex_lock(&battmgr->charge_lock);
+	/* An attach notification may queue another worker after PM cancelled
+	 * the old one. Only a suspend that passed the wake policy may stop it.
+	 */
+	if (READ_ONCE(battmgr->pps_suspended)) {
+		mutex_unlock(&battmgr->charge_lock);
+		return;
+	}
 	if (!battmgr->service_up) {
 		qcom_battmgr_pps_stop(battmgr, false);
 		mutex_unlock(&battmgr->charge_lock);
@@ -2261,6 +2356,7 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 
 	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD)
 		delay = qcom_battmgr_pd_update(battmgr);
+	qcom_battmgr_charge_wake_poll(battmgr);
 	if (delay && battmgr->tail_owned)
 		delay = min(delay, 4000U);
 
@@ -2325,18 +2421,21 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 	switch (action) {
 	case PM_HIBERNATION_PREPARE:
 	case PM_SUSPEND_PREPARE:
-		WRITE_ONCE(battmgr->pps_suspended, true);
 		cancel_delayed_work_sync(&battmgr->charge_work);
 		mutex_lock(&battmgr->charge_lock);
 		/* A direct suspend request can bypass the wakeup_count protocol. */
 		if (qcom_battmgr_charge_limited(battmgr))
 			qcom_battmgr_charge_limit_update(battmgr);
+		qcom_battmgr_charge_wake_poll(battmgr);
 		if (READ_ONCE(battmgr->charge_awake)) {
 			mutex_unlock(&battmgr->charge_lock);
-			WRITE_ONCE(battmgr->pps_suspended, false);
 			qcom_battmgr_charge_kick(battmgr);
 			return NOTIFY_BAD;
 		}
+		/* A running worker must never see "suspended" on a vetoed
+		 * request: that flag also instructs arbitration to drop the PHY.
+		 */
+		WRITE_ONCE(battmgr->pps_suspended, true);
 		if (battmgr->pps_ops)
 			battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
 		battmgr->suspend_route = status.delivering;
@@ -2352,6 +2451,8 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
 	case PM_POST_SUSPEND:
+		if (!READ_ONCE(battmgr->pps_suspended))
+			break;
 		scoped_guard(mutex, &battmgr->charge_lock) {
 			qcom_battmgr_restore_route(battmgr, battmgr->suspend_route);
 			battmgr->suspend_route = 0;
@@ -2409,10 +2510,6 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 		return -EINVAL;
 	}
 
-	if (!qcom_battmgr_charge_limited(battmgr)) {
-		scoped_guard(spinlock_irqsave, &battmgr->notify_lock)
-			qcom_battmgr_charge_wake_locked(battmgr, false);
-	}
 	qcom_battmgr_charge_kick(battmgr);
 
 	return ret;
@@ -2848,6 +2945,7 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 	case NOTIF_BAT_PROPERTY:
 	case NOTIF_BAT_CHARGING_STATE:
 		power_supply_changed(battmgr->bat_psy);
+		qcom_battmgr_charge_kick(battmgr);
 		break;
 	case NOTIF_USB_PROPERTY:
 		power_supply_changed(battmgr->usb_psy);
@@ -3393,7 +3491,8 @@ static bool qcom_battmgr_is_charger_notification(const void *data, size_t len, v
 
 	notification = le32_to_cpu(msg->notification);
 	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD)
-		return notification == NOTIF_OPLUS_PLUGIN;
+		return notification == NOTIF_OPLUS_PLUGIN ||
+		       (notification == NOTIF_BAT_CHARGING_STATE && READ_ONCE(battmgr->wake_on_recharge));
 
 	notification &= 0xff;
 
@@ -3523,6 +3622,8 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		schedule_work(&battmgr->enable_work);
 	} else {
 		battmgr->service_up = false;
+		battmgr->wake_generation++;
+		battmgr->wake_on_recharge = false;
 		qcom_battmgr_charge_wake_locked(battmgr, false);
 		/* A restarted firmware charges again by default */
 		battmgr->charge_inhibited = false;
@@ -3616,6 +3717,7 @@ static void qcom_battmgr_stop_notifications(void *data)
 
 	guard(spinlock_irqsave)(&battmgr->notify_lock);
 	battmgr->removing = true;
+	battmgr->wake_on_recharge = false;
 	qcom_battmgr_charge_wake_locked(battmgr, false);
 }
 
