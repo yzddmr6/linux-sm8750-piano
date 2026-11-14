@@ -4196,7 +4196,11 @@ static void xiaomi_mca_test_mipps_tail_replay(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, mca->cp_exits, 0);
 	}
 	KUNIT_ASSERT_TRUE(test, mca->ffc_active);
-	KUNIT_EXPECT_LT(test, mca->cp_mv, 10000);
+	/* The fixed old ADC trace does not respond to larger CC requests.
+	 * It can now reach the APDO ceiling; it must never exceed it. The
+	 * following CV observations still require reduction and handoff.
+	 */
+	KUNIT_EXPECT_LE(test, mca->cp_mv, mca->cp_max_mv);
 
 	/* Constructed future observations, not measurements of a charged pack. */
 	f->cells[0].capacity = f->cells[1].capacity = 95;
@@ -5197,7 +5201,124 @@ static void xiaomi_mca_test_cycle4_gauge_full(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->fg_commands[0][1], n); /* retry only failed peer */
 }
 
+static void xiaomi_mca_test_stock_ramp_steps(struct kunit *test)
+{
+	static const struct { int gap, mv; } rows[] = {
+		{ 0, 20 }, { 599, 20 }, { 600, 40 }, { 999, 40 },
+		{ 1000, 80 }, { 1999, 80 }, { 2000, 140 }, { 2999, 140 },
+		{ 3000, 160 }, { 3999, 160 }, { 4000, 200 }, { 12000, 200 },
+	};
+	int n, sign;
+
+	for (n = 0; n < ARRAY_SIZE(rows); n++) {
+		for (sign = -1; sign <= 1; sign += 2) {
+			int gap = sign * rows[n].gap;
+
+			KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_stock_vstep(gap, false), rows[n].mv);
+			KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_stock_vstep(gap, true), min(rows[n].mv, 80));
+			/* Bus excess overrides a still-positive (averaged) cell deficit. */
+			KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ramp_step(-1, gap, 100, false,
+				false, 0, 0), -rows[n].mv);
+		}
+	}
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ramp_step(1, 5000, 11, false, false, 0, 0), 200);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ramp_step(1, 5000, 10, false, false, 0, 0), 20);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ramp_step(1, 5000, 0, false, false, 0, 0), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ramp_step(0, 5000, 100, false, false, 0, 0), 0);
+}
+
+static void xiaomi_mca_test_ramp_bus_overshoot(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	full_charge = charge_policy = cp_charge = hv_charge = true;
+	mca_test_stage(test, f);
+	f->type = mca->real_type = mca->cp_type = MCA_TYPE_PD_PPS;
+	mca->cp_ma = 5000;
+	mca->cp_mv = 8200;
+	mca->cp_max_mv = 10000;
+	mca->cp_ibus_ma = mca->cp_ibus_hot = 3800;
+	f->cells[0].voltage = f->cells[1].voltage = 4000000;
+	f->cells[0].current_ua = f->cells[1].current_ua = 1000000;
+	f->stage_ma = 2000;
+	f->stage_mv = 8200;
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_cp_step(mca);
+	KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_EQ(test, mca->cp_mv, 8400);
+	KUNIT_EXPECT_TRUE(test, mca->cp_ramp_poll);
+	/* ADC sees an overshoot while gauges still report a 6 A deficit.
+	 * Native control subtracts its full 200 mV, not the old 20 mV.
+	 */
+	f->stage_ma = 4000;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp_mv, 8200);
+	KUNIT_EXPECT_TRUE(test, mca->cp_boost_done);
+	KUNIT_EXPECT_FALSE(test, mca->cp_fault);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_ON);
+	xiaomi_mca_cp_stop(mca, "test complete");
+}
+
+static void xiaomi_mca_test_stock_boost_constraints(struct kunit *test)
+{
+	static const struct { int direction, gap, boost_ms, buck_ms, want; } rows[] = {
+		{ 1, 400, 1999, 1000, 0 }, { 1, 400, 2000, 999, 0 },
+		{ 1, 400, 2000, 1000, 20 }, { -1, -400, 5000, 999, 0 },
+		{ -1, -400, 5000, 1000, -20 },
+		/* Large corrections are not subject to the project-7 restriction. */
+		{ 1, 4000, 700, 700, 200 }, { -1, 4000, 700, 700, -200 },
+	};
+	int n;
+
+	for (n = 0; n < ARRAY_SIZE(rows); n++)
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ramp_step(rows[n].direction, rows[n].gap,
+			100, false, true, rows[n].boost_ms, rows[n].buck_ms), rows[n].want);
+	/* Before the first downward correction there is no boost delay. */
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ramp_step(1, 400, 100, false, false, 0, 0), 20);
+}
+
+static void xiaomi_mca_test_cycle4_ramp(struct kunit *test)
+{
+	/* Real 05:05:41..05:07:47 samples, compressed to one row per ten
+	 * seconds plus the first 9 A sample. Old ADCs are inputs, not a
+	 * prediction of how cells respond to the new voltage requests.
+	 */
+	static const struct { int vbat, ibat, target, cv, step; } rows[] = {
+		{ 3912, -1074, 8000, 4150, 200 }, /* 05:05:41 */
+		{ 3966, 1291, 8000, 4150, 200 }, /* 05:05:51 */
+		{ 4009, 2284, 8000, 4150, 200 }, /* 05:06:20 */
+		{ 4065, 3636, 12000, 4144, 200 }, /* 05:06:30 */
+		{ 4110, 5081, 12000, 4144, 200 }, /* 05:06:40 */
+		{ 4137, 6418, 12000, 4144, 20 }, /* 05:06:50 */
+		{ 4166, 7414, 10650, 4300, 160 }, /* 05:07:00 */
+		{ 4198, 8560, 10650, 4300, 140 }, /* 05:07:10 */
+		{ 4201, 9029, 10650, 4300, 80 }, /* 05:07:16 */
+		{ 4207, 9268, 10650, 4300, 80 }, /* 05:07:20 */
+		{ 4209, 9609, 10650, 4300, 80 }, /* 05:07:30 */
+		{ 4212, 9775, 10650, 4300, 40 }, /* 05:07:40 */
+		{ 4213, 9842, 10650, 4300, 40 }, /* 05:07:47 */
+	};
+	int n;
+
+	for (n = 0; n < ARRAY_SIZE(rows); n++) {
+		int gap = rows[n].target - rows[n].ibat;
+
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ramp_step(1, gap,
+			rows[n].cv - rows[n].vbat, false, false, 0, 0), rows[n].step);
+		/* Same gauge sample but an actual IBUS over target must lower
+		 * voltage immediately, never continue the upward ramp.
+		 */
+		KUNIT_EXPECT_LT(test, xiaomi_mca_cp_ramp_step(-1, gap,
+			rows[n].cv - rows[n].vbat, false, false, 0, 0), 0);
+	}
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_stock_ramp_steps),
+	KUNIT_CASE(xiaomi_mca_test_ramp_bus_overshoot),
+	KUNIT_CASE(xiaomi_mca_test_stock_boost_constraints),
+	KUNIT_CASE(xiaomi_mca_test_cycle4_ramp),
 	KUNIT_CASE(xiaomi_mca_test_warm_termination_is_not_full),
 	KUNIT_CASE(xiaomi_mca_test_provider_late_start),
 	KUNIT_CASE(xiaomi_mca_test_gauge_mac_packets),

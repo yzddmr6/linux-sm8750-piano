@@ -350,7 +350,7 @@ MODULE_PARM_DESC(mipps_auth,
  * current, while the buck charger is held at MCA_CP_BUCK_MA.  The sequence
  * follows stock: ask the source for twice the battery voltage plus
  * MCA_CP_DELTA_MV, enable the stage, raise the voltage MCA_CP_STEP_MV at a
- * time until current flows, then regulate the voltage every MCA_CP_POLL_MS
+ * time until current flows, then regulate the voltage at the CC/CV cadence
  * so the bus current stays at its target and the battery current (both
  * gauges) below the limit of xiaomi_mca_cp_ibat_limit().  The limits follow
  * the selected stock battery table, across the enabled thermal rows.
@@ -360,6 +360,8 @@ MODULE_PARM_DESC(mipps_auth,
  * SC8541 independently enforces its protection registers and watchdog.
  */
 #define MCA_CP_POLL_MS		500
+/* Piano quickchg monitor 0x2230..2248: 175 ticks at CONFIG_HZ=250. */
+#define MCA_CP_RAMP_POLL_MS	700
 #define MCA_CP_VBAT_MIN_MV	3450	/* stock min_vbat */
 #define MCA_CP_VBAT_MAX_MV	4473	/* normal_volt_para18_35/35_48 */
 #define MCA_CP_TAPER_FCC_MA	3000
@@ -735,6 +737,9 @@ struct xiaomi_mca {
 	const char *hv_last_exit;
 	u32 cp_exits;
 	struct power_supply *cp_psy;	/* the stage, held while not MCA_CP_OFF */
+	bool cp_ramp_poll;	/* stock CC cadence; CV/opening retain their cadence */
+	bool cp_boost_done;	/* first downward regulation step, stock boost_done */
+	unsigned long cp_boost_at, cp_buck_at;
 	u32 cp_mv;		/* voltage asked of the PPS source */
 	u32 cp_ma;		/* APDO current limit, with source/authentication caps */
 	u32 cp_request_ma;	/* current in the most recent PPS request */
@@ -4124,6 +4129,8 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_stage = 0;
 	mca->cp_target_ma = 0;
 	mca->cp_parallel_done = false;
+	mca->cp_ramp_poll = mca->cp_boost_done = false;
+	mca->cp_boost_at = mca->cp_buck_at = jiffies;
 	mca->cp_taper_count = 0;
 	mca->cp_stop_phase = 0;
 	mca->cp = MCA_CP_OPENING;
@@ -4253,17 +4260,74 @@ static bool xiaomi_mca_cp_taper_complete(struct xiaomi_mca *mca, bool near_cv, i
 	return ++mca->cp_taper_count > 3;
 }
 
-/* One step of direct charging, every MCA_CP_POLL_MS */
+/* Piano vstep_para, quickchg 0x6d8c..6f20. The gap is total battery
+ * current, not pump IBUS: buck contributes to the same cell envelope.
+ * base-flip-same caps multipliers >= 5 at four in temperature row 1
+ * (8..13 C), NOT in the normal-temperature single-pump configuration.
+ */
+static int xiaomi_mca_cp_stock_vstep(int gap, bool cold)
+{
+	static const struct { int gap, mv; } steps[] = {
+		{ 4000, 200 }, { 3000, 160 }, { 2000, 140 },
+		{ 1000, 80 }, { 600, 40 },
+	};
+	int i, step = MCA_CP_REG_STEP_MV;
+
+	for (i = 0; i < ARRAY_SIZE(steps); i++) {
+		if (abs(gap) >= steps[i].gap) {
+			step = steps[i].mv;
+			break;
+		}
+	}
+	return cold ? min(step, 80) : step;
+}
+
+/* quickchg 0x6e18..6e38 and 0x71bc..7210. No extra vstep_ex table is
+ * enabled in Piano DT. The >=80 mV/2 s quirk at 0x7214..7254 is project 7;
+ * Piano's stock hwid.project is 9, so it must not be applied here.
+ * Direction/deadband and the independent CV/OVP/OCP guards stay outside.
+ */
+static int xiaomi_mca_cp_boost_step(int step, bool boost_done,
+				  unsigned int boost_ms, unsigned int buck_ms)
+{
+	if (boost_done && ((step == 20 && (boost_ms < 2000 || buck_ms < 1000)) ||
+			   (step == -20 && buck_ms < 1000)))
+		return 0;
+	return step;
+}
+
+static int xiaomi_mca_cp_ramp_step(int direction, int gap, int headroom,
+				 bool cold, bool boost_done,
+				 unsigned int boost_ms, unsigned int buck_ms)
+{
+	int step;
+
+	if (!direction)
+		return 0;
+	step = xiaomi_mca_cp_stock_vstep(gap, cold);
+	if (direction > 0) {
+		if (headroom <= 0)
+			return 0;
+		if (headroom <= 10)
+			step = MCA_CP_REG_STEP_MV;
+	} else {
+		step = -step;
+	}
+	return xiaomi_mca_cp_boost_step(step, boost_done, boost_ms, buck_ms);
+}
+
+/* Opening/CV retain 500 ms; PPS CC uses the stock 700 ms cadence. */
 static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 {
 	int vbat, ibat, tcool, tbat, vbus_uv, ibus_ua, tdie, on, ibus, over;
 	int ibat_max, target, ibus_all, buck_ma, budget, vmin, imax;
 	int band = xiaomi_mca_cp_band(mca->cp_type);
 	u32 mv = mca->cp_mv, cv;
-	int previous;
+	int previous, direction;
 	bool taper, ocp, parallel;
 	u32 fcc, icl;
 
+	mca->cp_ramp_poll = false;
 	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, &ocp)) {
 		xiaomi_mca_cp_stop(mca, "read failed");
 		return;
@@ -4493,13 +4557,30 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 						 (int)mca->fcc_set_ma)) / 2);
 
 		over = ibus - target;
-		if (over > 0)
+		/* Change only the PPS CC actuator step, not its direction or
+		 * current budget. QC pulses and final CV keep their regulator.
+		 */
+		mca->cp_ramp_poll = xiaomi_mca_is_pd(mca->cp_type) &&
+			(mca->cp_stage + 1 < xiaomi_mca_profile_counts[mca->cp_profile] ||
+			 !taper);
+		if (mca->cp_ramp_poll) {
+			direction = 0;
+			if (over > 0 || (ibat > ibat_max && mca->cp_ibat_trip <= ibat_max))
+				direction = -1;
+			else if (ibus + band <= target && ibat + 2 * band <= ibat_max)
+				direction = 1;
+			mv += xiaomi_mca_cp_ramp_step(direction, ibat_max - ibat,
+				(int)cv - vbat, mca->cell_zone == 8, mca->cp_boost_done,
+				jiffies_to_msecs(jiffies - mca->cp_boost_at),
+				jiffies_to_msecs(jiffies - mca->cp_buck_at));
+		} else if (over > 0) {
 			mv -= clamp(over / MCA_CP_REG_STEP_MA * MCA_CP_REG_STEP_MV,
 				    MCA_CP_REG_STEP_MV, MCA_CP_REG_MAX_STEP_MV);
-		else if (ibat > ibat_max && mca->cp_ibat_trip <= ibat_max)
+		} else if (ibat > ibat_max && mca->cp_ibat_trip <= ibat_max) {
 			mv -= MCA_CP_REG_STEP_MV;
-		else if (ibus + band <= target && ibat + 2 * band <= ibat_max)
+		} else if (ibus + band <= target && ibat + 2 * band <= ibat_max) {
 			mv += MCA_CP_REG_STEP_MV;
+		}
 		/* the gauges catch up with a lowered limit only from here */
 		if (over > MCA_CP_BAND_MA)
 			mca->cp_trip_at = jiffies;
@@ -4512,10 +4593,27 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	}
 
 	mv = clamp_t(u32, mv, 2 * vbat, 2 * vbat + MCA_CP_REQ_MAX_DELTA_MV);
+	/* A large CC step can exceed the unchanged final-CV headroom.
+	 * Fall back to the old 20 mV request, then apply the same guard;
+	 * rejecting the whole boost must not stall below the CV boundary.
+	 */
+	if (mca->cp_ramp_poll && mv > previous + MCA_CP_REG_STEP_MV &&
+	    xiaomi_mca_cp_row_cv_request(mca, previous, mv, vbat, cv) == previous)
+		mv = previous + xiaomi_mca_cp_boost_step(MCA_CP_REG_STEP_MV,
+			mca->cp_boost_done, jiffies_to_msecs(jiffies - mca->cp_boost_at),
+			jiffies_to_msecs(jiffies - mca->cp_buck_at));
 	mv = xiaomi_mca_cp_row_cv_request(mca, previous, mv, vbat, cv);
 	if (xiaomi_mca_cp_request(mca, mv)) {
 		xiaomi_mca_cp_learn_drop(mca);
 		xiaomi_mca_cp_stop(mca, "request refused");
+	} else if (xiaomi_mca_is_pd(mca->cp_type) && mca->cp == MCA_CP_ON) {
+		/* quickchg 0x77d4..77f0/0x78cc: track applied changes only. */
+		if (mca->cp_mv > previous)
+			mca->cp_boost_at = jiffies;
+		else if (mca->cp_mv < previous) {
+			mca->cp_boost_done = true;
+			mca->cp_buck_at = jiffies;
+		}
 	}
 }
 
@@ -5461,7 +5559,9 @@ out:
 		power_supply_changed(mca->psy);
 
 	schedule_delayed_work(&mca->poll_work,
-		xiaomi_mca_cp_active(mca) ? msecs_to_jiffies(MCA_CP_POLL_MS) :
+		xiaomi_mca_cp_active(mca) ? msecs_to_jiffies(
+			mca->cp == MCA_CP_ON && mca->cp_ramp_poll ?
+			MCA_CP_RAMP_POLL_MS : MCA_CP_POLL_MS) :
 		(mca->connector.cutoff ? HZ : MCA_POLL_INTERVAL));
 }
 
