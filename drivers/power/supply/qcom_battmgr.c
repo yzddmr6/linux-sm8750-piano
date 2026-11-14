@@ -906,14 +906,20 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = battmgr->status.status;
 		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
+			/* AP full is an attachment-scoped decision. Cell relaxation
+			 * can supply the system after output is disabled; it does
+			 * not undo full until the controller declares recharge.
+			 */
+			if (READ_ONCE(battmgr->buck.phase) == ERHAI_BUCK_FULL &&
+			    READ_ONCE(battmgr->buck_online)) {
+				val->intval = POWER_SUPPLY_STATUS_FULL;
+				break;
+			}
 			ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
 						BATT_CURR_NOW, &raw_ua);
 			if (ret)
 				return ret;
-			if (READ_ONCE(battmgr->buck.phase) == ERHAI_BUCK_FULL &&
-			    READ_ONCE(battmgr->buck_enable_applied) == 0)
-				val->intval = POWER_SUPPLY_STATUS_FULL;
-			else if (READ_ONCE(battmgr->buck.disable) ||
+			if (READ_ONCE(battmgr->buck.disable) ||
 				 READ_ONCE(battmgr->charge_policy_hold) ||
 				 READ_ONCE(battmgr->charge_inhibited))
 				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
