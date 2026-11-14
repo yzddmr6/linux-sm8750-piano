@@ -32,6 +32,7 @@
 #include <linux/delay.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/mod_devicetable.h>
 #include <linux/mutex.h>
@@ -499,7 +500,13 @@ struct sc8547a_device {
 	u8 pump_faults;
 	unsigned int adc_over_count;
 	unsigned int low_ibus_count;
-	unsigned long last_frame;
+	u64 irq_arrived_ns;	/* hard IRQ timestamp; IRQF_ONESHOT */
+	bool irq_pending;
+	u64 last_frame_ns;
+	unsigned int frame_gap_us, max_frame_gap_us;
+	unsigned int recoveries_answered;
+	bool awaiting_rehandshake;
+	unsigned long watchdog_fed_at;
 	bool frame_seen;
 	int master_ibus_ma, slave_ibus_ma;
 	int master_enabled, slave_enabled;
@@ -1329,21 +1336,25 @@ static int sc8547_slave_cp_enable(struct sc8547a_device *master, bool on)
 	return sc8547_set_chg_enable(sc, on);
 }
 
-/*
- * Keep the slave alive + measurable while it is enabled (mirror of the master's
- * REG_09=0x13 feed): the slave arms a 1000 ms watchdog at CP-close and its ADC
- * self-clears, so without a periodic refresh it would eventually disable itself
- * and its ibus would read 0. Call wherever the master watchdog is fed. NOTE: this
- * does NOT by itself make the slave share current — two SC8547 in parallel do not
- * auto-split; the vendor engages the slave as overload relief and runs an active
- * current-balance loop (oplus_switching / ibus_check deviation), not yet ported.
+/* Keep both converters alive before a blocking gauge read. During that
+ * read, the serial master's regular IRQs continue servicing the pair.
+ * Feed a slave with an unknown enable readback as well; REG09 cannot
+ * assert CHG_EN. Never feed a pump waiting for its stop watchdog.
  */
-static void sc8547_slave_feed_wd(void)
+static int sc8547_serial_feed(struct sc8547a_device *sc)
 {
-	if (!sc8547_slave_dev)
-		return;
-	sc8547_write_byte(sc8547_slave_dev, SC8547_REG_09, 0x13);
-	sc8547_write_byte(sc8547_slave_dev, SC8547_REG_11, 0x80);	/* keep ADC on */
+	int master, slave = 0;
+
+	if (!sc->cp_enabled || sc->auto_state != SC_AUTO_DELIVER || pump_stopping)
+		return 0;
+	master = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+	if (sc8547_slave_dev && sc8547_slave_dev->monitor_pump_faults) {
+		slave = sc8547_write_byte(sc8547_slave_dev, SC8547_REG_09, 0x13);
+		slave = slave ?: sc8547_set_adc_enable(sc8547_slave_dev, true);
+	}
+	if (!master && !slave)
+		sc->watchdog_fed_at = jiffies;
+	return master ?: slave;
 }
 
 /* Slave bus current (mA); 0 when no slave or its ADC/CP is idle. */
@@ -2263,6 +2274,7 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 static void sc8547_serial_clear_sample(struct sc8547a_device *sc)
 {
 	sc->frame_seen = false;
+	sc->frame_gap_us = sc->max_frame_gap_us = 0;
 	sc->master_ibus_ma = sc->slave_ibus_ma = -1;
 	sc->master_enabled = sc->slave_enabled = -1;
 	sc->serial_vbus_mv = sc->serial_reg06 = -1;
@@ -2409,6 +2421,11 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc, const char *why)
 	/* Stop both legs before touching the crossbar, resetting or feeding.
 	 * A lost ACK is fenced by the existing pump-off watchdog path.
 	 */
+	if (sc->auto_protection || sc8547_take_faults() > 0) {
+		sc->auto_protection = true;
+		sc8547_auto_finish(sc, "hw-ovp-ocp");
+		return;
+	}
 	sc->serial_last_retry = why;
 	if (sc8547_serial_off(sc)) {
 		sc8547_auto_finish(sc, "pump-stop-pending");
@@ -2421,12 +2438,13 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc, const char *why)
 	}
 	sc->auto_reservo_cnt++;
 	sc->rehandshakes++;
+	sc->awaiting_rehandshake = true;
 
 	dev_info(sc->dev, "SVOOC re-handshake %d/%d: %s, request=%u ibus=%d/%d mA en=%d/%d vbus=%d mV rx_age=%u ms last_rx=0x%02x flags=0x%02x reg06=%d pack_ma=%d\n",
 		 sc->auto_reservo_cnt, SC8547_AUTO_RESERVO_MAX, why, sc->serial_request,
 		 sc->master_ibus_ma, sc->slave_ibus_ma, sc->master_enabled, sc->slave_enabled,
-		 sc->serial_vbus_mv, jiffies_to_msecs(jiffies - sc->last_frame), sc->voocphy_rx_buff,
-		 sc->vooc_flag, sc->serial_reg06, sc->serial_ibat_ma);
+		 sc->serial_vbus_mv, (unsigned int)div_u64(ktime_get_ns() - sc->last_frame_ns, NSEC_PER_MSEC),
+		 sc->voocphy_rx_buff, sc->vooc_flag, sc->serial_reg06, sc->serial_ibat_ma);
 	sc->fastchg_enable = false;
 	sc->fastchg_deliver = false;
 	sc8547_vooc_arm_hw(sc);
@@ -2567,6 +2585,12 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 	sc->fastchg_deliver = true;
 	sc->fastchg_auto = false;	/* one-shot per arm consumed */
 	sc->auto_state = SC_AUTO_DELIVER;
+	if (sc->awaiting_rehandshake) {
+		sc->recoveries_answered++;
+		sc->awaiting_rehandshake = false;
+		dev_info(sc->dev, "SVOOC re-handshake answered: model=0x%02x window=%u\n",
+			 sc->adapter_model_ver, sc->auto_ident_retries);
+	}
 	dev_info(sc->dev,
 		 "auto fast-charge: SVOOC identified (soc %d%% temp %d.%d C cell %d mV cp %d mV) — deliver curve[%d] code %u\n",
 		 soc, temp_ddc / 10, temp_ddc % 10, cell_mv, sc8547_get_vbat(sc), sc->auto_curve_idx,
@@ -2620,23 +2644,27 @@ static bool sc8547_current_in_range(struct sc8547a_device *sc, int total_ma)
 /* A late frame can arrive between monitor polls. It belongs to a broken
  * exchange and must not refresh the watchdog for the old contract.
  */
-static bool sc8547_serial_timed_out(struct sc8547a_device *sc, unsigned long now)
+static bool sc8547_serial_timed_out(struct sc8547a_device *sc, u64 now_ns)
 {
 	return sc->auto_state == SC_AUTO_DELIVER && sc->frame_seen &&
-	       time_after_eq(now, sc->last_frame + msecs_to_jiffies(SC8547_COMMU_TIMEOUT_MS));
+	       now_ns >= sc->last_frame_ns + SC8547_COMMU_TIMEOUT_MS * NSEC_PER_MSEC;
 }
 
 static void sc8547_attach_work(struct work_struct *work)
 {
 	struct sc8547a_device *sc =
 		container_of(work, struct sc8547a_device, attach_work.work);
-	unsigned long sampled_at;
+	u64 sampled_at;
 	int gsoc = -1, gtemp = 0, gvbat = -1, ibat = 0;
 	int gret = -ENODATA, vbus;
 
 	guard(mutex)(&sc8547_pps_lock);
 	if (!sc->vooc_started)
 		return;
+	if (sc8547_serial_feed(sc)) {
+		sc8547_auto_reservo(sc, "watchdog-feed-io");
+		goto reschedule;
+	}
 	/* A pack/gauge GLINK round trip can outlast a PHY reply slot. The
 	 * gauge belongs to the pack, so it can be read outside the port
 	 * lock. Recheck ownership before touching either converter.
@@ -2651,7 +2679,7 @@ static void sc8547_attach_work(struct work_struct *work)
 		    (sc->auto_state != SC_AUTO_IDENTIFY && sc->auto_state != SC_AUTO_DELIVER))
 			return;
 	}
-	sampled_at = jiffies;
+	sampled_at = ktime_get_ns();
 
 	vbus = sc8547_get_vbus(sc);
 	if (!sc->auto_armed) {
@@ -2736,7 +2764,13 @@ static void sc8547_attach_work(struct work_struct *work)
 		/* RX_DONE frames are clocked by the source. CHG_EN can remain
 		 * set indefinitely with no source current while UCP is masked.
 		 */
-		if (sc8547_serial_timed_out(sc, sampled_at)) {
+		/* A pending IRQ may be a frame that arrived before the deadline.
+		 * Its thread checks the captured edge against the previous valid
+		 * one; a non-frame IRQ never refreshes that deadline.
+		 */
+		if (sc8547_serial_timed_out(sc, sampled_at) &&
+		    !(smp_load_acquire(&sc->irq_pending) &&
+		      !sc8547_serial_timed_out(sc, READ_ONCE(sc->irq_arrived_ns)))) {
 			sc8547_auto_reservo(sc, "frame-timeout");
 			goto reschedule;
 		}
@@ -2777,15 +2811,15 @@ static void sc8547_attach_work(struct work_struct *work)
 		if (!sc->cp_enabled)
 			goto reschedule;
 
-		if (sc->master_enabled < 0 || sc->serial_reg06 < 0) {
-			sc8547_auto_finish(sc, "pump-status-io");
+		if (sc->master_enabled < 0 || sc->slave_enabled < 0 || sc->serial_reg06 < 0) {
+			sc8547_auto_reservo(sc, "pump-status-io");
 			goto reschedule;
 		}
 
 		if (sc->vooc_vbus_status == SC_VBUS_NORMAL && cibus_total > SC8547_UCP_ARM_MA &&
 		    (sc8547_serial_arm_ucp(sc) || (slave_ma > SC8547_UCP_ARM_MA &&
 		    sc8547_serial_arm_ucp(sc8547_slave_dev)))) {
-			sc8547_auto_finish(sc, "ucp-restore-io");
+			sc8547_auto_reservo(sc, "ucp-restore-io");
 			goto reschedule;
 		}
 
@@ -2813,7 +2847,6 @@ static void sc8547_attach_work(struct work_struct *work)
 		} else {
 			bool slave_on = sc->slave_enabled > 0;
 
-			sc8547_write_byte(sc, SC8547_REG_09, 0x13);	/* feed watchdog */
 
 			/*
 			 * Dual-CP load-sharing (the vendor's threshold engage). Once
@@ -2827,12 +2860,12 @@ static void sc8547_attach_work(struct work_struct *work)
 			 */
 			if (!sc->slave_enabled && sc->vooc_vbus_status == SC_VBUS_NORMAL &&
 			    cibus >= SC8547_SLAVE_ENGAGE_IBUS_MA) {
-				sc8547_slave_cp_enable(sc, true);
-				sc->slave_on_since = jiffies;
-				sc->slave_low_cnt = 0;
-				dev_info(sc->dev,
-					 "dual-CP: engaging slave under load (master %d mA vbus %d mV vbat %d mV)\n",
-					 cibus, vbus, cvbat);
+				if (!sc8547_slave_cp_enable(sc, true)) {
+					sc->slave_on_since = jiffies;
+					sc->slave_low_cnt = 0;
+					dev_info_ratelimited(sc->dev, "dual-CP: requested slave under %d mA master load\n",
+							     cibus);
+				}
 			} else if (slave_on && slave_settle_ms &&
 				   jiffies - sc->slave_on_since <
 					   msecs_to_jiffies(slave_settle_ms)) {
@@ -2842,16 +2875,13 @@ static void sc8547_attach_work(struct work_struct *work)
 				 * ADC may still read its idle ~20 mA).  Feed
 				 * it; never judge the drop inside this window.
 				 */
-				sc8547_slave_feed_wd();
 				dev_dbg(sc->dev,
 					"dual-CP: slave settling (%u ms on, total %d mA)\n",
 					jiffies_to_msecs(jiffies - sc->slave_on_since),
 					cibus_total);
 			} else if (slave_on &&
 				   cibus_total < SC8547_SLAVE_DISENGAGE_IBUS_MA) {
-				if (++sc->slave_low_cnt < slave_drop_ticks) {
-					sc8547_slave_feed_wd();
-				} else {
+				if (++sc->slave_low_cnt >= slave_drop_ticks) {
 					sc8547_slave_cp_enable(sc, false);
 					sc->slave_low_cnt = 0;
 					dev_info(sc->dev,
@@ -2861,7 +2891,6 @@ static void sc8547_attach_work(struct work_struct *work)
 				}
 			} else if (slave_on) {
 				sc->slave_low_cnt = 0;
-				sc8547_slave_feed_wd();			/* keep the slave alive */
 			}
 
 			dev_dbg(sc->dev, "fastchg: vbus %d mV vbat %d mV ibus %d mA (master %d slave %d) margin %d mV REG06=0x%02x REG07=0x%02x slave_on=%d\n",
@@ -2891,13 +2920,13 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 	*active = sc && sc->vooc_started && sc->auto_state != SC_AUTO_OFF;
 	if (!sc)
 		return off;
-	off += sysfs_emit_at(buf, off, "svooc_last_exit=%s svooc_last_retry=%s rehandshakes=%u missed_asks=%u missed_code=%u missed_predata=0x%04x ",
+	off += sysfs_emit_at(buf, off, "svooc_last_exit=%s svooc_last_retry=%s rehandshakes=%u rehandshakes_answered=%u missed_asks=%u missed_code=%u missed_predata=0x%04x ",
 			     sc->serial_last_exit ?: "none", sc->serial_last_retry ?: "none",
-			     sc->rehandshakes, sc->missed_asks, sc->missed_request, sc->missed_predata);
+			     sc->rehandshakes, sc->recoveries_answered, sc->missed_asks, sc->missed_request, sc->missed_predata);
 	if (!*active)
 		return off;
 
-	age = sc->frame_seen ? (long long)jiffies_to_msecs(jiffies - sc->last_frame) : -1;
+	age = sc->frame_seen ? (long long)(unsigned int)div_u64(ktime_get_ns() - sc->last_frame_ns, NSEC_PER_MSEC) : -1;
 	ibus = sc->master_ibus_ma < 0 || sc->slave_ibus_ma < 0 ? -1 :
 		sc->master_ibus_ma + sc->slave_ibus_ma;
 	pump = sc->master_enabled > 0 || sc->slave_enabled > 0 ? 1 :
@@ -2906,14 +2935,15 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 		"protocol=supervooc state=%s model=%d target_code=%u request_code=%u request_ma=%u "
 		"pending_code=%d predata=0x%04x above_samples=%u "
 		"vbus_mv=%d pump=%d pump_ibus_ma=%d master_ibus_ma=%d slave_ibus_ma=%d "
-		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u "
+		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u frame_gap_us=%u max_gap_us=%u "
 		"exits=%u last_exit=%s\n",
 		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1,
 		sc->fastchg_deliver ? sc->fastchg_curr_code : 0, sc->serial_request, sc->serial_request * 100,
 		sc->request_pending ? sc->pending_request : -1, sc->serial_predata, sc->above_request_count,
 		sc->serial_vbus_mv, pump, ibus, sc->master_ibus_ma, sc->slave_ibus_ma,
 		sc->master_enabled, max(sc->slave_enabled, -1), age, sc->voocphy_rx_buff,
-		sc->vooc_flag, sc->serial_reg06, sc->rx_errors, sc->tx_errors, sc->serial_exits, sc->serial_last_exit ?: "none");
+		sc->vooc_flag, sc->serial_reg06, sc->rx_errors, sc->tx_errors, sc->frame_gap_us, sc->max_frame_gap_us,
+		sc->serial_exits, sc->serial_last_exit ?: "none");
 }
 EXPORT_SYMBOL_GPL(sc8547a_serial_describe);
 
@@ -2951,7 +2981,7 @@ void sc8547a_detached(void)
 	guard(mutex)(&sc8547_pps_lock);
 	if (sc8547_master_dev) {
 		sc8547_master_dev->responded = 0;
-		sc8547_master_dev->rehandshakes = 0;
+		sc8547_master_dev->rehandshakes = sc8547_master_dev->recoveries_answered = 0;
 		sc8547_master_dev->missed_asks = 0;
 		sc8547_master_dev->rx_errors = sc8547_master_dev->tx_errors = 0;
 		sc8547_master_dev->ufcs_handshake_tried = false;
@@ -2989,6 +3019,7 @@ int sc8547a_serial_session(bool enable)
 		sc->adc_over_count = 0;
 		sc->auto_armed = false;
 		sc->auto_ident_retries = 0;
+		sc->awaiting_rehandshake = false;
 		sc8547_serial_clear_sample(sc);
 		sc->model_received = false;
 		sc->auto_reservo_cnt = 0;
@@ -3018,7 +3049,7 @@ int sc8547a_serial_session(bool enable)
 EXPORT_SYMBOL_GPL(sc8547a_serial_session);
 
 /* IRQ-time frame processing. Returns true if a frame was handled. */
-static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
+static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 {
 	int word = sc8547_get_adapter_info(sc);
 
@@ -3043,7 +3074,7 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
 	if (!(sc->vooc_flag & VOOC_RXDATA_DONE_FLAG))
 		return !!(sc->vooc_flag & (VOOC_TXDATA_DONE_FLAG | VOOC_TXDATA_WR_FAIL_FLAG));
 
-	if (sc8547_serial_timed_out(sc, jiffies)) {
+	if (sc8547_serial_timed_out(sc, arrived_ns)) {
 		/* The monitor checks latched OCP/OVP and CV before rearming. */
 		mod_delayed_work(system_wq, &sc->attach_work, 0);
 		return true;
@@ -3063,8 +3094,17 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc)
 		 */
 		if (sc->request_pending && (sc->vooc_flag & VOOC_TXDATA_WR_FAIL_FLAG))
 			sc8547_request_missed(sc, sc->pending_request);
+		if (sc->frame_seen) {
+			sc->frame_gap_us = div_u64(arrived_ns - sc->last_frame_ns, NSEC_PER_USEC);
+			sc->max_frame_gap_us = max(sc->max_frame_gap_us, sc->frame_gap_us);
+		}
 		sc->frame_seen = true;
-		sc->last_frame = jiffies;
+		sc->last_frame_ns = arrived_ns;
+		if (time_after_eq(jiffies, sc->watchdog_fed_at + msecs_to_jiffies(SC8547_ATTACH_POLL_MS)) &&
+		    sc8547_serial_feed(sc)) {
+			sc8547_auto_reservo(sc, "watchdog-feed-io");
+			return true;
+		}
 		if (sc->fastchg_ask_cmd == VOOC_CMD_TELL_USB_BAD)
 			sc8547_auto_finish(sc, "adapter-reported-bad-connection");
 	}
@@ -3377,13 +3417,23 @@ EXPORT_SYMBOL_GPL(sc8547a_ufcs_monitor);
 
 /* ------------------------------- IRQ ---------------------------------- */
 
+static irqreturn_t sc8547_irq_arrival(int irq, void *data)
+{
+	struct sc8547a_device *sc = data;
+
+	WRITE_ONCE(sc->irq_arrived_ns, ktime_get_ns());
+	smp_store_release(&sc->irq_pending, true);
+	return IRQ_WAKE_THREAD;
+}
+
 static irqreturn_t sc8547_irq_handler(int irq, void *data)
 {
 	struct sc8547a_device *sc = data;
 	u8 state = 0;
 
-	/* When the PHY is armed, an IRQ is an adapter VOOC frame. */
+	/* IRQF_ONESHOT keeps this edge stable until the thread finishes. */
 	guard(mutex)(&sc8547_pps_lock);
+	WRITE_ONCE(sc->irq_pending, false);
 	if (sc8547_waiting_for_off())
 		return IRQ_HANDLED;
 	sc8547_collect_faults(sc);
@@ -3395,7 +3445,7 @@ static irqreturn_t sc8547_irq_handler(int irq, void *data)
 #endif
 	if (sc->vooc_started && sc->auto_armed &&
 	    (sc->auto_state == SC_AUTO_IDENTIFY || sc->auto_state == SC_AUTO_DELIVER)) {
-		if (sc8547_voocphy_isr(sc))
+		if (sc8547_voocphy_isr(sc, READ_ONCE(sc->irq_arrived_ns)))
 			return IRQ_HANDLED;
 	}
 
@@ -3541,7 +3591,7 @@ static int sc8547a_probe(struct i2c_client *client)
 		return dev_err_probe(sc->dev, ret, "UFCS PHY registration failed\n");
 
 	if (sc->irq > 0) {
-		ret = devm_request_threaded_irq(sc->dev, sc->irq, NULL,
+		ret = devm_request_threaded_irq(sc->dev, sc->irq, sc8547_irq_arrival,
 						sc8547_irq_handler,
 						IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 						dev_name(sc->dev), sc);
