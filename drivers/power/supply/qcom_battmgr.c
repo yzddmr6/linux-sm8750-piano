@@ -1763,8 +1763,10 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus, ua, real_type;
 	int ret;
 
-	if (test_and_clear_bit(PD_EVENT_SERVICE_RESET, &battmgr->pd_events))
+	if (test_and_clear_bit(PD_EVENT_SERVICE_RESET, &battmgr->pd_events)) {
 		battmgr->pd_restore_fcc = false;
+		battmgr->aicl_done = false;
+	}
 	if (test_and_clear_bit(PD_EVENT_RESET, &battmgr->pd_events)) {
 		if (qcom_battmgr_pps_stop(battmgr, false) ||
 		    qcom_battmgr_pd_stop(battmgr, false, "PD reset"))
@@ -1789,6 +1791,13 @@ read_source:
 	if (online && qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 					       USB_ADAP_TYPE, &type))
 		type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	real_type = type;
+	if (online && battmgr->pps_ops && battmgr->pps_ops->enabled() &&
+	    qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+				      USB_REAL_TYPE, &real_type)) {
+		/* Classification is optional. The power contract has its own readback. */
+		real_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	}
 	/* Process the PHY evidence before the wake and routing decisions.
 	 * Do not transfer evidence across a replacement Type-C partner.
 	 */
@@ -1798,8 +1807,12 @@ read_source:
 	scoped_guard(spinlock_irqsave, &battmgr->notify_lock) {
 		if (test_bit(PD_EVENT_DETACH, &battmgr->pd_events))
 			goto read_source;
-		if (online && !detached)
+		if (online && !detached) {
 			battmgr->retry_evidence |= (status.responded | status.delivering) & ERHAI_SERIAL;
+			if (test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events) ||
+			    (battmgr->pps_ops && battmgr->pps_ops->enabled() && real_type == 9))
+				battmgr->retry_evidence |= ERHAI_SERIAL;
+		}
 		serial_source = !detached && (battmgr->retry_evidence & ERHAI_SERIAL);
 		qcom_battmgr_charge_wake_locked(battmgr,
 			erhai_should_stay_awake(online == 1, battmgr->otg_request,
@@ -1847,13 +1860,6 @@ read_source:
 	}
 
 	power_supply_for_each_psy(&src, qcom_battmgr_pd_source_match);
-	real_type = type;
-	if (battmgr->pps_ops && battmgr->pps_ops->enabled() &&
-	    qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-				      USB_REAL_TYPE, &real_type)) {
-		/* Classification is optional. The power contract has its own readback. */
-		real_type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
-	}
 	if (type != battmgr->charge_detected_type)
 		battmgr->aicl_done = false;
 	if (!serial_source && type != battmgr->charge_detected_type) {
@@ -1891,9 +1897,6 @@ read_source:
 		battmgr->missing_routes |= (ERHAI_SERIAL | ERHAI_UFCS) & ~status.ready;
 	battmgr->retry_once |= battmgr->missing_routes & status.ready;
 	battmgr->missing_routes &= ~status.ready;
-	if (test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events) ||
-	    (battmgr->pps_ops && battmgr->pps_ops->enabled() && real_type == 9) /* ADSP VOOC */)
-		battmgr->retry_evidence |= ERHAI_SERIAL;
 	if (test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events))
 		battmgr->retry_evidence |= ERHAI_UFCS;
 	stable = battmgr->pd_state == PD_ACTIVE || status.delivering;
@@ -2081,6 +2084,8 @@ fixed_contract:
 			return PD_POLL_MS;
 		}
 	}
+	if (READ_ONCE(battmgr->otg_request) && qcom_battmgr_serial_icl(battmgr, false))
+		return PD_POLL_MS;
 	if ((try_qc && !qc) || READ_ONCE(battmgr->otg_request)) {
 		if (qcom_battmgr_pd_stop(battmgr, false, "no high-voltage sink"))
 			return PD_POLL_MS;
