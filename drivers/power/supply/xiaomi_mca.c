@@ -3518,6 +3518,16 @@ static int xiaomi_mca_fw_recharge(struct xiaomi_mca *mca)
 	ret = xiaomi_mca_gauges(mca, &vbat, &ibat, &cold, &hot, &vmin, &imax, NULL);
 	if (ret)
 		return ret;
+	/* Piano fg_comp .text 0x517c..0x5184 excludes the low-FV JEITA
+	 * endpoint from whole-pack full. Preserve that distinction: at the
+	 * warm endpoint hold charging, not raw-SOC full/recharge pulses.
+	 * The existing FV hysteresis releases this vote when the cell falls
+	 * below that endpoint or a restored temperature permits higher FV.
+	 */
+	if (status == 5 && mca->term_hot) {
+		mca->voltage_hold = mca->charge_blocked = true;
+		return xiaomi_mca_charge_stop(mca);
+	}
 	/* Status 5 is ignored throughout CP. Outside CP it is the stock
 	 * FG term_recharge vote, not permission to silently leave buck idle.
 	 */

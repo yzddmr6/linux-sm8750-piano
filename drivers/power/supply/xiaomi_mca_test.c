@@ -4626,14 +4626,14 @@ static void xiaomi_mca_test_full_recharge_matrix(struct kunit *test)
 			f->chgr_status = 5;
 			f->cells[0].current_ua = f->cells[1].current_ua = 0;
 			KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
-			KUNIT_EXPECT_TRUE(test, mca->charging_done);
+			KUNIT_EXPECT_EQ(test, mca->charging_done, temps[t] < 48);
 			KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
 			if (event == 2) {
 				f->cells[0].charge_now = f->cells[1].charge_now = 4462000; /* 97% */
 				KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
 				KUNIT_EXPECT_FALSE(test, mca->charging_done);
 				KUNIT_EXPECT_FALSE(test, mca->ffc_active);
-				KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+				KUNIT_EXPECT_EQ(test, f->charging_enabled, temps[t] < 48);
 			}
 		} else {
 			KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
@@ -4860,7 +4860,41 @@ static void xiaomi_mca_test_provider_late_start(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_DONE);
 }
 
+static void xiaomi_mca_test_warm_termination_is_not_full(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	int writes;
+
+	full_charge = charge_policy = hv_charge = true;
+	f->type = mca->real_type = MCA_TYPE_PD;
+	mca->cp = MCA_CP_DONE;
+	f->chgr_status = 5;
+	f->tbat = 50;
+	f->cells[0].temp = f->cells[1].temp = 500;
+	f->cells[0].voltage = f->cells[1].voltage = 4058000;
+	f->cells[0].charge_now = f->cells[1].charge_now = 1000000;
+	guard(mutex)(&mca->lock);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	KUNIT_EXPECT_TRUE(test, mca->voltage_hold);
+	KUNIT_EXPECT_FALSE(test, mca->charging_done);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
+	writes = f->enable_writes;
+	f->chgr_status = 7;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	KUNIT_EXPECT_EQ(test, f->enable_writes, writes); /* no warm rearm loop */
+	f->tbat = 25;
+	f->cells[0].temp = f->cells[1].temp = 250;
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	KUNIT_EXPECT_FALSE(test, mca->voltage_hold);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+	KUNIT_EXPECT_EQ(test, mca->fw_recharges, 0); /* thermal recovery, not full */
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_warm_termination_is_not_full),
 	KUNIT_CASE(xiaomi_mca_test_provider_late_start),
 	KUNIT_CASE(xiaomi_mca_test_stock_entry_matrix),
 	KUNIT_CASE(xiaomi_mca_test_stock_cc_cv_stages),
