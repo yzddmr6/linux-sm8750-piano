@@ -661,6 +661,7 @@ struct xiaomi_mca {
 
 	struct delayed_work poll_work;
 	bool term_written;	/* restore even after a lost write acknowledgment */
+	int cp_taper_ibus;
 	bool cp_normal_cv;
 	bool term_hot;		/* float-voltage thermal hysteresis */
 	bool fv_derated;	/* pack temperature unavailable */
@@ -3440,6 +3441,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	mca->cp_stage = 0;
 	mca->cp_target_ma = 0;
 	mca->cp_recharge_cv = 0;
+	mca->cp_taper_ibus = 0;
 	mca->cp = MCA_CP_OPENING;
 	/* Confirm the new FV before asking the source to open this session. */
 	ret = xiaomi_mca_full_charge_poll(mca);
@@ -3510,6 +3512,23 @@ static bool xiaomi_mca_cp_bus_trip(struct xiaomi_mca *mca, int ibus)
 	return ibus > (int)mca->cp_ibus_ma + margin;
 }
 
+/* A 2:1 stage reflects an adapter increment into at most half a step
+ * at the cell (ignoring cable loss). Keep the stock 9 mV CV band.
+ * Apply this after the current regulator, including its opening ramp.
+ */
+static int xiaomi_mca_cp_cv_request(u32 type, int previous, int requested, int vbat, int cv)
+{
+	int step = type == MCA_TYPE_HVDCP_3_B ? 200 : MCA_CP_REG_STEP_MV;
+	int headroom = cv - 9 - vbat;
+
+	if (headroom <= 0)
+		return min(requested, previous - clamp(roundup(-2 * headroom, step),
+						       step, MCA_CP_REG_MAX_STEP_MV));
+	if (requested > previous && 2 * headroom < max(step, requested - previous))
+		return previous;
+	return requested;
+}
+
 /* One step of direct charging, every MCA_CP_POLL_MS */
 static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 {
@@ -3517,6 +3536,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	int ibat_max, target, ibus_all, buck_ma, budget, vmin, imax;
 	int band = xiaomi_mca_cp_band(mca->cp_type);
 	u32 mv = mca->cp_mv, cv;
+	int previous;
 	bool taper, ocp;
 	u32 fcc, icl;
 
@@ -3674,6 +3694,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 
 	if (xiaomi_mca_is_qc_pump(mca->cp_type))
 		mv = mca->vbus_uv / 1000;
+	previous = mv;
 	if (mca->cp == MCA_CP_OPENING) {
 		if (ibus < MCA_CP_OPEN_IBUS_MA) {
 			if (mca->cp_type != MCA_TYPE_HVDCP_3_B ||
@@ -3704,8 +3725,16 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		fcc = xiaomi_mca_parallel_fcc(ibat_max, ibus_all, mca->fcc_set_ma);
 		icl = fcc / 2 + (fcc > 1000 ? 500 : 0);
 		/* The stock vbat_threshold ends parallel boosting near CV. */
-		if (vbat >= 4480 || taper)
+		if (!mca->cp_taper_ibus && (vbat >= 4480 || taper)) {
+			/* The buck stops contributing near CV. Do not transfer
+			 * its former current budget into the pump on that edge.
+			 */
+			mca->cp_taper_ibus = max(ibus, MCA_CP_OPEN_IBUS_MA);
+		}
+		if (mca->cp_taper_ibus) {
 			fcc = icl = MCA_CP_BUCK_MA;
+			target = min(target, mca->cp_taper_ibus);
+		}
 		budget = (int)xiaomi_mca_cp_src_ma(mca) - 200;
 		/* While raising a vote, allow for the load step before its ADC
 		 * sample is available. Steady regulation uses measured draw.
@@ -3749,6 +3778,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	}
 
 	mv = clamp_t(u32, mv, 2 * vbat, 2 * vbat + MCA_CP_REQ_MAX_DELTA_MV);
+	mv = xiaomi_mca_cp_cv_request(mca->cp_type, previous, mv, vbat, cv);
 	if (xiaomi_mca_cp_request(mca, mv)) {
 		xiaomi_mca_cp_learn_drop(mca);
 		xiaomi_mca_cp_stop(mca, "request refused");

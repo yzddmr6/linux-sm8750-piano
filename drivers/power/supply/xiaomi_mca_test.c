@@ -2986,6 +2986,47 @@ static void xiaomi_mca_test_measured_buck_share(struct kunit *test)
 	xiaomi_mca_cp_stop(mca, "test complete");
 }
 
+/* Recorded transition: both cells near 4.47 V; the buck share fell at
+ * 4480 mV and the previous policy increased the PPS request to 9800 mV.
+ */
+static void xiaomi_mca_test_tail_current_transfer(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	int previous;
+
+	full_charge = charge_policy = cp_charge = hv_charge = true;
+	mca_test_stage(test, f);
+	f->type = mca->real_type = mca->cp_type = MCA_TYPE_PD_PPS;
+	mca->ffc_active = true;
+	mca->cp_ma = 5000;
+	mca->cp_mv = 9660;
+	mca->cp_max_mv = 10000;
+	mca->cp_ibus_ma = mca->cp_ibus_hot = 3800;
+	mca->icl_set_ma = 1500;
+	mca->fcc_set_ma = 2000;
+	f->cells[0].current_ua = 2012000;
+	f->cells[1].current_ua = 2005000;
+	f->cells[0].voltage = 4504000;
+	f->cells[1].voltage = 4503000;
+	f->stage_ma = 2740;
+	f->stage_mv = 9412;
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_cp_step(mca);
+	KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_ON);
+	KUNIT_EXPECT_EQ(test, mca->cp_taper_ibus, 2740);
+	KUNIT_EXPECT_EQ(test, mca->fcc_set_ma, 500);
+	previous = mca->cp_mv;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_LE(test, mca->cp_mv, previous);
+	/* One 20 mV PPS step would consume the remaining cell headroom. */
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_cv_request(MCA_TYPE_PD_PPS, 9660, 9680,
+						       4529, 4540), 9660);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_cv_request(MCA_TYPE_HVDCP_3_B, 9200, 9220,
+						       4410, 4473), 9200);
+	xiaomi_mca_cp_stop(mca, "test complete");
+}
+
 static void xiaomi_mca_test_taper_handoff(struct kunit *test)
 {
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
@@ -3768,6 +3809,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_qc_regulation),
 	KUNIT_CASE(xiaomi_mca_test_measured_buck_share),
 	KUNIT_CASE(xiaomi_mca_test_taper_handoff),
+	KUNIT_CASE(xiaomi_mca_test_tail_current_transfer),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_values),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_errors),
 	KUNIT_CASE(xiaomi_mca_test_cc_toggle_refusal),
