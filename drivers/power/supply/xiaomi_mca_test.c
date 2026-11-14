@@ -3085,14 +3085,21 @@ static void xiaomi_mca_test_wired_wake_reconnect(struct kunit *test)
 
 	INIT_DELAYED_WORK(&mca->poll_work, mca_test_idle_poll);
 	mca->poll_ready = true;
-	f->type = MCA_TYPE_CDP;
+	f->type = MCA_TYPE_DCP;
 	mca_test_wired_tick(f);
+	KUNIT_EXPECT_TRUE(test, mca->charge_awake);
+	old = mca->input_generation;
+	xiaomi_mca_ucsi_update(mca, MCA_UCSI_OFFLINE);
 	KUNIT_EXPECT_FALSE(test, mca->charge_awake);
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_apply_wired_sample(mca, old, 1, MCA_TYPE_DCP));
+	KUNIT_EXPECT_FALSE(test, mca->charge_awake);
+	f->usb_online = 0;
+	mca_test_wired_tick(f);
 	/* A complete replug after prepare must be caught before platform sleep. */
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_prepare(mca->dev), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_pm_ops.suspend_noirq(mca->dev), 0);
 	old = mca->input_generation;
-	xiaomi_mca_ucsi_update(mca, MCA_UCSI_OFFLINE);
+	f->usb_online = 1;
 	xiaomi_mca_ucsi_update(mca, MCA_UCSI_CONNECTED);
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_apply_wired_sample(mca, old, 0, MCA_TYPE_CDP));
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_pm_ops.suspend_noirq(mca->dev), -EBUSY);

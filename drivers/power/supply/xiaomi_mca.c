@@ -1942,6 +1942,20 @@ static void xiaomi_mca_observe_aicl(struct xiaomi_mca *mca)
 		xiaomi_mca_record_collapse(mca);
 }
 
+static bool xiaomi_mca_charge_wake_locked(struct xiaomi_mca *mca, bool awake)
+{
+	lockdep_assert_held(&mca->rx_lock);
+	awake = awake && mca->charge_ws && mca->service_up;
+	if (mca->charge_awake == awake)
+		return false;
+	mca->charge_awake = awake;
+	if (awake)
+		__pm_stay_awake(mca->charge_ws);
+	else
+		__pm_relax(mca->charge_ws);
+	return true;
+}
+
 /* Remember disconnects even when a complete replug fits between two polls. */
 static void xiaomi_mca_ucsi_update(struct xiaomi_mca *mca, int state)
 {
@@ -1950,10 +1964,13 @@ static void xiaomi_mca_ucsi_update(struct xiaomi_mca *mca, int state)
 	if (state == MCA_UCSI_UNAVAILABLE)
 		return;
 	if (state != mca->ucsi_state) {
-		if (state == MCA_UCSI_OFFLINE)
+		if (state == MCA_UCSI_OFFLINE) {
 			mca->attach_generation++;
-		else if (mca->ucsi_state < MCA_UCSI_CONNECTED)
+			if (xiaomi_mca_charge_wake_locked(mca, false) && mca->poll_ready)
+				power_supply_changed(mca->psy);
+		} else if (mca->ucsi_state < MCA_UCSI_CONNECTED) {
 			mca->otg_requested = false; /* UCSI ONLINE means connected as sink. */
+		}
 		mca->input_generation++;
 		mca->input_pending = mca->service_up;
 		if (mca->poll_ready)
@@ -2789,20 +2806,6 @@ static int xiaomi_mca_restore_voltage(struct xiaomi_mca *mca)
 	}
 	mca->voltage_written = false;
 	return 0;
-}
-
-static bool xiaomi_mca_charge_wake_locked(struct xiaomi_mca *mca, bool awake)
-{
-	lockdep_assert_held(&mca->rx_lock);
-	awake = awake && mca->charge_ws && mca->service_up;
-	if (mca->charge_awake == awake)
-		return false;
-	mca->charge_awake = awake;
-	if (awake)
-		__pm_stay_awake(mca->charge_ws);
-	else
-		__pm_relax(mca->charge_ws);
-	return true;
 }
 
 /* ADSP real_type 17..19 describes wireless power. */
