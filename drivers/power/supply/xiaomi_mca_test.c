@@ -3032,6 +3032,7 @@ static void xiaomi_mca_test_buck_enable_readback(struct kunit *test)
 	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
 	struct xiaomi_mca *mca = &f->mca;
 
+	charge_policy = true;
 	guard(mutex)(&mca->lock);
 	f->charging_enabled = 0;
 	KUNIT_ASSERT_FALSE(test, mca->charge_disabled);
