@@ -514,7 +514,7 @@ struct sc8547a_device {
 	int serial_ibat_ma, serial_reg06;
 	unsigned int rehandshakes, serial_exits;
 	unsigned int rx_errors, tx_errors;
-	u8 model_frames[2];
+	u8 model_frames[2], model_flags[2];
 	const char *serial_last_exit;
 	const char *serial_last_retry;
 	unsigned long load_since;
@@ -530,10 +530,14 @@ struct sc8547a_device {
 	bool retry_current;
 	unsigned int adjust_failures;
 	unsigned int above_request_count;
+	unsigned long next_current_sample;
+	bool gauge_reading;
 	u16 serial_predata, ask_predata;
 	unsigned int missed_asks;
 	u8 missed_request;
 	u16 missed_predata;
+	bool measure_missed_slot;
+	int missed_peak_ibus_ma;
 	unsigned int		auto_taper_cnt;
 	int			auto_step_cnt;	/* advance debounce counter */
 	int			auto_reservo_cnt;	/* consecutive adapter-reset re-servos */
@@ -1348,7 +1352,7 @@ static int sc8547_serial_feed(struct sc8547a_device *sc)
 	if (!sc->cp_enabled || sc->auto_state != SC_AUTO_DELIVER || pump_stopping)
 		return 0;
 	master = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
-	if (sc8547_slave_dev && sc8547_slave_dev->monitor_pump_faults) {
+	if (sc8547_slave_dev && (sc8547_slave_dev->monitor_pump_faults || sc->slave_enabled)) {
 		slave = sc8547_write_byte(sc8547_slave_dev, SC8547_REG_09, 0x13);
 		slave = slave ?: sc8547_set_adc_enable(sc8547_slave_dev, true);
 	}
@@ -1720,6 +1724,7 @@ static void vooc_handle_tell_model_process(struct sc8547a_device *sc)
 {
 	if (sc->adapter_model_count == 2) {
 		sc->model_frames[0] = sc->voocphy_rx_buff;
+		sc->model_flags[0] = sc->vooc_flag;
 		sc->adapter_model_ver = sc->adapter_mesg << 4;
 		vooc_write_mesg_mask(TX0_DET_BIT5_MASK, &sc->voocphy_tx_buff[0],
 				     VOOC_BIT_ACTIVE);
@@ -1727,12 +1732,13 @@ static void vooc_handle_tell_model_process(struct sc8547a_device *sc)
 		vooc_write_mesg_mask(TX0_DET_BIT5_MASK, &sc->voocphy_tx_buff[0],
 				     VOOC_BIT_ACTIVE);
 		sc->model_frames[1] = sc->voocphy_rx_buff;
+		sc->model_flags[1] = sc->vooc_flag;
 		sc->adapter_model_ver |= sc->adapter_mesg;
 		sc->adapter_model_ver &= 0x7F;
 		sc->model_received = true;
-		dev_info(sc->dev, "adapter model 0x%02x from frames %02x/%02x (rx_err=%u tx_err=%u)\n",
+		dev_info(sc->dev, "adapter model 0x%02x from frames %02x/%02x flags=%02x/%02x (rx_err=%u tx_err=%u)\n",
 			 sc->adapter_model_ver, sc->model_frames[0], sc->model_frames[1],
-			 sc->rx_errors, sc->tx_errors);
+			 sc->model_flags[0], sc->model_flags[1], sc->rx_errors, sc->tx_errors);
 		sc->fastchg_ask_cmd = VOOC_CMD_UNKNOWN;
 	}
 }
@@ -1920,6 +1926,8 @@ static void sc8547_request_missed(struct sc8547a_device *sc, u8 code)
 	sc->missed_asks++;
 	sc->missed_request = code;
 	sc->missed_predata = sc->ask_predata;
+	sc->measure_missed_slot = true;
+	sc->missed_peak_ibus_ma = -1;
 	sc->serial_request = 0;
 	sc->request_pending = false;
 	sc->retry_current = true;
@@ -2274,6 +2282,8 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 static void sc8547_serial_clear_sample(struct sc8547a_device *sc)
 {
 	sc->frame_seen = false;
+	memset(sc->model_frames, 0, sizeof(sc->model_frames));
+	memset(sc->model_flags, 0, sizeof(sc->model_flags));
 	sc->frame_gap_us = sc->max_frame_gap_us = 0;
 	sc->master_ibus_ma = sc->slave_ibus_ma = -1;
 	sc->master_enabled = sc->slave_enabled = -1;
@@ -2281,7 +2291,9 @@ static void sc8547_serial_clear_sample(struct sc8547a_device *sc)
 	sc->serial_ibat_ma = 0;
 	sc->serial_request = sc->pending_request = 0;
 	sc->request_pending = sc->asked_current = sc->retry_current = false;
+	sc->measure_missed_slot = false;
 	sc->adjust_failures = sc->above_request_count = 0;
+	sc->next_current_sample = jiffies;
 	sc->serial_predata = sc->ask_predata = 0;
 }
 
@@ -2294,6 +2306,7 @@ static void sc8547_serial_end(struct sc8547a_device *sc, const char *why)
 		 sc->master_enabled, sc->slave_enabled, sc->serial_vbus_mv,
 		 sc->rehandshakes, sc->voocphy_rx_buff, sc->vooc_flag);
 	sc->serial_request = 0;
+	sc->request_pending = sc->measure_missed_slot = false;
 	sc->master_ibus_ma = sc->slave_ibus_ma = -1;
 	sc->master_enabled = sc->slave_enabled = sc->serial_quiesced ? 0 : -1;
 }
@@ -2437,6 +2450,7 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc, const char *why)
 		return;
 	}
 	sc->auto_reservo_cnt++;
+	sc->auto_ident_retries = 0; /* This recovery owns a fresh set of identify windows. */
 	sc->rehandshakes++;
 	sc->awaiting_rehandshake = true;
 
@@ -2468,64 +2482,26 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc, const char *why)
  */
 static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
 {
-	bool adsp_vooc = false;
-	bool real_vooc = false;
-	int ft = -ENODEV;
-	int rt = -ENODEV;
+	int ft, rt;
 
 	if (sc->auto_ident_retries >= identify_retries)
 		return false;
 
-	if (adsp_classify) {
+	/* A new arm clears the frame decoder, not the charger's identity.
+	 * Consult the PMIC only for an as-yet unidentified, silent source.
+	 */
+	if (!(sc->responded & ERHAI_SERIAL) && !sc->vooc_saw_any && adsp_classify) {
 		ft = erhai_otg_adsp_usb_prop(adsp_fastchg_type_prop);
-		adsp_vooc = ft >= 0 && (ft & 0x7f) >= adsp_fastchg_svooc_min;
-		if (ft >= 0)
-			dev_info(sc->dev,
-				 "slow adapter: ADSP fast-chg type %d (%s)\n",
-				 ft & 0x7f,
-				 adsp_vooc ? "VOOC-class" : "not VOOC");
-	}
-
-	/*
-	 * erhai: the ADSP never runs a VOOC session, so prop26 stays 0 and
-	 * adsp_vooc alone starves the ladder.  But the ADSP still classifies
-	 * the brick on its own DPDM leg — USB_REAL_TYPE in the VOOC family
-	 * (9 on this board; PPS heads read 8) — and that verdict must count
-	 * as evidence, or the serial ladder gets a single 4 s window and
-	 * identify_retries is dead weight (vooc-debug 调试笔记 §5).
-	 */
-	if (adsp_classify) {
 		rt = erhai_otg_adsp_usb_prop(adsp_real_type_prop);
-		real_vooc = rt == adsp_vooc_real_type;
-		if (rt >= 0)
-			dev_info(sc->dev,
-				 "slow adapter: USB real_type %d (%s)\n",
-				 rt, real_vooc ? "VOOC family" : "not VOOC");
+		if ((ft >= 0 && (ft & 0x7f) >= adsp_fastchg_svooc_min) ||
+		    rt == adsp_vooc_real_type)
+			sc->responded |= ERHAI_SERIAL;
 	}
-
-	/*
-	 * Only keep the ladder alive on VOOC evidence: an ADSP VOOC-family
-	 * verdict (Android's is_pd_svooc_adapter / sid_power), the ADSP
-	 * real_type VOOC family, or actual VOOC serial frames.  A plain
-	 * PD/5 V charger has neither and declines on the FIRST window —
-	 * identical to the old single-shot behaviour, so D+/D- and normal
-	 * charging are not held hostage by the retry loop.
-	 */
-	if (adsp_vooc || real_vooc)
-		sc->responded |= ERHAI_SERIAL;
-	if (!(sc->responded & ERHAI_SERIAL) && !sc->vooc_saw_any) {
-		dev_info(sc->dev,
-			 "no VOOC evidence (adsp %d, real %d, frames %d) — declining\n",
-			 ft, rt, sc->vooc_saw_any);
+	if (!(sc->responded & ERHAI_SERIAL) && !sc->vooc_saw_any)
 		return false;
-	}
 
-	dev_info(sc->dev, "slow adapter%s: re-arming identify %d/%u\n",
-		 adsp_vooc ? " (ADSP VOOC)" :
-		 (real_vooc ? " (real_type VOOC)" :
-		 (sc->vooc_saw_any ? " (serial frames)" : " (previous response)")),
-		 sc->auto_ident_retries + 1, identify_retries);
-
+	dev_info(sc->dev, "SVOOC re-arming identify %u/%u (responded=%u frames=%d)\n",
+		 sc->auto_ident_retries + 1, identify_retries, sc->responded, sc->vooc_saw_any);
 	sc->auto_ident_retries++;
 	sc8547_vooc_arm_hw(sc);		/* re-init PHY + resend handshake */
 	if (sc->auto_state == SC_AUTO_DECLINED)	/* DP alt-mode owns the switch */
@@ -2622,23 +2598,32 @@ static int sc8547_serial_arm_ucp(struct sc8547a_device *sc)
  * and confirmed request, even while renegotiating. The vendor prompts
  * midway through ten bad samples. A missing ASK by itself is harmless.
  */
+#define SC8547_REQUEST_MARGIN_MA	300
+#define SC8547_OVER_REQUEST_SAMPLES	10
+
 static bool sc8547_current_in_range(struct sc8547a_device *sc, int total_ma)
 {
 	u8 limit = sc->fastchg_curr_code;
 
+	/* A gauge read can overlap threaded-IRQ sampling. Count at most
+	 * once per hardware monitor period in either context.
+	 */
+	if (time_before(jiffies, sc->next_current_sample))
+		return true;
+	sc->next_current_sample = jiffies + msecs_to_jiffies(SC8547_ATTACH_POLL_MS);
 	if (sc->serial_request)
 		limit = min(limit, sc->serial_request);
-	if (!sc->cp_enabled || !limit || total_ma <= limit * 100 + 300) {
+	if (!sc->cp_enabled || !limit || total_ma <= limit * 100 + SC8547_REQUEST_MARGIN_MA) {
 		sc->above_request_count = 0;
 		return true;
 	}
-	if (++sc->above_request_count == 5) {
+	if (++sc->above_request_count == SC8547_OVER_REQUEST_SAMPLES / 2) {
 		sc->retry_current = true;
 		sc->change_polls = sc->adjust_failures = 0;
 		dev_info(sc->dev, "SVOOC over request: target=%u confirmed=%u ibus=%d mA; asking again\n",
 			 sc->fastchg_curr_code, sc->serial_request, total_ma);
 	}
-	return sc->above_request_count < 10;
+	return sc->above_request_count < SC8547_OVER_REQUEST_SAMPLES;
 }
 
 /* A late frame can arrive between monitor polls. It belongs to a broken
@@ -2672,9 +2657,11 @@ static void sc8547_attach_work(struct work_struct *work)
 	if (sc->auto_state == SC_AUTO_DELIVER ||
 	    (sc->auto_armed && sc->auto_state == SC_AUTO_IDENTIFY &&
 	     sc->adapter_check_ok && sc->model_received)) {
+		sc->gauge_reading = true;
 		mutex_unlock(&sc8547_pps_lock);
 		gret = sc8547_read_gauge(sc, &gsoc, &gtemp, &gvbat, &ibat);
 		mutex_lock(&sc8547_pps_lock);
+		sc->gauge_reading = false;
 		if (!sc->vooc_started || !sc->auto_armed ||
 		    (sc->auto_state != SC_AUTO_IDENTIFY && sc->auto_state != SC_AUTO_DELIVER))
 			return;
@@ -2720,6 +2707,8 @@ static void sc8547_attach_work(struct work_struct *work)
 		 */
 		sc->master_ibus_ma = cibus < 0 ? -1 : cibus;
 		sc->slave_ibus_ma = slave_ma < 0 ? -1 : slave_ma;
+		if (sc->measure_missed_slot && cibus >= 0 && slave_ma >= 0)
+			sc->missed_peak_ibus_ma = max(sc->missed_peak_ibus_ma, cibus_total);
 		sc->serial_vbus_mv = vbus > 0 ? vbus : -1;
 		sc->serial_ibat_ma = gret ? 0 : ibat;
 		sc->serial_reg06 = sc8547_read_byte(sc, SC8547_REG_06, &r6) ? -1 : r6;
@@ -2788,7 +2777,7 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc8547_auto_reservo(sc, "above-request");
 			goto reschedule;
 		}
-		if (cibus_total >= SC8547_LOW_IBUS_MA && !sc->above_request_count) {
+		if (cibus_total >= SC8547_LOW_IBUS_MA && !sc->above_request_count && sc->serial_request) {
 			sc->low_ibus_count = 0;
 			if (!sc->load_seen) {
 				sc->load_since = jiffies;
@@ -2920,9 +2909,10 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 	*active = sc && sc->vooc_started && sc->auto_state != SC_AUTO_OFF;
 	if (!sc)
 		return off;
-	off += sysfs_emit_at(buf, off, "svooc_last_exit=%s svooc_last_retry=%s rehandshakes=%u rehandshakes_answered=%u missed_asks=%u missed_code=%u missed_predata=0x%04x ",
+	off += sysfs_emit_at(buf, off, "svooc_last_exit=%s svooc_last_retry=%s rehandshakes=%u rehandshakes_answered=%u missed_asks=%u missed_code=%u missed_predata=0x%04x missed_peak_ibus_ma=%d ",
 			     sc->serial_last_exit ?: "none", sc->serial_last_retry ?: "none",
-			     sc->rehandshakes, sc->recoveries_answered, sc->missed_asks, sc->missed_request, sc->missed_predata);
+			     sc->rehandshakes, sc->recoveries_answered, sc->missed_asks, sc->missed_request, sc->missed_predata,
+			     sc->missed_asks ? sc->missed_peak_ibus_ma : -1);
 	if (!*active)
 		return off;
 
@@ -2933,13 +2923,14 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 		sc->master_enabled < 0 || sc->slave_enabled < 0 ? -1 : 0;
 	return off + sysfs_emit_at(buf, off,
 		"protocol=supervooc state=%s model=%d target_code=%u request_code=%u request_ma=%u "
-		"pending_code=%d predata=0x%04x above_samples=%u "
+		"pending_code=%d predata=0x%04x above_samples=%u model_rx=0x%02x%02x model_flags=0x%02x%02x "
 		"vbus_mv=%d pump=%d pump_ibus_ma=%d master_ibus_ma=%d slave_ibus_ma=%d "
 		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u frame_gap_us=%u max_gap_us=%u "
 		"exits=%u last_exit=%s\n",
 		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1,
 		sc->fastchg_deliver ? sc->fastchg_curr_code : 0, sc->serial_request, sc->serial_request * 100,
 		sc->request_pending ? sc->pending_request : -1, sc->serial_predata, sc->above_request_count,
+		sc->model_frames[0], sc->model_frames[1], sc->model_flags[0], sc->model_flags[1],
 		sc->serial_vbus_mv, pump, ibus, sc->master_ibus_ma, sc->slave_ibus_ma,
 		sc->master_enabled, max(sc->slave_enabled, -1), age, sc->voocphy_rx_buff,
 		sc->vooc_flag, sc->serial_reg06, sc->rx_errors, sc->tx_errors, sc->frame_gap_us, sc->max_frame_gap_us,
@@ -3052,6 +3043,7 @@ EXPORT_SYMBOL_GPL(sc8547a_serial_session);
 static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 {
 	int word = sc8547_get_adapter_info(sc);
+	bool replied;
 
 	if (word < 0)
 		return false;
@@ -3069,6 +3061,7 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 		   (sc->vooc_flag & (VOOC_TXDATA_DONE_FLAG | VOOC_RXDATA_DONE_FLAG))) {
 		sc->serial_request = sc->pending_request;
 		sc->request_pending = sc->retry_current = false;
+		sc->measure_missed_slot = false;
 		sc->adjust_failures = sc->change_polls = 0;
 	}
 	if (!(sc->vooc_flag & VOOC_RXDATA_DONE_FLAG))
@@ -3086,7 +3079,13 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 		return false;
 	}
 
-	if (vooc_reply_adapter_mesg(sc)) {
+	replied = vooc_reply_adapter_mesg(sc);
+	if (sc->fastchg_ask_cmd == VOOC_CMD_TELL_USB_BAD) {
+		/* The peer has withdrawn permission even if our reply missed. */
+		sc8547_auto_finish(sc, "adapter-reported-bad-connection");
+		return true;
+	}
+	if (replied) {
 		if (sc->adapter_type == SC_ADAPTER_SVOOC)
 			sc->responded |= ERHAI_SERIAL;
 		/* A combined RX/WR_FAIL IRQ still needs its normal reply.
@@ -3100,13 +3099,25 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 		}
 		sc->frame_seen = true;
 		sc->last_frame_ns = arrived_ns;
-		if (time_after_eq(jiffies, sc->watchdog_fed_at + msecs_to_jiffies(SC8547_ATTACH_POLL_MS)) &&
-		    sc8547_serial_feed(sc)) {
-			sc8547_auto_reservo(sc, "watchdog-feed-io");
-			return true;
+		if (sc->gauge_reading && sc->cp_enabled &&
+		    time_after_eq(jiffies, sc->watchdog_fed_at + msecs_to_jiffies(SC8547_ATTACH_POLL_MS))) {
+			int master, slave;
+
+			if (sc8547_serial_feed(sc)) {
+				sc8547_auto_reservo(sc, "watchdog-feed-io");
+				return true;
+			}
+			master = sc8547_get_ibus(sc);
+			slave = sc8547_slave_ibus();
+			if (master < 0 || slave < 0) {
+				sc8547_auto_reservo(sc, "pump-adc-io");
+				return true;
+			}
+			sc->master_ibus_ma = master;
+			sc->slave_ibus_ma = slave;
+			if (!sc8547_current_in_range(sc, master + slave))
+				sc8547_auto_reservo(sc, "above-request");
 		}
-		if (sc->fastchg_ask_cmd == VOOC_CMD_TELL_USB_BAD)
-			sc8547_auto_finish(sc, "adapter-reported-bad-connection");
 	}
 	dev_dbg(sc->dev, "VOOC mesg=0x%02x ask=0x%02x tx=%02x%02x\n",
 		sc->adapter_mesg, sc->fastchg_ask_cmd,
