@@ -212,6 +212,9 @@ enum mca_real_type {
 	MCA_TYPE_PD_PPS,
 	MCA_TYPE_ACA = 14,
 	MCA_TYPE_DCP_B,
+	MCA_TYPE_BPP = 17,
+	MCA_TYPE_EPP,
+	MCA_TYPE_HPP,
 	MCA_TYPE_MAX = 20,
 };
 
@@ -231,9 +234,9 @@ static const char * const mca_real_type_names[MCA_TYPE_MAX] = {
 	[MCA_TYPE_PD_PPS]	= "PD_PPS",
 	[MCA_TYPE_ACA]		= "ACA",
 	[MCA_TYPE_DCP_B]	= "DCP",
-	[17]			= "BPP",
-	[18]			= "EPP",
-	[19]			= "HPP",
+	[MCA_TYPE_BPP]		= "BPP",
+	[MCA_TYPE_EPP]		= "EPP",
+	[MCA_TYPE_HPP]		= "HPP",
 };
 
 /* VBUS above this means a source is attached (USB default is 5 V) */
@@ -659,6 +662,9 @@ struct xiaomi_mca {
 	/* Thresholds are shared by the two cells and protected by rx_lock. */
 	unsigned int charge_start, charge_end;
 	struct wakeup_source *charge_ws;
+	u32 input_generation;	/* changes that invalidate the wired source sample */
+	bool input_pending;	/* PM must let the worker classify this input */
+	bool otg_requested;	/* firmware role request, independent of gate errors */
 	bool charge_awake;	/* protected by rx_lock, like the thresholds */
 	bool charge_hold;	/* SOC hysteresis, protected by lock */
 	bool charge_blocked;	/* no CP/HV policy until limits can be satisfied */
@@ -1936,6 +1942,20 @@ static void xiaomi_mca_observe_aicl(struct xiaomi_mca *mca)
 		xiaomi_mca_record_collapse(mca);
 }
 
+static bool xiaomi_mca_charge_wake_locked(struct xiaomi_mca *mca, bool awake)
+{
+	lockdep_assert_held(&mca->rx_lock);
+	awake = awake && mca->charge_ws && mca->service_up;
+	if (mca->charge_awake == awake)
+		return false;
+	mca->charge_awake = awake;
+	if (awake)
+		__pm_stay_awake(mca->charge_ws);
+	else
+		__pm_relax(mca->charge_ws);
+	return true;
+}
+
 /* Remember disconnects even when a complete replug fits between two polls. */
 static void xiaomi_mca_ucsi_update(struct xiaomi_mca *mca, int state)
 {
@@ -1943,8 +1963,16 @@ static void xiaomi_mca_ucsi_update(struct xiaomi_mca *mca, int state)
 
 	if (state == MCA_UCSI_UNAVAILABLE)
 		return;
-	if (state == MCA_UCSI_OFFLINE && mca->ucsi_state != MCA_UCSI_OFFLINE) {
-		mca->attach_generation++;
+	if (state != mca->ucsi_state) {
+		if (state == MCA_UCSI_OFFLINE) {
+			mca->attach_generation++;
+			if (xiaomi_mca_charge_wake_locked(mca, false) && mca->poll_ready)
+				power_supply_changed(mca->psy);
+		} else if (mca->ucsi_state < MCA_UCSI_CONNECTED) {
+			mca->otg_requested = false; /* UCSI ONLINE means connected as sink. */
+		}
+		mca->input_generation++;
+		mca->input_pending = mca->service_up;
 		if (mca->poll_ready)
 			mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
 	}
@@ -2780,38 +2808,27 @@ static int xiaomi_mca_restore_voltage(struct xiaomi_mca *mca)
 	return 0;
 }
 
-/*
- * Android smart_charge -> set_soc_limit_sts stops buck charging through
- * the charge-enable vote and makes the quick-charge strategy exit. It does
- * not map a percentage to a float voltage (delta_fv is a separate policy).
- */
-static void xiaomi_mca_charge_wake_locked(struct xiaomi_mca *mca, bool awake)
+/* ADSP real_type 17..19 describes wireless power. */
+static bool xiaomi_mca_should_stay_awake(bool online, bool otg, u32 type)
 {
-	lockdep_assert_held(&mca->rx_lock);
-	awake = awake && mca->charge_end < 100 && mca->service_up;
-	if (mca->charge_awake == awake)
-		return;
-	mca->charge_awake = awake;
-	if (awake)
-		__pm_stay_awake(mca->charge_ws);
-	else
-		__pm_relax(mca->charge_ws);
+	return online && !otg && type != MCA_TYPE_SDP && type != MCA_TYPE_CDP &&
+	       (type < MCA_TYPE_BPP || type > MCA_TYPE_HPP);
 }
 
-/* Stock online_wake_lock, limited to protected charging instead of all USB. */
-static void xiaomi_mca_charge_wake_poll(struct xiaomi_mca *mca, bool allowed)
+/* Apply only a sample taken entirely after the last source/role or service
+ * change. A rejected sample leaves the event queued for the next worker.
+ */
+static bool xiaomi_mca_apply_wired_sample(struct xiaomi_mca *mca, u32 generation,
+					  u32 online, u32 type)
 {
-	bool limited;
-	u32 online;
-
-	scoped_guard(spinlock_irqsave, &mca->rx_lock)
-		limited = mca->charge_end < 100;
-	allowed = allowed && limited && !mca->otg_active;
-	/* Do not use policy's cached online state after a failed VBUS read. */
-	if (allowed)
-		allowed = !xiaomi_mca_read(mca, MCA_PROP_USB_ONLINE, &online) && online == 1;
-	scoped_guard(spinlock_irqsave, &mca->rx_lock)
-		xiaomi_mca_charge_wake_locked(mca, allowed);
+	guard(spinlock_irqsave)(&mca->rx_lock);
+	if (generation != mca->input_generation || !mca->service_up || !mca->poll_ready)
+		return false;
+	if (online == U32_MAX)
+		return false;
+	mca->input_pending = false;
+	return xiaomi_mca_charge_wake_locked(mca,
+			xiaomi_mca_should_stay_awake(online == 1, mca->otg_requested, type));
 }
 
 static void xiaomi_mca_charge_wake_remove(void *data)
@@ -2897,7 +2914,6 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		mca->charge_hold = false;
 	if (end == 100 && !charge_policy && !mca->charge_disabled) {
 		mca->charge_blocked = false;
-		xiaomi_mca_charge_wake_poll(mca, false);
 		return 0;
 	}
 	if (end < 100) {
@@ -2953,7 +2969,6 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		int err = ret ?: -ENODATA;
 
 		mca->charge_blocked = true;
-		xiaomi_mca_charge_wake_poll(mca, false);
 		mca->gauge_failures = min(mca->gauge_failures + 1, 3U);
 		if (mca->charge_hold || mca->charge_hot || mca->charge_cold) {
 			stop_ret = xiaomi_mca_charge_stop(mca);
@@ -3022,12 +3037,10 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 	mca->charge_blocked = mca->charge_hold || mca->charge_hot || mca->charge_cold;
 	if (mca->charge_blocked) {
 		stop_ret = xiaomi_mca_charge_stop(mca);
-		xiaomi_mca_charge_wake_poll(mca, false);
 		return ret ?: stop_ret;
 	}
 	/* full_charge only selects FV; it never overrides SOC/thermal stops. */
 	ret = xiaomi_mca_charge_enable(mca, true);
-	xiaomi_mca_charge_wake_poll(mca, !ret);
 	return ret;
 }
 
@@ -4077,12 +4090,15 @@ static void xiaomi_mca_callback(const void *data, size_t len, void *priv)
 			mca->notify_dropped++;
 		else
 			mca->notify_pending++;
-		if (mca->poll_ready &&
-		    (record->id == MCA_NOTIFY_TYPE_CHANGE ||
-		     record->id == MCA_NOTIFY_TYPEC_CHANGE ||
-		     record->id == MCA_NOTIFY_BOOST ||
-		     record->id == MCA_NOTIFY_OTG_CP_CONFIG))
-			mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
+		if (record->id == MCA_NOTIFY_TYPE_CHANGE || record->id == MCA_NOTIFY_TYPEC_CHANGE ||
+		    record->id == MCA_NOTIFY_OTG_CP_CONFIG || record->id == MCA_NOTIFY_BOOST) {
+			mca->input_generation++;
+			mca->input_pending = mca->service_up;
+			if (mca->piano_otg && record->id == MCA_NOTIFY_OTG_CP_CONFIG)
+				mca->otg_requested = !!record->data[0];
+			if (mca->poll_ready)
+				mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
+		}
 		return;
 	}
 
@@ -4120,16 +4136,22 @@ static void xiaomi_mca_pdr_notify(void *priv, int state)
 	struct xiaomi_mca *mca = priv;
 
 	guard(spinlock_irqsave)(&mca->rx_lock);
-	if (mca->service_up != (state == SERVREG_SERVICE_STATE_UP))
+	if (mca->service_up != (state == SERVREG_SERVICE_STATE_UP)) {
 		mca->service_generation++;
+		mca->input_generation++;
+		mca->input_pending = state == SERVREG_SERVICE_STATE_UP;
+	}
 	mca->service_up = state == SERVREG_SERVICE_STATE_UP;
-	if (!mca->service_up)
-		xiaomi_mca_charge_wake_locked(mca, false);
+	if (!mca->service_up) {
+		mca->otg_requested = false;
+		if (xiaomi_mca_charge_wake_locked(mca, false) && mca->poll_ready)
+			power_supply_changed(mca->psy);
+	}
 	if (mca->poll_ready && mca->service_up)
 		mod_delayed_work(system_percpu_wq, &mca->poll_work, 0);
 }
 
-static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
+static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca, u32 *sampled_type)
 {
 	bool online;
 	u32 real_type = MCA_TYPE_UNKNOWN, vbus;
@@ -4185,10 +4207,12 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca)
 		mca->ibus_ua = xiaomi_mca_read_u32(mca, MCA_PROP_USB_CURRENT_NOW);
 		mca->icl_ma = xiaomi_mca_read_u32(mca, MCA_PROP_INPUT_CURRENT_LIMIT);
 		if (xiaomi_mca_read_type(mca, &real_type)) {
+			*sampled_type = MCA_TYPE_UNKNOWN;
 			mca->unknown_polls = 0;
 			xiaomi_mca_cp_stop(mca, "charger type read failed");
 			return;
 		}
+		*sampled_type = real_type;
 		if (mca->ibus_ua < 0 || mca->icl_ma == -1) {
 			mca->unknown_polls = 0;
 			xiaomi_mca_cp_stop(mca, "telemetry read failed");
@@ -4318,15 +4342,17 @@ static void xiaomi_mca_poll(struct work_struct *work)
 {
 	struct xiaomi_mca *mca = container_of(to_delayed_work(work), struct xiaomi_mca,
 					      poll_work);
-	struct xiaomi_mca_state now;
+	struct xiaomi_mca_state now = { .real_type = U32_MAX };
 	struct xiaomi_mca_cells cells;
-	u32 generation;
-	bool changed = false;
+	u32 generation, input_generation;
+	bool changed = false, policy_sample = false;
 	int ret;
 
 	scoped_guard(mutex, &mca->lock) {
-		scoped_guard(spinlock_irqsave, &mca->rx_lock)
+		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
 			generation = mca->service_generation;
+			input_generation = mca->input_generation;
+		}
 		xiaomi_mca_observe_aicl(mca);
 		xiaomi_mca_sync_config(mca);
 		if (mca->policy_generation != generation) {
@@ -4389,7 +4415,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			goto out;
 		if (charge_policy && !mca->otg_active && !mca->pen_dirty) {
 			mca->policy_active = true;
-			xiaomi_mca_policy_poll(mca);
+			xiaomi_mca_policy_poll(mca, &now.real_type);
 		} else if (!mca->otg_active && !mca->pen_dirty && mca->policy_active) {
 			if (xiaomi_mca_cp_stop(mca, "policy disabled"))
 				goto out;
@@ -4402,23 +4428,39 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			mca->cp = MCA_CP_OFF;
 			mca->hv = MCA_HV_OFF;
 		}
-		if (xiaomi_mca_read(mca, MCA_PROP_USB_ONLINE, &now.online) ||
-		    xiaomi_mca_read(mca, MCA_PROP_CHGR_STATUS, &now.chgr_status) ||
-		    xiaomi_mca_read_type(mca, &now.real_type)) {
+		policy_sample = true;
+out:
+		/* This is the existing USB change-reporting sample. A type read
+		 * failure on an online input means unknown, including before APSD.
+		 */
+		now.online = xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE);
+		ret = now.online == U32_MAX ? -EIO : 0;
+		if (now.online == 1) {
+			if (now.real_type == U32_MAX) {
+				ret = xiaomi_mca_read_type(mca, &now.real_type);
+				if (ret)
+					now.real_type = MCA_TYPE_UNKNOWN;
+			}
+			now.chgr_status = xiaomi_mca_read_u32(mca, MCA_PROP_CHGR_STATUS);
+			if (now.chgr_status == U32_MAX)
+				ret = -EIO;
+		} else {
+			now.real_type = MCA_TYPE_UNKNOWN;
+		}
+		if (ret) {
 			mca->last_valid = false;
 		} else {
-			if (!now.online)
+			if (policy_sample && !now.online)
 				xiaomi_mca_record_collapse(mca);
 			changed = !mca->last_valid || memcmp(&now, &mca->last, sizeof(now));
 			mca->last = now;
 			mca->last_valid = true;
 
-			if (now.online != mca->icl_source.online ||
-			    now.real_type != mca->icl_source.real_type)
+			if (policy_sample && (now.online != mca->icl_source.online ||
+					      now.real_type != mca->icl_source.real_type))
 				xiaomi_mca_restore_icl(mca);
 		}
-
-out:
+		changed |= xiaomi_mca_apply_wired_sample(mca, input_generation, now.online, now.real_type);
 		mca->poll_cells = NULL;
 		/* Identity discovery must also reach userspace while charging is held. */
 		changed |= xiaomi_mca_identity_changed(mca);
@@ -4869,8 +4911,11 @@ static void xiaomi_mca_stop_poll(void *data)
 	scoped_guard(spinlock_irqsave, &mca->rx_lock)
 		mca->poll_ready = false;
 	disable_delayed_work_sync(&mca->poll_work);
-	scoped_guard(spinlock_irqsave, &mca->rx_lock)
-		xiaomi_mca_charge_wake_locked(mca, false);
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		mca->input_pending = false;
+		if (xiaomi_mca_charge_wake_locked(mca, false) && mca->psy)
+			power_supply_changed(mca->psy);
+	}
 }
 
 static void xiaomi_mca_debugfs_remove(void *data)
@@ -5061,6 +5106,17 @@ out:
 	return 0;
 }
 
+/* A reconnect can be reported after prepare() has drained the worker.
+ * The noirq admission check uses the same cached state, without GLINK I/O.
+ */
+static int xiaomi_mca_check_sleep(struct device *dev)
+{
+	struct xiaomi_mca *mca = dev_get_drvdata(dev);
+
+	guard(spinlock_irqsave)(&mca->rx_lock);
+	return mca->charge_awake || mca->input_pending ? -EBUSY : 0;
+}
+
 /*
  * All prepare callbacks precede supplier suspend, and all supplier resumes
  * finish before complete. A freezable queue alone cannot hand back the
@@ -5071,17 +5127,16 @@ static int xiaomi_mca_prepare(struct device *dev)
 	struct xiaomi_mca *mca = dev_get_drvdata(dev);
 	int ret;
 
+	/* Direct requests can bypass wakeup_count. Leave an active worker
+	 * running, especially while it is servicing the pump watchdog.
+	 */
+	ret = xiaomi_mca_check_sleep(dev);
+	if (ret)
+		return ret;
 	disable_delayed_work_sync(&mca->poll_work);
 	scoped_guard(mutex, &mca->lock) {
-		bool busy;
-
-		/* Direct suspend requests need not use the wakeup_count protocol. */
-		scoped_guard(spinlock_irqsave, &mca->rx_lock)
-			busy = mca->charge_awake;
-		if (busy) {
-			dev_info(dev, "protected charging in progress; system sleep refused\n");
-			ret = -EBUSY;
-		} else {
+		ret = xiaomi_mca_check_sleep(dev);
+		if (!ret) {
 			ret = xiaomi_mca_quiesce(mca);
 			if (ret)
 				dev_err(dev, "cannot quiesce charging for system sleep: %d\n", ret);
@@ -5119,6 +5174,7 @@ static void xiaomi_mca_complete(struct device *dev)
 
 static const struct dev_pm_ops xiaomi_mca_pm_ops = {
 	.prepare = xiaomi_mca_prepare,
+	.suspend_noirq = xiaomi_mca_check_sleep,
 	.complete = xiaomi_mca_complete,
 };
 
@@ -5162,8 +5218,6 @@ static int xiaomi_mca_threshold_set(struct power_supply *psy,
 			if (value < 1 || value > 100 || value <= mca->charge_start)
 				return -EINVAL;
 			mca->charge_end = value;
-			if (value == 100)
-				xiaomi_mca_charge_wake_locked(mca, false);
 			break;
 		default:
 			return -EINVAL;
