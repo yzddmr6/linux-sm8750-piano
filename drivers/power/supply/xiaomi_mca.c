@@ -635,9 +635,6 @@ struct xiaomi_mca {
 	struct mca_connector connector;
 	/* A policy tick uses one observation for FV, buck and pump control. */
 	const struct xiaomi_mca_cells *poll_cells;
-	u32 poll_pack_temp;
-	int poll_pack_error;
-	bool poll_pack_valid;
 	struct device *dev;
 	struct pmic_glink_client *client;
 	struct power_supply *psy;
@@ -689,6 +686,8 @@ struct xiaomi_mca {
 	u8 fw_recharge; /* 0 idle, 1 disable pending, 2 enable pending, 3 resumed */
 	u32 fw_recharges;
 	int pmic_pack_mv, pmic_fv_raw, pmic_iterm_raw;
+	int pmic_pack_tbat;
+	bool pmic_pack_tbat_valid;
 	bool cp_normal_cv;
 	bool term_hot;		/* float-voltage thermal hysteresis */
 	bool fv_derated;	/* incomplete sample: retain the previous FV */
@@ -1092,29 +1091,6 @@ static int xiaomi_mca_read(struct xiaomi_mca *mca, u32 property, u32 *value)
 	*value = 0;
 
 	return xiaomi_mca_transfer(mca, MCA_OPCODE_READ, property, value);
-}
-
-/* One coherent temperature observation per policy tick, shared by FV,
- * enable/hold and CP regulation. A later GLINK miss cannot reinterpret the
- * same tick as a different JEITA zone or spuriously finish the CP session.
- */
-static int xiaomi_mca_pack_temperature(struct xiaomi_mca *mca, u32 *temp)
-{
-	int ret;
-
-	if (mca->poll_cells && mca->poll_pack_valid) {
-		if (!mca->poll_pack_error)
-			*temp = mca->poll_pack_temp;
-		return mca->poll_pack_error;
-	}
-	ret = xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, temp);
-	if (mca->poll_cells) {
-		mca->poll_pack_valid = true;
-		mca->poll_pack_error = ret;
-		if (!ret)
-			mca->poll_pack_temp = *temp;
-	}
-	return ret;
 }
 
 static void xiaomi_mca_invalidate(struct xiaomi_mca *mca)
@@ -2724,11 +2700,6 @@ static int xiaomi_mca_set_iterm(struct xiaomi_mca *mca, u32 ma)
 	return xiaomi_mca_write_u32(mca, MCA_PROP_TERM_CURRENT, ma);
 }
 
-/* Stock strategy_quickchg_adjust_vterm: every fifth valid observation,
- * keep 24..36 mV between the compensated PMIC node and PACK_VBAT.
- * The quick-charge node's compensation is 40 mV in Piano's DT; the
- * buck voter separately uses 40/45 mV in its two FFC temperature rows.
- */
 static void xiaomi_mca_adjust_pmic_fv(struct xiaomi_mca *mca)
 {
 	/* Piano quickchg .text 0x746c..0x74e4: single_cp_pmic=4650
@@ -2799,8 +2770,8 @@ static int xiaomi_mca_restore_term_volt(struct xiaomi_mca *mca)
 
 static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 {
-	int vbat, ibat, cold, hot, vmin, imax, ret, pack_ret;
-	u32 pack, temp;
+	int vbat, ibat, cold, hot, vmin, imax, ret;
+	u32 pack;
 
 	lockdep_assert_held(&mca->lock);
 	if (mca->sleeping)
@@ -2810,9 +2781,7 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 		mca->ffc_active = false;
 		return xiaomi_mca_restore_term_volt(mca);
 	}
-	pack_ret = xiaomi_mca_pack_temperature(mca, &temp);
 	ret = xiaomi_mca_gauges(mca, &vbat, &ibat, &cold, &hot, &vmin, &imax, NULL);
-	ret = ret ?: pack_ret;
 	mca->fv_derated = !!ret;
 	/* Piano fg_comp fg_update_status 0x40d8..0x40fc exits on a failed
 	 * sample. A transport error is NOT a JEITA temperature. Retain all
@@ -2822,7 +2791,7 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 		/* A surviving, measured hot sensor still constrains both cells.
 		 * Missing sensors by themselves never create a thermal vote.
 		 */
-		if (hot >= MCA_TERM_HOT_DEGC || (!pack_ret && (s32)temp >= MCA_TERM_HOT_DEGC)) {
+		if (hot >= MCA_TERM_HOT_DEGC) {
 			mca->term_hot = true;
 			mca->cp_fv_base = 0;
 			return xiaomi_mca_apply_pmic_pair(mca, xiaomi_mca_pmic_fv(mca),
@@ -2830,8 +2799,6 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 		}
 		return 0;
 	}
-	hot = max_t(int, hot, (s32)temp);
-	cold = min_t(int, cold, (s32)temp);
 	if (hot >= MCA_TERM_HOT_DEGC)
 		mca->term_hot = true;
 	else if (hot < MCA_TERM_COOL_DEGC)
@@ -3608,9 +3575,8 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 	union power_supply_propval val;
 	struct power_supply *psy;
 	unsigned int start, end;
-	int soc = 0, n, ret = 0, stop_ret, pack_ret, cell_ret;
+	int soc = 0, n, ret = 0, stop_ret, cell_ret;
 	int vbat, ibat, tcool, tbat, vmin, imax;
-	u32 tpack;
 
 	lockdep_assert_held(&mca->lock);
 	if (mca->sleeping)
@@ -3650,12 +3616,7 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 				mca->charge_hold = false;
 		}
 	}
-	pack_ret = xiaomi_mca_pack_temperature(mca, &tpack);
 	cell_ret = xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, NULL);
-	if (!pack_ret) {
-		tbat = max_t(int, tbat, (s32)tpack);
-		tcool = min_t(int, tcool, (s32)tpack);
-	}
 	/* A surviving thermometer can assert a hold. Clearing one requires
 	 * a complete sample.
 	 */
@@ -3663,7 +3624,7 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		mca->charge_hot = true;
 	if (tcool < -9)
 		mca->charge_cold = true;
-	ret = ret ?: pack_ret ?: cell_ret;
+	ret = ret ?: cell_ret;
 	if (!ret && !(full_charge && charge_policy && mca->fv_derated)) {
 		mca->coolest_temp = tcool;
 		if (!full_charge)
@@ -3692,10 +3653,15 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 			return err;
 
 		ret = xiaomi_mca_cp_stop(mca, "gauge unavailable");
-		/* No invented hot/default FV on loss of telemetry. The existing
-		 * temperature vote and firmware JEITA remain in effect. The pump
-		 * cannot remain regulated without both gauges; buck is autonomous.
+		/* A real, persistent gauge outage relinquishes AP-controlled FFC
+		 * to the firmware boot profile (4400 mV/100 mA termination), never
+		 * to a fabricated hot temperature. A measured warm row still wins.
+		 * PACK_TBAT telemetry errors do not enter this path.
 		 */
+		if (!ret)
+			ret = xiaomi_mca_apply_pmic_pair(mca,
+				mca->term_hot ? MCA_TERM_HOT_MV + 30 : MCA_TERM_DEFAULT_MV,
+				MCA_ITERM_DEFAULT_MA);
 		if (end < 100 && mca->gauge_failures >= 3) {
 			stop_ret = xiaomi_mca_charge_stop(mca);
 			return ret ?: stop_ret ?: err;
@@ -3874,7 +3840,7 @@ static u32 xiaomi_mca_cp_ibat_limit(struct xiaomi_mca *mca, int vbat, int ibat)
 /* Called from the poll at 9 V on the buck charger, or right after the auth */
 static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 {
-	int vbat, ibat, tcool, tbat, tpack, ret, vmin, imax;
+	int vbat, ibat, tcool, tbat, ret, vmin, imax;
 	u32 start_mv, ma, src_ma, max_mv = 0;
 
 	if (mca->cp_fault || mca->charging_done || mca->otg_active ||
@@ -3889,14 +3855,12 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 
 	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, NULL))
 		return;
-	if (xiaomi_mca_pack_temperature(mca, &tpack))
-		return;
-	xiaomi_mca_select_profile(mca, min(tcool, tpack), max(tbat, tpack));
+	xiaomi_mca_select_profile(mca, tcool, tbat);
 	/* Piano DT min_vbat/max_vbat, independent of the current CV row. */
 	if (vmin < MCA_CP_VBAT_MIN_MV || vbat > 4550 ||
 	    imax >= MCA_CP_CELL_OCP_MA ||
 	    mca->cell_zone < MCA_CP_TBAT_MIN ||
-	    max(tbat, tpack) >= MCA_CP_TBAT_EXIT ||
+	    tbat >= MCA_CP_TBAT_EXIT ||
 	    xiaomi_mca_read_u32(mca, MCA_PROP_VERIFY_PROCESS))
 		return;
 
@@ -4076,7 +4040,7 @@ static bool xiaomi_mca_cp_taper_complete(struct xiaomi_mca *mca, bool near_cv, i
 /* One step of direct charging, every MCA_CP_POLL_MS */
 static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 {
-	int vbat, ibat, tcool, tbat, tpack, vbus_uv, ibus_ua, tdie, on, ibus, over;
+	int vbat, ibat, tcool, tbat, vbus_uv, ibus_ua, tdie, on, ibus, over;
 	int ibat_max, target, ibus_all, buck_ma, budget, vmin, imax;
 	int band = xiaomi_mca_cp_band(mca->cp_type);
 	u32 mv = mca->cp_mv, cv;
@@ -4089,12 +4053,8 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_stop(mca, "read failed");
 		return;
 	}
-	if (xiaomi_mca_pack_temperature(mca, &tpack)) {
-		xiaomi_mca_cp_stop(mca, "pack temperature unavailable");
-		return;
-	}
 
-	xiaomi_mca_select_profile(mca, min(tcool, tpack), max(tbat, tpack));
+	xiaomi_mca_select_profile(mca, tcool, tbat);
 	/* Never continue a high-current APDO after authentication is revoked. */
 	if (mca->cp_ma > MCA_CP_STD_PPS_MAX_MA) {
 		u32 verified;
@@ -4135,7 +4095,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		return;
 	}
 	if (mca->cell_zone < MCA_CP_TBAT_MIN ||
-	    max(tbat, tpack) >= MCA_CP_TBAT_EXIT) {
+	    tbat >= MCA_CP_TBAT_EXIT) {
 		xiaomi_mca_cp_stop(mca, "battery temperature");
 		return;
 	}
@@ -4328,7 +4288,7 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 		if (++mca->cp_polls % MCA_CP_LOG_POLLS == 0)
 			dev_info(mca->dev, "direct charging at %u mV: bus %d mV %d/%d mA, battery %d mV %d/%d mA %d degC, stage %d.%d degC\n",
 				 mca->cp_mv, vbus_uv / 1000, ibus, target,
-				 vbat, ibat, ibat_max, max(tbat, tpack),
+				 vbat, ibat, ibat_max, tbat,
 				 tdie / 10, tdie % 10);
 	}
 
@@ -5027,7 +4987,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca, u32 *sampled_type)
 		if (xiaomi_mca_cp_stop(mca, "detached"))
 			return;
 		if (mca->cp != MCA_CP_DONE)
-			mca->cp = MCA_CP_OFF;
+				mca->cp = MCA_CP_OFF;
 		if (mca->icl_written)
 			xiaomi_mca_reset_icl(mca);
 		if (mca->fcc_written)
@@ -5097,6 +5057,13 @@ static void xiaomi_mca_pmic_telemetry(struct xiaomi_mca *mca, u32 status)
 	u32 value;
 	int vbat = -1, ibat, cold, hot, vmin, imax;
 
+	/* Piano fg_comp .text 0x44e0..0x4504: PACK_TBAT is reporting only.
+	 * strategy_fg_ops_get_temp (0x5970) returns the separate FG field.
+	 * Preserve an unavailable diagnostic, never feed it into JEITA.
+	 */
+	mca->pmic_pack_tbat_valid = !xiaomi_mca_read(mca, MCA_PROP_PACK_TBAT, &value);
+	if (mca->pmic_pack_tbat_valid)
+		mca->pmic_pack_tbat = (s32)value;
 	mca->pmic_fv_raw = xiaomi_mca_read(mca, MCA_PROP_TERM_VOLT, &value) ? -1 : (int)value;
 	mca->pmic_iterm_raw = xiaomi_mca_read(mca, MCA_PROP_TERM_CURRENT, &value) ? -1 : (int)value;
 	if (!mca->last_valid || !mca->last.online ||
@@ -5136,7 +5103,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 			if (xiaomi_mca_cp_stop(mca, "ADSP restart"))
 				goto out;
 			if (mca->cp != MCA_CP_DONE)
-			mca->cp = MCA_CP_OFF;
+				mca->cp = MCA_CP_OFF;
 			mca->hv = MCA_HV_OFF;
 			mca->icl_written = false;
 			mca->icl_set_ma = 0;
@@ -5191,7 +5158,6 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		if (charge_policy || READ_ONCE(mca->charge_end) < 100 || mca->charge_disabled) {
 			xiaomi_mca_sample_cells(mca, &cells);
 			mca->poll_cells = &cells;
-			mca->poll_pack_valid = false;
 		}
 		ret = xiaomi_mca_full_charge_poll(mca);
 		if (ret) {
@@ -5222,7 +5188,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 				xiaomi_mca_request_volt(mca, 5000);
 			mca->policy_active = false;
 			if (mca->cp != MCA_CP_DONE)
-			mca->cp = MCA_CP_OFF;
+				mca->cp = MCA_CP_OFF;
 			mca->hv = MCA_HV_OFF;
 		}
 		policy_sample = true;
@@ -5538,17 +5504,21 @@ static ssize_t charge_profile_show(struct device *dev,
 {
 	struct xiaomi_mca *mca = xiaomi_mca_from_dev(dev);
 
-	char t[2][16];
+	char t[3][16];
 	int i;
 
 	guard(mutex)(&mca->lock);
-	for (i = 0; i < ARRAY_SIZE(t); i++) {
+	for (i = 0; i < 2; i++) {
 		if (!mca->connector.valid[i])
 			strscpy(t[i], "unavailable", sizeof(t[i]));
 		else
 			snprintf(t[i], sizeof(t[i]), "%d", mca->connector.temp[i]);
 	}
-	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u aicl_cap_ma=%u hv_exit=%s last_exit=%s conn_mc=%s conn2_mc=%s antiburn=%u pmic_chgr_status=%u pmic_fv_raw=%d pmic_fv_target=%u pmic_iterm_raw=%d pmic_pack_mv=%d buck_suspended=%u fw_recharge=%u fw_recharges=%u full=%u voltage_hold=%u recovery_5v=%u taper_count=%u stop_phase=%u sw_cv_steps=%u sw_cv_fcc=%u gauge_errors=%u\n",
+	if (mca->pmic_pack_tbat_valid)
+		snprintf(t[2], sizeof(t[2]), "%d", mca->pmic_pack_tbat);
+	else
+		strscpy(t[2], "unavailable", sizeof(t[2]));
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u aicl_cap_ma=%u hv_exit=%s last_exit=%s conn_mc=%s conn2_mc=%s antiburn=%u pmic_chgr_status=%u pmic_fv_raw=%d pmic_fv_target=%u pmic_iterm_raw=%d pmic_pack_mv=%d buck_suspended=%u fw_recharge=%u fw_recharges=%u full=%u voltage_hold=%u recovery_5v=%u taper_count=%u stop_phase=%u sw_cv_steps=%u sw_cv_fcc=%u gauge_errors=%u pmic_pack_tbat=%s\n",
 		 xiaomi_mca_profile_names[mca->cp_profile],
 		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
 		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma, mca->hv, mca->hv_pps,
@@ -5560,7 +5530,7 @@ static ssize_t charge_profile_show(struct device *dev,
 			mca->pmic_fv_raw, mca->pmic_fv_target, mca->pmic_iterm_raw,
 			mca->pmic_pack_mv, mca->cp_input_suspended, mca->fw_recharge, mca->fw_recharges,
 			mca->charging_done, mca->voltage_hold, mca->recover_5v, mca->cp_taper_count,
-			mca->cp_stop_phase, mca->buck_cv_steps, mca->buck_cv_fcc, mca->gauge_failures);
+			mca->cp_stop_phase, mca->buck_cv_steps, mca->buck_cv_fcc, mca->gauge_failures, t[2]);
 }
 static DEVICE_ATTR_RO(charge_profile);
 
@@ -5610,6 +5580,7 @@ static const struct {
 	{ "term_voltage_raw", MCA_PROP_TERM_VOLT },
 	{ "term_current_raw", MCA_PROP_TERM_CURRENT },
 	{ "pack_voltage_mv", MCA_PROP_PACK_VBAT },
+	{ "pack_temperature_raw", MCA_PROP_PACK_TBAT },
 	{ "input_current_limit_ma", MCA_PROP_INPUT_CURRENT_LIMIT },
 	{ "aicl_enabled", MCA_PROP_AICL_ENABLED },
 	{ "aicl_status", MCA_PROP_AICL_STATUS },
@@ -5779,7 +5750,7 @@ static void xiaomi_mca_unbind_restore(void *data)
 /* Hand off the buck under a confirmed fixed contract. */
 static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca, u32 fixed_ma)
 {
-	u32 type, icl, fcc, tbat;
+	u32 type, icl, fcc;
 	int ret;
 
 	if (!mca->icl_written && !mca->fcc_written)
@@ -5819,10 +5790,10 @@ static int xiaomi_mca_sleep_currents(struct xiaomi_mca *mca, u32 fixed_ma)
 	}
 
 	if (mca->fcc_written) {
-		ret = xiaomi_mca_pack_temperature(mca, &tbat);
-		if (ret)
-			return ret;
-		fcc = xiaomi_mca_fcc_thermal(mca, fcc, min((s32)tbat, mca->coolest_temp));
+		/* The policy's last complete pair of cell temperatures. Firmware
+		 * JEITA remains enabled while the AP and gauges suspend.
+		 */
+		fcc = xiaomi_mca_fcc_thermal(mca, fcc, mca->coolest_temp);
 		ret = xiaomi_mca_write_u32(mca, MCA_PROP_CHARGE_CURRENT, fcc);
 		if (ret)
 			return ret;
