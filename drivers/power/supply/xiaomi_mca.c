@@ -674,6 +674,7 @@ struct xiaomi_mca {
 	bool cp_parallel_done;
 	unsigned int cp_taper_count;
 	u8 cp_stop_phase;
+	u8 cp_total_errors, cp_chip_errors;
 	bool charging_done, voltage_hold, recover_5v;
 	unsigned int term_count, buck_cv_steps;
 	u32 buck_cv_fcc;
@@ -2917,6 +2918,43 @@ static int xiaomi_mca_cp_set_buck(struct xiaomi_mca *mca, u32 icl_ma,
 	return 0;
 }
 
+/* Piano quickchg total_err >=11 (0x2d28..0x2d3c), per-CP error_num
+ * >=5 (0x9bdc..0x9bf8). This board has one pump, so no alternate CP.
+ * Success/stop do not reset them; attachment exit clears proc_data
+ * (0x28d0..0x28dc). No timer or stable-run reset belongs to this budget.
+ */
+static bool xiaomi_mca_cp_failed(struct xiaomi_mca *mca)
+{
+	return mca->cp_total_errors >= 11 || mca->cp_chip_errors >= 5;
+}
+
+static void xiaomi_mca_cp_count_failure(struct xiaomi_mca *mca, const char *why)
+{
+	bool chip = !strcmp(why, "stage turned itself off") ||
+		(!strcmp(why, "stage read failed") && mca->cp == MCA_CP_ON) ||
+		!strcmp(why, "no current");
+	bool total = chip || !strcmp(why, "stage read failed") ||
+		!strcmp(why, "stage refused") ||
+		!strcmp(why, "adapter request refused") || !strcmp(why, "request refused") ||
+		!strcmp(why, "buck pause refused") ||
+		!strcmp(why, "QC failed to reach opening voltage");
+
+	/* open_path 0x8d64..0x8d8c + start 0x9d38..0x9d54; unexpected
+	 * CP disable increments both in monitor 0x1d40..0x1d8c. CP ADC
+	 * failure while running increments error_num (0x4f94/0x6300).
+	 * An opening read failure instead returns through 0x8d48..0x8d60
+	 * to the total-error increment in start_charging.
+	 * Gauge, temperature, normal taper and FV votes are not CP failures.
+	 */
+	if (chip)
+		mca->cp_chip_errors = min(mca->cp_chip_errors + 1, 5);
+	if (total)
+		mca->cp_total_errors = min(mca->cp_total_errors + 1, 11);
+	if (xiaomi_mca_cp_failed(mca))
+		dev_warn(mca->dev, "pump failure budget exhausted: total=%u chip=%u; buck until detach\n",
+			 mca->cp_total_errors, mca->cp_chip_errors);
+}
+
 static void xiaomi_mca_cp_session_done(struct xiaomi_mca *mca, const char *reason)
 {
 	/* Piano stop_charging .text 0x4848..0x4858 preserves CHARGE_DONE
@@ -2925,7 +2963,8 @@ static void xiaomi_mca_cp_session_done(struct xiaomi_mca *mca, const char *reaso
 	 * Existing OVP/OCP/authentication latches remain attachment-scoped.
 	 */
 	mca->cp_last_exit = reason;
-	mca->cp = mca->cp_fault || mca->auth_lost || !strcmp(reason, "taper complete") ?
+	mca->cp = mca->cp_fault || mca->auth_lost || xiaomi_mca_cp_failed(mca) ||
+		!strcmp(reason, "taper complete") ?
 		MCA_CP_DONE : MCA_CP_OFF;
 }
 
@@ -2982,6 +3021,7 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	if (!xiaomi_mca_cp_active(mca))
 		return 0;
 	if (mca->cp != MCA_CP_STOPPING) {
+		xiaomi_mca_cp_count_failure(mca, why);
 		mca->cp_stop_reason = why;
 		mca->cp_stop_phase = 0;
 	}
@@ -3852,7 +3892,7 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	int vbat, ibat, tcool, tbat, ret, vmin, imax;
 	u32 start_mv, ma, src_ma, max_mv = 0;
 
-	if (mca->cp_fault || mca->charging_done || mca->otg_active ||
+	if (xiaomi_mca_cp_failed(mca) || mca->cp_fault || mca->charging_done || mca->otg_active ||
 	    mca->otg_requested || mca->pen_on || mca->pen_dirty || mca->charge_blocked)
 		return;
 	if (!cp_charge || !hv_charge || !charge_current ||
@@ -4058,9 +4098,12 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	bool taper, ocp, parallel;
 	u32 fcc, icl;
 
-	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, &ocp) ||
-	    xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &on)) {
+	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, &ocp)) {
 		xiaomi_mca_cp_stop(mca, "read failed");
+		return;
+	}
+	if (xiaomi_mca_cp_get(mca, POWER_SUPPLY_PROP_ONLINE, &on)) {
+		xiaomi_mca_cp_stop(mca, "stage read failed");
 		return;
 	}
 
@@ -4897,6 +4940,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca, u32 *sampled_type)
 		mca->auth_lost = false;
 		mca->cp_fault = false;
 		mca->cp_exits = 0;
+		mca->cp_total_errors = mca->cp_chip_errors = 0;
 		mca->fw_recharge = 0;
 		mca->fw_recharges = 0;
 		mca->cp_last_exit = NULL;
@@ -5528,7 +5572,7 @@ static ssize_t charge_profile_show(struct device *dev,
 		snprintf(t[2], sizeof(t[2]), "%d", mca->pmic_pack_tbat);
 	else
 		strscpy(t[2], "unavailable", sizeof(t[2]));
-	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u aicl_cap_ma=%u hv_exit=%s last_exit=%s conn_mc=%s conn2_mc=%s antiburn=%u pmic_chgr_status=%u pmic_fv_raw=%d pmic_fv_target=%u pmic_iterm_raw=%d pmic_pack_mv=%d buck_suspended=%u fw_recharge=%u fw_recharges=%u full=%u voltage_hold=%u recovery_5v=%u taper_count=%u stop_phase=%u sw_cv_steps=%u sw_cv_fcc=%u gauge_errors=%u pmic_pack_tbat=%s\n",
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u aicl_cap_ma=%u hv_exit=%s last_exit=%s conn_mc=%s conn2_mc=%s antiburn=%u pmic_chgr_status=%u pmic_fv_raw=%d pmic_fv_target=%u pmic_iterm_raw=%d pmic_pack_mv=%d buck_suspended=%u fw_recharge=%u fw_recharges=%u full=%u voltage_hold=%u recovery_5v=%u taper_count=%u stop_phase=%u sw_cv_steps=%u sw_cv_fcc=%u gauge_errors=%u pmic_pack_tbat=%s cp_total_errors=%u cp_chip_errors=%u\n",
 		 xiaomi_mca_profile_names[mca->cp_profile],
 		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
 		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma, mca->hv, mca->hv_pps,
@@ -5540,7 +5584,7 @@ static ssize_t charge_profile_show(struct device *dev,
 			mca->pmic_fv_raw, mca->pmic_fv_target, mca->pmic_iterm_raw,
 			mca->pmic_pack_mv, mca->cp_input_suspended, mca->fw_recharge, mca->fw_recharges,
 			mca->charging_done, mca->voltage_hold, mca->recover_5v, mca->cp_taper_count,
-			mca->cp_stop_phase, mca->buck_cv_steps, mca->buck_cv_fcc, mca->gauge_failures, t[2]);
+			mca->cp_stop_phase, mca->buck_cv_steps, mca->buck_cv_fcc, mca->gauge_failures, t[2], mca->cp_total_errors, mca->cp_chip_errors);
 }
 static DEVICE_ATTR_RO(charge_profile);
 

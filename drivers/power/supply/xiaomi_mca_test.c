@@ -4958,9 +4958,91 @@ static void xiaomi_mca_test_exit_retry_class(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mca.cp, MCA_CP_DONE);
 }
 
+static void xiaomi_mca_test_stock_failure_budget(struct kunit *test)
+{
+	static const struct { const char *reason; int limit; } cases[] = {
+		{ "adapter request refused", 11 }, { "stage turned itself off", 5 },
+	};
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	u32 writes, sample;
+	int row, n;
+
+	full_charge = charge_policy = charge_current = cp_charge = hv_charge = true;
+	mca_test_named_stage(test, f, "sc8541");
+	power_supply_put(mca->cp_psy);
+	mca->cp_psy = NULL;
+	mca->cp = MCA_CP_OFF;
+	f->stage_on = false;
+	f->pdos[1] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(5000), cpu_to_le32(11000), cpu_to_le32(5000) };
+	guard(mutex)(&mca->lock);
+	mca->cp = MCA_CP_OPENING;
+	xiaomi_mca_cp_count_failure(mca, "stage read failed");
+	KUNIT_EXPECT_EQ(test, mca->cp_total_errors, 1);
+	KUNIT_EXPECT_EQ(test, mca->cp_chip_errors, 0);
+	mca->cp = MCA_CP_ON;
+	xiaomi_mca_cp_count_failure(mca, "stage read failed");
+	KUNIT_EXPECT_EQ(test, mca->cp_total_errors, 2);
+	KUNIT_EXPECT_EQ(test, mca->cp_chip_errors, 1);
+	mca->cp = MCA_CP_OFF;
+	mca->cp_total_errors = mca->cp_chip_errors = 0;
+	for (row = 0; row < ARRAY_SIZE(cases); row++) {
+		for (n = 0; n < cases[row].limit; n++) {
+			mca->hv = MCA_HV_ON;
+			f->vbus = mca->vbus_uv = 9000000;
+			f->type = mca->real_type = MCA_TYPE_PD;
+			f->usb_online = 1;
+			xiaomi_mca_cp_try_start(mca);
+			KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_OPENING);
+			KUNIT_EXPECT_EQ(test, f->icl, 0);
+			if (n == 2) {
+				/* A successful running observation is not a reset. */
+				mca->cp = MCA_CP_ON;
+				f->stage_on = true;
+				f->stage_mv = 8400;
+				f->stage_ma = 1500;
+				xiaomi_mca_cp_step(mca);
+				KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_ON);
+				KUNIT_EXPECT_EQ(test, mca->cp_total_errors, n);
+			}
+			if (!row && !n) {
+				f->stage_error = -EIO;
+				KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_stop(mca, cases[row].reason), -EIO);
+				KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_stop(mca, "pending stop"), -EIO);
+				KUNIT_EXPECT_EQ(test, mca->cp_total_errors, 1);
+				f->stage_error = 0;
+			}
+			KUNIT_ASSERT_EQ(test, xiaomi_mca_cp_stop(mca, cases[row].reason), 0);
+			KUNIT_EXPECT_EQ(test, mca->cp_total_errors, n + 1);
+			KUNIT_EXPECT_EQ(test, mca->cp_chip_errors, row ? n + 1 : 0);
+			KUNIT_EXPECT_GT(test, f->icl, 0);
+			KUNIT_EXPECT_EQ(test, mca->cp,
+				n + 1 == cases[row].limit ? MCA_CP_DONE : MCA_CP_OFF);
+		}
+		xiaomi_mca_pdr_notify(mca, SERVREG_SERVICE_STATE_DOWN);
+		xiaomi_mca_pdr_notify(mca, SERVREG_SERVICE_STATE_UP);
+		KUNIT_EXPECT_EQ(test, mca->cp_total_errors, cases[row].limit);
+		writes = f->writes;
+		for (n = 0; n < 3; n++)
+			xiaomi_mca_cp_try_start(mca);
+		KUNIT_EXPECT_EQ(test, f->writes, writes); /* no more zero ICL */
+		KUNIT_EXPECT_GT(test, f->icl, 0);
+		/* Actual detach handling clears the budget, not a VBUS dip/PDR. */
+		f->vbus = f->usb_online = 0;
+		xiaomi_mca_ucsi_update(mca, MCA_UCSI_OFFLINE);
+		xiaomi_mca_ucsi_update(mca, MCA_UCSI_PD_SINK);
+		xiaomi_mca_policy_poll(mca, &sample);
+		KUNIT_EXPECT_EQ(test, mca->cp_total_errors, 0);
+		KUNIT_EXPECT_EQ(test, mca->cp_chip_errors, 0);
+		KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
+	}
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_warm_termination_is_not_full),
 	KUNIT_CASE(xiaomi_mca_test_provider_late_start),
+	KUNIT_CASE(xiaomi_mca_test_stock_failure_budget),
 	KUNIT_CASE(xiaomi_mca_test_exit_retry_class),
 	KUNIT_CASE(xiaomi_mca_test_real_full_v5),
 	KUNIT_CASE(xiaomi_mca_test_stock_entry_matrix),
