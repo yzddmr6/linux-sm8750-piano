@@ -55,6 +55,7 @@
 
 #include "sc8547a.h"
 #include "erhai_cell_envelope.h"
+#include "erhai_svooc_lcf.h"
 
 /*
  * Android parity for slow/noisy third-party (S)VOOC adapters.  The vendor
@@ -137,6 +138,7 @@ static const char * const sc8547_gauge_names[] = {
 #include "erhai_otg_glink.h"
 #include "sc8547a.h"
 #include "erhai_cell_envelope.h"
+#include "erhai_svooc_lcf.h"
 
 /* ---- register map (charge-pump / VOOC-PHY function, I2C addr 0x6F) ---- */
 #define SC8547_REG_00			0x00	/* VBAT_OVP */
@@ -368,7 +370,8 @@ MODULE_PARM_DESC(slave_drop_ticks,
 #define SC8547_AUTO_CODE_CEILING	61	/* 24926 (24924 table): 6100 mA */
 
 #define SC8547_AUTO_IDENTIFY_MS		4000	/* window to see adapter_check_ok */
-#define SC8547_AUTO_STEP_DEBOUNCE	4	/* consecutive ticks (~1 s) to advance */
+#define SC8547_CURVE_SAMPLE_MS		500 /* VOOC_VOL_EVENT_TIME */
+#define SC8547_AUTO_STEP_DEBOUNCE	4	/* four 500 ms voltage samples */
 /*
  * A genuine SVOOC adapter periodically resets its VOOC link (drops output and
  * waits for a fresh handshake) after tens of seconds of CC. That is not an
@@ -381,7 +384,7 @@ MODULE_PARM_DESC(slave_drop_ticks,
 /* Oplus AP VOOC PHY: VOOC_COMMU_EVENT_TIME and VOOCPHY_UCP_SS_IBUS_MIN. */
 #define SC8547_COMMU_TIMEOUT_MS		200
 #define SC8547_UCP_ARM_MA		600
-#define SC8547_LOW_IBUS_MA		300	/* same ADC floor as the serial taper check */
+#define SC8547_LOW_IBUS_MA		300	/* pump no-load floor, separate from gauge LCF */
 #define SC8547_AUTO_SUSTAINED_MS	5000	/* CC held this long -> reset is keep-alive */
 #define SC8547_AUTO_DETACH_DEBOUNCE_MS	2500	/* longer absence window while delivering */
 
@@ -512,7 +515,12 @@ struct sc8547a_device {
 	enum sc8547_auto_state	auto_state;
 	unsigned long		auto_identify_deadline;
 	const struct erhai_charge_curve *auto_curve;
-	int curve_temp, curve_sample_temp, curve_entry_temp;
+	int curve_temp, curve_sample_temp, curve_entry_temp, curve_entry_soc;
+	int curve_vbat_mv, cell_vbat_mv;
+	unsigned long curve_next_sample;
+	unsigned int curve_full_count;
+	bool curve_sampled;
+	struct erhai_svooc_lcf lcf;
 	int curve_temp_bounds[6];
 	unsigned int thermal_ma;
 	unsigned int curve_ma;	/* selected CC/CV table */
@@ -2347,20 +2355,25 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 	unsigned int limit, previous_code = sc->fastchg_curr_code;
 	bool new_table;
 
-	raw = erhai_curve_select(svooc_curves, soc, temp);
+	sc->curve_sampled = false;
+	sc->curve_vbat_mv = mv;
+	if (entering || !sc->auto_curve)
+		sc->curve_entry_soc = soc;
+	raw = erhai_curve_select(svooc_curves, sc->curve_entry_soc, temp);
 	sc->curve_sample_temp = temp;
 	sc->curve_temp = sc8547_curve_temperature(sc, temp, soc, entering || !sc->auto_curve);
 	if (entering || !sc->auto_curve)
 		sc->curve_entry_temp = sc->curve_temp;
 	/* current_max follows the handshake's voltage curve; changing
 	 * temperature votes must not replace it with a colder CC ceiling.
-	 * Retain the existing monotonic SOC-bin adjustment separately.
+	 * batt_soc_plugin is captured at handshake entry too; crossing a
+	 * SOC boundary must not replace the voltage curve or its thermal vote.
 	 */
-	curve = erhai_curve_select(svooc_curves, soc, sc->curve_entry_temp);
-	thermal = erhai_curve_select(svooc_curves, soc, sc->curve_temp);
+	curve = erhai_curve_select(svooc_curves, sc->curve_entry_soc, sc->curve_entry_temp);
+	thermal = erhai_curve_select(svooc_curves, sc->curve_entry_soc, sc->curve_temp);
 	/* vooc_high_temp (entry) and over_high_temp (running). */
 	if (!raw || !curve || !thermal || mv <= SC8547_CELL_MIN_VALID_MV ||
-	    mv >= min(erhai_cell_cv(temp), erhai_cell_cv(sc->curve_temp)))
+	    (entering && mv >= min(erhai_cell_cv(temp), erhai_cell_cv(sc->curve_temp))))
 		return false;
 
 	new_table = entering || !sc->auto_curve || sc->auto_curve->steps != curve->steps;
@@ -2369,7 +2382,12 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 		sc->auto_curve_idx = erhai_curve_start(curve, mv, true);
 		sc->auto_step_cnt = 0;
 		sc->auto_taper_cnt = 0;
-	} else {
+		sc->curve_full_count = 0;
+		sc->curve_next_sample = jiffies + msecs_to_jiffies(SC8547_CURVE_SAMPLE_MS);
+		erhai_svooc_lcf_start(&sc->lcf, temp, jiffies);
+	} else if (time_after_eq(jiffies, sc->curve_next_sample)) {
+		sc->curve_sampled = true;
+		sc->curve_next_sample = jiffies + msecs_to_jiffies(SC8547_CURVE_SAMPLE_MS);
 		step = &curve->steps[sc->auto_curve_idx];
 		if (!step->last && mv > step->mv && ibus < step->ma + 1000) {
 			if (++sc->auto_step_cnt >= SC8547_AUTO_STEP_DEBOUNCE) {
@@ -2379,16 +2397,6 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 		} else {
 			sc->auto_step_cnt = 0;
 		}
-	}
-	step = &curve->steps[sc->auto_curve_idx];
-	/* Let even a one-row high-SOC curve deliver. Only a measured
-	 * low-current tail on a running pump hands the cell to the buck.
-	 */
-	if (!entering && sc->cp_enabled && step->last && ibus < 300) {
-		if (++sc->auto_taper_cnt >= SC8547_AUTO_STEP_DEBOUNCE)
-			return false;
-	} else {
-		sc->auto_taper_cnt = 0;
 	}
 	/* AP PHY current_max descends with the curve. current_batt_temp is
 	 * a separate, reversible vote (oplus_ap_voocphy.c:5316-5324).
@@ -2410,9 +2418,9 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 		limit = min_t(unsigned int, limit, sc->first_request);
 	sc->fastchg_curr_code = limit;
 	if (!entering && previous_code != limit)
-		dev_info(sc->dev, "SVOOC current %u -> %u: temp=%d range=%d entry=%d curve=%u thermal=%u first=%u row=%u\n",
+		dev_info(sc->dev, "SVOOC current %u -> %u: temp=%d range=%d entry=%d soc=%d cp=%d cell=%d curve=%u thermal=%u first=%u row=%u\n",
 			 previous_code, limit, temp, sc->curve_temp, sc->curve_entry_temp,
-			 sc->curve_ma / 100, sc->thermal_ma / 100, sc->first_request,
+			 sc->curve_entry_soc, mv, sc->cell_vbat_mv, sc->curve_ma / 100, sc->thermal_ma / 100, sc->first_request,
 			 sc->auto_curve_idx);
 	return true;
 }
@@ -2669,6 +2677,8 @@ static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
 static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 				      int soc, int temp_ddc, int cell_mv)
 {
+	int cp_mv;
+
 	if (!sc->adapter_check_ok || !sc->model_received) {
 		if (time_before(jiffies, sc->auto_identify_deadline))
 			return;
@@ -2689,12 +2699,12 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 		return;
 	}
 
-	/*
-	 * Gate and index the curve on the CELL voltage (gauge). The CP's own
-	 * reading is inflated by the delivery IR drop and would make a half-full
-	 * pack look like it is already at CV.
+	/* Domestic AP PHY has no external_gauge_support: its curve input
+	 * is REG1B CP VBAT, not the ADSP gauge or adapter-feedback estimate.
 	 */
-	if (!sc8547_auto_update_curve(sc, soc, temp_ddc, cell_mv, 0, true)) {
+	cp_mv = sc8547_get_vbat(sc);
+	sc->cell_vbat_mv = cell_mv;
+	if (cp_mv <= 0 || !sc8547_auto_update_curve(sc, soc, temp_ddc, cp_mv, 0, true)) {
 		sc8547_auto_decline(sc, "outside-cell-curve");
 		return;
 	}
@@ -2718,7 +2728,7 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 	}
 	dev_info(sc->dev,
 		 "auto fast-charge: SVOOC identified (soc %d%% temp %d.%d C cell %d mV cp %d mV) — deliver curve[%d] code %u\n",
-		 soc, temp_ddc / 10, temp_ddc % 10, cell_mv, sc8547_get_vbat(sc), sc->auto_curve_idx,
+		 soc, temp_ddc / 10, temp_ddc % 10, cell_mv, cp_mv, sc->auto_curve_idx,
 		 sc->fastchg_curr_code);
 }
 
@@ -2853,7 +2863,9 @@ static void sc8547_attach_work(struct work_struct *work)
 	if (sc->auto_state == SC_AUTO_DELIVER) {
 		int cpbat = sc8547_get_vbat(sc);	/* cell + delivery IR drop */
 		int cibus = sc8547_get_ibus(sc);
-		int cvbat = gvbat;
+		int cvbat = cpbat;
+		int full_mv;
+		bool low_full;
 		int previous_temp = sc->curve_temp;
 
 		/*
@@ -2878,6 +2890,7 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc->missed_peak_ibus_ma = max(sc->missed_peak_ibus_ma, cibus_total);
 		sc->serial_vbus_mv = vbus > 0 ? vbus : -1;
 		sc->serial_ibat_ma = gret ? 0 : ibat;
+		sc->cell_vbat_mv = gret ? -1 : gvbat;
 		sc->serial_reg06 = sc8547_read_byte(sc, SC8547_REG_06, &r6) ? -1 : r6;
 		sc->slave_enabled = sc8547_slave_enabled();
 		sc->master_enabled = sc8547_read_byte(sc, SC8547_REG_07, &r7) ?
@@ -2907,19 +2920,31 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc8547_auto_finish(sc, "adc-limit-or-io");
 			goto reschedule;
 		}
-		/* Four low readings on a discharging cell cannot qualify as a charge taper. */
-		if (ibat <= 0)
-			sc->auto_taper_cnt = 0;
 		if (gret || cpbat <= 0 || vbus <= 0 || cibus < 0 || slave_ma < 0 ||
+		    (!gret && gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp))) ||
 		    !sc8547_auto_update_curve(sc, gsoc, gtemp, cvbat, cibus_total, false)) {
 			if (!gret && gtemp >= 0 && gtemp < 510 && gvbat > 0 &&
-			    (gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp)) ||
-			     sc->auto_taper_cnt >= SC8547_AUTO_STEP_DEBOUNCE)) {
+			    gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp))) {
 				erhai_charge_tail_complete(ERHAI_SERIAL);
 				sc8547_auto_finish(sc, "buck-tail");
 			} else {
 				sc8547_auto_finish(sc, "cell-envelope-or-adc");
 			}
+			goto reschedule;
+		}
+		/* AP PHY voltage monitor: domestic QBG enables FCL, so the
+		 * sustained full threshold needs six 500 ms observations.
+		 * Keep the existing gauge-side cell CV stop above as well.
+		 */
+		full_mv = min(erhai_cell_cv(sc->curve_entry_temp),
+			      min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp)));
+		if (sc->cp_enabled && sc->curve_sampled)
+			sc->curve_full_count = cpbat > full_mv ? sc->curve_full_count + 1 : 0;
+		low_full = sc->cp_enabled &&
+			erhai_svooc_lcf_update(&sc->lcf, gtemp, gvbat, ibat, jiffies);
+		if (sc->curve_full_count > 5 || low_full) {
+			erhai_charge_tail_complete(ERHAI_SERIAL);
+			sc8547_auto_finish(sc, low_full ? "low-current-full" : "cp-voltage-full");
 			goto reschedule;
 		}
 		if (sc8547_new_temperature_session(previous_temp, sc->curve_temp, gsoc)) {
@@ -3123,13 +3148,15 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 	pump = sc->master_enabled > 0 || sc->slave_enabled > 0 ? 1 :
 		sc->master_enabled < 0 || sc->slave_enabled < 0 ? -1 : 0;
 	return off + sysfs_emit_at(buf, off,
-		"curve_temp=%d sample_temp=%d entry_temp=%d curve_code=%u thermal_code=%u curve_idx=%u warm_boundary=%d "
+		"curve_temp=%d sample_temp=%d entry_temp=%d entry_soc=%d curve_vbat_mv=%d cell_vbat_mv=%d lcf_count=%u lcf_region=%d cp_full_count=%u curve_code=%u thermal_code=%u curve_idx=%u warm_boundary=%d "
 		"protocol=supervooc state=%s model=%d allow_sent=%d pre_allow_buck_ua=%d first_request_code=%u target_code=%u request_code=%u request_ma=%u "
 		"pending_code=%d predata=0x%04x above_samples=%u model_rx=0x%02x%02x model_flags=0x%02x%02x "
 		"vbus_mv=%d pump=%d pump_ibus_ma=%d master_ibus_ma=%d slave_ibus_ma=%d "
 		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u frame_gap_us=%u max_gap_us=%u "
 		"exits=%u last_exit=%s\n",
-		sc->curve_temp, sc->curve_sample_temp, sc->curve_entry_temp, sc->curve_ma / 100, sc->thermal_ma / 100,
+		sc->curve_temp, sc->curve_sample_temp, sc->curve_entry_temp, sc->curve_entry_soc,
+		sc->curve_vbat_mv, sc->cell_vbat_mv, sc->lcf.full_count, sc->lcf.region,
+		sc->curve_full_count, sc->curve_ma / 100, sc->thermal_ma / 100,
 		sc->auto_curve_idx, sc->curve_temp_bounds[5],
 		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1,
 		sc->allow_sent, sc->pre_allow_buck_ua, sc->first_request,
