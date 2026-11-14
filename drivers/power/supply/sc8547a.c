@@ -520,6 +520,9 @@ struct sc8547a_device {
 	bool monitor_pump_faults;
 	u8 pump_faults;
 	unsigned int adc_over_count;
+	unsigned int leg_over_count;
+	unsigned long next_leg_check;
+	bool slave_check_pending, slave_trouble;
 	unsigned int low_ibus_count;
 	u64 irq_arrived_ns;	/* hard IRQ timestamp; IRQF_ONESHOT */
 	bool irq_pending;
@@ -2375,6 +2378,9 @@ static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
 	sc->serial_ucp_armed = false;
 	sc->low_ibus_count = 0;
 	sc->load_seen = false;
+	sc->slave_check_pending = sc->slave_trouble = false;
+	sc->leg_over_count = 0;
+	sc->next_leg_check = jiffies;
 	sc->hw_profile_set = false;
 	sc->vooc_vbus_status = SC_VBUS_LOW;
 }
@@ -2638,6 +2644,23 @@ static int sc8547_serial_arm_ucp(struct sc8547a_device *sc)
 #define SC8547_REQUEST_MARGIN_MA	400
 #define SC8547_OVER_REQUEST_SAMPLES	10
 
+/* AP VOOC PHY IBUS_CHECK: three 100 ms samples over the board's
+ * 4500 mA per-leg limit reduce current_max to code 30. IRQs keep this
+ * running during gauge transactions. Neither ADC replaces REG0F OCP.
+ */
+static void sc8547_check_leg_current(struct sc8547a_device *sc, int master, int slave)
+{
+	if (master < 0 || slave < 0 || time_before(jiffies, sc->next_leg_check))
+		return;
+	sc->next_leg_check = jiffies + msecs_to_jiffies(100);
+	if (master <= 4500 && slave <= 4500) {
+		sc->leg_over_count = 0;
+		return;
+	}
+	if (++sc->leg_over_count == 3)
+		sc->fastchg_curr_code = min_t(u8, sc->fastchg_curr_code, 30);
+}
+
 static bool sc8547_current_in_range(struct sc8547a_device *sc, int ibat_ma)
 {
 	int bus_ma = ibat_ma / 2;
@@ -2762,8 +2785,9 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc8547_auto_finish(sc, "hw-ovp-ocp");
 			goto reschedule;
 		}
-		if (cpbat >= SC8547_CP_OVP_CEILING_MV || cibus >= 4500 ||
-		    slave_ma >= 4500 || cibus_total >= SC8547_IBUS_ABORT_MA || (!gret && ibat > 13600))
+		if (sc->cp_enabled)
+			sc8547_check_leg_current(sc, cibus, slave_ma);
+		if (cpbat >= SC8547_CP_OVP_CEILING_MV || cibus_total >= SC8547_IBUS_ABORT_MA || (!gret && ibat > 13600))
 			sc->adc_over_count++;
 		else
 			sc->adc_over_count = 0;
@@ -2864,27 +2888,41 @@ static void sc8547_attach_work(struct work_struct *work)
 		} else {
 			bool slave_on = sc->slave_enabled > 0;
 
+			u8 switching;
 
-			/*
-			 * Dual-CP load-sharing (the vendor's threshold engage). Once
-			 * the master's own half-bus climbs past the engage threshold
-			 * the adapter is holding Vbus high enough that the slave's 2:1
-			 * error window is valid, so latch it in and let the two pumps
-			 * split the bus — this keeps a single pump off its OCP and
-			 * stops the adapter over-volting Vbus to force current through
-			 * one converter (the low-SoC code-73 collapse). Retried every
-			 * tick until CHG_EN sticks; dropped when total demand falls.
+			/* Stock checks EN, switching, minimum slave load and pair
+			 * deviation after 300 ms, for up to 60 more 50 ms slots.
+			 * Observe it without sleeping in the port lock.
 			 */
-			if (!sc->slave_enabled && sc->vooc_vbus_status == SC_VBUS_NORMAL &&
+			if (sc->slave_check_pending && time_after_eq(jiffies,
+			    sc->slave_on_since + msecs_to_jiffies(300))) {
+				if (slave_on && slave_ma >= 500 && abs(cibus - slave_ma) <= 1000 &&
+				    !sc8547_read_byte(sc8547_slave_dev, SC8547_REG_06, &switching) &&
+				    (switching & BIT(2)))
+					sc->slave_check_pending = false;
+				else if (time_after_eq(jiffies,
+					 sc->slave_on_since + msecs_to_jiffies(300 + 60 * 50)))
+					sc->slave_trouble = true;
+			}
+			if (!slave_on && !sc->slave_check_pending && !sc->slave_trouble &&
+			    sc->vooc_vbus_status == SC_VBUS_NORMAL &&
 			    cibus > SC8547_SLAVE_ENGAGE_IBUS_MA) {
-				if (sc8547_slave_cp_enable(sc, true) || sc8547_slave_enabled() <= 0) {
-					/* AP PHY CURRENT_TROUBLE_LIMIT for failed slave pickup. */
-					sc->fastchg_curr_code = min_t(u8, sc->fastchg_curr_code, 30);
+				if (sc8547_slave_cp_enable(sc, true)) {
+					sc->slave_trouble = true;
 				} else {
+					sc->slave_check_pending = true;
 					sc->slave_on_since = jiffies;
 					sc->slave_low_cnt = 0;
 					dev_info_ratelimited(sc->dev, "dual-CP: requested slave under %d mA master load\n",
 							     cibus);
+				}
+			}
+			if (sc->slave_trouble) {
+				sc->fastchg_curr_code = min_t(u8, sc->fastchg_curr_code, 30);
+				sc->slave_check_pending = false;
+				if (slave_on && sc8547_slave_cp_enable(sc, false)) {
+					sc8547_auto_reservo(sc, "slave-stop-io");
+					goto reschedule;
 				}
 			} else if (slave_on && slave_settle_ms &&
 				   jiffies - sc->slave_on_since <
@@ -3267,6 +3305,9 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 		}
 		sc->frame_seen = true;
 		sc->last_frame_ns = arrived_ns;
+		/* Apply the stock 100 ms per-leg check after replying. */
+		if (sc->cp_enabled && time_after_eq(jiffies, sc->next_leg_check))
+			sc8547_check_leg_current(sc, sc8547_get_ibus(sc), sc8547_slave_ibus());
 		if (sc->gauge_reading && sc->cp_enabled &&
 		    time_after_eq(jiffies, sc->watchdog_fed_at + msecs_to_jiffies(SC8547_ATTACH_POLL_MS))) {
 			int master, slave;
