@@ -1226,8 +1226,8 @@ static int qcom_battmgr_charge_enable(struct qcom_battmgr *battmgr, bool enable)
 /*
  * Stop charging once the state of charge reaches the end threshold and
  * resume once it has fallen to the start threshold.  Nothing is sent while
- * no end threshold below 100 % is set, so charging is then left entirely
- * to the firmware.
+ * no end threshold below 100 % is set. Erhai still runs its independent
+ * AP buck full/recharge controller.
  */
 static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 {
@@ -1626,8 +1626,12 @@ static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 	int ret, err, fcc_err = 0;
 
 	if (battmgr->pd_restore_fcc) {
-		ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
-						BATT_CHG_CTRL_LIM, battmgr->pd_saved_fcc_ua);
+		/* FFC now owns FCC and saved the ordinary vote for its exit. */
+		if (battmgr->buck.phase == ERHAI_FFC_FAST && battmgr->buck_saved_fcc_valid)
+			ret = 0;
+		else
+			ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+							BATT_CHG_CTRL_LIM, battmgr->pd_saved_fcc_ua);
 		fcc_err = ret;
 		if (!ret)
 			battmgr->pd_restore_fcc = false;
@@ -2041,7 +2045,8 @@ static unsigned int qcom_battmgr_buck_tick(struct qcom_battmgr *b)
 	if (!b->buck_online || READ_ONCE(b->otg_request))
 		return 0;
 	qcom_battmgr_tail_owned(b); /* A pump may have just published completion. */
-	if (b->serial_probe || qcom_battmgr_pps_running(b))
+	if (b->serial_probe || qcom_battmgr_pps_running(b) ||
+	    (b->pps_ops && b->pps_ops->ufcs_active(b->pps_data)))
 		return 0;
 	if (b->buck.phase == ERHAI_BUCK_OFF)
 		erhai_buck_start(&b->buck, jiffies);
@@ -2404,7 +2409,8 @@ read_source:
 	/* The Type-C partner's PD capabilities are stronger evidence than
 	 * an incomplete BC1.2 classification. PPS also checks its APDO.
 	 */
-	prefer_pps = !status.connector_blocked && !tail &&
+	prefer_pps = !status.connector_blocked && !tail && !battmgr->buck.disable &&
+		     battmgr->buck.phase != ERHAI_BUCK_FULL &&
 		     !test_bit(PD_EVENT_TAIL, &battmgr->pd_events) && !READ_ONCE(battmgr->pps_suspended) &&
 		     battmgr->pps_ops && battmgr->pps_ops->enabled() &&
 		     src.sink && !READ_ONCE(battmgr->otg_request);
