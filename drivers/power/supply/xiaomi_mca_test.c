@@ -2592,6 +2592,7 @@ static void xiaomi_mca_test_connector_stop(struct kunit *test)
 	mca->piano_otg = true;
 	mca->connector.tripped = true;
 	mca->otg_requested = true;
+	mca->voltage_written = false;
 	f->vbus = 5000000;
 	xiaomi_mca_connector_stop(mca);
 	KUNIT_EXPECT_FALSE(test, f->stage_on);
@@ -2600,7 +2601,13 @@ static void xiaomi_mca_test_connector_stop(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_PEN_BOOST_ENABLE);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->last_data), 0);
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_enable(mca, true), -EBUSY);
+	/* A pending high-voltage request must be cancelled even at 5 V. */
 	mca->otg_requested = false;
+	mca->voltage_written = true;
+	xiaomi_mca_connector_stop(mca);
+	KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_VDM_VSAFE0V);
+	KUNIT_EXPECT_FALSE(test, mca->voltage_written);
+	KUNIT_EXPECT_EQ(test, f->voltage_requests, 0U);
 	mca->connector.tripped = false;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
 	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);

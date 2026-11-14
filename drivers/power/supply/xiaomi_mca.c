@@ -2964,33 +2964,47 @@ static bool xiaomi_mca_connector_trip(struct mca_connector *c, const int temp[2]
 
 static void xiaomi_mca_connector_stop(struct xiaomi_mca *mca)
 {
-	u32 vbus, dummy = 0, type = MCA_TYPE_UNKNOWN;
+	u32 vbus, dummy = 0, type;
 	int ret, i;
 
 	mca->charge_blocked = true;
-	ret = xiaomi_mca_charge_stop(mca);
+	ret = xiaomi_mca_cp_stop(mca, "connector overtemperature");
 	if (ret)
-		dev_warn_ratelimited(mca->dev, "connector charge stop failed: %d\n", ret);
+		dev_warn_ratelimited(mca->dev, "connector pump stop failed: %d\n", ret);
+	ret = xiaomi_mca_charge_enable(mca, false);
+	if (ret)
+		dev_warn_ratelimited(mca->dev, "connector buck stop failed: %d\n", ret);
 	/* Both OTG source selectors in the Piano configuration are zero. */
 	ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_ENABLE, 0);
 	if (ret)
 		dev_warn_ratelimited(mca->dev, "connector boost stop failed: %d\n", ret);
 
-	/* Piano connector_antiburn_ensure_vbus_sense5V: give the adapter
-	 * five 200 ms response intervals. An unresponsive adapter must not
-	 * prevent the board's independent hardware cutoff.
+	/* Ordinary contract teardown may wait six seconds. Use the stock
+	 * connector-specific rundown before operating the independent MOS.
 	 */
+	mca->hv = MCA_HV_OFF;
+	if (!mca->voltage_written &&
+	    !xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus) && vbus < 6000000)
+		return;
+	if (xiaomi_mca_read_type(mca, &type))
+		return;
 	for (i = 0; i < 5; i++) {
-		if (!xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus) && vbus < 6000000)
-			break;
-		if (!i)
-			xiaomi_mca_read_type(mca, &type);
 		if (xiaomi_mca_is_pd(type))
-			xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, MCA_PROP_VDM_VSAFE0V,
-						 &dummy, 0);
+			ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, MCA_PROP_VDM_VSAFE0V,
+						       &dummy, 0);
 		else if (xiaomi_mca_is_qc(type))
-			xiaomi_mca_write_u32(mca, MCA_PROP_QC_VOLT, 5000);
+			ret = xiaomi_mca_write_u32(mca, MCA_PROP_QC_VOLT, 5000);
+		else
+			break;
+		if (ret)
+			break;
 		msleep(200);
+		if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus))
+			break;
+		if (vbus < 6000000) {
+			mca->voltage_written = false;
+			break;
+		}
 	}
 }
 
@@ -3022,7 +3036,7 @@ static bool xiaomi_mca_connector_poll(struct xiaomi_mca *mca)
 	}
 	if (powered && max(temp[0], temp[1]) >= 60000)
 		board = xiaomi_mca_connector_board(mca);
-	hot = xiaomi_mca_connector_trip(c, temp, ktime_get(), powered, board);
+	hot = xiaomi_mca_connector_trip(c, temp, ktime_get_boottime(), powered, board);
 	if (hot) {
 		c->tripped = true;
 		xiaomi_mca_connector_stop(mca);
