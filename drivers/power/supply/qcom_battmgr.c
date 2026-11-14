@@ -1109,13 +1109,20 @@ static bool qcom_battmgr_charge_limited(struct qcom_battmgr *battmgr)
 	return end && end < CHARGE_CTRL_END_THR_MAX;
 }
 
-/* Stock wired wakelock, restricted to charging with software SOC protection. */
+/* The ADSP USB_ADAP_TYPE identifies the two computer-port exceptions.
+ * Unknown is a wired source while APSD or the serial PHY is identifying it.
+ */
+static bool erhai_should_stay_awake(bool online, bool otg, u32 type)
+{
+	return online && !otg && type != POWER_SUPPLY_USB_TYPE_SDP &&
+	       type != POWER_SUPPLY_USB_TYPE_CDP;
+}
+
 static void qcom_battmgr_charge_wake_locked(struct qcom_battmgr *battmgr, bool awake)
 {
 	lockdep_assert_held(&battmgr->notify_lock);
 	awake = awake && (battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE) &&
-		qcom_battmgr_charge_limited(battmgr) &&
-		battmgr->service_up && !battmgr->removing;
+		battmgr->charge_ws && battmgr->service_up && !battmgr->removing;
 	if (battmgr->charge_awake == awake)
 		return;
 	battmgr->charge_awake = awake;
@@ -1123,23 +1130,8 @@ static void qcom_battmgr_charge_wake_locked(struct qcom_battmgr *battmgr, bool a
 		__pm_stay_awake(battmgr->charge_ws);
 	else
 		__pm_relax(battmgr->charge_ws);
-}
-
-static void qcom_battmgr_charge_wake_poll(struct qcom_battmgr *battmgr, bool allowed)
-{
-	u32 online, health;
-
-	allowed = allowed && qcom_battmgr_charge_limited(battmgr) &&
-		!READ_ONCE(battmgr->otg_request);
-	/* Never retain a wake lock from cached online or health telemetry. */
-	if (allowed)
-		allowed = !qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-						    USB_ONLINE, &online) && online == 1 &&
-			  !qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
-						    BATT_HEALTH, &health) &&
-			  health == POWER_SUPPLY_HEALTH_GOOD;
-	scoped_guard(spinlock_irqsave, &battmgr->notify_lock)
-		qcom_battmgr_charge_wake_locked(battmgr, allowed);
+	if (battmgr->usb_psy)
+		power_supply_changed(battmgr->usb_psy);
 }
 
 static void qcom_battmgr_charge_wake_remove(void *data)
@@ -1186,15 +1178,12 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 			battmgr->charge_inhibited = false;
 			dev_info(battmgr->dev, "charge limit removed, charging resumed\n");
 		}
-		qcom_battmgr_charge_wake_poll(battmgr, false);
 		return;
 	}
 
 	ret = qcom_battmgr_bat_sm8350_update(battmgr, POWER_SUPPLY_PROP_CAPACITY);
-	if (ret) {
-		qcom_battmgr_charge_wake_poll(battmgr, false);
+	if (ret)
 		return;
-	}
 
 	soc = battmgr->status.percent;
 	if (soc >= end)
@@ -1219,9 +1208,6 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 		dev_info(battmgr->dev, "charging resumed at %u%% (start threshold %u%%)\n",
 			 soc, start);
 	}
-
-	/* Keep checking until a stop request succeeds; never sleep past the limit. */
-	qcom_battmgr_charge_wake_poll(battmgr, !battmgr->charge_inhibited);
 }
 
 /* Caller owns @lock until it has consumed the PDO array. */
@@ -1295,7 +1281,11 @@ static void qcom_battmgr_partner_removed(struct device *dev)
 		return;
 	guard(mutex)(&erhai_bridge_lock);
 	b = erhai_battmgr;
-	if (b && port->parent->parent == b->dev->parent && !READ_ONCE(b->removing)) {
+	if (b && port->parent->parent == b->dev->parent) {
+		guard(spinlock_irqsave)(&b->notify_lock);
+		if (b->removing)
+			return;
+		qcom_battmgr_charge_wake_locked(b, false);
 		set_bit(PD_EVENT_DETACH, &b->pd_events);
 		mod_delayed_work(system_freezable_wq, &b->charge_work, 0);
 	}
@@ -1732,8 +1722,8 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
 	struct erhai_probe_status status = {};
 	bool stable, ufcs_active, tail, probe_idle, prefer_pps, dedicated, can_probe;
-	bool qc, try_qc, caps_changed, current_changed = false;
-	u32 online, type, health, vbat, vbus, ua, real_type;
+	bool detached, qc, try_qc, caps_changed, current_changed = false;
+	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus, ua, real_type;
 	int ret;
 
 	if (test_and_clear_bit(PD_EVENT_SERVICE_RESET, &battmgr->pd_events))
@@ -1747,12 +1737,28 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 
+	/* Consume the detach before the property transaction. A removal
+	 * during it invalidates both values and is consumed on the next pass.
+	 */
+read_source:
+	detached = test_and_clear_bit(PD_EVENT_DETACH, &battmgr->pd_events);
 	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 				      USB_ONLINE, &online)) {
+		if (detached)
+			set_bit(PD_EVENT_DETACH, &battmgr->pd_events);
 		qcom_battmgr_pps_stop(battmgr, false);
 		return PD_POLL_MS;
 	}
-	if (test_and_clear_bit(PD_EVENT_DETACH, &battmgr->pd_events) || !online) {
+	if (online && qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
+					       USB_ADAP_TYPE, &type))
+		type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
+	scoped_guard(spinlock_irqsave, &battmgr->notify_lock) {
+		if (test_bit(PD_EVENT_DETACH, &battmgr->pd_events))
+			goto read_source;
+		qcom_battmgr_charge_wake_locked(battmgr,
+			erhai_should_stay_awake(online == 1, battmgr->otg_request, type));
+	}
+	if (detached || !online) {
 		ret = qcom_battmgr_pps_stop(battmgr, false);
 		if (battmgr->pps_ops)
 			battmgr->pps_ops->detached(battmgr->pps_data);
@@ -1791,10 +1797,6 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 		if (!online)
 			return 0;
 	}
-
-	if (qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
-				      USB_ADAP_TYPE, &type))
-		type = POWER_SUPPLY_USB_TYPE_UNKNOWN;
 
 	power_supply_for_each_psy(&src, qcom_battmgr_pd_source_match);
 	real_type = type;
@@ -2251,6 +2253,10 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 		return;
 
 	mutex_lock(&battmgr->charge_lock);
+	if (READ_ONCE(battmgr->pps_suspended)) {
+		mutex_unlock(&battmgr->charge_lock);
+		return;
+	}
 	if (!battmgr->service_up) {
 		qcom_battmgr_pps_stop(battmgr, false);
 		mutex_unlock(&battmgr->charge_lock);
@@ -2311,6 +2317,30 @@ static int qcom_battmgr_psy_notify(struct notifier_block *nb,
 	return NOTIFY_OK;
 }
 
+/* A menu suspend can bypass wakeup_count. Flush the existing charge
+ * work before admitting sleep so a new attachment gets its ordinary PD
+ * sample. A live charger can veto without delaying its pump watchdog.
+ */
+static bool qcom_battmgr_prepare_sleep(struct qcom_battmgr *b)
+{
+	scoped_guard(spinlock_irqsave, &b->notify_lock) {
+		if (b->charge_awake && !test_bit(PD_EVENT_DETACH, &b->pd_events))
+			return false;
+	}
+
+	flush_delayed_work(&b->charge_work);
+	/* A second worker may already have consumed DETACH and still be in
+	 * USB_ONLINE. Wait for that sample to commit before testing the lock.
+	 */
+	guard(mutex)(&b->charge_lock);
+	guard(spinlock_irqsave)(&b->notify_lock);
+	if (b->charge_awake ||
+	    (b->service_up && !b->removing && test_bit(PD_EVENT_DETACH, &b->pd_events)))
+		return false;
+	WRITE_ONCE(b->pps_suspended, true);
+	return true;
+}
+
 /*
  * A PPS contract is not monitored while the system is suspended, so end it
  * before freezing the worker and hand over to autonomous fixed PD. The work
@@ -2325,18 +2355,9 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 	switch (action) {
 	case PM_HIBERNATION_PREPARE:
 	case PM_SUSPEND_PREPARE:
-		WRITE_ONCE(battmgr->pps_suspended, true);
-		cancel_delayed_work_sync(&battmgr->charge_work);
-		mutex_lock(&battmgr->charge_lock);
-		/* A direct suspend request can bypass the wakeup_count protocol. */
-		if (qcom_battmgr_charge_limited(battmgr))
-			qcom_battmgr_charge_limit_update(battmgr);
-		if (READ_ONCE(battmgr->charge_awake)) {
-			mutex_unlock(&battmgr->charge_lock);
-			WRITE_ONCE(battmgr->pps_suspended, false);
-			qcom_battmgr_charge_kick(battmgr);
+		if (!qcom_battmgr_prepare_sleep(battmgr))
 			return NOTIFY_BAD;
-		}
+		mutex_lock(&battmgr->charge_lock);
 		if (battmgr->pps_ops)
 			battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
 		battmgr->suspend_route = status.delivering;
@@ -2352,6 +2373,8 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 	case PM_POST_HIBERNATION:
 	case PM_POST_RESTORE:
 	case PM_POST_SUSPEND:
+		if (!READ_ONCE(battmgr->pps_suspended))
+			break;
 		scoped_guard(mutex, &battmgr->charge_lock) {
 			qcom_battmgr_restore_route(battmgr, battmgr->suspend_route);
 			battmgr->suspend_route = 0;
@@ -2409,10 +2432,6 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 		return -EINVAL;
 	}
 
-	if (!qcom_battmgr_charge_limited(battmgr)) {
-		scoped_guard(spinlock_irqsave, &battmgr->notify_lock)
-			qcom_battmgr_charge_wake_locked(battmgr, false);
-	}
 	qcom_battmgr_charge_kick(battmgr);
 
 	return ret;
@@ -2861,6 +2880,8 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OTG_VBUS) {
 			WRITE_ONCE(battmgr->otg_request,
 				   notification == NOTIF_OPLUS_OTG_ENABLE);
+			if (battmgr->otg_request)
+				qcom_battmgr_charge_wake_locked(battmgr, false);
 			queue_work(system_freezable_wq, &battmgr->otg_work);
 			qcom_battmgr_usb_event(battmgr);
 			break;
