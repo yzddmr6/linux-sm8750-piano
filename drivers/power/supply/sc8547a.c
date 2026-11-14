@@ -2344,7 +2344,7 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 	const struct erhai_charge_curve *curve;
 	const struct erhai_charge_step *step;
 	const struct erhai_charge_curve *raw, *thermal;
-	unsigned int limit;
+	unsigned int limit, previous_code = sc->fastchg_curr_code;
 	bool new_table;
 
 	raw = erhai_curve_select(svooc_curves, soc, temp);
@@ -2409,6 +2409,11 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 	if (sc->first_request && !entering)
 		limit = min_t(unsigned int, limit, sc->first_request);
 	sc->fastchg_curr_code = limit;
+	if (!entering && previous_code != limit)
+		dev_info(sc->dev, "SVOOC current %u -> %u: temp=%d range=%d entry=%d curve=%u thermal=%u first=%u row=%u\n",
+			 previous_code, limit, temp, sc->curve_temp, sc->curve_entry_temp,
+			 sc->curve_ma / 100, sc->thermal_ma / 100, sc->first_request,
+			 sc->auto_curve_idx);
 	return true;
 }
 
