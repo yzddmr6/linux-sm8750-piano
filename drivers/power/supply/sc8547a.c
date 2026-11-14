@@ -2594,37 +2594,35 @@ static int sc8547_serial_arm_ucp(struct sc8547a_device *sc)
 	return ret;
 }
 
-/* AP PHY current_pwd = expected code * 100 + 300 mA. Compare the
- * physical load with the more restrictive of the latest cell/leg target
- * and confirmed request, even while renegotiating. The vendor prompts
- * midway through ten bad samples. A missing ASK by itself is harmless.
+/* 24924 copycat_vooc_support, non-bidirectional CP: compare gauge
+ * charge current / 2 against the transmitted ASK_CURRENT value. See
+ * oplus_ap_voocphy.c:3392-3396, 5782-5806 and VOOC_CURR_EVENT_TIME.
  */
-#define SC8547_REQUEST_MARGIN_MA	300
+#define SC8547_REQUEST_MARGIN_MA	400
 #define SC8547_OVER_REQUEST_SAMPLES	10
 
-static bool sc8547_current_in_range(struct sc8547a_device *sc, int total_ma)
+static bool sc8547_current_in_range(struct sc8547a_device *sc, int ibat_ma)
 {
-	u8 limit = sc->fastchg_curr_code;
+	int bus_ma = ibat_ma / 2;
 
-	/* A gauge read can overlap threaded-IRQ sampling. Count at most
-	 * once per hardware monitor period in either context.
-	 */
 	if (time_before(jiffies, sc->next_current_sample))
 		return true;
-	sc->next_current_sample = jiffies + msecs_to_jiffies(SC8547_ATTACH_POLL_MS);
-	if (sc->serial_request)
-		limit = min(limit, sc->serial_request);
-	if (!sc->cp_enabled || !limit || total_ma <= limit * 100 + SC8547_REQUEST_MARGIN_MA) {
+	sc->next_current_sample = jiffies + msecs_to_jiffies(1000);
+	if (!sc->cp_enabled || !sc->serial_request || bus_ma <= 1500 ||
+	    bus_ma <= sc->serial_request * 100 + SC8547_REQUEST_MARGIN_MA) {
 		sc->above_request_count = 0;
 		return true;
 	}
-	if (++sc->above_request_count == SC8547_OVER_REQUEST_SAMPLES / 2) {
+	/* Vendor count starts at ten, prompts at three remaining, reloads
+	 * ten and exits on the following excessive sample with zero left.
+	 */
+	if (++sc->above_request_count == SC8547_OVER_REQUEST_SAMPLES - 3) {
 		sc->retry_current = true;
 		sc->change_polls = sc->adjust_failures = 0;
-		dev_info(sc->dev, "SVOOC over request: target=%u confirmed=%u ibus=%d mA; asking again\n",
-			 sc->fastchg_curr_code, sc->serial_request, total_ma);
+		dev_info(sc->dev, "SVOOC over confirmed code %u: pack %d mA; asking again\n",
+			 sc->serial_request, ibat_ma);
 	}
-	return sc->above_request_count < SC8547_OVER_REQUEST_SAMPLES;
+	return sc->above_request_count < 2 * SC8547_OVER_REQUEST_SAMPLES - 2;
 }
 
 /* A late frame can arrive between monitor polls. It belongs to a broken
@@ -2774,7 +2772,7 @@ static void sc8547_attach_work(struct work_struct *work)
 					     (4000 + share_ma) / 100);
 		if (sc->adc_over_count)
 			sc->fastchg_curr_code = max_t(int, SC8547_CURR_CODE_MIN, sc->fastchg_curr_code - 1);
-		if (!sc8547_current_in_range(sc, cibus_total)) {
+		if (!sc8547_current_in_range(sc, ibat)) {
 			sc8547_auto_reservo(sc, "above-request");
 			goto reschedule;
 		}
@@ -3060,6 +3058,8 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 		}
 	} else if (sc->request_pending &&
 		   (sc->vooc_flag & (VOOC_TXDATA_DONE_FLAG | VOOC_RXDATA_DONE_FLAG))) {
+		if (sc->serial_request != sc->pending_request)
+			sc->above_request_count = 0;
 		sc->serial_request = sc->pending_request;
 		sc->request_pending = sc->retry_current = false;
 		sc->measure_missed_slot = false;
@@ -3118,8 +3118,7 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 			sc->slave_ibus_ma = slave;
 			if (sc->measure_missed_slot)
 				sc->missed_peak_ibus_ma = max(sc->missed_peak_ibus_ma, master + slave);
-			if (!sc8547_current_in_range(sc, master + slave))
-				sc8547_auto_reservo(sc, "above-request");
+			/* This IRQ has no fresh gauge sample for the 1 s contract check. */
 		}
 	}
 	dev_dbg(sc->dev, "VOOC mesg=0x%02x ask=0x%02x tx=%02x%02x\n",
