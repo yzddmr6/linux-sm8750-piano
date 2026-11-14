@@ -2343,8 +2343,8 @@ static bool sc8547_new_temperature_session(int old, int next, int soc)
 	       (old < 210 && next >= 210);
 }
 
-/* Re-index on a change of bin. Within a bin use the AP VOOC PHY's
- * four consecutive voltage/current samples to descend the curve.
+/* Select the SOC/temperature table once per handshake. The AP VOOC
+ * PHY descends its voltage rows after four 500 ms observations.
  */
 static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int temp,
 				     int mv, int ibus, bool entering)
@@ -2451,10 +2451,12 @@ static void sc8547_serial_end(struct sc8547a_device *sc, const char *why)
 {
 	sc->serial_last_exit = why;
 	sc->serial_exits++;
-	dev_info(sc->dev, "SVOOC end: %s, code=%u ibus=%d/%d mA en=%d/%d vbus=%d mV retries=%u last_rx=%02x flags=%02x\n",
+	dev_info(sc->dev, "SVOOC end: %s, code=%u ibus=%d/%d mA en=%d/%d vbus=%d mV retries=%u last_rx=%02x flags=%02x cell=%d cp=%d ibat=%d entry_soc=%d row=%u lcf_region=%d\n",
 		 why, sc->serial_request, sc->master_ibus_ma, sc->slave_ibus_ma,
 		 sc->master_enabled, sc->slave_enabled, sc->serial_vbus_mv,
-		 sc->rehandshakes, sc->voocphy_rx_buff, sc->vooc_flag);
+		 sc->rehandshakes, sc->voocphy_rx_buff, sc->vooc_flag,
+		 sc->cell_vbat_mv, sc->curve_vbat_mv, sc->serial_ibat_ma,
+		 sc->curve_entry_soc, sc->auto_curve_idx, sc->lcf.region);
 	sc->serial_request = 0;
 	sc->request_pending = sc->measure_missed_slot = false;
 	sc->master_ibus_ma = sc->slave_ibus_ma = -1;
@@ -2891,6 +2893,7 @@ static void sc8547_attach_work(struct work_struct *work)
 		sc->serial_vbus_mv = vbus > 0 ? vbus : -1;
 		sc->serial_ibat_ma = gret ? 0 : ibat;
 		sc->cell_vbat_mv = gret ? -1 : gvbat;
+		sc->curve_vbat_mv = cpbat;
 		sc->serial_reg06 = sc8547_read_byte(sc, SC8547_REG_06, &r6) ? -1 : r6;
 		sc->slave_enabled = sc8547_slave_enabled();
 		sc->master_enabled = sc8547_read_byte(sc, SC8547_REG_07, &r7) ?
