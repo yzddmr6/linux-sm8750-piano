@@ -613,8 +613,9 @@ struct xiaomi_mca_cells {
 
 struct mca_connector {
 	struct gpio_desc *cutoff;
-	struct iio_channel *ntc[2];
-	int temp[2];	/* mC, INT_MIN when unavailable */
+	struct iio_channel *ntc[6];
+	int temp[2];	/* last good mC, INT_MIN until first valid sample */
+	bool valid[2];
 	ktime_t sampled;
 	bool tripped;
 };
@@ -2908,32 +2909,62 @@ static int xiaomi_mca_charge_stop(struct xiaomi_mca *mca)
 	return 0;
 }
 
-/* Piano connector_antiburn: the hotter contact selects its own slope.
- * Userspace supplies VIRTUAL-SENSOR0 in stock. Without that estimate
- * do not waive the 60 C trip on the assumption that the board is hot.
+/* Stock thermal-normal.conf and thermal-chg-only.conf VIRTUAL-SENSOR.
+ * Only needed at the 60 C contact/50 C board cross-check.
  */
-static bool xiaomi_mca_connector_trip(struct mca_connector *c, const int temp[2],
-				      ktime_t now, bool powered)
+static int xiaomi_mca_connector_board(struct xiaomi_mca *mca)
 {
-	int i = temp[0] >= temp[1] ? 0 : 1;
+	static const int weight[] = { 131, -9, 89, 232 };
+	union power_supply_propval cell[2];
+	s64 sum;
+	int i, val, cold;
+
+	for (i = 0; i < ARRAY_SIZE(cell); i++)
+		if (!mca->batteries[i] || power_supply_get_property(mca->batteries[i],
+					POWER_SUPPLY_PROP_TEMP, &cell[i]))
+			return INT_MIN;
+	cold = min(cell[0].intval, cell[1].intval);
+	val = cold <= 150 || cold > 1000 ? cold : max(cell[0].intval, cell[1].intval);
+	sum = (s64)500 * val * 100;
+	for (i = 0; i < ARRAY_SIZE(weight); i++) {
+		if (!IS_REACHABLE(CONFIG_IIO) ||
+		    iio_read_channel_processed(mca->connector.ntc[i + 2], &val) < 0)
+			return INT_MIN;
+		sum += (s64)weight[i] * val;
+	}
+	return div_s64(sum, 1000) + 1600;
+}
+
+/* Piano connector_antiburn: the hotter contact selects its own slope. */
+static bool xiaomi_mca_connector_trip(struct mca_connector *c, const int temp[2],
+				      ktime_t now, bool powered, int board)
+{
 	s64 elapsed = ktime_ms_delta(now, c->sampled);
-	bool slope = c->sampled && elapsed > 0 && c->temp[i] != INT_MIN &&
-		     temp[i] != INT_MIN && (s64)temp[i] - c->temp[i] >= 4 * elapsed;
+	bool continuous = temp[0] != INT_MIN && temp[1] != INT_MIN &&
+			  c->valid[0] && c->valid[1] && elapsed > 0;
+	bool rising[2];
+	int i, hot;
 
-	bool can_recover = c->sampled && c->temp[0] != INT_MIN && c->temp[1] != INT_MIN &&
-			   temp[0] != INT_MIN && temp[1] != INT_MIN && elapsed > 0;
-
+	for (i = 0; i < 2; i++) {
+		rising[i] = c->sampled && elapsed > 0 && c->valid[i] &&
+			    temp[i] != INT_MIN && (s64)temp[i] - c->temp[i] >= 4 * elapsed;
+		c->valid[i] = temp[i] != INT_MIN;
+		if (c->valid[i])
+			c->temp[i] = temp[i];
+	}
 	c->sampled = now;
-	memcpy(c->temp, temp, sizeof(c->temp));
+	hot = c->temp[0] >= c->temp[1] ? 0 : 1;
 	if (c->tripped)
-		return !can_recover || temp[i] >= 55000 || slope;
-	return powered && (temp[i] >= 60000 || (temp[i] >= 35000 && slope));
+		return !continuous || c->temp[hot] >= 55000 || rising[hot];
+	return powered && (c->temp[hot] >= 65000 ||
+			   (c->temp[hot] >= 60000 && (board == INT_MIN || board / 1000 <= 50)) ||
+			   (c->temp[hot] >= 35000 && rising[hot]));
 }
 
 static bool xiaomi_mca_connector_poll(struct xiaomi_mca *mca)
 {
 	struct mca_connector *c = &mca->connector;
-	int temp[2], ret, i;
+	int temp[2], ret, i, board = INT_MIN;
 	bool hot, powered;
 	u32 online;
 	u8 otg = 0, cid = 0;
@@ -2947,7 +2978,7 @@ static bool xiaomi_mca_connector_poll(struct xiaomi_mca *mca)
 	}
 	/* On a cold connector no source query is needed for protection. */
 	powered = false;
-	if (max(temp[0], temp[1]) >= 35000 || c->tripped) {
+	if (max(max(temp[0], temp[1]), max(c->temp[0], c->temp[1])) >= 35000 || c->tripped) {
 		ret = xiaomi_mca_read_blob(mca, MCA_PROP_OTG_PLUGIN, &otg, sizeof(otg));
 		/* Unknown role must not mask a hot port. */
 		powered = ret || otg || READ_ONCE(mca->otg_requested);
@@ -2956,19 +2987,32 @@ static bool xiaomi_mca_connector_poll(struct xiaomi_mca *mca)
 		if (!powered)
 			powered = xiaomi_mca_read_blob(mca, MCA_PROP_CID_STATUS, &cid, sizeof(cid)) || cid;
 	}
-	hot = xiaomi_mca_connector_trip(c, temp, ktime_get(), powered);
+	if (powered && max(temp[0], temp[1]) >= 60000)
+		board = xiaomi_mca_connector_board(mca);
+	hot = xiaomi_mca_connector_trip(c, temp, ktime_get(), powered, board);
 	if (hot) {
+		u32 type, vbus, dummy = 0;
+
 		c->tripped = true;
 		mca->charge_blocked = true;
 		ret = xiaomi_mca_charge_stop(mca);
 		if (ret)
 			dev_warn_ratelimited(mca->dev, "connector charge stop failed: %d\n", ret);
-		/* Stock OTG/en_src are both zero. Disabling the wired boost is
-		 * idempotent, including when its plugin status failed to read.
-		 */
+		/* Stock OTG/en_src are both zero on Piano. */
 		ret = xiaomi_mca_write_u32(mca, MCA_PROP_PEN_BOOST_ENABLE, 0);
 		if (ret)
 			dev_warn_ratelimited(mca->dev, "connector boost stop failed: %d\n", ret);
+		/* Stock sends a zero-length VSAFE0V VDM and checks VBUS before
+		 * operating the MOS on a high voltage supply. Keep the software
+		 * stop in force if the adapter has not yet reduced its output.
+		 */
+		if (xiaomi_mca_read(mca, MCA_PROP_USB_VOLTAGE_NOW, &vbus) || vbus >= 6000000) {
+			if (!xiaomi_mca_read_type(mca, &type) && xiaomi_mca_is_pd(type))
+				xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, 0x2100b, &dummy, 0);
+			else if (xiaomi_mca_is_qc(mca->real_type))
+				xiaomi_mca_write_u32(mca, MCA_PROP_QC_VOLT, 5000);
+			return true;
+		}
 	}
 	if (hot || c->tripped) {
 		ret = gpiod_set_value_cansleep(c->cutoff, hot);
@@ -4837,7 +4881,7 @@ static ssize_t charge_profile_show(struct device *dev,
 
 	guard(mutex)(&mca->lock);
 	for (i = 0; i < ARRAY_SIZE(t); i++) {
-		if (!mca->connector.cutoff || mca->connector.temp[i] == INT_MIN)
+		if (!mca->connector.valid[i])
 			strscpy(t[i], "unavailable", sizeof(t[i]));
 		else
 			snprintf(t[i], sizeof(t[i]), "%d", mca->connector.temp[i]);
@@ -5395,15 +5439,15 @@ static int xiaomi_mca_connector_init(struct xiaomi_mca *mca)
 {
 	struct device *dev = mca->dev;
 	struct mca_connector *c = &mca->connector;
-	static const char * const names[] = { "connector", "connector2" };
+	static const char * const names[] = { "connector", "connector2", "quiet", "charger", "wifi", "cpu" };
 	int i;
 
 	if (!device_property_present(dev, "xiaomi,connector-cutoff-gpios"))
-		return 0;
+		return mca->piano_otg ? -ENODEV : 0;
 	if (!IS_REACHABLE(CONFIG_IIO))
 		return -ENODEV;
+	c->temp[0] = c->temp[1] = INT_MIN;
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
-		c->temp[i] = INT_MIN;
 		c->ntc[i] = devm_iio_channel_get(dev, names[i]);
 		if (IS_ERR(c->ntc[i]))
 			return PTR_ERR(c->ntc[i]);
@@ -5414,7 +5458,11 @@ static int xiaomi_mca_connector_init(struct xiaomi_mca *mca)
 	/* Preserve an asserted cutoff across a driver reload. Only a valid
 	 * cool sample may reopen the port. Stock probe uses raw low normally.
 	 */
-	i = gpiod_get_value_cansleep(c->cutoff);
+	i = gpiod_get_direction(c->cutoff);
+	if (!i)
+		i = gpiod_get_value_cansleep(c->cutoff);
+	else if (i > 0)
+		i = 0;
 	if (i < 0 && i != -EINVAL)
 		return i;
 	/* pmic_gpio_get returns -EINVAL for a disabled pad. */
@@ -5435,12 +5483,12 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 		return -ENOMEM;
 
 	mca->dev = dev;
+	mca->piano_otg = of_device_is_compatible(dev->of_node, "xiaomi,piano-pmic-glink");
 	ret = xiaomi_mca_connector_init(mca);
 	if (ret)
 		return dev_err_probe(dev, ret, "connector protection unavailable\n");
 	mca->hv_retry = jiffies;
 	mca->charge_end = 100;
-	mca->piano_otg = of_device_is_compatible(dev->of_node, "xiaomi,piano-pmic-glink");
 	dev_set_drvdata(dev, mca);
 	init_completion(&mca->ack);
 	spin_lock_init(&mca->rx_lock);

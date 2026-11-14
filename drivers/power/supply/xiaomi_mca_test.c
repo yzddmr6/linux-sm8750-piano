@@ -2587,6 +2587,7 @@ static void xiaomi_mca_test_connector(struct kunit *test)
 	static const struct {
 		int prev[2], temp[2];
 		bool active, wired, otg, trip;
+		int board;
 	} cases[] = {
 		{ { 30000, 30000 }, { 65000, 30000 }, false, true, false, true },
 		{ { 30000, 60000 }, { 30000, 60000 }, false, false, true, true },
@@ -2596,6 +2597,9 @@ static void xiaomi_mca_test_connector(struct kunit *test)
 		{ { 42000, 30000 }, { 42000, 36000 }, false, true, false, false },
 		{ { 31000, 31000 }, { 34999, 32000 }, false, true, false, false },
 		{ { 30000, 30000 }, { 70000, 30000 }, false, false, false, false },
+		{ { 60000, 59000 }, { 60000, 59000 }, false, true, false, false, 51000 },
+		{ { 65000, 59000 }, { 65000, 59000 }, false, true, false, true, 51000 },
+		{ { 60000, 59000 }, { 60000, 59000 }, false, true, false, true, 50000 },
 		{ { 55000, 54500 }, { 55000, 54500 }, true, true, false, true },
 		{ { 55000, 54500 }, { 54999, 54500 }, true, true, false, false },
 		{ { 55000, 54500 }, { INT_MIN, 54000 }, true, false, false, true },
@@ -2610,8 +2614,10 @@ static void xiaomi_mca_test_connector(struct kunit *test)
 					   .tripped = cases[i].active };
 
 		memcpy(c.temp, cases[i].prev, sizeof(c.temp));
+		c.valid[0] = c.temp[0] != INT_MIN;
+		c.valid[1] = c.temp[1] != INT_MIN;
 		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_connector_trip(&c, cases[i].temp,
-				    ms_to_ktime(2000), cases[i].wired || cases[i].otg),
+				    ms_to_ktime(2000), cases[i].wired || cases[i].otg, cases[i].board),
 				    cases[i].trip, "case %d", i);
 	}
 }
