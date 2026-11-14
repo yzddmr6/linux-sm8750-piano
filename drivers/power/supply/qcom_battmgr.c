@@ -1331,8 +1331,13 @@ static int qcom_battmgr_serial_buck(struct qcom_battmgr *b, bool suspend)
 	return ret;
 }
 
-static int qcom_battmgr_serial_stop(struct qcom_battmgr *b)
+static int qcom_battmgr_serial_stop(struct qcom_battmgr *b, const char *reason)
 {
+	if (b->serial_probe)
+		dev_info(b->dev, "serial release: %s online=%d type=%u events=%lx hold=%d inhibited=%d error=%d buck=%u/%d\n",
+			 reason, b->buck_online, b->charge_detected_type, b->pd_events,
+			 b->charge_policy_hold, b->charge_inhibited, b->charge_error,
+			 b->buck.phase, b->buck.disable);
 	if (b->pps_ops) {
 		int ret = b->pps_ops->serial_session(false);
 
@@ -1352,9 +1357,10 @@ static int qcom_battmgr_serial_stop(struct qcom_battmgr *b)
 	return qcom_battmgr_serial_buck(b, false);
 }
 
-static int qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr, bool upgrading)
+static int qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr, bool upgrading,
+				  const char *reason)
 {
-	int ret = qcom_battmgr_serial_stop(battmgr);
+	int ret = qcom_battmgr_serial_stop(battmgr, reason);
 
 	if (ret || !battmgr->pps_ops)
 		return ret;
@@ -2156,7 +2162,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	}
 	if (test_and_clear_bit(PD_EVENT_RESET, &battmgr->pd_events)) {
 		qcom_battmgr_buck_invalidate(battmgr);
-		if (qcom_battmgr_pps_stop(battmgr, false) ||
+		if (qcom_battmgr_pps_stop(battmgr, false, "PD-reset") ||
 		    qcom_battmgr_pd_stop(battmgr, false, "PD reset"))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
@@ -2173,7 +2179,7 @@ read_source:
 				      USB_ONLINE, &online)) {
 		if (detached)
 			set_bit(PD_EVENT_DETACH, &battmgr->pd_events);
-		qcom_battmgr_pps_stop(battmgr, false);
+		qcom_battmgr_pps_stop(battmgr, false, "USB_ONLINE-read-failed");
 		return PD_POLL_MS;
 	}
 	if (online && qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
@@ -2212,7 +2218,7 @@ read_source:
 		bool keep_tail;
 
 		qcom_battmgr_buck_invalidate(battmgr);
-		ret = qcom_battmgr_pps_stop(battmgr, false);
+		ret = qcom_battmgr_pps_stop(battmgr, false, "detach-or-offline");
 		if (!online && battmgr->buck.phase != ERHAI_BUCK_OFF)
 			ret = qcom_battmgr_buck_pause(battmgr) ?: ret;
 		/* Check after requesting PHY stop: its last sample may have
@@ -2339,7 +2345,7 @@ read_source:
 		}
 	}
 	if (battmgr->retry_stopping) {
-		ret = qcom_battmgr_pps_stop(battmgr, true);
+		ret = qcom_battmgr_pps_stop(battmgr, true, "upward-retry");
 		ret = ret ?: qcom_battmgr_pd_stop(battmgr, false, "qualified protocol retry");
 		if (ret && time_before(jiffies, battmgr->retry_deadline))
 			return PD_POLL_MS;
@@ -2380,12 +2386,13 @@ read_source:
 				battmgr->aicl_done = false;
 				return PD_POLL_MS;
 			}
+			dev_info(battmgr->dev, "serial setup failed: %d\n", ret);
 			/* Keep the reservation until the entire retry ladder is done. */
 			battmgr->serial_backoff = true;
 			battmgr->serial_retry = qcom_battmgr_probe_retry(&battmgr->serial_failures);
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 		}
-		if (qcom_battmgr_serial_stop(battmgr))
+		if (qcom_battmgr_serial_stop(battmgr, "serial-ineligible"))
 			return PD_POLL_MS;
 		battmgr->serial_probe = false;
 	}
@@ -2410,7 +2417,7 @@ read_source:
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 	if (battmgr->pps_ops && battmgr->pps_ops->ufcs_active(battmgr->pps_data) &&
-	    qcom_battmgr_pps_stop(battmgr, false))
+	    qcom_battmgr_pps_stop(battmgr, false, "UFCS-exit"))
 		return PD_POLL_MS;
 	/* A failed 5 V readback or a disappearing PHY cancels this reservation. */
 	battmgr->retry_pending = 0;
@@ -2450,7 +2457,7 @@ read_source:
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 	if (qcom_battmgr_pps_running(battmgr)) {
-		if (qcom_battmgr_pps_stop(battmgr, false))
+		if (qcom_battmgr_pps_stop(battmgr, false, "PPS-exit"))
 			return PD_POLL_MS;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
@@ -2750,7 +2757,7 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 		return;
 	}
 	if (!battmgr->service_up) {
-		qcom_battmgr_pps_stop(battmgr, false);
+		qcom_battmgr_pps_stop(battmgr, false, "service-down");
 		mutex_unlock(&battmgr->charge_lock);
 		return;
 	}
@@ -2881,7 +2888,7 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 		if (battmgr->pps_ops)
 			battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
 		battmgr->suspend_route = status.delivering;
-		if (qcom_battmgr_pps_stop(battmgr, false)) {
+		if (qcom_battmgr_pps_stop(battmgr, false, "suspend")) {
 			mutex_unlock(&battmgr->charge_lock);
 			WRITE_ONCE(battmgr->pps_suspended, false);
 			qcom_battmgr_charge_kick(battmgr);
@@ -4004,7 +4011,7 @@ static void qcom_battmgr_otg_worker(struct work_struct *work)
 	if (!battmgr->service_up || on == battmgr->otg_vbus)
 		return;
 
-	if (on && (qcom_battmgr_pps_stop(battmgr, false) ||
+	if (on && (qcom_battmgr_pps_stop(battmgr, false, "OTG-enable") ||
 		   qcom_battmgr_pd_stop(battmgr, false, "USB source role")))
 		return;
 
@@ -4169,7 +4176,7 @@ static void qcom_battmgr_cancel_work(void *data)
 	disable_delayed_work_sync(&battmgr->charge_work);
 	disable_work_sync(&battmgr->otg_work);
 	mutex_lock(&battmgr->charge_lock);
-	qcom_battmgr_pps_stop(battmgr, false);
+	qcom_battmgr_pps_stop(battmgr, false, "driver-stop");
 	if (battmgr->service_up) {
 		qcom_battmgr_pd_stop(battmgr, false, "driver stopped");
 		qcom_battmgr_buck_release(battmgr);
@@ -4354,7 +4361,7 @@ void erhai_pps_unregister(struct device *parent)
 	struct qcom_battmgr *battmgr = dev_get_drvdata(parent);
 
 	guard(mutex)(&battmgr->charge_lock);
-	qcom_battmgr_pps_stop(battmgr, false);
+	qcom_battmgr_pps_stop(battmgr, false, "PPS-unregister");
 	battmgr->pps_ops = NULL;
 	battmgr->pps_data = NULL;
 	set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
