@@ -2265,6 +2265,28 @@ static u8 sc8547_adapter_cap(u8 model)
 	return 0;
 }
 
+/* oplus_chg_vooc rang_rise/drop_update and fastchg_range_switch.
+ * The low-temperature transitions below are renegotiated up to 90%
+ * SOC; crossing into/out of warm is renegotiated at any SOC. This
+ * chooses between in-session derating and a new handshake, never
+ * between admitting and refusing a high-SOC source.
+ */
+static bool sc8547_new_temperature_session(int old, int temp, int soc)
+{
+	int next = erhai_curve_temp(old, temp);
+
+	if (next == old || temp < 0 || temp >= 510)
+		return false;
+	if ((old < 440) != (next < 440))
+		return true;
+	if (soc > 90)
+		return false;
+	if (next < old)
+		return old >= 120 && next < 120;
+	return (old < 120 && next >= 120) || (old < 160 && next >= 160) ||
+	       (old < 210 && next >= 210);
+}
+
 /* Re-index on a change of bin. Within a bin use the AP VOOC PHY's
  * four consecutive voltage/current samples to descend the curve.
  */
@@ -2759,6 +2781,7 @@ static void sc8547_attach_work(struct work_struct *work)
 		int cpbat = sc8547_get_vbat(sc);	/* cell + delivery IR drop */
 		int cibus = sc8547_get_ibus(sc);
 		int cvbat = gvbat;
+		int previous_temp = sc->curve_temp;
 
 		/*
 		 * Under dual-CP the master REG_13 reads only its half of the bus
@@ -2824,6 +2847,10 @@ static void sc8547_attach_work(struct work_struct *work)
 			} else {
 				sc8547_auto_finish(sc, "cell-envelope-or-adc");
 			}
+			goto reschedule;
+		}
+		if (sc8547_new_temperature_session(previous_temp, gtemp, gsoc)) {
+			sc8547_auto_reservo(sc, "temperature-range");
 			goto reschedule;
 		}
 		/* RX_DONE frames are clocked by the source. CHG_EN can remain
@@ -3212,7 +3239,8 @@ void sc8547a_serial_buck_sample(int ua)
 	sc = sc8547_master_dev;
 	if (sc && sc->auto_state == SC_AUTO_DELIVER && sc->curve_sent && !sc->buck_ready) {
 		sc->pre_allow_buck_ua = ua;
-		sc->buck_ready = ua == 0;
+		/* The suspended PMIC reports zero or one 3 mA ADC step. */
+		sc->buck_ready = ua >= 0 && ua <= 3000;
 	}
 }
 EXPORT_SYMBOL_GPL(sc8547a_serial_buck_sample);
