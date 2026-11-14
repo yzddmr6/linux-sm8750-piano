@@ -1482,9 +1482,14 @@ static void erhai_pps_detached(void *data)
 static ssize_t erhai_pps_describe(void *data, char *buf, ssize_t off)
 {
 	struct erhai_pps *p = data;
+	bool serial;
+
+	off = sc8547a_serial_describe(buf, off, &serial);
+	if (serial)
+		return off;
 
 	return off + sysfs_emit_at(buf, off, "protocol=%s state=%s request_mv=%u request_ma=%u pump=%u pump_ibus_ma=%d exits=%u last_exit=%s\n",
-			  pps_sc_delivering() ? "supervooc" : p->ufcs ? "ufcs" :
+			  p->ufcs ? "ufcs" :
 			  p->state == PPS_IDLE ? "none" : "pps",
 			  pps_state_names[p->state], p->set_volt_mv, p->set_curr_ma,
 			  pps_cp_is_engaged(), pps_cp_is_engaged() ? p->pump_ibus_ma : 0, p->exits, p->last_reason ?: "none");
