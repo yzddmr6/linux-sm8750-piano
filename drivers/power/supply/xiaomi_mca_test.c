@@ -1771,7 +1771,7 @@ static void xiaomi_mca_test_otg_config(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->writes, 3);
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x201c, &invalid, 1));
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x201a, expected, 4));
-	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x200f, expected, 4));
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_write_allowed(0x200f, expected, 4));
 	KUNIT_EXPECT_FALSE(test, xiaomi_mca_write_allowed(0x2010, expected, 4));
 }
 
@@ -2580,6 +2580,78 @@ static void xiaomi_mca_test_threshold_stop_failure_sleep(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_quiesce(&f->mca), 0);
 	KUNIT_EXPECT_EQ(test, f->voltage_requests, 1);
 	KUNIT_EXPECT_FALSE(test, f->mca.voltage_written);
+}
+
+static void xiaomi_mca_test_connector_stop(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	guard(mutex)(&mca->lock);
+	mca_test_stage(test, f);
+	mca->piano_otg = true;
+	mca->connector.tripped = true;
+	mca->otg_requested = true;
+	mca->voltage_written = false;
+	f->vbus = 5000000;
+	xiaomi_mca_connector_stop(mca);
+	KUNIT_EXPECT_FALSE(test, f->stage_on);
+	KUNIT_EXPECT_TRUE(test, mca->charge_disabled);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
+	KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_PEN_BOOST_ENABLE);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->last_data), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_enable(mca, true), -EBUSY);
+	/* A pending high-voltage request must be cancelled even at 5 V. */
+	mca->otg_requested = false;
+	mca->voltage_written = true;
+	xiaomi_mca_connector_stop(mca);
+	KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_VDM_VSAFE0V);
+	KUNIT_EXPECT_FALSE(test, mca->voltage_written);
+	KUNIT_EXPECT_EQ(test, f->voltage_requests, 1U);
+	KUNIT_EXPECT_FALSE(test, f->voltage_before_stop);
+	mca->connector.tripped = false;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+}
+
+static void xiaomi_mca_test_connector(struct kunit *test)
+{
+	static const struct {
+		int prev[2], temp[2];
+		bool active, wired, otg, trip;
+		int board;
+	} cases[] = {
+		{ { 30000, 30000 }, { 65000, 30000 }, false, true, false, true },
+		{ { 30000, 60000 }, { 30000, 60000 }, false, false, true, true },
+		{ { 59999, 30000 }, { 59999, 30000 }, false, true, false, false },
+		{ { 31000, 29000 }, { 35000, 30000 }, false, true, false, true },
+		{ { 31001, 31000 }, { 35000, 35000 }, false, true, false, false },
+		{ { 42000, 30000 }, { 42000, 36000 }, false, true, false, false },
+		{ { 31000, 31000 }, { 34999, 32000 }, false, true, false, false },
+		{ { 30000, 30000 }, { 70000, 30000 }, false, false, false, false },
+		{ { 60000, 59000 }, { 60000, 59000 }, false, true, false, false, 51000 },
+		{ { 65000, 59000 }, { 65000, 59000 }, false, true, false, true, 51000 },
+		{ { 60000, 59000 }, { 60000, 59000 }, false, true, false, true, 50000 },
+		{ { 55000, 54500 }, { 55000, 54500 }, true, true, false, true },
+		{ { 55000, 54500 }, { 54999, 54500 }, true, true, false, false },
+		{ { 55000, 54500 }, { INT_MIN, 54000 }, true, false, false, true },
+		{ { 50000, INT_MIN }, { INT_MIN, 65000 }, false, true, false, true },
+		{ { INT_MIN, 30000 }, { 45000, 31000 }, false, true, false, false },
+		{ { 48000, 44000 }, { 53000, 44000 }, true, false, true, true },
+	};
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct mca_connector c = { .sampled = ms_to_ktime(1000),
+					   .tripped = cases[i].active };
+
+		memcpy(c.temp, cases[i].prev, sizeof(c.temp));
+		c.valid[0] = c.temp[0] != INT_MIN;
+		c.valid[1] = c.temp[1] != INT_MIN;
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_connector_trip(&c, cases[i].temp,
+				    ms_to_ktime(2000), cases[i].wired || cases[i].otg, cases[i].board),
+				    cases[i].trip, "case %d", i);
+	}
 }
 
 static void xiaomi_mca_test_wake_policy(struct kunit *test)
@@ -3745,6 +3817,8 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_auth_stop_failure),
 	KUNIT_CASE(xiaomi_mca_test_vbus_error_not_detach),
 	KUNIT_CASE(xiaomi_mca_test_threshold_interface),
+	KUNIT_CASE(xiaomi_mca_test_connector),
+	KUNIT_CASE(xiaomi_mca_test_connector_stop),
 	KUNIT_CASE(xiaomi_mca_test_wake_policy),
 	KUNIT_CASE(xiaomi_mca_test_wired_wake_transitions),
 	KUNIT_CASE(xiaomi_mca_test_wired_wake_reconnect),

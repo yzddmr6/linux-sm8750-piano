@@ -154,9 +154,14 @@
 		compatible = "xiaomi,piano-pmic-glink", "qcom,sm8750-pmic-glink",
 			     "qcom,sm8550-pmic-glink", "qcom,pmic-glink";
 		xiaomi,charge-pump = <&sc8541>;
+		xiaomi,connector-cutoff-gpios = <&pm8550_gpios 9 GPIO_ACTIVE_HIGH>;
+		io-channels = <&pmk8550_vadc 0x747>, <&pmk8550_vadc 0x14b>,
+			      <&pmk8550_vadc 0x74a>, <&pmk8550_vadc 0x74d>,
+			      <&pmk8550_vadc 0x146>, <&pmk8550_vadc 0x144>;
+		io-channel-names = "connector", "connector2", "quiet", "charger", "wifi", "cpu";
 		orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;
 
-		pinctrl-0 = <&usb_orientation_default>;
+		pinctrl-0 = <&usb_orientation_default &connector_cutoff_default>;
 		pinctrl-names = "default";
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -1582,6 +1587,12 @@
 };
 
 &pm8550_gpios {
+	connector_cutoff_default: connector-cutoff-state {
+		pins = "gpio9";
+		function = "normal";
+		power-source = <0>;
+	};
+
 	pm8550_therm_default: therm-default-state {
 		pins = "gpio2", "gpio3", "gpio4";
 		function = "normal";
