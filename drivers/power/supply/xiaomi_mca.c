@@ -2988,6 +2988,11 @@ static void xiaomi_mca_connector_stop(struct xiaomi_mca *mca)
 		return;
 	if (xiaomi_mca_read_type(mca, &type))
 		return;
+	/* The stock buck event votes for 5 V even on a PD adapter which
+	 * does not implement Xiaomi's additional VSAFE0V VDM.
+	 */
+	if (xiaomi_mca_is_pd(type))
+		xiaomi_mca_write_u32(mca, MCA_PROP_PD_FIXED_VOLT, 5000);
 	for (i = 0; i < 5; i++) {
 		if (xiaomi_mca_is_pd(type))
 			ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, MCA_PROP_VDM_VSAFE0V,

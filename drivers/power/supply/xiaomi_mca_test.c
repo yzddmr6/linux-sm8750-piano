@@ -2607,7 +2607,8 @@ static void xiaomi_mca_test_connector_stop(struct kunit *test)
 	xiaomi_mca_connector_stop(mca);
 	KUNIT_EXPECT_EQ(test, f->last_prop, MCA_PROP_VDM_VSAFE0V);
 	KUNIT_EXPECT_FALSE(test, mca->voltage_written);
-	KUNIT_EXPECT_EQ(test, f->voltage_requests, 0U);
+	KUNIT_EXPECT_EQ(test, f->voltage_requests, 1U);
+	KUNIT_EXPECT_FALSE(test, f->voltage_before_stop);
 	mca->connector.tripped = false;
 	KUNIT_EXPECT_EQ(test, xiaomi_mca_charge_limit_poll(mca), 0);
 	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
