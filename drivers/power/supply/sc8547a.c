@@ -339,8 +339,8 @@ static const char * const sc8547_gauge_names[] = {
  * (diff ~70 mV) just self-clears, so we engage it under load in the monitor and
  * retry until it latches; drop it again when total bus demand falls low.
  */
-#define SC8547_SLAVE_ENGAGE_IBUS_MA	1500	/* master half this high -> close slave */
-#define SC8547_SLAVE_DISENGAGE_IBUS_MA	1200	/* total bus below this -> drop slave */
+#define SC8547_SLAVE_ENGAGE_IBUS_MA	1400	/* master half this high -> close slave */
+#define SC8547_SLAVE_DISENGAGE_IBUS_MA	1100	/* total bus below this -> drop slave */
 
 /*
  * Settle grace + drop debounce (2026-10-01, bench-measured on Marcos' pad).
@@ -461,6 +461,7 @@ struct sc8547a_device {
 	struct mutex		i2c_lock;	/* serialises multi-op RMW */
 	struct dentry		*debug_root;
 	int			irq;
+	u8 first_request; /* First confirmed ASK_CURRENT of this handshake. */
 	u8			ovp_reg;
 	u8			ocp_reg;
 	bool			is_slave;
@@ -2306,8 +2307,10 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 	limit = curve->steps[sc->auto_curve_idx].ma;
 	if (raw->steps != curve->steps)
 		limit = min_t(unsigned int, limit, raw->steps[erhai_curve_start(raw, mv, true)].ma);
-	sc->curve_ma = new_table ? limit : min(sc->curve_ma, limit);
-	sc->fastchg_curr_code = min_t(unsigned int, sc->curve_ma / 100, sc->adapter_cap);
+	/* Stock AP PHY keeps current_max across steps in this handshake. */
+	sc->curve_ma = entering ? limit : min(sc->curve_ma, limit);
+	limit = min_t(unsigned int, sc->curve_ma / 100, sc->adapter_cap);
+	sc->fastchg_curr_code = entering ? limit : min_t(unsigned int, limit, sc->fastchg_curr_code);
 	return true;
 }
 
@@ -2325,7 +2328,7 @@ static void sc8547_serial_clear_sample(struct sc8547a_device *sc)
 	sc->master_enabled = sc->slave_enabled = -1;
 	sc->serial_vbus_mv = sc->serial_reg06 = -1;
 	sc->serial_ibat_ma = 0;
-	sc->serial_request = sc->pending_request = 0;
+	sc->first_request = sc->serial_request = sc->pending_request = 0;
 	sc->request_pending = sc->asked_current = sc->retry_current = false;
 	sc->measure_missed_slot = false;
 	sc->adjust_failures = sc->above_request_count = 0;
@@ -2592,7 +2595,6 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 		sc8547_svooc_hw_setting(sc);
 		sc->hw_profile_set = true;
 	}
-	sc->fastchg_curr_code = min_t(u8, sc->fastchg_curr_code, 40);
 	sc->fastchg_enable = true;
 	sc->fastchg_deliver = true;
 	sc->fastchg_auto = false;	/* one-shot per arm consumed */
@@ -2722,7 +2724,6 @@ static void sc8547_attach_work(struct work_struct *work)
 		int cpbat = sc8547_get_vbat(sc);	/* cell + delivery IR drop */
 		int cibus = sc8547_get_ibus(sc);
 		int cvbat = gvbat;
-		int share_ma = 0;
 
 		/*
 		 * Under dual-CP the master REG_13 reads only its half of the bus
@@ -2798,14 +2799,6 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc8547_auto_reservo(sc, "frame-timeout");
 			goto reschedule;
 		}
-		/* Until both ADCs show load, limit to the board's 4 A per
-		 * pump rating. On an uneven split use the weaker leg's
-		 * measured contribution, leaving the other leg its reserve.
-		 */
-		if (sc->master_enabled > 0 && sc->slave_enabled > 0)
-			share_ma = min(cibus, slave_ma);
-		sc->fastchg_curr_code = min_t(unsigned int, sc->fastchg_curr_code,
-					     (4000 + share_ma) / 100);
 		if (sc->adc_over_count)
 			sc->fastchg_curr_code = max_t(int, SC8547_CURR_CODE_MIN, sc->fastchg_curr_code - 1);
 		if (!sc8547_current_in_range(sc, ibat)) {
@@ -2883,8 +2876,11 @@ static void sc8547_attach_work(struct work_struct *work)
 			 * tick until CHG_EN sticks; dropped when total demand falls.
 			 */
 			if (!sc->slave_enabled && sc->vooc_vbus_status == SC_VBUS_NORMAL &&
-			    cibus >= SC8547_SLAVE_ENGAGE_IBUS_MA) {
-				if (!sc8547_slave_cp_enable(sc, true)) {
+			    cibus > SC8547_SLAVE_ENGAGE_IBUS_MA) {
+				if (sc8547_slave_cp_enable(sc, true) || sc8547_slave_enabled() <= 0) {
+					/* AP PHY CURRENT_TROUBLE_LIMIT for failed slave pickup. */
+					sc->fastchg_curr_code = min_t(u8, sc->fastchg_curr_code, 30);
+				} else {
 					sc->slave_on_since = jiffies;
 					sc->slave_low_cnt = 0;
 					dev_info_ratelimited(sc->dev, "dual-CP: requested slave under %d mA master load\n",
@@ -2965,12 +2961,12 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 	pump = sc->master_enabled > 0 || sc->slave_enabled > 0 ? 1 :
 		sc->master_enabled < 0 || sc->slave_enabled < 0 ? -1 : 0;
 	return off + sysfs_emit_at(buf, off,
-		"protocol=supervooc state=%s model=%d target_code=%u request_code=%u request_ma=%u "
+		"protocol=supervooc state=%s model=%d first_request_code=%u target_code=%u request_code=%u request_ma=%u "
 		"pending_code=%d predata=0x%04x above_samples=%u model_rx=0x%02x%02x model_flags=0x%02x%02x "
 		"vbus_mv=%d pump=%d pump_ibus_ma=%d master_ibus_ma=%d slave_ibus_ma=%d "
 		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u frame_gap_us=%u max_gap_us=%u "
 		"exits=%u last_exit=%s\n",
-		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1,
+		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1, sc->first_request,
 		sc->fastchg_deliver ? sc->fastchg_curr_code : 0, sc->serial_request, sc->serial_request * 100,
 		sc->request_pending ? sc->pending_request : -1, sc->serial_predata, sc->above_request_count,
 		sc->model_frames[0], sc->model_frames[1], sc->model_flags[0], sc->model_flags[1],
@@ -3229,6 +3225,8 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 		   (sc->vooc_flag & (VOOC_TXDATA_DONE_FLAG | VOOC_RXDATA_DONE_FLAG))) {
 		if (sc->serial_request != sc->pending_request)
 			sc->above_request_count = 0;
+		if (!sc->first_request && sc->pending_request)
+			sc->first_request = sc->pending_request;
 		sc->serial_request = sc->pending_request;
 		sc->request_pending = sc->retry_current = false;
 		sc->measure_missed_slot = false;
