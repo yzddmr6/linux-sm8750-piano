@@ -325,6 +325,16 @@ static const char * const sc8547_gauge_names[] = {
  * over-voltage guard, set well above any legitimate loaded reading (the highest
  * seen is ~4.49 V).
  */
+/*
+ * Stock oplus_chg_comm battery over-voltage stop (VBAT >= 4600 mV, resume
+ * below 4400 mV). During delivery the curve rows, the CP-side full check and
+ * low-current-full end the pump on the CP Vbat. A gauge-side stop at the cell
+ * CV fired first on this unit (cell 4550 mV against CP 4506 mV at 5.4 A),
+ * ending the pump at 89 % before the 4535/4545 mV rows could advance and
+ * leaving 90 minutes to the 1.5 A buck stage.
+ */
+#define SC8547_CELL_OVP_MV		4600
+
 #define SC8547_CP_OVP_CEILING_MV	4800	/* CP-side hard guard: cell CV (4.5 V)
 						 * plus the measured ~0.3 V IR drop
 						 * at 8 A; a wilder reading than this
@@ -2935,10 +2945,9 @@ static void sc8547_attach_work(struct work_struct *work)
 		}
 		if (gret || gvbat <= SC8547_CELL_MIN_VALID_MV || cpbat <= 0 ||
 		    vbus <= 0 || cibus < 0 || slave_ma < 0 ||
-		    (!gret && gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp))) ||
+		    (!gret && gvbat >= SC8547_CELL_OVP_MV) ||
 		    !sc8547_auto_update_curve(sc, gsoc, gtemp, cvbat, cibus_total, false)) {
-			if (!gret && gtemp >= 0 && gtemp < 510 && gvbat > 0 &&
-			    gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp))) {
+			if (!gret && gtemp >= 0 && gtemp < 510 && gvbat >= SC8547_CELL_OVP_MV) {
 				erhai_charge_tail_complete(ERHAI_SERIAL);
 				sc8547_auto_finish(sc, "buck-tail");
 			} else {
@@ -2948,7 +2957,8 @@ static void sc8547_attach_work(struct work_struct *work)
 		}
 		/* AP PHY voltage monitor: domestic QBG enables FCL, so the
 		 * sustained full threshold needs six 500 ms observations.
-		 * Keep the existing gauge-side cell CV stop above as well.
+		 * The CV end is judged on the CP Vbat, like the curve rows;
+		 * the gauge only enforces the stock battery OVP above.
 		 */
 		full_mv = min(erhai_cell_cv(sc->curve_entry_temp),
 			      min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp)));
