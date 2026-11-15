@@ -333,28 +333,6 @@ static const char * const sc8547_gauge_names[] = {
 #define SC8547_SLAVE_ENGAGE_IBUS_MA	1400	/* master half this high -> close slave */
 #define SC8547_SLAVE_DISENGAGE_IBUS_MA	1100	/* total bus below this -> drop slave */
 
-/*
- * Settle grace + drop debounce (2026-10-01, bench-measured on Marcos' pad).
- * The adapter's output is shared the instant the slave closes, so the master's
- * own half falls to the slave's share BEFORE the slave ramps off its own
- * soft-start; the slave's ADC can also still read its idle value (~20 mA) on
- * the first tick after the enable.  A one-tick "total low" test therefore
- * drops a slave that was about to share: measured 22:36 — engage at master
- * 1781 mA, drop one tick later at "total 1044 mA", pack stuck at 58 %; and
- * 22:55 after a re-plug, the same pad held master 1061 + slave 1008 mA = 2.4 A
- * and charged (63->64 %).  So never judge the drop inside slave_settle_ms of
- * the engage, and require slave_drop_ticks consecutive low totals after that.
- */
-static unsigned int slave_settle_ms = 4000;
-module_param(slave_settle_ms, uint, 0644);
-MODULE_PARM_DESC(slave_settle_ms,
-		 "dual-CP: never judge the slave drop inside this window after the engage (ms, default 4000, 0 = old behaviour)");
-
-static unsigned int slave_drop_ticks = 3;
-module_param(slave_drop_ticks, uint, 0644);
-MODULE_PARM_DESC(slave_drop_ticks,
-		 "dual-CP: consecutive low total-bus ticks before dropping the slave (default 3, 1 = old behaviour)");
-
 /* Project 24926 selects the domestic 67 W SC8547A curve. */
 #define SC8547_AUTO_CODE_CEILING	61	/* 24926 (24924 table): 6100 mA */
 
@@ -561,6 +539,7 @@ struct sc8547a_device {
 	int			auto_ident_retries;	/* identify re-arms on this plug */
 	bool			vooc_saw_any;	/* any decodable VOOC frame this attempt */
 	/* --- dual-CP slave load-sharing state --- */
+	unsigned long		slave_next_sample;
 	unsigned long		slave_on_since;	/* jiffies the slave last engaged (0 = n/a) */
 	unsigned int		slave_low_cnt;	/* consecutive low-total ticks since then */
 };
@@ -1483,11 +1462,15 @@ int sc8547a_pps_share(int master_ma, int margin_mv, unsigned int demand_ma,
 	*slave_ma = 0;
 	if (!sc || !pps_cp_engaged)
 		return 0;
-	if (demand_ma < 1600)
+	if (demand_ma <= 1600)
 		return sc8547_pps_slave_off();
 	if (!pps_slave_engaged) {
 		/* virtual_cp cp_open_curr_thr_ma / cp_close_curr_thr_ma. */
-		if (demand_ma <= 1900 || master_ma <= 1900 || margin_mv < 200)
+		/* Domestic virtual_cp >=1900 mA opens, <=1600 mA closes.
+		 * Keep 200 mV headroom: same-chip lab observed 6/16 double
+		 * drops below 180 mV, none in 6 closes at or above it.
+		 */
+		if (demand_ma < 1900 || master_ma < 1900 || margin_mv < 200)
 			return 0;
 		ret = sc8547_slave_hw_setting(sc8547_master_dev);
 		if (ret)
@@ -2779,6 +2762,24 @@ static bool sc8547_serial_timed_out(struct sc8547a_device *sc, u64 now_ns)
 	       now_ns >= sc->last_frame_ns + SC8547_COMMU_TIMEOUT_MS * NSEC_PER_MSEC;
 }
 
+/* AP PHY curr_event_handle: VOOC_CURR_EVENT_TIME=1000 ms, check
+ * disable_sub_cp_count == 3 before incrementing (four low observations).
+ */
+static bool sc8547_slave_should_drop(struct sc8547a_device *sc, int total_ma)
+{
+	if (total_ma >= SC8547_SLAVE_DISENGAGE_IBUS_MA) {
+		sc->slave_low_cnt = 0;
+		return false;
+	}
+	if (time_before(jiffies, sc->slave_next_sample))
+		return false;
+	sc->slave_next_sample = jiffies + msecs_to_jiffies(1000);
+	if (sc->slave_low_cnt++ < 3)
+		return false;
+	sc->slave_low_cnt = 0;
+	return true;
+}
+
 static void sc8547_attach_work(struct work_struct *work)
 {
 	struct sc8547a_device *sc =
@@ -3030,6 +3031,7 @@ static void sc8547_attach_work(struct work_struct *work)
 				} else {
 					sc->slave_check_pending = true;
 					sc->slave_on_since = jiffies;
+					sc->slave_next_sample = jiffies + msecs_to_jiffies(1000);
 					sc->slave_low_cnt = 0;
 					dev_info_ratelimited(sc->dev, "dual-CP: requested slave under %d mA master load\n",
 							     cibus);
@@ -3043,31 +3045,14 @@ static void sc8547_attach_work(struct work_struct *work)
 					sc8547_auto_reservo(sc, "slave-stop-io");
 					goto reschedule;
 				}
-			} else if (slave_on && slave_settle_ms &&
-				   jiffies - sc->slave_on_since <
-					   msecs_to_jiffies(slave_settle_ms)) {
-				/*
-				 * Settling: the adapter's output is already
-				 * split, but the slave has not ramped yet (its
-				 * ADC may still read its idle ~20 mA).  Feed
-				 * it; never judge the drop inside this window.
-				 */
-				dev_dbg(sc->dev,
-					"dual-CP: slave settling (%u ms on, total %d mA)\n",
-					jiffies_to_msecs(jiffies - sc->slave_on_since),
-					cibus_total);
-			} else if (slave_on &&
-				   cibus_total < SC8547_SLAVE_DISENGAGE_IBUS_MA) {
-				if (++sc->slave_low_cnt >= slave_drop_ticks) {
-					sc8547_slave_cp_enable(sc, false);
-					sc->slave_low_cnt = 0;
-					dev_info(sc->dev,
-						 "dual-CP: dropping slave (total %d mA low for %u ticks, %u ms on)\n",
-						 cibus_total, slave_drop_ticks,
-						 jiffies_to_msecs(jiffies - sc->slave_on_since));
+			} else if (slave_on && !sc->slave_check_pending &&
+				   sc8547_slave_should_drop(sc, cibus_total)) {
+				if (sc8547_slave_cp_enable(sc, false)) {
+					sc8547_auto_reservo(sc, "slave-stop-io");
+					goto reschedule;
 				}
-			} else if (slave_on) {
-				sc->slave_low_cnt = 0;
+				dev_info(sc->dev, "dual-CP: dropping slave (total %d mA, four 1 s observations)\n",
+					 cibus_total);
 			}
 
 			dev_dbg(sc->dev, "fastchg: vbus %d mV vbat %d mV ibus %d mA (master %d slave %d) margin %d mV REG06=0x%02x REG07=0x%02x slave_on=%d\n",
