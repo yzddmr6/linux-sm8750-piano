@@ -138,7 +138,8 @@ static bool pps_enable = true;
 module_param(pps_enable, bool, 0644);
 MODULE_PARM_DESC(pps_enable, "master kill switch for the PPS fast-charge engine");
 
-static unsigned int pps_poll_ms = 2000;
+/* oplus_chg_pps.c PPS_MONITOR_TIME_MS / PPS_START_PDO_DELAY_MS. */
+static unsigned int pps_poll_ms = 500;
 module_param(pps_poll_ms, uint, 0444);
 MODULE_PARM_DESC(pps_poll_ms, "engine poll period (ms)");
 
@@ -153,14 +154,6 @@ static unsigned int pps_target_volt_mv = 8400;
 module_param(pps_target_volt_mv, uint, 0444);
 MODULE_PARM_DESC(pps_target_volt_mv,
 		 "PPS target VBUS (mV) - Android measures 8.4-8.6 V with the 100 W Anker");
-
-static unsigned int pps_max_volt_mv = 8900;
-module_param(pps_max_volt_mv, uint, 0444);
-MODULE_PARM_DESC(pps_max_volt_mv, "hard PPS VBUS ceiling (mV)");
-
-static unsigned int pps_volt_step_mv = 400;
-module_param(pps_volt_step_mv, uint, 0444);
-MODULE_PARM_DESC(pps_volt_step_mv, "VBUS ramp step (mV) per poll");
 
 static unsigned int pps_start_curr_ma = 1000;
 module_param(pps_start_curr_ma, uint, 0444);
@@ -197,11 +190,6 @@ module_param(pps_vbus_collapse_mv, uint, 0444);
 MODULE_PARM_DESC(pps_vbus_collapse_mv,
 		 "VBUS below this while targeting >5 V means a bad cable/adapter -> exit (mV)");
 
-static unsigned int pps_stall_polls = 15;
-module_param(pps_stall_polls, uint, 0444);
-MODULE_PARM_DESC(pps_stall_polls,
-		 "consecutive polls with ~no pack current at >7 V VBUS before exiting (0 = never)");
-
 static bool pps_cp_init = true;
 module_param(pps_cp_init, bool, 0444);
 MODULE_PARM_DESC(pps_cp_init,
@@ -225,16 +213,19 @@ module_param(pps_cp_entry_margin_mv, uint, 0444);
 MODULE_PARM_DESC(pps_cp_entry_margin_mv,
 		 "pump entry: request 2*vbat + this before engaging (mV; vendor +450)");
 
-static unsigned int pps_cp_lift_ms = 5000;
+/* PPS_START_CHECK_DELAY_MS: initial check plus PPS_START_RETAY_MAX (3). */
+static unsigned int pps_cp_lift_ms = 2000;
 module_param(pps_cp_lift_ms, uint, 0444);
 MODULE_PARM_DESC(pps_cp_lift_ms,
 		 "time allowed for the pump to engage after the entry request, buck suspended (ms)");
 
-static unsigned int pps_cp_rearm_ms = 10000;
+/* No additional quiet time: failed routes already use battmgr backoff. */
+static unsigned int pps_cp_rearm_ms = 0;
 module_param(pps_cp_rearm_ms, uint, 0444);
 MODULE_PARM_DESC(pps_cp_rearm_ms, "hold-off after a pump drop or a failed entry (ms)");
 
-static unsigned int pps_cp_rearm_max = 5;
+/* PPS_START_RETAY_MAX in the stock PPS start controller. */
+static unsigned int pps_cp_rearm_max = 3;
 module_param(pps_cp_rearm_max, uint, 0444);
 MODULE_PARM_DESC(pps_cp_rearm_max, "pump retries per PPS session before returning to fixed PD and backing off");
 
@@ -264,12 +255,8 @@ MODULE_PARM_DESC(pps_cp_ibat_max_ma, "pump ibus servo: step VBUS down while the 
 static unsigned int pps_cp_min_ibus_ma = 300;
 module_param(pps_cp_min_ibus_ma, uint, 0444);
 MODULE_PARM_DESC(pps_cp_min_ibus_ma,
-		 "engaged pump carrying less than this for 4 polls (after pps_cp_settle_ms) is "
+		 "engaged pump carrying less than this for 4 stock 500 ms polls is "
 		 "released to the buck (mA; vendor 300)");
-
-static unsigned int pps_cp_settle_ms = 2000;
-module_param(pps_cp_settle_ms, uint, 0444);
-MODULE_PARM_DESC(pps_cp_settle_ms, "grace after an engage before the low-ibus check (ms)");
 
 static unsigned int pps_cp_max_volt_mv = 9900;
 module_param(pps_cp_max_volt_mv, uint, 0444);
@@ -277,16 +264,17 @@ MODULE_PARM_DESC(pps_cp_max_volt_mv,
 		 "pump PPS VBUS ceiling (mV); 9900 keeps the engaged chip under its 10 V VBUS_OVP "
 		 "(lab: 9.17 V max at 4 A), vendor 10500");
 
-static unsigned int pps_cp_feed_ms = 300;
+/* Stock current_work and virtual_cp monitor cadence, below the 1 s watchdog. */
+static unsigned int pps_cp_feed_ms = 500;
 module_param(pps_cp_feed_ms, uint, 0444);
 MODULE_PARM_DESC(pps_cp_feed_ms,
 		 "engine poll period (ms) while the CP is engaged - must stay under the "
-		 "SC8547A 1000 ms REG_09 watchdog window");
+		 "SC8547A 5000 ms REG_09 pump watchdog window");
 
 static unsigned int pps_log_ticks = 60;
 module_param(pps_log_ticks, uint, 0444);
 MODULE_PARM_DESC(pps_log_ticks,
-		 "log this many charging ticks per session to dmesg (default 60 = ~2 minutes at 2000 ms)");
+		 "log this many charging ticks per session to dmesg (default 60 at 500 ms)");
 
 static bool pps_voocphy_enable = true;
 module_param(pps_voocphy_enable, bool, 0444);
@@ -348,7 +336,6 @@ struct erhai_pps {
 	const char		*last_reason;
 	unsigned long		state_since;	/* jiffies state was entered */
 	unsigned long		ramp_since;
-	unsigned int		stall_count;
 
 	/* what we last commanded / observed */
 	unsigned int		set_volt_mv;
@@ -383,7 +370,6 @@ struct erhai_pps {
 	bool			adc_held;	/* sc8547a ADC held on for the session */
 	unsigned long		cp_lift_since;	/* entry request sent (0 = not lifting) */
 	unsigned long		cp_holdoff_until;
-	unsigned long		cp_engaged_since;
 	unsigned int		cp_low_cnt;	/* consecutive low-ibus polls */
 	unsigned long		cp_fed_at;	/* last successful feed */
 	bool			inhibit_held;	/* policy inhibit seen this session */
@@ -607,7 +593,7 @@ static int pps_revert(struct erhai_pps *p)
 #undef PPS_RESTORE
 	online = pps_usb_get(0);
 	if (online > 0) {
-		msleep(100);
+		/* A voltage readback, not a fixed sleep, completes handoff. */
 		vbus = pps_usb_get(1);
 		if (vbus < 0 || vbus > 5500000)
 			err = err ?: -EAGAIN;
@@ -623,7 +609,6 @@ static int pps_revert(struct erhai_pps *p)
 	p->adc_held = false;
 	p->set_volt_mv = 0;
 	p->set_curr_ma = 0;
-	p->stall_count = 0;
 	p->high_bus_samples = 0;
 	p->buck_off = false;
 	p->cp_lift_since = 0;
@@ -757,6 +742,21 @@ static int pps_cp_release(struct erhai_pps *p, const char *why, bool count)
  * voltage on the pump's own ibus, 40 mV at a time (vendor pps.c:3242-3361).
  * Returns non-zero when the engine must exit.
  */
+/* oplus_pps_charge_start: compare the CP ADC with floor100(2*VBAT)
+ * + 450 mV and choose the largest stock voltage step no greater than
+ * the error (minimum 100 mV). The running servo remains 40/100 mV.
+ */
+static unsigned int pps_start_voltage(unsigned int request, int vbus, int vbat)
+{
+	int target = (vbat * 2 / 100) * 100 + pps_cp_entry_margin_mv;
+	int error = abs(vbus - target);
+	int step = error >= 2000 ? 2000 : error >= 1000 ? 1000 :
+		   error >= 500 ? 500 : error >= 200 ? 200 : 100;
+
+	return clamp_t(unsigned int, vbus < target ? request + step : request - step,
+		       vbat * 2 + 100, pps_cp_max_volt_mv);
+}
+
 static int pps_cp_step(struct erhai_pps *p)
 {
 	const struct erhai_pps_sc_api *a = pps_sc_cp_get();
@@ -805,7 +805,10 @@ static int pps_cp_step(struct erhai_pps *p)
 				 */
 				sc8547a_pps_share(cibus, diff, 0, &slave_ma);
 				slave_ma = 0;
-				p->slave_retry_at = jiffies + (HZ << min(p->slave_failures, 5U));
+				/* virtual_cp MONITOR_WORK_DELAY_MS: retry on its next
+				 * 500 ms observation, without a second 32 s holdoff.
+				 */
+				p->slave_retry_at = jiffies + msecs_to_jiffies(500);
 				p->slave_failures = min(p->slave_failures + 1, 6U);
 			} else {
 				p->slave_failures = 0;
@@ -823,12 +826,16 @@ static int pps_cp_step(struct erhai_pps *p)
 		if (max(cibus, slave_ma) > 4000)
 			target = min_t(unsigned int, target, max(0, cibus + slave_ma - 500));
 		cibus += slave_ma;
+		/* Count consecutive failed starts, not isolated drops spread
+		 * over a charge. A working converter and measured input end
+		 * the failure episode (stock start success clears retry_count).
+		 */
+		if (cibus >= pps_cp_min_ibus_ma)
+			p->cp_rearms = 0;
 		p->cp_fed_at = jiffies;
 		/* switching but carrying nothing: with the buck suspended the
 		 * pack would sit idle (vendor: 4 results under 300 mA) */
-		if (cibus < (int)pps_cp_min_ibus_ma &&
-		    time_after_eq(jiffies, p->cp_engaged_since +
-				  msecs_to_jiffies(pps_cp_settle_ms))) {
+		if (cibus < (int)pps_cp_min_ibus_ma) {
 			if (++p->cp_low_cnt >= 4) {
 				if (p->curve->steps[p->curve_idx].last)
 					return -ENODATA;
@@ -863,7 +870,8 @@ static int pps_cp_step(struct erhai_pps *p)
 		if (pps_cp_buck_suspend && pps_buck_set(p, true))
 			return -EIO;
 		nv = min_t(unsigned int,
-			   roundup(cvbat * 2 + pps_cp_entry_margin_mv, 20),
+			   p->ufcs ? roundup(cvbat * 2 + pps_cp_entry_margin_mv, 20) :
+			   (cvbat * 2 / 100) * 100 + pps_cp_entry_margin_mv,
 			   pps_cp_max_volt_mv);
 		p->cp_lift_since = jiffies | 1;
 		pr_info("erhai_pps: CP entry: buck %s, request %u mV at %u mA (chip vbat %d mV diff %d mV)\n",
@@ -871,10 +879,16 @@ static int pps_cp_step(struct erhai_pps *p)
 		return pps_pdo_set(p, nv, p->set_curr_ma);
 	}
 
-	rc = a->cp_engage(&need);
+	/* Stock PPS starts only within [target, target + 200 mV]. Do not
+	 * reuse the wider running error window as a startup condition.
+	 */
+	nv = (cvbat * 2 / 100) * 100 + pps_cp_entry_margin_mv;
+	if (!p->ufcs && (cvbus < nv || cvbus > nv + 200))
+		rc = -EAGAIN;
+	else
+		rc = a->cp_engage(&need);
 	if (rc == 0) {
 		p->cp_lift_since = 0;
-		p->cp_engaged_since = jiffies;
 		p->cp_fed_at = jiffies;
 		p->cp_low_cnt = 0;
 		p->cp_engages++;
@@ -893,16 +907,18 @@ static int pps_cp_step(struct erhai_pps *p)
 	 */
 	if (rc != -EAGAIN)
 		return rc;
-	if (rc == -EAGAIN) {
+	if (!p->ufcs) {
+		nv = pps_start_voltage(p->set_volt_mv, cvbus, cvbat);
+	} else {
 		nv = p->set_volt_mv;
 		if (diff > (int)pps_cp_diff_max_mv)
 			nv -= pps_cp_vstep_over_mv;
 		else if (diff < (int)pps_cp_entry_margin_mv / 2)
 			nv += pps_cp_vstep_over_mv;
 		nv = clamp_t(unsigned int, nv, cvbat * 2 + 100, pps_cp_max_volt_mv);
-		if (nv != p->set_volt_mv && pps_pdo_set(p, nv, p->set_curr_ma))
-			return -EIO;
 	}
+	if (nv != p->set_volt_mv && pps_pdo_set(p, nv, p->set_curr_ma))
+		return -EIO;
 	if (time_after_eq(jiffies, p->cp_lift_since +
 			  msecs_to_jiffies(pps_cp_lift_ms))) {
 		pr_info("erhai_pps: CP entry timed out (diff %d mV, engage rc=%d)\n",
@@ -917,11 +933,14 @@ static int pps_cp_step(struct erhai_pps *p)
 }
 
 
-/* The maximum scalar alone does not identify the APDO's voltage range. */
+/* Like oplus_chg_pps.c:2043, admit the complete regulation range, not
+ * just the first request. Our pump floor is 2 * vbat_uv_thr_mv + 100 mV;
+ * the firmware-compatible 8.4 V first write is inside that same APDO.
+ */
 static int pps_source_limit(u32 *selected, bool *grant_known)
 {
 	int ma = pps_usb_get(PPS_PROP_USB_GET_PPS_MAX_CURR);
-	int apdo = erhai_pps_apdo_current(pps_target_volt_mv, pps_cp_max_volt_mv, selected);
+	int apdo = erhai_pps_apdo_current(pps_vbat_min_mv * 2 + 100, pps_cp_max_volt_mv, selected);
 
 	if (grant_known)
 		*grant_known = ma > 0;
@@ -930,6 +949,19 @@ static int pps_source_limit(u32 *selected, bool *grant_known)
 	if (ma <= 0)
 		ma = min(pps_cable_safe_ma, 3000U);
 	return min3(min(pps_target_curr_ma, pps_max_curr_ma), (unsigned int)min(ma, apdo), 5000U);
+}
+
+/* cc463675855a oplus_pps_current_work: current step by remaining error.
+ * Electrical safety decreases are applied immediately elsewhere.
+ */
+static unsigned int pps_next_current(unsigned int now, unsigned int target)
+{
+	unsigned int delta = now > target ? now - target : target - now;
+	unsigned int step = delta >= 500 ? 500 : delta >= 300 ? 300 : delta >= 100 ? 100 : 50;
+
+	if (delta < step)
+		return target;
+	return now > target ? now - step : now + step;
 }
 
 /* ---- the poll ---- */
@@ -1130,7 +1162,6 @@ fail:
 		return;
 	}
 	case PPS_RAMP: {
-		unsigned int next, ci;
 
 		if (online <= 0) {
 			pps_exit(p, PPS_EXIT_REASON_DETACH);
@@ -1138,7 +1169,7 @@ fail:
 		}
 		/* did we actually leave 5 V in time? */
 		if (time_after_eq(jiffies, p->ramp_since +
-				  msecs_to_jiffies(pps_poll_ms * 6)) &&
+				  msecs_to_jiffies(pps_cp_lift_ms)) &&
 		    p->vbus_mv < (int)pps_start_volt_mv) {
 			pps_exit(p, PPS_EXIT_REASON_RAMP_TIMEOUT);
 			return;
@@ -1147,30 +1178,8 @@ fail:
 			pps_exit(p, PPS_EXIT_REASON_COLLAPSE);
 			return;
 		}
-		if (p->set_volt_mv >= pps_target_volt_mv) {
-			if (p->vbus_mv < pps_start_volt_mv)
-				return;
+		if (p->vbus_mv >= pps_start_volt_mv)
 			pps_enter(p, PPS_CHARGING, "VBUS at target");
-			return;
-		}
-		next = min(p->set_volt_mv + pps_volt_step_mv, pps_target_volt_mv);
-		next = min(next, pps_max_volt_mv);
-		if (pps_usb_set(PPS_PROP_USB_SET_PPS_VOLT, next)) {
-			pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
-			return;
-		}
-		/* keep the input current moving toward the target */
-		if (p->set_curr_ma < p->target_curr_ma) {
-			ci = min(p->set_curr_ma + 250U, p->target_curr_ma);
-			if (pps_usb_set(PPS_PROP_USB_SET_PPS_CURR, ci)) {
-				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
-				return;
-			}
-			p->set_curr_ma = ci;
-		}
-		p->set_volt_mv = next;
-		pr_info("erhai_pps: ramp VBUS %u mV curr %u mA (read %d mV)\n",
-			p->set_volt_mv, p->set_curr_ma, p->vbus_mv);
 		return;
 	}
 	case PPS_CHARGING:
@@ -1191,16 +1200,6 @@ fail:
 			pps_exit(p, PPS_EXIT_REASON_COLLAPSE);
 			return;
 		}
-		/* pack-stall watchdog: nothing flowing at high VBUS */
-		if (pps_stall_polls && p->vbus_mv > 7000 &&
-		    p->ibat_ma < 100 && !p->cp_lift_since) {
-			if (++p->stall_count >= pps_stall_polls) {
-				pps_exit(p, PPS_EXIT_REASON_STALL);
-				return;
-			}
-		} else {
-			p->stall_count = 0;
-		}
 
 
 		/*
@@ -1208,8 +1207,7 @@ fail:
 		 * grant; we nudge PPS curr to the input target, never yank.
 		 */
 		if (p->set_curr_ma < p->target_curr_ma) {
-			unsigned int n = min(p->set_curr_ma + 250U,
-					     p->target_curr_ma);
+			unsigned int n = pps_next_current(p->set_curr_ma, p->target_curr_ma);
 
 			if (pps_pdo_set(p, p->set_volt_mv, n)) {
 				pps_exit(p, PPS_EXIT_REASON_SET_FAIL);
@@ -1273,11 +1271,11 @@ static void pps_cp_backstop(struct erhai_pps *p)
 	if (!p->buck_off || p->state == PPS_EXIT)
 		return;
 	if (pps_cp_is_engaged())
-		stuck = time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(1000));
+		stuck = time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(SC8547_PPS_WATCHDOG_MS));
 	else
 		stuck = !p->cp_lift_since ||
 			time_after(jiffies, p->cp_lift_since +
-				   msecs_to_jiffies(pps_cp_lift_ms + 1000));
+				   msecs_to_jiffies(pps_cp_lift_ms));
 	if (!stuck)
 		return;
 	pr_warn("erhai_pps: CP backstop: buck suspended without a working pump - resuming the buck\n");
@@ -1341,7 +1339,7 @@ static unsigned int erhai_pps_update(void *data, bool caps_changed)
 	if (p->state != PPS_IDLE && time_before(jiffies, p->next_poll))
 		return jiffies_to_msecs(p->next_poll - jiffies) + 1;
 	if (pps_cp_is_engaged() &&
-	    time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(1000))) {
+	    time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(SC8547_PPS_WATCHDOG_MS))) {
 
 		pps_exit(p, "pump watchdog deadline missed");
 	} else {
@@ -1514,6 +1512,7 @@ static const struct erhai_pps_ops erhai_pps_ops = {
 	.enabled = erhai_pps_enabled,
 	.probe_status = erhai_probe_status,
 	.serial_session = sc8547a_serial_session,
+	.serial_buck_sample = sc8547a_serial_buck_sample,
 	.active = erhai_pps_active,
 	.available = erhai_pps_available,
 	.recharge = erhai_pps_recharge,

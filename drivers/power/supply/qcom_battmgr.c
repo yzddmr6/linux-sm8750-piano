@@ -29,6 +29,7 @@
 #include <linux/workqueue.h>
 
 #include "erhai_cell_envelope.h"
+#include "erhai_buck.h"
 #include "erhai_otg_glink.h"
 
 #define BATTMGR_CHEMISTRY_LEN	4
@@ -137,6 +138,8 @@ enum qcom_battmgr_variant {
 /* Charger firmware gauge qualification properties (oplus_hal_adsp.h). */
 #define BATT_OPLUS_AUTH			30
 #define BATT_OPLUS_HMAC			40
+#define BATT_OPLUS_FULL_PARA		48
+#define BATT_OPLUS_SET_FULL		64
 #define BATT_OPLUS_CHG_EN		24
 /* Fixed PDO voltage in mV, written with BATTMGR_BAT_PROPERTY_SET */
 #define BATT_OPLUS_SET_QC		26	/* non-soccp BATT_SET_QC, mV */
@@ -155,6 +158,7 @@ enum qcom_battmgr_variant {
 #define USB_MOISTURE_DET_EN		8
 #define USB_MOISTURE_DET_STS		9
 #define USB_OPLUS_RERUN_AICL		67
+#define USB_OPLUS_CID_STATUS		21 /* oplus_hal_adsp.h: USB_CID_STATUS */
 #define USB_REAL_TYPE			11
 /* OPLUS firmware: VBUS boost control */
 #define USB_OPLUS_OTG_AP_ENABLE		17
@@ -567,6 +571,7 @@ struct qcom_battmgr {
 	bool tail_owned;
 	unsigned int recharge_samples;
 	unsigned long recharge_at;
+	unsigned long serial_tail_check_at;
 	u32 charge_detected_type;
 	const char *fixed_exit;
 	unsigned int serial_failures, ufcs_failures;
@@ -585,6 +590,15 @@ struct qcom_battmgr {
 	bool serial_blocked;
 	bool aicl_done;
 	bool serial_icl_vote;
+	bool serial_buck_suspended;
+	bool buck_online;
+	struct erhai_buck buck;
+	struct erhai_buck_sample buck_sample;
+	int buck_fv_applied, buck_fcc_applied, buck_enable_applied;
+	int buck_para_applied, buck_full_applied, buck_error, buck_gauge_error;
+	bool buck_saved_fcc_valid;
+	u32 buck_saved_fcc_ua;
+	unsigned long buck_sample_at;
 	int serial_icl_ua, serial_input_ua, serial_max_ua;
 	unsigned long serial_sample_at;
 	bool pd_logged;
@@ -672,6 +686,20 @@ static int qcom_battmgr_set_property(struct qcom_battmgr *battmgr, int opcode,
 				     u32 property, u32 value)
 {
 	int ret;
+
+	if (opcode == BATTMGR_BAT_PROPERTY_SET) {
+		switch (property) {
+		case BATT_VOLT_MAX:
+			WRITE_ONCE(battmgr->buck_fv_applied, -1);
+			break;
+		case BATT_CHG_CTRL_LIM:
+			WRITE_ONCE(battmgr->buck_fcc_applied, -1);
+			break;
+		case BATT_OPLUS_CHG_EN:
+			WRITE_ONCE(battmgr->buck_enable_applied, -1);
+			break;
+		}
+	}
 
 	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_set_property_locked(battmgr, opcode, property, value);
@@ -844,12 +872,21 @@ out_unlock:
 	return ret;
 }
 
+/* The ADSP charge state can stay latched while the cell supplies the
+ * system. Use the same signed convention as CURRENT_NOW for Erhai.
+ */
+static int erhai_battery_status(int status, int current_ua)
+{
+	return current_ua < 0 ? POWER_SUPPLY_STATUS_DISCHARGING : status;
+}
+
 static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 					 enum power_supply_property psp,
 					 union power_supply_propval *val)
 {
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 	enum qcom_battmgr_unit unit = battmgr->unit;
+	u32 raw_ua;
 	int ret;
 
 	if (!battmgr->service_up)
@@ -868,6 +905,31 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = battmgr->status.status;
+		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
+			/* AP full is an attachment-scoped decision. Cell relaxation
+			 * can supply the system after output is disabled; it does
+			 * not undo full until the controller declares recharge.
+			 */
+			if (READ_ONCE(battmgr->buck.phase) == ERHAI_BUCK_FULL &&
+			    READ_ONCE(battmgr->buck_online)) {
+				val->intval = POWER_SUPPLY_STATUS_FULL;
+				break;
+			}
+			ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						BATT_CURR_NOW, &raw_ua);
+			if (ret)
+				return ret;
+			if (READ_ONCE(battmgr->buck.disable) ||
+				 READ_ONCE(battmgr->charge_policy_hold) ||
+				 READ_ONCE(battmgr->charge_inhibited))
+				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+			else if ((s32)raw_ua < 0)
+				val->intval = POWER_SUPPLY_STATUS_CHARGING;
+			else if (READ_ONCE(battmgr->buck.phase) != ERHAI_BUCK_OFF &&
+				 val->intval == POWER_SUPPLY_STATUS_FULL)
+				val->intval = POWER_SUPPLY_STATUS_NOT_CHARGING;
+			val->intval = erhai_battery_status(val->intval, -(s32)raw_ua);
+		}
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
 		val->intval = battmgr->info.charge_type;
@@ -1151,6 +1213,9 @@ static int qcom_battmgr_charge_enable(struct qcom_battmgr *battmgr, bool enable)
 {
 	int ret;
 
+	enable &= !battmgr->buck.disable &&
+		  !test_bit(PD_EVENT_TAIL, &battmgr->pd_events);
+
 	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
 					BATT_OPLUS_CHG_EN, enable);
 
@@ -1159,6 +1224,7 @@ static int qcom_battmgr_charge_enable(struct qcom_battmgr *battmgr, bool enable)
 		dev_warn(battmgr->dev, "failed to turn charging %s: %d\n",
 			 enable ? "on" : "off", ret);
 	battmgr->charge_error = !!ret;
+	battmgr->buck_enable_applied = ret ? -1 : enable;
 
 	return ret;
 }
@@ -1166,8 +1232,8 @@ static int qcom_battmgr_charge_enable(struct qcom_battmgr *battmgr, bool enable)
 /*
  * Stop charging once the state of charge reaches the end threshold and
  * resume once it has fallen to the start threshold.  Nothing is sent while
- * no end threshold below 100 % is set, so charging is then left entirely
- * to the firmware.
+ * no end threshold below 100 % is set. Erhai still runs its independent
+ * AP buck full/recharge controller.
  */
 static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 {
@@ -1243,12 +1309,62 @@ static bool qcom_battmgr_pps_running(struct qcom_battmgr *battmgr)
 	return battmgr->pps_ops && battmgr->pps_ops->active(battmgr->pps_data);
 }
 
-static int qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr, bool upgrading)
+/* 24926 AP VOOC PHY votes WIRED_CHARGE_SUSPEND in direct charge.
+ * The ADSP HAL maps that vote to USB ICL 0 and its release to U32_MAX.
+ * The charge lock serializes it with the 5 V fallback and PD/PPS votes.
+ */
+static int qcom_battmgr_serial_buck(struct qcom_battmgr *b, bool suspend)
 {
-	if (!battmgr->pps_ops)
+	int ret;
+
+	if (suspend == b->serial_buck_suspended)
 		return 0;
-	return battmgr->pps_ops->serial_session(false) ?:
-		battmgr->pps_ops->stop(battmgr->pps_data, upgrading);
+	/* Even on a missing ACK the firmware may have accepted a suspend. */
+	b->serial_buck_suspended = true;
+	ret = qcom_battmgr_set_property(b, BATTMGR_USB_PROPERTY_SET, USB_INPUT_CURR_LIMIT,
+					suspend ? 0 : U32_MAX);
+	if (!ret) {
+		b->serial_buck_suspended = suspend;
+		b->serial_icl_vote = false;
+		b->aicl_done = false;
+	}
+	return ret;
+}
+
+static int qcom_battmgr_serial_stop(struct qcom_battmgr *b, const char *reason)
+{
+	if (b->serial_probe)
+		dev_info(b->dev, "serial release: %s online=%d type=%u events=%lx hold=%d inhibited=%d error=%d buck=%u/%d\n",
+			 reason, b->buck_online, b->charge_detected_type, b->pd_events,
+			 b->charge_policy_hold, b->charge_inhibited, b->charge_error,
+			 b->buck.phase, b->buck.disable);
+	if (b->pps_ops) {
+		int ret = b->pps_ops->serial_session(false);
+
+		if (ret)
+			return ret;
+	}
+	/* VOOC normal-full retains FASTCHG output-disable while input
+	 * suspend is released, then common starts the 15 s FFC wait.
+	 */
+	if (b->buck_enable_applied != 0 &&
+	    (test_bit(PD_EVENT_TAIL, &b->pd_events) || b->buck.phase == ERHAI_FFC_WAIT)) {
+		int ret = qcom_battmgr_charge_enable(b, false);
+
+		if (ret)
+			return ret;
+	}
+	return qcom_battmgr_serial_buck(b, false);
+}
+
+static int qcom_battmgr_pps_stop(struct qcom_battmgr *battmgr, bool upgrading,
+				  const char *reason)
+{
+	int ret = qcom_battmgr_serial_stop(battmgr, reason);
+
+	if (ret || !battmgr->pps_ops)
+		return ret;
+	return battmgr->pps_ops->stop(battmgr->pps_data, upgrading);
 }
 
 /* Match only the Type-C supply belonging to this PMIC GLINK instance. */
@@ -1399,15 +1515,28 @@ static ssize_t charge_contract_show(struct device *dev, struct device_attribute 
 			 b->pd_state == PD_ACTIVE && !b->qc_contract ? PD_FIXED_MV : 0,
 			 b->pd_state == PD_ACTIVE ? b->pd_input_limit_ua : 0);
 
-	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d detected_type=%u serial_source=%d serial_icl_vote=%d fixed_exit=%s ",
+	len += sysfs_emit_at(buf, len, "qc_mv=%u serial_probe=%d detected_type=%u serial_source=%d serial_icl_vote=%d serial_buck_suspended=%d buck_tail=%d fixed_exit=%s ",
 			     b->pd_state == PD_ACTIVE && b->qc_contract ? PD_FIXED_MV : 0,
 			     b->serial_probe, b->charge_detected_type, !!(b->retry_evidence & ERHAI_SERIAL),
-			     b->serial_icl_vote, b->fixed_exit ?: "none");
+			     b->serial_icl_vote, b->serial_buck_suspended,
+			     b->tail_owned || test_bit(PD_EVENT_TAIL, &b->pd_events), b->fixed_exit ?: "none");
 	if (b->serial_icl_vote)
 		len += sysfs_emit_at(buf, len, "fallback_vote_ua=%u fallback_icl_ua=%d fallback_input_ua=%d fallback_max_ua=%d fallback_age_ms=%lld ",
 				     ERHAI_SERIAL_5V_UA, b->serial_icl_ua, b->serial_input_ua,
 				     b->serial_max_ua, b->serial_sample_at ?
 				     (long long)jiffies_to_msecs(jiffies - b->serial_sample_at) : -1LL);
+	len += sysfs_emit_at(buf, len,
+		"buck_phase=%u ffc_step=%u ffc_used=%d buck_fv_mv=%d buck_fcc_ua=%d "
+		"buck_enable=%d buck_cutoff_mv=%d buck_cutoff_ma=%d buck_recharge_mv=%d "
+		"buck_v_hits=%u buck_i_hits=%u buck_full=%d buck_error=%d buck_gauge_error=%d "
+		"buck_mv=%d buck_ma=%d buck_temp=%d buck_sample_age_ms=%lld ",
+		b->buck.phase, b->buck.step, b->buck.ffc_used, b->buck_fv_applied,
+		b->buck_fcc_applied, b->buck_enable_applied, b->buck.cutoff_mv,
+		b->buck.cutoff_ma, b->buck.recharge_mv, b->buck.voltage_count,
+		b->buck.current_count, b->buck.phase == ERHAI_BUCK_FULL, b->buck_error,
+		b->buck_gauge_error,
+		b->buck_sample.mv, b->buck_sample.ma, b->buck_sample.temp,
+		b->buck_sample_at ? (long long)jiffies_to_msecs(jiffies - b->buck_sample_at) : -1LL);
 	if (b->pps_ops)
 		return b->pps_ops->describe(b->pps_data, buf, len);
 	return len + sysfs_emit_at(buf, len, "state=idle\n");
@@ -1460,7 +1589,7 @@ static void qcom_battmgr_pd_log(struct qcom_battmgr *battmgr, u32 type)
 }
 
 /* Erhai fixed-PD buck profile. FCC controls battery demand independently
- * of USB ICL. The firmware continues to own the CV and JEITA loops. Use
+ * of USB ICL. The AP owns the tail FV/full/recharge decisions. Use
  * the domestic cell envelope and the firmware-reported FCC rating.
  * BATT_TEMP is in centi-C. */
 static int qcom_battmgr_pd_fcc(struct qcom_battmgr *b)
@@ -1468,6 +1597,9 @@ static int qcom_battmgr_pd_fcc(struct qcom_battmgr *b)
 	const struct erhai_charge_step *step;
 	u32 auth, hmac, temp, soc, uv, max_fcc, want, current_fcc;
 	int ret;
+
+	if (b->buck.phase != ERHAI_BUCK_OFF && b->buck.phase != ERHAI_BUCK_NORMAL)
+		return 0;
 
 	ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM, &current_fcc);
 	if (ret)
@@ -1487,7 +1619,7 @@ static int qcom_battmgr_pd_fcc(struct qcom_battmgr *b)
 	    !qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CHG_CTRL_LIM_MAX, &max_fcc) &&
 	    max_fcc > 0 && max_fcc <= INT_MAX) {
 		step = erhai_cell_entry(soc / 100, (s32)temp < 0 ? -1 : (s32)temp / 10, uv / 1000);
-		/* Outside the direct-charge table the ADSP retains CV/JEITA. */
+		/* The ordinary buck profile applies outside the pump table. */
 		if (step)
 			want = min(max_fcc, step->ma * 2000U);
 	}
@@ -1506,8 +1638,12 @@ static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 	int ret, err, fcc_err = 0;
 
 	if (battmgr->pd_restore_fcc) {
-		ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
-						BATT_CHG_CTRL_LIM, battmgr->pd_saved_fcc_ua);
+		/* FFC now owns FCC and saved the ordinary vote for its exit. */
+		if (battmgr->buck.phase == ERHAI_FFC_FAST && battmgr->buck_saved_fcc_valid)
+			ret = 0;
+		else
+			ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
+							BATT_CHG_CTRL_LIM, battmgr->pd_saved_fcc_ua);
 		fcc_err = ret;
 		if (!ret)
 			battmgr->pd_restore_fcc = false;
@@ -1543,30 +1679,6 @@ static int qcom_battmgr_pd_stop(struct qcom_battmgr *battmgr, bool offline,
 	else
 		dev_info(battmgr->dev, "PD: restored 5 V (%s)\n", reason);
 	return err;
-}
-
-/* Domestic common.dtsi: batt-them-thr, wired-vbatdet-mv and
- * non-standard-vbatdet-mv. Direct charging switches to warm at 44 C,
- * one degree before the buck, so use its warm recharge threshold there.
- */
-static int erhai_recharge_mv(int temp, unsigned int cycles, bool qualified)
-{
-	int mv;
-
-	if (temp < 0 || temp >= 510)
-		return 0;
-	if (!qualified)
-		return 3680;
-	if (temp < 50)
-		mv = 4290;
-	else if (temp < 350)
-		mv = 4390;
-	else if (temp < 440)
-		mv = 4370;
-	else
-		mv = 4030;
-	/* dec-vol-cc-full-thr / dec-vol-fv-full-mv. */
-	return mv - (cycles >= 1200 ? 60 : cycles >= 800 ? 40 : cycles >= 400 ? 20 : 0);
 }
 
 static void qcom_battmgr_route_delivered(struct erhai_route_retry *retry)
@@ -1606,32 +1718,17 @@ static void qcom_battmgr_restore_route(struct qcom_battmgr *b, unsigned int rout
  */
 static bool qcom_battmgr_tail_owned(struct qcom_battmgr *b)
 {
-	u32 temp, uv, auth, hmac, cycles;
-
 	if (test_and_clear_bit(PD_EVENT_TAIL, &b->pd_events)) {
 		b->tail_owned = true;
 		b->recharge_samples = 0;
 		b->recharge_at = jiffies;
+		if (b->buck.phase == ERHAI_BUCK_OFF)
+			erhai_buck_start(&b->buck, jiffies);
+		erhai_buck_pump_done(&b->buck, jiffies);
 	}
-	if (!b->tail_owned || time_before(jiffies, b->recharge_at))
-		return b->tail_owned;
-	b->recharge_at = jiffies + 4 * HZ;
-	if (qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, &temp) ||
-	    qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, &uv) ||
-	    qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_AUTH, &auth) ||
-	    qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_HMAC, &hmac) ||
-	    qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CYCLE_COUNT, &cycles) ||
-	    !uv || (s32)temp < 0 ||
-	    uv > 1000U * erhai_recharge_mv((s32)temp / 10, cycles, auth == 1 && hmac == 1)) {
-		b->recharge_samples = 0;
-	} else if (++b->recharge_samples >= 6) {
-		b->tail_owned = false;
-		qcom_battmgr_restore_route(b, READ_ONCE(b->tail_route));
-		if (b->pps_ops)
-			b->pps_ops->recharge(b->pps_data);
-		b->serial_backoff = b->ufcs_backoff = false;
-		b->serial_failures = b->ufcs_failures = 0;
-	}
+	/* A voltage dip during the FFC wait or its disabled idle interval
+	 * is not recharge. Only check_rechg after AP full releases this latch.
+	 */
 	return b->tail_owned;
 }
 
@@ -1639,6 +1736,9 @@ void erhai_charge_tail_complete(unsigned int route)
 {
 	guard(mutex)(&erhai_bridge_lock);
 	if (erhai_battmgr) {
+		if (route == ERHAI_SERIAL)
+			WRITE_ONCE(erhai_battmgr->serial_tail_check_at,
+				   jiffies + msecs_to_jiffies(3000));
 		WRITE_ONCE(erhai_battmgr->tail_route, route);
 		set_bit(PD_EVENT_TAIL, &erhai_battmgr->pd_events);
 	}
@@ -1783,6 +1883,266 @@ sample:
 	return 0;
 }
 
+/* All actuator writes share charge_lock with protocol arbitration and
+ * user limits. A lost acknowledgement invalidates the cached command.
+ */
+static void qcom_battmgr_buck_invalidate(struct qcom_battmgr *b)
+{
+	b->buck_fv_applied = b->buck_fcc_applied = -1;
+	b->buck_enable_applied = b->buck_para_applied = -1;
+	b->buck_full_applied = -1;
+}
+
+static int qcom_battmgr_buck_write(struct qcom_battmgr *b, unsigned int property,
+				 int value, int *applied)
+{
+	int ret;
+
+	if (*applied == value)
+		return 0;
+	*applied = -1;
+	ret = qcom_battmgr_set_property(b, BATTMGR_BAT_PROPERTY_SET, property, value);
+	if (!ret)
+		*applied = value;
+	return ret;
+}
+
+static int qcom_battmgr_buck_pause(struct qcom_battmgr *b)
+{
+	int ret, fv_ret = 0;
+
+	ret = qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN, 0, &b->buck_enable_applied);
+	if (b->buck.normal_fv_mv && b->buck.temp_region < 7)
+		fv_ret = qcom_battmgr_buck_write(b, BATT_VOLT_MAX, b->buck.normal_fv_mv,
+					       &b->buck_fv_applied);
+	return ret ?: fv_ret;
+}
+
+static int qcom_battmgr_buck_apply(struct qcom_battmgr *b)
+{
+	struct erhai_buck *buck = &b->buck;
+	bool enable = !buck->disable && !b->charge_policy_hold && !b->charge_inhibited &&
+		      !READ_ONCE(b->otg_request);
+	int ret, hint, para, region, ffc = 0;
+	u32 fcc;
+
+	if (buck->temp_region >= 7 &&
+	    b->buck_sample.mv > buck->fv_mv - ERHAI_BUCK_WARM_FV_MARGIN_MV &&
+	    b->buck_fv_applied != buck->fv_mv)
+		enable = false;
+
+	/* switch_ffc and FFC_IDLE use an output-disable vote, not ICL=0;
+	 * the USB source continues supplying the system during both waits.
+	 */
+	if (!enable || b->buck_enable_applied < 0 || b->buck_fv_applied < buck->fv_mv) {
+		ret = qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN, 0,
+					    &b->buck_enable_applied);
+		if (ret)
+			return ret;
+	}
+	/* oplus_comm_check_allow_set_fv keeps the PMIC power path above
+	 * a warm cell. Output remains disabled while it exceeds warm FV.
+	 */
+	if (buck->temp_region < 7 ||
+	    b->buck_sample.mv <= buck->fv_mv - ERHAI_BUCK_WARM_FV_MARGIN_MV) {
+		ret = qcom_battmgr_buck_write(b, BATT_VOLT_MAX, buck->fv_mv,
+					    &b->buck_fv_applied);
+		if (ret)
+			return ret;
+	}
+	if (buck->fcc_ma) {
+		if (!b->buck_saved_fcc_valid) {
+			ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET,
+						BATT_CHG_CTRL_LIM, &fcc);
+			if (ret)
+				return ret;
+			b->buck_saved_fcc_ua = b->pd_restore_fcc ? b->pd_saved_fcc_ua : fcc;
+			b->buck_saved_fcc_valid = true;
+		}
+		ret = qcom_battmgr_buck_write(b, BATT_CHG_CTRL_LIM, buck->fcc_ma * 1000,
+					    &b->buck_fcc_applied);
+		if (ret)
+			return ret;
+	} else if (b->buck_saved_fcc_valid) {
+		ret = qcom_battmgr_buck_write(b, BATT_CHG_CTRL_LIM, b->buck_saved_fcc_ua,
+					    &b->buck_fcc_applied);
+		if (ret)
+			return ret;
+		b->buck_saved_fcc_valid = false;
+	}
+	/* HAL get_props_from_adsp_by_buffer / set_full_para_qbg.
+	 * V3P7 has a zero-width little-cold-high entry in the newer enum.
+	 */
+	region = buck->temp_region >= 2 ? buck->temp_region + 1 : buck->temp_region;
+	if (buck->phase >= ERHAI_FFC_WAIT && buck->phase <= ERHAI_FFC_IDLE)
+		ffc = buck->phase - ERHAI_FFC_WAIT + 1;
+	para = (region << 3) | (ffc << 1);
+	hint = qcom_battmgr_buck_write(b, BATT_OPLUS_FULL_PARA, para,
+				     &b->buck_para_applied);
+	ret = qcom_battmgr_buck_write(b, BATT_OPLUS_SET_FULL,
+				    buck->phase == ERHAI_BUCK_FULL && buck->temp_region <= 6,
+				    &b->buck_full_applied);
+	b->buck_gauge_error = hint ?: ret;
+	/* These report AP decisions to the gauge. The output-disable and
+	 * FV/FCC actuators above remain authoritative if a hint is rejected.
+	 */
+	return qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN, enable,
+				      &b->buck_enable_applied);
+}
+
+static int qcom_battmgr_buck_release(struct qcom_battmgr *b)
+{
+	bool enable;
+	int ret;
+
+	if (b->buck.phase == ERHAI_BUCK_OFF)
+		return 0;
+	if (!b->buck.normal_fv_mv) {
+		ret = qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN,
+					    !b->charge_policy_hold && !b->charge_inhibited,
+					    &b->buck_enable_applied);
+		if (!ret)
+			b->buck = (struct erhai_buck){};
+		return ret;
+	}
+	enable = b->buck.phase != ERHAI_BUCK_FULL && !b->buck.over_voltage &&
+		 b->buck.temp_region > 0 && b->buck.temp_region < 8 &&
+		 !b->charge_policy_hold && !b->charge_inhibited;
+	/* Withdraw elevated FV before leaving AP supervision, including reboot. */
+	b->buck.phase = ERHAI_BUCK_NORMAL;
+	b->buck.disable = true;
+	b->buck.fv_mv = b->buck.normal_fv_mv;
+	b->buck.fcc_ma = 0;
+	ret = qcom_battmgr_buck_apply(b);
+	if (ret)
+		return ret;
+	enable &= b->buck_fv_applied == b->buck.normal_fv_mv;
+	ret = qcom_battmgr_buck_write(b, BATT_OPLUS_CHG_EN, enable,
+				    &b->buck_enable_applied);
+	if (ret)
+		return ret;
+	b->buck = (struct erhai_buck){};
+	return 0;
+}
+
+static int qcom_battmgr_buck_read(struct qcom_battmgr *b, struct erhai_buck_sample *s)
+{
+	u32 mv, ma, temp, soc, cycles, auth, hmac;
+	int ret;
+
+	ret = qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_VOLT_NOW, &mv);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CURR_NOW, &ma);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_TEMP, &temp);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CAPACITY, &soc);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_CYCLE_COUNT,
+					    &cycles);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_AUTH, &auth);
+	ret = ret ?: qcom_battmgr_get_property(b, BATTMGR_BAT_PROPERTY_GET, BATT_OPLUS_HMAC, &hmac);
+	if (ret)
+		return ret;
+	if (!mv || soc > 10000 || ma == BIT(31))
+		return -ENODATA;
+	*s = (struct erhai_buck_sample){
+		.mv = mv / 1000, .ma = -(s32)ma / 1000, .temp = (s32)temp / 10,
+		.soc = soc / 100, .cycles = cycles, .qualified = auth == 1 && hmac == 1,
+	};
+	return 0;
+}
+
+static unsigned int qcom_battmgr_buck_tick(struct qcom_battmgr *b)
+{
+	struct erhai_buck_sample sample;
+	enum erhai_buck_phase previous;
+	unsigned int step;
+	int ret;
+
+	if (!b->buck_online || READ_ONCE(b->otg_request))
+		return 0;
+	qcom_battmgr_tail_owned(b); /* A pump may have just published completion. */
+	if (b->serial_probe || qcom_battmgr_pps_running(b) ||
+	    (b->pps_ops && b->pps_ops->ufcs_active(b->pps_data)))
+		return 0;
+	if (b->buck.phase == ERHAI_BUCK_OFF)
+		erhai_buck_start(&b->buck, jiffies);
+	if (time_before(jiffies, b->buck.next_sample) && !b->buck_error)
+		return jiffies_to_msecs(b->buck.next_sample - jiffies);
+	ret = qcom_battmgr_buck_read(b, &sample);
+	if (ret)
+		goto fail;
+	b->buck_sample = sample;
+	b->buck_sample_at = jiffies;
+	previous = b->buck.phase;
+	step = b->buck.step;
+	if (!b->charge_policy_hold && !b->charge_inhibited)
+		erhai_buck_update(&b->buck, &sample, jiffies);
+	else {
+		erhai_buck_temperature(&b->buck, sample.temp);
+		erhai_buck_normal_limits(&b->buck, &sample);
+		if (b->buck.phase != ERHAI_BUCK_NORMAL && b->buck.phase != ERHAI_FFC_FAST)
+			b->buck.disable = true;
+		b->buck.next_sample = jiffies + msecs_to_jiffies(4000);
+	}
+	ret = qcom_battmgr_buck_apply(b);
+	if (ret)
+		goto fail;
+	if (previous != b->buck.phase || step != b->buck.step || b->buck_error) {
+		dev_info(b->dev, "buck phase=%u step=%u FV=%d mV FCC=%d uA enable=%d cell=%d mV %d mA\n",
+			 b->buck.phase, b->buck.step, b->buck_fv_applied, b->buck_fcc_applied,
+			 b->buck_enable_applied, sample.mv, sample.ma);
+		power_supply_changed(b->bat_psy);
+	}
+	b->buck_error = 0;
+	if (b->buck.recharged) {
+		b->buck.recharged = false;
+		b->tail_owned = false;
+		qcom_battmgr_restore_route(b, READ_ONCE(b->tail_route));
+		if (b->pps_ops)
+			b->pps_ops->recharge(b->pps_data);
+		b->serial_backoff = b->ufcs_backoff = false;
+		b->serial_failures = b->ufcs_failures = 0;
+	}
+	return jiffies_to_msecs(b->buck.next_sample - jiffies) ?: 1;
+
+fail:
+	if (b->buck_error != ret)
+		dev_warn(b->dev, "buck supervision failed: %d; withdrawing charge output\n", ret);
+	b->buck_error = ret;
+	b->buck.current_count = b->buck.sw_count = b->buck.hw_count = 0;
+	b->buck.recharge_count = 0;
+	/* Do not leave 4.63 V active without current gauge data or an
+	 * acknowledged control sequence. Retry through the normal worker.
+	 */
+	qcom_battmgr_buck_pause(b);
+	return PD_POLL_MS;
+}
+
+/* A SUPERVOOC reset interrupts VBUS and can unregister the UCSI partner
+ * without anyone removing the cable. Stock AP VOOC PHY, FAST_NOTIFY_FULL
+ * and check_chg_out_work_func: recheck the source after 3 s, below 2.5 V.
+ * Use the board's CID detector (oplus_chg_8350_get_hw_detect) as well.
+ * Unknown CID is not a detach; an unsupported CID falls back to the AP
+ * PHY's voltage check. Stop contracts immediately in either case.
+ */
+static bool qcom_battmgr_keep_serial_tail(struct qcom_battmgr *b)
+{
+	u32 cid, uv;
+	int ret;
+
+	if (READ_ONCE(b->tail_route) != ERHAI_SERIAL ||
+	    !(b->tail_owned || test_bit(PD_EVENT_TAIL, &b->pd_events)))
+		return false;
+	if (time_before(jiffies, READ_ONCE(b->serial_tail_check_at)))
+		return true;
+	ret = qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_OPLUS_CID_STATUS, &cid);
+	if (ret && ret != -EOPNOTSUPP)
+		return true;
+	if (!ret && cid)
+		return true;
+	if (qcom_battmgr_get_property(b, BATTMGR_USB_PROPERTY_GET, USB_VOLT_NOW, &uv))
+		return true;
+	return uv >= 2500000;
+}
+
 static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 {
 	struct qcom_battmgr_pd_source src = { .battmgr = battmgr };
@@ -1792,12 +2152,17 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus, ua, real_type;
 	int ret;
 
+	if (!battmgr->pps_ops && qcom_battmgr_serial_buck(battmgr, false))
+		return PD_POLL_MS;
 	if (test_and_clear_bit(PD_EVENT_SERVICE_RESET, &battmgr->pd_events)) {
 		battmgr->pd_restore_fcc = false;
 		battmgr->aicl_done = false;
+		qcom_battmgr_buck_invalidate(battmgr);
+		battmgr->buck.next_sample = jiffies;
 	}
 	if (test_and_clear_bit(PD_EVENT_RESET, &battmgr->pd_events)) {
-		if (qcom_battmgr_pps_stop(battmgr, false) ||
+		qcom_battmgr_buck_invalidate(battmgr);
+		if (qcom_battmgr_pps_stop(battmgr, false, "PD-reset") ||
 		    qcom_battmgr_pd_stop(battmgr, false, "PD reset"))
 			return PD_POLL_MS;
 		battmgr->pd_state = PD_IDLE;
@@ -1814,7 +2179,7 @@ read_source:
 				      USB_ONLINE, &online)) {
 		if (detached)
 			set_bit(PD_EVENT_DETACH, &battmgr->pd_events);
-		qcom_battmgr_pps_stop(battmgr, false);
+		qcom_battmgr_pps_stop(battmgr, false, "USB_ONLINE-read-failed");
 		return PD_POLL_MS;
 	}
 	if (online && qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
@@ -1843,26 +2208,47 @@ read_source:
 				battmgr->retry_evidence |= ERHAI_SERIAL;
 		}
 		serial_source = !detached && (battmgr->retry_evidence & ERHAI_SERIAL);
+		battmgr->buck_online = online && !READ_ONCE(battmgr->otg_request);
 		qcom_battmgr_charge_wake_locked(battmgr,
 			erhai_should_stay_awake(online == 1, battmgr->otg_request,
-						serial_source ? POWER_SUPPLY_USB_TYPE_DCP : type));
+						serial_source || (battmgr->buck.phase >= ERHAI_FFC_WAIT &&
+				battmgr->buck.phase <= ERHAI_FFC_IDLE) ? POWER_SUPPLY_USB_TYPE_DCP : type));
 	}
 	if (detached || !online) {
-		ret = qcom_battmgr_pps_stop(battmgr, false);
-		if (battmgr->pps_ops)
-			battmgr->pps_ops->detached(battmgr->pps_data);
-		test_and_clear_bit(PD_EVENT_TAIL, &battmgr->pd_events);
-		battmgr->tail_owned = false;
+		bool keep_tail;
+
+		qcom_battmgr_buck_invalidate(battmgr);
+		ret = qcom_battmgr_pps_stop(battmgr, false, "detach-or-offline");
+		if (!online && battmgr->buck.phase != ERHAI_BUCK_OFF)
+			ret = qcom_battmgr_buck_pause(battmgr) ?: ret;
+		/* Check after requesting PHY stop: its last sample may have
+		 * announced CV while the removal notification was in flight.
+		 */
+		keep_tail = qcom_battmgr_keep_serial_tail(battmgr);
+		if (!keep_tail) {
+			if (qcom_battmgr_buck_release(battmgr)) {
+				set_bit(PD_EVENT_DETACH, &battmgr->pd_events);
+				return PD_POLL_MS;
+			}
+			if (battmgr->pps_ops)
+				battmgr->pps_ops->detached(battmgr->pps_data);
+			test_and_clear_bit(PD_EVENT_TAIL, &battmgr->pd_events);
+			battmgr->tail_owned = false;
+			WRITE_ONCE(battmgr->serial_tail_check_at, 0);
+			WRITE_ONCE(battmgr->tail_route, 0);
+		}
+		battmgr->recharge_samples = 0;
 		battmgr->stable_seen = false;
 		battmgr->missing_routes = battmgr->retry_pending = 0;
 		battmgr->retry_stopping = false;
-		battmgr->retry_once = battmgr->retry_evidence = 0;
+		battmgr->retry_once = 0;
+		battmgr->retry_evidence = keep_tail ? ERHAI_SERIAL : 0;
+		serial_source = keep_tail;
 		battmgr->serial_retry_state = (struct erhai_route_retry){};
 		battmgr->ufcs_retry_state = (struct erhai_route_retry){};
 		battmgr->pps_retry_state = (struct erhai_route_retry){};
 		battmgr->fixed_retry_state = (struct erhai_route_retry){};
 		battmgr->restore_route = battmgr->suspend_route = 0;
-		WRITE_ONCE(battmgr->tail_route, 0);
 		test_and_clear_bit(PD_EVENT_SVOOC_RESPONSE, &battmgr->pd_events);
 		test_and_clear_bit(PD_EVENT_UFCS_RESPONSE, &battmgr->pd_events);
 		battmgr->serial_failures = battmgr->ufcs_failures = 0;
@@ -1885,7 +2271,7 @@ read_source:
 		battmgr->pd_logged = false;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 		if (!online)
-			return 0;
+			return keep_tail ? PD_POLL_MS : 0;
 	}
 
 	power_supply_for_each_psy(&src, qcom_battmgr_pd_source_match);
@@ -1915,7 +2301,8 @@ read_source:
 		      qcom_battmgr_usb_idle(battmgr)));
 	tail = qcom_battmgr_tail_owned(battmgr);
 	dedicated |= serial_source;
-	can_probe = dedicated && !READ_ONCE(battmgr->pps_suspended) &&
+	can_probe = dedicated && battmgr->buck.phase != ERHAI_BUCK_FULL &&
+		    !battmgr->buck.disable && !READ_ONCE(battmgr->pps_suspended) &&
 		    !READ_ONCE(battmgr->otg_request) && !battmgr->charge_inhibited &&
 		    !battmgr->charge_policy_hold && !battmgr->charge_error;
 	can_probe_pumps = can_probe && !status.connector_blocked;
@@ -1958,7 +2345,7 @@ read_source:
 		}
 	}
 	if (battmgr->retry_stopping) {
-		ret = qcom_battmgr_pps_stop(battmgr, true);
+		ret = qcom_battmgr_pps_stop(battmgr, true, "upward-retry");
 		ret = ret ?: qcom_battmgr_pd_stop(battmgr, false, "qualified protocol retry");
 		if (ret && time_before(jiffies, battmgr->retry_deadline))
 			return PD_POLL_MS;
@@ -1989,21 +2376,23 @@ read_source:
 			battmgr->retry_once &= ~ERHAI_SERIAL;
 			battmgr->restore_route &= ~ERHAI_SERIAL;
 			ret = battmgr->pps_ops->serial_session(true);
+			battmgr->serial_blocked = ret == -EPERM;
+			if (!ret)
+				ret = qcom_battmgr_serial_buck(battmgr, status.serial_needs_buck_off);
+			if (!ret && status.serial_needs_buck_off && !status.serial_buck_ready)
+				battmgr->pps_ops->serial_buck_sample(erhai_usb_readback(battmgr, USB_CURR_NOW));
 			if (!ret) {
-				if (status.delivering == ERHAI_SERIAL &&
-				    qcom_battmgr_serial_icl(battmgr, false))
-					return PD_POLL_MS;
 				battmgr->serial_probe = true;
 				battmgr->aicl_done = false;
 				return PD_POLL_MS;
 			}
+			dev_info(battmgr->dev, "serial setup failed: %d\n", ret);
 			/* Keep the reservation until the entire retry ladder is done. */
-			battmgr->serial_blocked = ret == -EPERM;
 			battmgr->serial_backoff = true;
 			battmgr->serial_retry = qcom_battmgr_probe_retry(&battmgr->serial_failures);
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 		}
-		if (battmgr->pps_ops->serial_session(false))
+		if (qcom_battmgr_serial_stop(battmgr, "serial-ineligible"))
 			return PD_POLL_MS;
 		battmgr->serial_probe = false;
 	}
@@ -2028,14 +2417,15 @@ read_source:
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 	if (battmgr->pps_ops && battmgr->pps_ops->ufcs_active(battmgr->pps_data) &&
-	    qcom_battmgr_pps_stop(battmgr, false))
+	    qcom_battmgr_pps_stop(battmgr, false, "UFCS-exit"))
 		return PD_POLL_MS;
 	/* A failed 5 V readback or a disappearing PHY cancels this reservation. */
 	battmgr->retry_pending = 0;
 	/* The Type-C partner's PD capabilities are stronger evidence than
 	 * an incomplete BC1.2 classification. PPS also checks its APDO.
 	 */
-	prefer_pps = !status.connector_blocked && !tail &&
+	prefer_pps = !status.connector_blocked && !tail && !battmgr->buck.disable &&
+		     battmgr->buck.phase != ERHAI_BUCK_FULL &&
 		     !test_bit(PD_EVENT_TAIL, &battmgr->pd_events) && !READ_ONCE(battmgr->pps_suspended) &&
 		     battmgr->pps_ops && battmgr->pps_ops->enabled() &&
 		     src.sink && !READ_ONCE(battmgr->otg_request);
@@ -2067,7 +2457,7 @@ read_source:
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
 	if (qcom_battmgr_pps_running(battmgr)) {
-		if (qcom_battmgr_pps_stop(battmgr, false))
+		if (qcom_battmgr_pps_stop(battmgr, false, "PPS-exit"))
 			return PD_POLL_MS;
 		set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 	}
@@ -2355,7 +2745,7 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 {
 	struct qcom_battmgr *battmgr = container_of(to_delayed_work(work),
 						    struct qcom_battmgr, charge_work);
-	unsigned int delay = 0;
+	unsigned int delay = 0, buck_delay;
 
 	/* Kicked again by qcom_battmgr_enable_worker() once the service is up */
 	if (READ_ONCE(battmgr->removing) || READ_ONCE(battmgr->pps_suspended))
@@ -2367,7 +2757,7 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 		return;
 	}
 	if (!battmgr->service_up) {
-		qcom_battmgr_pps_stop(battmgr, false);
+		qcom_battmgr_pps_stop(battmgr, false, "service-down");
 		mutex_unlock(&battmgr->charge_lock);
 		return;
 	}
@@ -2376,6 +2766,11 @@ static void qcom_battmgr_charge_worker(struct work_struct *work)
 
 	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD)
 		delay = qcom_battmgr_pd_update(battmgr);
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
+		buck_delay = qcom_battmgr_buck_tick(battmgr);
+		if (buck_delay)
+			delay = delay ? min(delay, buck_delay) : buck_delay;
+	}
 	if (delay && battmgr->tail_owned)
 		delay = min(delay, 4000U);
 
@@ -2406,6 +2801,19 @@ void erhai_charge_recheck(void)
 		qcom_battmgr_charge_kick(erhai_battmgr);
 }
 EXPORT_SYMBOL_GPL(erhai_charge_recheck);
+
+/* A serial IRQ has already sent the curve. If GLINK is busy the
+ * existing serial-session poll will service its buck handoff.
+ */
+void erhai_charge_try_recheck(void)
+{
+	if (!mutex_trylock(&erhai_bridge_lock))
+		return;
+	if (erhai_battmgr)
+		qcom_battmgr_charge_kick(erhai_battmgr);
+	mutex_unlock(&erhai_bridge_lock);
+}
+EXPORT_SYMBOL_GPL(erhai_charge_try_recheck);
 
 /*
  * A charger came or went: the firmware may have turned charging back on, so
@@ -2452,6 +2860,8 @@ static bool qcom_battmgr_prepare_sleep(struct qcom_battmgr *b)
 	guard(mutex)(&b->charge_lock);
 	guard(spinlock_irqsave)(&b->notify_lock);
 	if (b->charge_awake ||
+	    (b->buck_online && b->buck.phase >= ERHAI_FFC_WAIT &&
+	     b->buck.phase <= ERHAI_FFC_IDLE) ||
 	    (b->service_up && !b->removing && test_bit(PD_EVENT_DETACH, &b->pd_events)))
 		return false;
 	WRITE_ONCE(b->pps_suspended, true);
@@ -2478,7 +2888,7 @@ static int qcom_battmgr_pm_notify(struct notifier_block *nb,
 		if (battmgr->pps_ops)
 			battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
 		battmgr->suspend_route = status.delivering;
-		if (qcom_battmgr_pps_stop(battmgr, false)) {
+		if (qcom_battmgr_pps_stop(battmgr, false, "suspend")) {
 			mutex_unlock(&battmgr->charge_lock);
 			WRITE_ONCE(battmgr->pps_suspended, false);
 			qcom_battmgr_charge_kick(battmgr);
@@ -3388,6 +3798,7 @@ static void qcom_battmgr_sm8350_callback(struct qcom_battmgr *battmgr,
 			battmgr->usb.usb_type = val;
 			break;
 		case USB_REAL_TYPE:
+		case USB_OPLUS_CID_STATUS:
 		case 26: /* OPLUS serial fast-charge classification */
 		case USB_OPLUS_PPS_TYPE:
 		case USB_OPLUS_PPS_MAX_CURR:
@@ -3600,7 +4011,7 @@ static void qcom_battmgr_otg_worker(struct work_struct *work)
 	if (!battmgr->service_up || on == battmgr->otg_vbus)
 		return;
 
-	if (on && (qcom_battmgr_pps_stop(battmgr, false) ||
+	if (on && (qcom_battmgr_pps_stop(battmgr, false, "OTG-enable") ||
 		   qcom_battmgr_pd_stop(battmgr, false, "USB source role")))
 		return;
 
@@ -3661,6 +4072,7 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		schedule_work(&battmgr->enable_work);
 	} else {
 		battmgr->service_up = false;
+		battmgr->buck_online = false;
 		qcom_battmgr_charge_wake_locked(battmgr, false);
 		/* A restarted firmware charges again by default */
 		battmgr->charge_inhibited = false;
@@ -3764,9 +4176,11 @@ static void qcom_battmgr_cancel_work(void *data)
 	disable_delayed_work_sync(&battmgr->charge_work);
 	disable_work_sync(&battmgr->otg_work);
 	mutex_lock(&battmgr->charge_lock);
-	qcom_battmgr_pps_stop(battmgr, false);
-	if (battmgr->service_up)
+	qcom_battmgr_pps_stop(battmgr, false, "driver-stop");
+	if (battmgr->service_up) {
 		qcom_battmgr_pd_stop(battmgr, false, "driver stopped");
+		qcom_battmgr_buck_release(battmgr);
+	}
 	mutex_unlock(&battmgr->charge_lock);
 }
 
@@ -3947,7 +4361,7 @@ void erhai_pps_unregister(struct device *parent)
 	struct qcom_battmgr *battmgr = dev_get_drvdata(parent);
 
 	guard(mutex)(&battmgr->charge_lock);
-	qcom_battmgr_pps_stop(battmgr, false);
+	qcom_battmgr_pps_stop(battmgr, false, "PPS-unregister");
 	battmgr->pps_ops = NULL;
 	battmgr->pps_data = NULL;
 	set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
@@ -4034,6 +4448,7 @@ static int qcom_battmgr_probe(struct auxiliary_device *adev,
 	mutex_init(&battmgr->lock);
 	spin_lock_init(&battmgr->notify_lock);
 	mutex_init(&battmgr->charge_lock);
+	qcom_battmgr_buck_invalidate(battmgr);
 	init_completion(&battmgr->ack);
 	battmgr->request_opcode = U32_MAX;
 

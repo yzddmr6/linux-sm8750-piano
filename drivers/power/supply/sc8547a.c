@@ -55,6 +55,7 @@
 
 #include "sc8547a.h"
 #include "erhai_cell_envelope.h"
+#include "erhai_svooc_lcf.h"
 
 /*
  * Android parity for slow/noisy third-party (S)VOOC adapters.  The vendor
@@ -137,6 +138,7 @@ static const char * const sc8547_gauge_names[] = {
 #include "erhai_otg_glink.h"
 #include "sc8547a.h"
 #include "erhai_cell_envelope.h"
+#include "erhai_svooc_lcf.h"
 
 /* ---- register map (charge-pump / VOOC-PHY function, I2C addr 0x6F) ---- */
 #define SC8547_REG_00			0x00	/* VBAT_OVP */
@@ -163,6 +165,7 @@ static const char * const sc8547_gauge_names[] = {
 #define   SC8547_CHARGE_MODE_1_1	1
 #define   SC8547_WATCHDOG_MASK		0x07
 #define   SC8547_WATCHDOG_DIS		0
+#define SC8547_PPS_WATCHDOG_REG		0x14 /* REG09: 2:1 profile, watchdog 5 s */
 #define SC8547_REG_0D			0x0D
 #define SC8547_REG_0F			0x0F	/* interrupt flag */
 #define SC8547_REG_10			0x10	/* insert-irq mask */
@@ -339,36 +342,15 @@ static const char * const sc8547_gauge_names[] = {
  * (diff ~70 mV) just self-clears, so we engage it under load in the monitor and
  * retry until it latches; drop it again when total bus demand falls low.
  */
-#define SC8547_SLAVE_ENGAGE_IBUS_MA	1500	/* master half this high -> close slave */
-#define SC8547_SLAVE_DISENGAGE_IBUS_MA	1200	/* total bus below this -> drop slave */
-
-/*
- * Settle grace + drop debounce (2026-10-01, bench-measured on Marcos' pad).
- * The adapter's output is shared the instant the slave closes, so the master's
- * own half falls to the slave's share BEFORE the slave ramps off its own
- * soft-start; the slave's ADC can also still read its idle value (~20 mA) on
- * the first tick after the enable.  A one-tick "total low" test therefore
- * drops a slave that was about to share: measured 22:36 — engage at master
- * 1781 mA, drop one tick later at "total 1044 mA", pack stuck at 58 %; and
- * 22:55 after a re-plug, the same pad held master 1061 + slave 1008 mA = 2.4 A
- * and charged (63->64 %).  So never judge the drop inside slave_settle_ms of
- * the engage, and require slave_drop_ticks consecutive low totals after that.
- */
-static unsigned int slave_settle_ms = 4000;
-module_param(slave_settle_ms, uint, 0644);
-MODULE_PARM_DESC(slave_settle_ms,
-		 "dual-CP: never judge the slave drop inside this window after the engage (ms, default 4000, 0 = old behaviour)");
-
-static unsigned int slave_drop_ticks = 3;
-module_param(slave_drop_ticks, uint, 0644);
-MODULE_PARM_DESC(slave_drop_ticks,
-		 "dual-CP: consecutive low total-bus ticks before dropping the slave (default 3, 1 = old behaviour)");
+#define SC8547_SLAVE_ENGAGE_IBUS_MA	1400	/* master half this high -> close slave */
+#define SC8547_SLAVE_DISENGAGE_IBUS_MA	1100	/* total bus below this -> drop slave */
 
 /* Project 24926 selects the domestic 67 W SC8547A curve. */
 #define SC8547_AUTO_CODE_CEILING	61	/* 24926 (24924 table): 6100 mA */
 
 #define SC8547_AUTO_IDENTIFY_MS		4000	/* window to see adapter_check_ok */
-#define SC8547_AUTO_STEP_DEBOUNCE	4	/* consecutive ticks (~1 s) to advance */
+#define SC8547_CURVE_SAMPLE_MS		500 /* VOOC_VOL_EVENT_TIME */
+#define SC8547_AUTO_STEP_DEBOUNCE	4	/* four 500 ms voltage samples */
 /*
  * A genuine SVOOC adapter periodically resets its VOOC link (drops output and
  * waits for a fresh handshake) after tens of seconds of CC. That is not an
@@ -381,7 +363,7 @@ MODULE_PARM_DESC(slave_drop_ticks,
 /* Oplus AP VOOC PHY: VOOC_COMMU_EVENT_TIME and VOOCPHY_UCP_SS_IBUS_MIN. */
 #define SC8547_COMMU_TIMEOUT_MS		200
 #define SC8547_UCP_ARM_MA		600
-#define SC8547_LOW_IBUS_MA		300	/* same ADC floor as the serial taper check */
+#define SC8547_LOW_IBUS_MA		300	/* pump no-load floor, separate from gauge LCF */
 #define SC8547_AUTO_SUSTAINED_MS	5000	/* CC held this long -> reset is keep-alive */
 #define SC8547_AUTO_DETACH_DEBOUNCE_MS	2500	/* longer absence window while delivering */
 
@@ -461,6 +443,10 @@ struct sc8547a_device {
 	struct mutex		i2c_lock;	/* serialises multi-op RMW */
 	struct dentry		*debug_root;
 	int			irq;
+	bool allow_sent, buck_ready;
+	int pre_allow_buck_ua;
+	unsigned long allow_deadline;
+	u8 first_request; /* First confirmed ASK_CURRENT of this handshake. */
 	u8			ovp_reg;
 	u8			ocp_reg;
 	bool			is_slave;
@@ -508,7 +494,14 @@ struct sc8547a_device {
 	enum sc8547_auto_state	auto_state;
 	unsigned long		auto_identify_deadline;
 	const struct erhai_charge_curve *auto_curve;
-	int curve_temp;
+	int curve_temp, curve_sample_temp, curve_entry_temp, curve_entry_soc;
+	int curve_vbat_mv, cell_vbat_mv;
+	unsigned long curve_next_sample;
+	unsigned int curve_full_count;
+	bool curve_sampled;
+	struct erhai_svooc_lcf lcf;
+	int curve_temp_bounds[6];
+	unsigned int thermal_ma;
 	unsigned int curve_ma;	/* selected CC/CV table */
 	int			auto_curve_idx;	/* current row (descends only) */
 	bool			auto_protection;
@@ -519,6 +512,9 @@ struct sc8547a_device {
 	bool monitor_pump_faults;
 	u8 pump_faults;
 	unsigned int adc_over_count;
+	unsigned int leg_over_count;
+	unsigned long next_leg_check;
+	bool slave_check_pending, slave_trouble;
 	unsigned int low_ibus_count;
 	u64 irq_arrived_ns;	/* hard IRQ timestamp; IRQF_ONESHOT */
 	bool irq_pending;
@@ -564,6 +560,7 @@ struct sc8547a_device {
 	int			auto_ident_retries;	/* identify re-arms on this plug */
 	bool			vooc_saw_any;	/* any decodable VOOC frame this attempt */
 	/* --- dual-CP slave load-sharing state --- */
+	unsigned long		slave_next_sample;
 	unsigned long		slave_on_since;	/* jiffies the slave last engaged (0 = n/a) */
 	unsigned int		slave_low_cnt;	/* consecutive low-total ticks since then */
 };
@@ -1133,7 +1130,7 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_cp_engaged);
  * Engage the master CP for 2:1 delivery.  The chip input must be inside the
  * 2:1 error window (110 mV <= vbus - 2*vbat <= 700 mV, same constants as the
  * VOOC deliver path).  Applies the SVOOC constant-current profile (idempotent),
- * arms the 1000 ms REG_09 watchdog, then latches CHG_EN.  Returns 0 on
+ * arms the stock 5000 ms REG_09 watchdog, then latches CHG_EN.  Returns 0 on
  * success; -EAGAIN (*need_mv = midpoint-target difference) while outside the
  * window so the caller can servo the PPS voltage toward it.
  */
@@ -1168,7 +1165,7 @@ int sc8547a_pps_cp_engage(int *need_mv)
 	 */
 	ret = sc8547_svooc_hw_setting(sc);
 	if (!ret)
-		ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+		ret = sc8547_write_byte(sc, SC8547_REG_09, SC8547_PPS_WATCHDOG_REG);
 	if (!ret) {
 		pps_cp_engaged = true; /* an enable with a lost ACK may have switched */
 		ret = sc8547_set_chg_enable(sc, true);
@@ -1186,7 +1183,7 @@ int sc8547a_pps_cp_engage(int *need_mv)
 EXPORT_SYMBOL_GPL(sc8547a_pps_cp_engage);
 
 /*
- * Feed the 1000 ms watchdog and report state.  Call on every engine poll
+ * Feed the stock 5000 ms pump watchdog and report state.  Call on every engine poll
  * while engaged.  Re-latches CHG_EN (a watchdog expiry self-clears REG_07)
  * and recomputes the 2:1 window: leaving it disengages the CP (safe fallback
  * to the buck path) and returns -EAGAIN so the engine stops servoing.
@@ -1220,7 +1217,7 @@ int sc8547a_pps_cp_feed(int *vbus_mv, int *vbat_mv)
 	}
 	if (!(control & SC8547_CHG_EN_MASK))
 		goto drop;
-	ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+	ret = sc8547_write_byte(sc, SC8547_REG_09, SC8547_PPS_WATCHDOG_REG);
 	if (!ret)
 		ret = sc8547_set_chg_enable(sc, true);
 	if (!ret)
@@ -1236,7 +1233,13 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_cp_feed);
 
 static void sc8547_wait_for_watchdog(void)
 {
-	WRITE_ONCE(pump_off_at, jiffies + HZ + 1);
+	/* A missing stop ACK cannot prove a leg stopped. Wait out the
+	 * actual profile; never use the serial 1 s fence for a 5 s pump.
+	 */
+	unsigned int timeout = pps_cp_engaged || pps_slave_engaged ?
+		SC8547_PPS_WATCHDOG_MS : 1000;
+
+	WRITE_ONCE(pump_off_at, jiffies + msecs_to_jiffies(timeout) + 1);
 	WRITE_ONCE(pump_stopping, true);
 }
 
@@ -1249,7 +1252,7 @@ static int sc8547_pps_disengage(void)
 		if (sc8547_waiting_for_off())
 			return -EAGAIN;
 		/* No register access since the failed stop. Both enables
-		 * were preceded by a successful REG09=1s watchdog write.
+		 * were preceded by a successful profile-specific watchdog write.
 		 */
 		pump_stopping = false;
 		pps_cp_engaged = pps_slave_engaged = false;
@@ -1367,7 +1370,8 @@ static int sc8547_slave_cp_enable(struct sc8547a_device *master, bool on)
 	if (!sc)
 		return -ENODEV;
 	if (on) {
-		ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+		ret = sc8547_write_byte(sc, SC8547_REG_09,
+					 pps_cp_engaged ? SC8547_PPS_WATCHDOG_REG : 0x13);
 		ret = ret ?: sc8547_write_byte(sc, SC8547_REG_11, 0x80);
 		if (ret)
 			return ret;
@@ -1486,11 +1490,15 @@ int sc8547a_pps_share(int master_ma, int margin_mv, unsigned int demand_ma,
 	*slave_ma = 0;
 	if (!sc || !pps_cp_engaged)
 		return 0;
-	if (demand_ma < 1600)
+	if (demand_ma <= 1600)
 		return sc8547_pps_slave_off();
 	if (!pps_slave_engaged) {
 		/* virtual_cp cp_open_curr_thr_ma / cp_close_curr_thr_ma. */
-		if (demand_ma <= 1900 || master_ma <= 1900 || margin_mv < 200)
+		/* Domestic virtual_cp >=1900 mA opens, <=1600 mA closes.
+		 * Keep 200 mV headroom: same-chip lab observed 6/16 double
+		 * drops below 180 mV, none in 6 closes at or above it.
+		 */
+		if (demand_ma < 1900 || master_ma < 1900 || margin_mv < 200)
 			return 0;
 		ret = sc8547_slave_hw_setting(sc8547_master_dev);
 		if (ret)
@@ -1504,7 +1512,7 @@ int sc8547a_pps_share(int master_ma, int margin_mv, unsigned int demand_ma,
 		return ret;
 	if (!(control & SC8547_CHG_EN_MASK))
 		return sc8547_pps_slave_off() ?: -ENOLINK;
-	ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+	ret = sc8547_write_byte(sc, SC8547_REG_09, SC8547_PPS_WATCHDOG_REG);
 	ret = ret ?: sc8547_set_adc_enable(sc, true);
 	if (ret)
 		return ret;
@@ -1635,7 +1643,7 @@ static void vooc_handle_ask_fastchg_ornot(struct sc8547a_device *sc)
 	 * on curve_sent: the adapter re-polls ask_fastchg post-curve, and THAT reply
 	 * carries allow=1.
 	 */
-	u8 allow = (sc->fastchg_enable && sc->curve_sent) ? VOOC_BIT_ACTIVE : 0;
+	u8 allow = (sc->fastchg_enable && sc->curve_sent && sc->buck_ready) ? VOOC_BIT_ACTIVE : 0;
 	u8 r_l;
 
 	switch (sc->adapter_type) {
@@ -1824,20 +1832,16 @@ static void vooc_handle_ask_batt_sys_process(struct sc8547a_device *sc)
 	vooc_write_mesg_mask(TX1_DET_BIT0_TO_BIT1_MASK, &sc->voocphy_tx_buff[1], h);
 
 	if (sc->ask_batt_sys == 1) {
+		bool first_curve = !sc->curve_sent;
+
 		sc->fastchg_ask_cmd = VOOC_CMD_UNKNOWN;
-		sc->curve_sent = true;	/* allow-bit may now assert on next ask_fastchg */
-		/*
-		 * Pre-stage the is_vbus_ok reply (vendor set_is_vbus_ok_predata,
-		 * one-shot here) so the first is_vbus_ok frame is answered instantly
-		 * from hardware and the adapter ramps Vbus. Only when delivering — in
-		 * observation mode we must not stage a raise. REG_2C (reactive txbuff)
-		 * for the intervening 0x4/0xa frames is untouched, so REG_31 survives
-		 * to the first is_vbus_ok clock.
+		sc->curve_sent = true;
+		/* The next ASK_FASTCHG can grant permission. Start the ADSP
+		 * transaction now, outside the IRQ, so neither REG31 nor the
+		 * allow reply can authorize a rise with the buck drawing current.
 		 */
-		if (sc->fastchg_deliver)
-			sc8547_set_predata(sc, SC8547_IS_VBUS_OK_PREDATA_SVOOC);
-		dev_info(sc->dev, "battery-sys curve sent%s\n",
-			 sc->fastchg_deliver ? " (is_vbus_ok predata staged)" : "");
+		if (first_curve && sc->fastchg_deliver)
+			sc->allow_deadline = jiffies + msecs_to_jiffies(identify_ms);
 	}
 }
 
@@ -1887,7 +1891,7 @@ static void vooc_handle_is_vbus_ok(struct sc8547a_device *sc)
 		sc->vooc_vbus_status, sc->fastchg_deliver, sc->cp_enabled);
 
 	/* Stage-1 safety: never latch NORMAL unless real delivery is armed. */
-	if (sc->vooc_vbus_status == SC_VBUS_NORMAL && !sc->fastchg_deliver)
+	if (!sc->allow_sent || (sc->vooc_vbus_status == SC_VBUS_NORMAL && !sc->fastchg_deliver))
 		sc->vooc_vbus_status = SC_VBUS_HIGH;
 
 	switch (sc->vooc_vbus_status) {
@@ -2101,6 +2105,14 @@ static bool vooc_reply_adapter_mesg(struct sc8547a_device *sc)
 			sc8547_request_missed(sc, sc->fastchg_curr_code);
 		return valid;
 	}
+	/* AP VOOC PHY sets IS_VBUS_OK predata after sending allow. */
+	if (cmd == VOOC_CMD_ASK_BATT_SYS_PROCESS && sc->curve_sent && !sc->buck_ready)
+		erhai_charge_try_recheck();
+	if (cmd == VOOC_CMD_ASK_FASTCHG_ORNOT && sc->fastchg_enable &&
+	    sc->curve_sent && sc->buck_ready) {
+		sc->allow_sent = true;
+		sc8547_set_predata(sc, SC8547_IS_VBUS_OK_PREDATA_SVOOC);
+	}
 	if (cmd == VOOC_CMD_ASK_CURRENT_LEVEL) {
 		sc->pending_request = sc->fastchg_deliver ? sc->fastchg_curr_code : 0;
 		sc->request_pending = true;
@@ -2254,35 +2266,119 @@ static u8 sc8547_adapter_cap(u8 model)
 	return 0;
 }
 
-/* Re-index on a change of bin. Within a bin use the AP VOOC PHY's
- * four consecutive voltage/current samples to descend the curve.
+/* oplus_chg_vooc query_temp_range / rang_rise/drop_update. Apply
+ * hysteresis to the reverse transition only, retaining it across a
+ * temperature re-arm. VOOC_TEMP_RANGE_THD is 10, THD_HIGH is 20;
+ * these are not the common buck's BATT_TEMP_HYST.
+ */
+#define SC8547_TEMP_RANGE_HYST_DDC 10
+#define SC8547_TEMP_RANGE_HIGH_DDC 20
+static int sc8547_curve_temperature(struct sc8547a_device *sc, int temp,
+				    int soc, bool entering)
+{
+	static const int bounds[] = { 50, 120, 160, 210, 350, 440 };
+	unsigned int region, previous;
+	int low, high, margin;
+
+	if (!sc->curve_temp_bounds[0])
+		memcpy(sc->curve_temp_bounds, bounds, sizeof(bounds));
+	for (region = 0; region < ARRAY_SIZE(bounds); region++)
+		if ((entering ? temp : sc->curve_temp) <
+		    (entering ? sc->curve_temp_bounds[region] : bounds[region]))
+			break;
+	previous = region;
+	low = region ? sc->curve_temp_bounds[region - 1] : 0;
+	high = region < ARRAY_SIZE(bounds) ? sc->curve_temp_bounds[region] : 510;
+	if (!entering && temp > high && region < ARRAY_SIZE(bounds)) {
+		/* NORMAL_LOW and high-SOC LITTLE_COOL transitions keep the
+		 * other dynamic boundaries; the remaining rise paths reset.
+		 */
+		if (region < 2 || region == 5 || (region < 4 && soc <= 90))
+			memcpy(sc->curve_temp_bounds, bounds, sizeof(bounds));
+		margin = region == 2 && soc <= 90 ? SC8547_TEMP_RANGE_HIGH_DDC :
+			 SC8547_TEMP_RANGE_HYST_DDC;
+		sc->curve_temp_bounds[region] = bounds[region] - margin;
+		region++;
+	} else if (!entering && temp < low && region) {
+		memcpy(sc->curve_temp_bounds, bounds, sizeof(bounds));
+		region--;
+		sc->curve_temp_bounds[region] = bounds[region] + SC8547_TEMP_RANGE_HYST_DDC;
+	}
+	if (!entering && region == previous)
+		return sc->curve_temp;
+	/* The tables use fixed region endpoints; the AP sends the region
+	 * index selected with the dynamic thresholds to the stock PHY.
+	 */
+	low = region ? bounds[region - 1] : 0;
+	high = region < ARRAY_SIZE(bounds) ? bounds[region] - 1 : 509;
+	return min(max(temp, low), high);
+}
+
+/* oplus_chg_vooc rang_rise/drop_update and fastchg_range_switch.
+ * The low-temperature transitions below are renegotiated up to 90%
+ * SOC; crossing into/out of warm is renegotiated at any SOC. This
+ * chooses between in-session derating and a new handshake, never
+ * between admitting and refusing a high-SOC source.
+ */
+static bool sc8547_new_temperature_session(int old, int next, int soc)
+{
+	if (next == old || next < 0 || next >= 510)
+		return false;
+	if ((old < 440) != (next < 440))
+		return true;
+	if (soc > 90)
+		return false;
+	if (next < old)
+		return old >= 120 && next < 120;
+	return (old < 120 && next >= 120) || (old < 160 && next >= 160) ||
+	       (old < 210 && next >= 210);
+}
+
+/* Select the SOC/temperature table once per handshake. The AP VOOC
+ * PHY descends its voltage rows after four 500 ms observations.
  */
 static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int temp,
 				     int mv, int ibus, bool entering)
 {
 	const struct erhai_charge_curve *curve;
 	const struct erhai_charge_step *step;
-	const struct erhai_charge_curve *raw;
-	unsigned int limit;
-	int last_temp = sc->curve_temp;
+	const struct erhai_charge_curve *raw, *thermal;
+	unsigned int limit, previous_code = sc->fastchg_curr_code;
 	bool new_table;
 
-	raw = erhai_curve_select(svooc_curves, soc, temp);
-	sc->curve_temp = entering || !sc->auto_curve ? temp : erhai_curve_temp(sc->curve_temp, temp);
-	curve = erhai_curve_select(svooc_curves, soc, sc->curve_temp);
+	sc->curve_sampled = false;
+	sc->curve_vbat_mv = mv;
+	if (entering || !sc->auto_curve)
+		sc->curve_entry_soc = soc;
+	raw = erhai_curve_select(svooc_curves, sc->curve_entry_soc, temp);
+	sc->curve_sample_temp = temp;
+	sc->curve_temp = sc8547_curve_temperature(sc, temp, soc, entering || !sc->auto_curve);
+	if (entering || !sc->auto_curve)
+		sc->curve_entry_temp = sc->curve_temp;
+	/* current_max follows the handshake's voltage curve; changing
+	 * temperature votes must not replace it with a colder CC ceiling.
+	 * batt_soc_plugin is captured at handshake entry too; crossing a
+	 * SOC boundary must not replace the voltage curve or its thermal vote.
+	 */
+	curve = erhai_curve_select(svooc_curves, sc->curve_entry_soc, sc->curve_entry_temp);
+	thermal = erhai_curve_select(svooc_curves, sc->curve_entry_soc, sc->curve_temp);
 	/* vooc_high_temp (entry) and over_high_temp (running). */
-	if (!raw || !curve || mv <= SC8547_CELL_MIN_VALID_MV ||
-	    mv >= min(erhai_cell_cv(temp), erhai_cell_cv(sc->curve_temp)))
+	if (!raw || !curve || !thermal || mv <= SC8547_CELL_MIN_VALID_MV ||
+	    (entering && mv >= min(erhai_cell_cv(temp), erhai_cell_cv(sc->curve_temp))))
 		return false;
 
-	new_table = entering || !sc->auto_curve || sc->auto_curve->steps != curve->steps ||
-		    last_temp != sc->curve_temp;
+	new_table = entering || !sc->auto_curve || sc->auto_curve->steps != curve->steps;
 	if (new_table) {
 		sc->auto_curve = curve;
 		sc->auto_curve_idx = erhai_curve_start(curve, mv, true);
 		sc->auto_step_cnt = 0;
 		sc->auto_taper_cnt = 0;
-	} else {
+		sc->curve_full_count = 0;
+		sc->curve_next_sample = jiffies + msecs_to_jiffies(SC8547_CURVE_SAMPLE_MS);
+		erhai_svooc_lcf_start(&sc->lcf, temp, jiffies);
+	} else if (time_after_eq(jiffies, sc->curve_next_sample)) {
+		sc->curve_sampled = true;
+		sc->curve_next_sample = jiffies + msecs_to_jiffies(SC8547_CURVE_SAMPLE_MS);
 		step = &curve->steps[sc->auto_curve_idx];
 		if (!step->last && mv > step->mv && ibus < step->ma + 1000) {
 			if (++sc->auto_step_cnt >= SC8547_AUTO_STEP_DEBOUNCE) {
@@ -2293,21 +2389,30 @@ static bool sc8547_auto_update_curve(struct sc8547a_device *sc, int soc, int tem
 			sc->auto_step_cnt = 0;
 		}
 	}
-	step = &curve->steps[sc->auto_curve_idx];
-	/* Let even a one-row high-SOC curve deliver. Only a measured
-	 * low-current tail on a running pump hands the cell to the buck.
+	/* AP PHY current_max descends with the curve. current_batt_temp is
+	 * a separate, reversible vote (oplus_ap_voocphy.c:5316-5324).
+	 * Never burn a transient raw-temperature clamp into current_max.
 	 */
-	if (!entering && sc->cp_enabled && step->last && ibus < 300) {
-		if (++sc->auto_taper_cnt >= SC8547_AUTO_STEP_DEBOUNCE)
-			return false;
-	} else {
-		sc->auto_taper_cnt = 0;
-	}
 	limit = curve->steps[sc->auto_curve_idx].ma;
+	sc->curve_ma = entering ? limit : min(sc->curve_ma, limit);
+	sc->thermal_ma = thermal->steps != curve->steps ?
+		thermal->steps[erhai_curve_start(thermal, mv, true)].ma : curve->steps[0].ma;
 	if (raw->steps != curve->steps)
-		limit = min_t(unsigned int, limit, raw->steps[erhai_curve_start(raw, mv, true)].ma);
-	sc->curve_ma = new_table ? limit : min(sc->curve_ma, limit);
-	sc->fastchg_curr_code = min_t(unsigned int, sc->curve_ma / 100, sc->adapter_cap);
+		sc->thermal_ma = min_t(unsigned int, sc->thermal_ma,
+			raw->steps[erhai_curve_start(raw, mv, true)].ma);
+	limit = min(sc->curve_ma, sc->thermal_ma) / 100;
+	limit = min_t(unsigned int, limit, sc->adapter_cap);
+	/* A source can remember the first ASK_CURRENT as the session ceiling.
+	 * The worker renegotiates if a recovered temperature needs more.
+	 */
+	if (sc->first_request && !entering)
+		limit = min_t(unsigned int, limit, sc->first_request);
+	sc->fastchg_curr_code = limit;
+	if (!entering && previous_code != limit)
+		dev_info(sc->dev, "SVOOC current %u -> %u: temp=%d range=%d entry=%d soc=%d cp=%d cell=%d curve=%u thermal=%u first=%u row=%u\n",
+			 previous_code, limit, temp, sc->curve_temp, sc->curve_entry_temp,
+			 sc->curve_entry_soc, mv, sc->cell_vbat_mv, sc->curve_ma / 100, sc->thermal_ma / 100, sc->first_request,
+			 sc->auto_curve_idx);
 	return true;
 }
 
@@ -2325,7 +2430,7 @@ static void sc8547_serial_clear_sample(struct sc8547a_device *sc)
 	sc->master_enabled = sc->slave_enabled = -1;
 	sc->serial_vbus_mv = sc->serial_reg06 = -1;
 	sc->serial_ibat_ma = 0;
-	sc->serial_request = sc->pending_request = 0;
+	sc->first_request = sc->serial_request = sc->pending_request = 0;
 	sc->request_pending = sc->asked_current = sc->retry_current = false;
 	sc->measure_missed_slot = false;
 	sc->adjust_failures = sc->above_request_count = 0;
@@ -2337,10 +2442,12 @@ static void sc8547_serial_end(struct sc8547a_device *sc, const char *why)
 {
 	sc->serial_last_exit = why;
 	sc->serial_exits++;
-	dev_info(sc->dev, "SVOOC end: %s, code=%u ibus=%d/%d mA en=%d/%d vbus=%d mV retries=%u last_rx=%02x flags=%02x\n",
+	dev_info(sc->dev, "SVOOC end: %s, code=%u ibus=%d/%d mA en=%d/%d vbus=%d mV retries=%u last_rx=%02x flags=%02x cell=%d cp=%d ibat=%d entry_soc=%d row=%u lcf_region=%d\n",
 		 why, sc->serial_request, sc->master_ibus_ma, sc->slave_ibus_ma,
 		 sc->master_enabled, sc->slave_enabled, sc->serial_vbus_mv,
-		 sc->rehandshakes, sc->voocphy_rx_buff, sc->vooc_flag);
+		 sc->rehandshakes, sc->voocphy_rx_buff, sc->vooc_flag,
+		 sc->cell_vbat_mv, sc->curve_vbat_mv, sc->serial_ibat_ma,
+		 sc->curve_entry_soc, sc->auto_curve_idx, sc->lcf.region);
 	sc->serial_request = 0;
 	sc->request_pending = sc->measure_missed_slot = false;
 	sc->master_ibus_ma = sc->slave_ibus_ma = -1;
@@ -2360,7 +2467,8 @@ static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
 	sc->model_received = false;
 	sc->adapter_cap = 0;
 	sc->ask_batt_sys = 0;
-	sc->curve_sent = false;
+	sc->curve_sent = sc->allow_sent = sc->buck_ready = false;
+	sc->pre_allow_buck_ua = -ENODATA;
 	sc->vooc_head = SVOOC_INVERT_HEAD;
 	sc->vooc_saw_any = false;
 	/* delivery-phase state (gates fastchg_deliver / fastchg_curr_code persist) */
@@ -2372,6 +2480,9 @@ static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
 	sc->serial_ucp_armed = false;
 	sc->low_ibus_count = 0;
 	sc->load_seen = false;
+	sc->slave_check_pending = sc->slave_trouble = false;
+	sc->leg_over_count = 0;
+	sc->next_leg_check = jiffies;
 	sc->hw_profile_set = false;
 	sc->vooc_vbus_status = SC_VBUS_LOW;
 }
@@ -2559,6 +2670,8 @@ static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
 static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 				      int soc, int temp_ddc, int cell_mv)
 {
+	int cp_mv;
+
 	if (!sc->adapter_check_ok || !sc->model_received) {
 		if (time_before(jiffies, sc->auto_identify_deadline))
 			return;
@@ -2579,12 +2692,13 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 		return;
 	}
 
-	/*
-	 * Gate and index the curve on the CELL voltage (gauge). The CP's own
-	 * reading is inflated by the delivery IR drop and would make a half-full
-	 * pack look like it is already at CV.
+	/* Domestic AP PHY has no external_gauge_support: its curve input
+	 * is REG1B CP VBAT, not the ADSP gauge or adapter-feedback estimate.
 	 */
-	if (!sc8547_auto_update_curve(sc, soc, temp_ddc, cell_mv, 0, true)) {
+	cp_mv = sc8547_get_vbat(sc);
+	sc->cell_vbat_mv = cell_mv;
+	if (cell_mv <= SC8547_CELL_MIN_VALID_MV || cp_mv <= 0 ||
+	    !sc8547_auto_update_curve(sc, soc, temp_ddc, cp_mv, 0, true)) {
 		sc8547_auto_decline(sc, "outside-cell-curve");
 		return;
 	}
@@ -2592,11 +2706,14 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 		sc8547_svooc_hw_setting(sc);
 		sc->hw_profile_set = true;
 	}
-	sc->fastchg_curr_code = min_t(u8, sc->fastchg_curr_code, 40);
 	sc->fastchg_enable = true;
 	sc->fastchg_deliver = true;
 	sc->fastchg_auto = false;	/* one-shot per arm consumed */
 	sc->auto_state = SC_AUTO_DELIVER;
+	if (sc->curve_sent) {
+		sc->allow_deadline = jiffies + msecs_to_jiffies(identify_ms);
+		erhai_charge_recheck();
+	}
 	if (sc->awaiting_rehandshake) {
 		sc->recoveries_answered++;
 		sc->awaiting_rehandshake = false;
@@ -2605,7 +2722,7 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 	}
 	dev_info(sc->dev,
 		 "auto fast-charge: SVOOC identified (soc %d%% temp %d.%d C cell %d mV cp %d mV) — deliver curve[%d] code %u\n",
-		 soc, temp_ddc / 10, temp_ddc % 10, cell_mv, sc8547_get_vbat(sc), sc->auto_curve_idx,
+		 soc, temp_ddc / 10, temp_ddc % 10, cell_mv, cp_mv, sc->auto_curve_idx,
 		 sc->fastchg_curr_code);
 }
 
@@ -2635,6 +2752,25 @@ static int sc8547_serial_arm_ucp(struct sc8547a_device *sc)
  */
 #define SC8547_REQUEST_MARGIN_MA	400
 #define SC8547_OVER_REQUEST_SAMPLES	10
+
+/* AP VOOC PHY IBUS_CHECK: three 100 ms samples over the board's
+ * 4500 mA per-leg limit reduce current_max to code 30. IRQs keep this
+ * running during gauge transactions. Neither ADC replaces REG0F OCP.
+ */
+static void sc8547_check_leg_current(struct sc8547a_device *sc, int master, int slave)
+{
+	if (master < 0 || slave < 0 || time_before(jiffies, sc->next_leg_check))
+		return;
+	sc->next_leg_check = jiffies + msecs_to_jiffies(100);
+	if (master <= 4500 && slave <= 4500) {
+		sc->leg_over_count = 0;
+		return;
+	}
+	if (++sc->leg_over_count == 3) {
+		sc->curve_ma = min(sc->curve_ma, 3000U);
+		sc->fastchg_curr_code = min_t(u8, sc->fastchg_curr_code, 30);
+	}
+}
 
 static bool sc8547_current_in_range(struct sc8547a_device *sc, int ibat_ma)
 {
@@ -2667,6 +2803,24 @@ static bool sc8547_serial_timed_out(struct sc8547a_device *sc, u64 now_ns)
 {
 	return sc->auto_state == SC_AUTO_DELIVER && sc->frame_seen &&
 	       now_ns >= sc->last_frame_ns + SC8547_COMMU_TIMEOUT_MS * NSEC_PER_MSEC;
+}
+
+/* AP PHY curr_event_handle: VOOC_CURR_EVENT_TIME=1000 ms, check
+ * disable_sub_cp_count == 3 before incrementing (four low observations).
+ */
+static bool sc8547_slave_should_drop(struct sc8547a_device *sc, int total_ma)
+{
+	if (total_ma >= SC8547_SLAVE_DISENGAGE_IBUS_MA) {
+		sc->slave_low_cnt = 0;
+		return false;
+	}
+	if (time_before(jiffies, sc->slave_next_sample))
+		return false;
+	sc->slave_next_sample = jiffies + msecs_to_jiffies(1000);
+	if (sc->slave_low_cnt++ < 3)
+		return false;
+	sc->slave_low_cnt = 0;
+	return true;
 }
 
 static void sc8547_attach_work(struct work_struct *work)
@@ -2721,8 +2875,10 @@ static void sc8547_attach_work(struct work_struct *work)
 	if (sc->auto_state == SC_AUTO_DELIVER) {
 		int cpbat = sc8547_get_vbat(sc);	/* cell + delivery IR drop */
 		int cibus = sc8547_get_ibus(sc);
-		int cvbat = gvbat;
-		int share_ma = 0;
+		int cvbat = cpbat;
+		int full_mv;
+		bool low_full;
+		int previous_temp = sc->curve_temp;
 
 		/*
 		 * Under dual-CP the master REG_13 reads only its half of the bus
@@ -2736,8 +2892,9 @@ static void sc8547_attach_work(struct work_struct *work)
 		int faults = sc8547_take_faults();
 		int vsys = sc8547_get_output_mv(sc, SC8547_REG_19);
 
-		/* 24924 non-bidirectional, single-pack GET_BATT_VOL cable
-		 * compensation from the AP PHY. Use the sum of both REG13s.
+		/* 24926 has no external_gauge_support. In the stock AP PHY
+		 * GET_BATT_VOL uses REG1B for gauge_vbatt and both REG13s
+		 * for cp_ichg. The pack gauge still owns the cell curve.
 		 */
 		sc->master_ibus_ma = cibus < 0 ? -1 : cibus;
 		sc->slave_ibus_ma = slave_ma < 0 ? -1 : slave_ma;
@@ -2745,12 +2902,14 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc->missed_peak_ibus_ma = max(sc->missed_peak_ibus_ma, cibus_total);
 		sc->serial_vbus_mv = vbus > 0 ? vbus : -1;
 		sc->serial_ibat_ma = gret ? 0 : ibat;
+		sc->cell_vbat_mv = gret ? -1 : gvbat;
+		sc->curve_vbat_mv = cpbat;
 		sc->serial_reg06 = sc8547_read_byte(sc, SC8547_REG_06, &r6) ? -1 : r6;
 		sc->slave_enabled = sc8547_slave_enabled();
 		sc->master_enabled = sc8547_read_byte(sc, SC8547_REG_07, &r7) ?
 			-1 : !!(r7 & SC8547_CHG_EN_MASK);
-		if (!gret && gvbat > 0 && vsys > 0 && vbus > 0 && cibus >= 0 && slave_ma >= 0)
-			sc->adapter_vbat_mv = vbus / 2 - (vsys - gvbat) / 4 -
+		if (cpbat > 0 && vsys > 0 && vbus > 0 && cibus >= 0 && slave_ma >= 0)
+			sc->adapter_vbat_mv = vbus / 2 - (vsys - cpbat) / 4 -
 					      cibus_total * 75 / 1000;
 		else
 			sc->adapter_vbat_mv = 0;
@@ -2760,8 +2919,13 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc8547_auto_finish(sc, "hw-ovp-ocp");
 			goto reschedule;
 		}
-		if (cpbat >= SC8547_CP_OVP_CEILING_MV || cibus >= 4500 ||
-		    slave_ma >= 4500 || cibus_total >= SC8547_IBUS_ABORT_MA || (!gret && ibat > 13600))
+		if (sc->curve_sent && !sc->buck_ready && time_after_eq(jiffies, sc->allow_deadline)) {
+			sc8547_auto_reservo(sc, "buck-still-drawing");
+			goto reschedule;
+		}
+		if (sc->cp_enabled)
+			sc8547_check_leg_current(sc, cibus, slave_ma);
+		if (cpbat >= SC8547_CP_OVP_CEILING_MV || cibus_total >= SC8547_IBUS_ABORT_MA || (!gret && ibat > 13600))
 			sc->adc_over_count++;
 		else
 			sc->adc_over_count = 0;
@@ -2769,19 +2933,41 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc8547_auto_finish(sc, "adc-limit-or-io");
 			goto reschedule;
 		}
-		/* Four low readings on a discharging cell cannot qualify as a charge taper. */
-		if (ibat <= 0)
-			sc->auto_taper_cnt = 0;
-		if (gret || cpbat <= 0 || vbus <= 0 || cibus < 0 || slave_ma < 0 ||
+		if (gret || gvbat <= SC8547_CELL_MIN_VALID_MV || cpbat <= 0 ||
+		    vbus <= 0 || cibus < 0 || slave_ma < 0 ||
+		    (!gret && gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp))) ||
 		    !sc8547_auto_update_curve(sc, gsoc, gtemp, cvbat, cibus_total, false)) {
 			if (!gret && gtemp >= 0 && gtemp < 510 && gvbat > 0 &&
-			    (gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp)) ||
-			     sc->auto_taper_cnt >= SC8547_AUTO_STEP_DEBOUNCE)) {
+			    gvbat >= min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp))) {
 				erhai_charge_tail_complete(ERHAI_SERIAL);
 				sc8547_auto_finish(sc, "buck-tail");
 			} else {
 				sc8547_auto_finish(sc, "cell-envelope-or-adc");
 			}
+			goto reschedule;
+		}
+		/* AP PHY voltage monitor: domestic QBG enables FCL, so the
+		 * sustained full threshold needs six 500 ms observations.
+		 * Keep the existing gauge-side cell CV stop above as well.
+		 */
+		full_mv = min(erhai_cell_cv(sc->curve_entry_temp),
+			      min(erhai_cell_cv(gtemp), erhai_cell_cv(sc->curve_temp)));
+		if (sc->cp_enabled && sc->curve_sampled)
+			sc->curve_full_count = cpbat > full_mv ? sc->curve_full_count + 1 : 0;
+		low_full = sc->cp_enabled &&
+			erhai_svooc_lcf_update(&sc->lcf, gtemp, gvbat, ibat, jiffies);
+		if (sc->curve_full_count > 5 || low_full) {
+			erhai_charge_tail_complete(ERHAI_SERIAL);
+			sc8547_auto_finish(sc, low_full ? "low-current-full" : "cp-voltage-full");
+			goto reschedule;
+		}
+		if (sc8547_new_temperature_session(previous_temp, sc->curve_temp, gsoc)) {
+			sc8547_auto_reservo(sc, "temperature-range");
+			goto reschedule;
+		}
+		if (sc->first_request &&
+		    min_t(unsigned int, min(sc->curve_ma, sc->thermal_ma) / 100, sc->adapter_cap) > sc->first_request) {
+			sc8547_auto_reservo(sc, "temperature-ceiling");
 			goto reschedule;
 		}
 		/* RX_DONE frames are clocked by the source. CHG_EN can remain
@@ -2797,16 +2983,10 @@ static void sc8547_attach_work(struct work_struct *work)
 			sc8547_auto_reservo(sc, "frame-timeout");
 			goto reschedule;
 		}
-		/* Until both ADCs show load, limit to the board's 4 A per
-		 * pump rating. On an uneven split use the weaker leg's
-		 * measured contribution, leaving the other leg its reserve.
-		 */
-		if (sc->master_enabled > 0 && sc->slave_enabled > 0)
-			share_ma = min(cibus, slave_ma);
-		sc->fastchg_curr_code = min_t(unsigned int, sc->fastchg_curr_code,
-					     (4000 + share_ma) / 100);
-		if (sc->adc_over_count)
+		if (sc->adc_over_count) {
 			sc->fastchg_curr_code = max_t(int, SC8547_CURR_CODE_MIN, sc->fastchg_curr_code - 1);
+			sc->curve_ma = min(sc->curve_ma, sc->fastchg_curr_code * 100U);
+		}
 		if (!sc8547_current_in_range(sc, ibat)) {
 			sc8547_auto_reservo(sc, "above-request");
 			goto reschedule;
@@ -2870,50 +3050,52 @@ static void sc8547_attach_work(struct work_struct *work)
 		} else {
 			bool slave_on = sc->slave_enabled > 0;
 
+			u8 switching;
 
-			/*
-			 * Dual-CP load-sharing (the vendor's threshold engage). Once
-			 * the master's own half-bus climbs past the engage threshold
-			 * the adapter is holding Vbus high enough that the slave's 2:1
-			 * error window is valid, so latch it in and let the two pumps
-			 * split the bus — this keeps a single pump off its OCP and
-			 * stops the adapter over-volting Vbus to force current through
-			 * one converter (the low-SoC code-73 collapse). Retried every
-			 * tick until CHG_EN sticks; dropped when total demand falls.
+			/* Stock checks EN, switching, minimum slave load and pair
+			 * deviation after 300 ms, for up to 60 more 50 ms slots.
+			 * Observe it without sleeping in the port lock.
 			 */
-			if (!sc->slave_enabled && sc->vooc_vbus_status == SC_VBUS_NORMAL &&
-			    cibus >= SC8547_SLAVE_ENGAGE_IBUS_MA) {
-				if (!sc8547_slave_cp_enable(sc, true)) {
+			if (sc->slave_check_pending && time_after_eq(jiffies,
+			    sc->slave_on_since + msecs_to_jiffies(300))) {
+				if (slave_on && slave_ma >= 500 && abs(cibus - slave_ma) <= 1000 &&
+				    !sc8547_read_byte(sc8547_slave_dev, SC8547_REG_06, &switching) &&
+				    (switching & BIT(2)))
+					sc->slave_check_pending = false;
+				else if (time_after_eq(jiffies,
+					 sc->slave_on_since + msecs_to_jiffies(300 + 60 * 50)))
+					sc->slave_trouble = true;
+			}
+			if (!slave_on && !sc->slave_check_pending && !sc->slave_trouble &&
+			    sc->vooc_vbus_status == SC_VBUS_NORMAL &&
+			    cibus > SC8547_SLAVE_ENGAGE_IBUS_MA) {
+				if (sc8547_slave_cp_enable(sc, true)) {
+					sc->slave_trouble = true;
+				} else {
+					sc->slave_check_pending = true;
 					sc->slave_on_since = jiffies;
+					sc->slave_next_sample = jiffies + msecs_to_jiffies(1000);
 					sc->slave_low_cnt = 0;
 					dev_info_ratelimited(sc->dev, "dual-CP: requested slave under %d mA master load\n",
 							     cibus);
 				}
-			} else if (slave_on && slave_settle_ms &&
-				   jiffies - sc->slave_on_since <
-					   msecs_to_jiffies(slave_settle_ms)) {
-				/*
-				 * Settling: the adapter's output is already
-				 * split, but the slave has not ramped yet (its
-				 * ADC may still read its idle ~20 mA).  Feed
-				 * it; never judge the drop inside this window.
-				 */
-				dev_dbg(sc->dev,
-					"dual-CP: slave settling (%u ms on, total %d mA)\n",
-					jiffies_to_msecs(jiffies - sc->slave_on_since),
-					cibus_total);
-			} else if (slave_on &&
-				   cibus_total < SC8547_SLAVE_DISENGAGE_IBUS_MA) {
-				if (++sc->slave_low_cnt >= slave_drop_ticks) {
-					sc8547_slave_cp_enable(sc, false);
-					sc->slave_low_cnt = 0;
-					dev_info(sc->dev,
-						 "dual-CP: dropping slave (total %d mA low for %u ticks, %u ms on)\n",
-						 cibus_total, slave_drop_ticks,
-						 jiffies_to_msecs(jiffies - sc->slave_on_since));
+			}
+			if (sc->slave_trouble) {
+				sc->curve_ma = min(sc->curve_ma, 3000U);
+				sc->fastchg_curr_code = min_t(u8, sc->fastchg_curr_code, 30);
+				sc->slave_check_pending = false;
+				if (slave_on && sc8547_slave_cp_enable(sc, false)) {
+					sc8547_auto_reservo(sc, "slave-stop-io");
+					goto reschedule;
 				}
-			} else if (slave_on) {
-				sc->slave_low_cnt = 0;
+			} else if (slave_on && !sc->slave_check_pending &&
+				   sc8547_slave_should_drop(sc, cibus_total)) {
+				if (sc8547_slave_cp_enable(sc, false)) {
+					sc8547_auto_reservo(sc, "slave-stop-io");
+					goto reschedule;
+				}
+				dev_info(sc->dev, "dual-CP: dropping slave (total %d mA, four 1 s observations)\n",
+					 cibus_total);
 			}
 
 			dev_dbg(sc->dev, "fastchg: vbus %d mV vbat %d mV ibus %d mA (master %d slave %d) margin %d mV REG06=0x%02x REG07=0x%02x slave_on=%d\n",
@@ -2964,12 +3146,18 @@ ssize_t sc8547a_serial_describe(char *buf, ssize_t off, bool *active)
 	pump = sc->master_enabled > 0 || sc->slave_enabled > 0 ? 1 :
 		sc->master_enabled < 0 || sc->slave_enabled < 0 ? -1 : 0;
 	return off + sysfs_emit_at(buf, off,
-		"protocol=supervooc state=%s model=%d target_code=%u request_code=%u request_ma=%u "
+		"curve_temp=%d sample_temp=%d entry_temp=%d entry_soc=%d curve_vbat_mv=%d cell_vbat_mv=%d lcf_count=%u lcf_region=%d cp_full_count=%u curve_code=%u thermal_code=%u curve_idx=%u warm_boundary=%d "
+		"protocol=supervooc state=%s model=%d allow_sent=%d pre_allow_buck_ua=%d first_request_code=%u target_code=%u request_code=%u request_ma=%u "
 		"pending_code=%d predata=0x%04x above_samples=%u model_rx=0x%02x%02x model_flags=0x%02x%02x "
 		"vbus_mv=%d pump=%d pump_ibus_ma=%d master_ibus_ma=%d slave_ibus_ma=%d "
 		"master_pump=%d slave_pump=%d frame_age_ms=%lld last_rx=0x%02x flags=0x%02x reg06=%d rx_errors=%u tx_errors=%u frame_gap_us=%u max_gap_us=%u "
 		"exits=%u last_exit=%s\n",
+		sc->curve_temp, sc->curve_sample_temp, sc->curve_entry_temp, sc->curve_entry_soc,
+		sc->curve_vbat_mv, sc->cell_vbat_mv, sc->lcf.full_count, sc->lcf.region,
+		sc->curve_full_count, sc->curve_ma / 100, sc->thermal_ma / 100,
+		sc->auto_curve_idx, sc->curve_temp_bounds[5],
 		serial_state_names[sc->auto_state], sc->model_received ? sc->adapter_model_ver : -1,
+		sc->allow_sent, sc->pre_allow_buck_ua, sc->first_request,
 		sc->fastchg_deliver ? sc->fastchg_curr_code : 0, sc->serial_request, sc->serial_request * 100,
 		sc->request_pending ? sc->pending_request : -1, sc->serial_predata, sc->above_request_count,
 		sc->model_frames[0], sc->model_frames[1], sc->model_flags[0], sc->model_flags[1],
@@ -3104,8 +3292,11 @@ void sc8547a_probe_status(struct erhai_probe_status *status)
 #endif
 	status->responded = sc->responded;
 	status->first_ufcs_timeout = sc->first_ufcs_timeout;
-	if (sc->auto_state == SC_AUTO_DELIVER && sc->fastchg_deliver)
+	if (sc->auto_state == SC_AUTO_DELIVER && sc->fastchg_deliver) {
 		status->delivering = ERHAI_SERIAL;
+		status->serial_needs_buck_off = sc->curve_sent;
+		status->serial_buck_ready = sc->buck_ready;
+	}
 	if (sc->auto_protection)
 		status->protected |= ERHAI_SERIAL;
 }
@@ -3148,6 +3339,21 @@ void sc8547a_detached(void)
 }
 EXPORT_SYMBOL_GPL(sc8547a_detached);
 
+/* Called by battmgr only after the ADSP acknowledged USB ICL=0. */
+void sc8547a_serial_buck_sample(int ua)
+{
+	struct sc8547a_device *sc;
+
+	guard(mutex)(&sc8547_pps_lock);
+	sc = sc8547_master_dev;
+	if (sc && sc->auto_state == SC_AUTO_DELIVER && sc->curve_sent && !sc->buck_ready) {
+		sc->pre_allow_buck_ua = ua;
+		/* The suspended PMIC reports zero or one 3 mA ADC step. */
+		sc->buck_ready = ua >= 0 && ua <= 3000;
+	}
+}
+EXPORT_SYMBOL_GPL(sc8547a_serial_buck_sample);
+
 int sc8547a_serial_session(bool enable)
 {
 	struct sc8547a_device *sc;
@@ -3170,6 +3376,7 @@ int sc8547a_serial_session(bool enable)
 		if (sc->ufcs_owner || !sc8547_slave_dev || sc->irq <= 0 || pps_cp_engaged || pps_adc_hold)
 			return -EAGAIN;
 		sc->auto_state = SC_AUTO_IDENTIFY;
+		memset(sc->curve_temp_bounds, 0, sizeof(sc->curve_temp_bounds));
 		sc->fastchg_auto = true;
 		sc->serial_quiesced = false;
 		sc->adc_over_count = 0;
@@ -3226,6 +3433,8 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 		   (sc->vooc_flag & (VOOC_TXDATA_DONE_FLAG | VOOC_RXDATA_DONE_FLAG))) {
 		if (sc->serial_request != sc->pending_request)
 			sc->above_request_count = 0;
+		if (!sc->first_request && sc->pending_request)
+			sc->first_request = sc->pending_request;
 		sc->serial_request = sc->pending_request;
 		sc->request_pending = sc->retry_current = false;
 		sc->measure_missed_slot = false;
@@ -3266,6 +3475,9 @@ static bool sc8547_voocphy_isr(struct sc8547a_device *sc, u64 arrived_ns)
 		}
 		sc->frame_seen = true;
 		sc->last_frame_ns = arrived_ns;
+		/* Apply the stock 100 ms per-leg check after replying. */
+		if (sc->cp_enabled && time_after_eq(jiffies, sc->next_leg_check))
+			sc8547_check_leg_current(sc, sc8547_get_ibus(sc), sc8547_slave_ibus());
 		if (sc->gauge_reading && sc->cp_enabled &&
 		    time_after_eq(jiffies, sc->watchdog_fed_at + msecs_to_jiffies(SC8547_ATTACH_POLL_MS))) {
 			int master, slave;
@@ -3564,7 +3776,7 @@ int sc8547a_ufcs_monitor(void)
 		return -ENOLINK;
 	/* oplus_hal_sc8547a.c: CP_WATCHDOG_RESET reads REG07. Service
 	 * the PHY even after a recoverable drop has returned load to buck.
-	 * A still-running 2:1 pump retains its tighter 1 s watchdog.
+	 * A running 2:1 pump uses the stock 5 s CP watchdog.
 	 */
 	ret = sc8547_read_byte(sc, SC8547_REG_07, &control);
 	if (ret)
