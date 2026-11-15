@@ -16,6 +16,9 @@
 
 #include <linux/types.h>
 
+/* oplus_chg_pps/ufcs: CP_WATCHDOG_TIMEOUT_5S / UFCS_CP_WATCHDOG_TIMEOUT_MS. */
+#define SC8547_PPS_WATCHDOG_MS 5000
+
 /*
  * Is the serial VOOC ladder currently DELIVERING (CP enabled, real SuperVOOC
  * current flowing)?  The PPS host engine stands down while this is true; the

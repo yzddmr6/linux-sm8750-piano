@@ -269,7 +269,7 @@ static unsigned int pps_cp_feed_ms = 500;
 module_param(pps_cp_feed_ms, uint, 0444);
 MODULE_PARM_DESC(pps_cp_feed_ms,
 		 "engine poll period (ms) while the CP is engaged - must stay under the "
-		 "SC8547A 1000 ms REG_09 watchdog window");
+		 "SC8547A 5000 ms REG_09 pump watchdog window");
 
 static unsigned int pps_log_ticks = 60;
 module_param(pps_log_ticks, uint, 0444);
@@ -1262,7 +1262,7 @@ static void pps_cp_backstop(struct erhai_pps *p)
 	if (!p->buck_off || p->state == PPS_EXIT)
 		return;
 	if (pps_cp_is_engaged())
-		stuck = time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(1000));
+		stuck = time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(SC8547_PPS_WATCHDOG_MS));
 	else
 		stuck = !p->cp_lift_since ||
 			time_after(jiffies, p->cp_lift_since +
@@ -1330,7 +1330,7 @@ static unsigned int erhai_pps_update(void *data, bool caps_changed)
 	if (p->state != PPS_IDLE && time_before(jiffies, p->next_poll))
 		return jiffies_to_msecs(p->next_poll - jiffies) + 1;
 	if (pps_cp_is_engaged() &&
-	    time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(1000))) {
+	    time_after(jiffies, p->cp_fed_at + msecs_to_jiffies(SC8547_PPS_WATCHDOG_MS))) {
 
 		pps_exit(p, "pump watchdog deadline missed");
 	} else {

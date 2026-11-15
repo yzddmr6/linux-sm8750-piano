@@ -154,6 +154,7 @@ static const char * const sc8547_gauge_names[] = {
 #define   SC8547_CHARGE_MODE_1_1	1
 #define   SC8547_WATCHDOG_MASK		0x07
 #define   SC8547_WATCHDOG_DIS		0
+#define SC8547_PPS_WATCHDOG_REG		0x14 /* REG09: 2:1 profile, watchdog 5 s */
 #define SC8547_REG_0D			0x0D
 #define SC8547_REG_0F			0x0F	/* interrupt flag */
 #define SC8547_REG_10			0x10	/* insert-irq mask */
@@ -1109,7 +1110,7 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_cp_engaged);
  * Engage the master CP for 2:1 delivery.  The chip input must be inside the
  * 2:1 error window (110 mV <= vbus - 2*vbat <= 700 mV, same constants as the
  * VOOC deliver path).  Applies the SVOOC constant-current profile (idempotent),
- * arms the 1000 ms REG_09 watchdog, then latches CHG_EN.  Returns 0 on
+ * arms the stock 5000 ms REG_09 watchdog, then latches CHG_EN.  Returns 0 on
  * success; -EAGAIN (*need_mv = midpoint-target difference) while outside the
  * window so the caller can servo the PPS voltage toward it.
  */
@@ -1144,7 +1145,7 @@ int sc8547a_pps_cp_engage(int *need_mv)
 	 */
 	ret = sc8547_svooc_hw_setting(sc);
 	if (!ret)
-		ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+		ret = sc8547_write_byte(sc, SC8547_REG_09, SC8547_PPS_WATCHDOG_REG);
 	if (!ret) {
 		pps_cp_engaged = true; /* an enable with a lost ACK may have switched */
 		ret = sc8547_set_chg_enable(sc, true);
@@ -1162,7 +1163,7 @@ int sc8547a_pps_cp_engage(int *need_mv)
 EXPORT_SYMBOL_GPL(sc8547a_pps_cp_engage);
 
 /*
- * Feed the 1000 ms watchdog and report state.  Call on every engine poll
+ * Feed the stock 5000 ms pump watchdog and report state.  Call on every engine poll
  * while engaged.  Re-latches CHG_EN (a watchdog expiry self-clears REG_07)
  * and recomputes the 2:1 window: leaving it disengages the CP (safe fallback
  * to the buck path) and returns -EAGAIN so the engine stops servoing.
@@ -1196,7 +1197,7 @@ int sc8547a_pps_cp_feed(int *vbus_mv, int *vbat_mv)
 	}
 	if (!(control & SC8547_CHG_EN_MASK))
 		goto drop;
-	ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+	ret = sc8547_write_byte(sc, SC8547_REG_09, SC8547_PPS_WATCHDOG_REG);
 	if (!ret)
 		ret = sc8547_set_chg_enable(sc, true);
 	if (!ret)
@@ -1212,7 +1213,13 @@ EXPORT_SYMBOL_GPL(sc8547a_pps_cp_feed);
 
 static void sc8547_wait_for_watchdog(void)
 {
-	WRITE_ONCE(pump_off_at, jiffies + HZ + 1);
+	/* A missing stop ACK cannot prove a leg stopped. Wait out the
+	 * actual profile; never use the serial 1 s fence for a 5 s pump.
+	 */
+	unsigned int timeout = pps_cp_engaged || pps_slave_engaged ?
+		SC8547_PPS_WATCHDOG_MS : 1000;
+
+	WRITE_ONCE(pump_off_at, jiffies + msecs_to_jiffies(timeout) + 1);
 	WRITE_ONCE(pump_stopping, true);
 }
 
@@ -1225,7 +1232,7 @@ static int sc8547_pps_disengage(void)
 		if (sc8547_waiting_for_off())
 			return -EAGAIN;
 		/* No register access since the failed stop. Both enables
-		 * were preceded by a successful REG09=1s watchdog write.
+		 * were preceded by a successful profile-specific watchdog write.
 		 */
 		pump_stopping = false;
 		pps_cp_engaged = pps_slave_engaged = false;
@@ -1343,7 +1350,8 @@ static int sc8547_slave_cp_enable(struct sc8547a_device *master, bool on)
 	if (!sc)
 		return -ENODEV;
 	if (on) {
-		ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+		ret = sc8547_write_byte(sc, SC8547_REG_09,
+					 pps_cp_engaged ? SC8547_PPS_WATCHDOG_REG : 0x13);
 		ret = ret ?: sc8547_write_byte(sc, SC8547_REG_11, 0x80);
 		if (ret)
 			return ret;
@@ -1484,7 +1492,7 @@ int sc8547a_pps_share(int master_ma, int margin_mv, unsigned int demand_ma,
 		return ret;
 	if (!(control & SC8547_CHG_EN_MASK))
 		return sc8547_pps_slave_off() ?: -ENOLINK;
-	ret = sc8547_write_byte(sc, SC8547_REG_09, 0x13);
+	ret = sc8547_write_byte(sc, SC8547_REG_09, SC8547_PPS_WATCHDOG_REG);
 	ret = ret ?: sc8547_set_adc_enable(sc, true);
 	if (ret)
 		return ret;
@@ -3733,7 +3741,7 @@ int sc8547a_ufcs_monitor(void)
 		return -ENOLINK;
 	/* oplus_hal_sc8547a.c: CP_WATCHDOG_RESET reads REG07. Service
 	 * the PHY even after a recoverable drop has returned load to buck.
-	 * A still-running 2:1 pump retains its tighter 1 s watchdog.
+	 * A running 2:1 pump uses the stock 5 s CP watchdog.
 	 */
 	ret = sc8547_read_byte(sc, SC8547_REG_07, &control);
 	if (ret)
