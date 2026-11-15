@@ -433,6 +433,15 @@ module_param(cp_ibat_max, uint, 0444);
 MODULE_PARM_DESC(cp_ibat_max,
 		 "Battery current ceiling, both cells, mA (0 follows selected stock table; 1000-12400 overrides downwards)");
 
+/*
+ * Stock DTPT: the read-only safety alerts of both BQ27Z561 gauges, internal
+ * short circuit (ISC) and safe operating area (SOA), sampled while a source
+ * is attached. Neither the alerts nor the gauge data flash are written.
+ */
+#define MCA_FG_REG_SOA		0x70
+#define MCA_FG_REG_ISC		0x72
+#define MCA_DTPT_INTERVAL	(5 * HZ)	/* fg_comp 0x331c: 1250 ticks, HZ=250 */
+
 
 /* Chinese lwn tables; the _gbl node is only for non-CN hardware. */
 enum xiaomi_mca_profile {
@@ -684,6 +693,10 @@ struct xiaomi_mca {
 	bool term_hot;		/* float-voltage thermal hysteresis */
 	bool fv_derated;	/* incomplete sample: retain the previous FV */
 	unsigned int gauge_failures;
+	/* Stock DTPT: both gauges' ISC/SOA alerts, kept across attachments. */
+	bool dtpt, dtpt_sampled;
+	u8 fg_isc[2], fg_soa[2];
+	unsigned long dtpt_at;
 	int cell_zone;		/* coldest sensor: 0, 8, 13 or 18 C row */
 	bool zone_valid, ffc_warm, cold_fv, pmic_comp_warm, pmic_iterm_warm;
 	bool ffc_done;
@@ -1833,18 +1846,38 @@ static u32 xiaomi_mca_policy_fcc(u32 real_type, bool hv)
 	return limits->charge_current_ma;
 }
 
+/* Piano quickchg 0x68ac..0x6918 and 0x84dc..0x8558, buckchg_jeita
+ * 0xa08..0xa30: DTPT takes 8/10 of the selected table row, before the
+ * source, channel and thermal limits; nothing else changes.
+ */
+static u32 xiaomi_mca_dtpt_ma(const struct xiaomi_mca *mca, u32 ma)
+{
+	return mca->dtpt ? ma * 8 / 10 : ma;
+}
+
+/* CN mca_buckchg_jeita jeita_para CC row for the coolest cell, in mA */
+static u32 xiaomi_mca_jeita_ma(struct xiaomi_mca *mca, int tbat)
+{
+	bool zone = mca->zone_valid;
+
+	if (tbat < 3)
+		return 880;
+	if (tbat < 8 || (zone && mca->cell_zone < 8))
+		return 1768;
+	if (tbat < 13 || (zone && mca->cell_zone < 13))
+		return 4520;
+	if (tbat < 18 || (zone && mca->cell_zone < 18))
+		return 7232;
+	return tbat < 48 ? 8000 : 4520;
+}
+
 /* Charge current for @full at battery temperature @tbat */
 static u32 xiaomi_mca_fcc_thermal(struct xiaomi_mca *mca, u32 full, int tbat)
 {
-	/* CN mca_buckchg_jeita. Firmware and charge_limit_poll own stop. */
+	/* Firmware and charge_limit_poll own stop. */
 	if (tbat < -9 || tbat >= 55)
 		return min_t(u32, full, MCA_FCC_DEFAULT_MA);
-	if (tbat < 3)
-		return min_t(u32, full, 880);
-	if (tbat < 8 || (mca->zone_valid && mca->cell_zone < 8))
-		return min_t(u32, full, 1768);
-	/* All other active JEITA rows allow >= 4520 mA, above buck max. */
-	return full;
+	return min(full, xiaomi_mca_dtpt_ma(mca, xiaomi_mca_jeita_ma(mca, tbat)));
 }
 
 static void xiaomi_mca_apply_fcc(struct xiaomi_mca *mca, int tbat, u32 icl)
@@ -2709,24 +2742,19 @@ static int xiaomi_mca_gauge_mac_write(struct bq27xxx_device_info *di, u16 cmd)
 	return ret;
 }
 
-/* Piano bq27z561 .text 0xdb68..0xdc98 and 0xf908..0xf990. These are
- * volatile vendor MAC commands, not data-flash writes. Use the registered
- * gauge executor and its lock: the built-in bq27xxx owner remains intact.
+/*
+ * One transaction with the registered executor of gauge @index, under its
+ * lock: the built-in bq27xxx owner remains intact. @mac sends the vendor
+ * MAC command @arg; otherwise one byte of standard command @arg is read and
+ * returned. Callers allowlist @arg: no data flash, no unseal.
  */
-static int xiaomi_mca_gauge_command(struct xiaomi_mca *mca, unsigned int index, u16 cmd)
+static int xiaomi_mca_gauge_xfer(unsigned int index, bool mac, u16 arg)
 {
 	struct power_supply *psy;
 	struct bq27xxx_device_info *di;
 	struct device *parent;
 	int ret = -ENODEV;
 
-#if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
-	KUNIT_STATIC_STUB_REDIRECT(xiaomi_mca_gauge_command, mca, index, cmd);
-#endif
-	if (index >= ARRAY_SIZE(xiaomi_mca_supplied_to) ||
-	    (cmd != 0x31 && cmd != 0x3e && cmd != 0x3f) ||
-	    !of_machine_is_compatible("xiaomi,piano"))
-		return -EINVAL;
 	psy = power_supply_get_by_name(xiaomi_mca_supplied_to[index]);
 	if (!psy)
 		return -ENODEV;
@@ -2737,29 +2765,97 @@ static int xiaomi_mca_gauge_command(struct xiaomi_mca *mca, unsigned int index, 
 	if (!parent->driver || strcmp(parent->driver->name, "bq27xxx-battery"))
 		goto unlock;
 	di = power_supply_get_drvdata(psy);
-	if (!di || di->chip != BQ27Z561 || di->bat != psy || !di->bus.write_bulk)
+	if (!di || di->chip != BQ27Z561 || di->bat != psy ||
+	    (mac ? !di->bus.write_bulk : !di->bus.read))
 		goto unlock;
 	mutex_lock(&di->lock);
 	if (di->removed || di->suspended) {
 		ret = -EAGAIN;
-	} else {
-		ret = xiaomi_mca_gauge_mac_write(di, cmd);
+	} else if (mac) {
+		ret = xiaomi_mca_gauge_mac_write(di, arg);
 		/* Read actual flags/SOC on the next property access, never write
 		 * a fabricated 100 into the driver's cache.
 		 */
 		if (!ret)
 			di->last_update = jiffies - 6 * HZ;
+	} else {
+		ret = di->bus.read(di, arg, true);
 	}
 	mutex_unlock(&di->lock);
 unlock:
 	device_unlock(parent);
-	if (!ret)
+	if (mac && !ret)
 		power_supply_changed(psy);
 put:
 	power_supply_put(psy);
+	return ret;
+}
+
+/* Piano bq27z561 .text 0xdb68..0xdc98 and 0xf908..0xf990. These are
+ * volatile vendor MAC commands, not data-flash writes.
+ */
+static int xiaomi_mca_gauge_command(struct xiaomi_mca *mca, unsigned int index, u16 cmd)
+{
+	int ret;
+
+#if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(xiaomi_mca_gauge_command, mca, index, cmd);
+#endif
+	if (index >= ARRAY_SIZE(xiaomi_mca_supplied_to) ||
+	    (cmd != 0x31 && cmd != 0x3e && cmd != 0x3f) ||
+	    !of_machine_is_compatible("xiaomi,piano"))
+		return -EINVAL;
+	ret = xiaomi_mca_gauge_xfer(index, true, cmd);
 	if (ret)
 		dev_warn_ratelimited(mca->dev, "gauge %u MAC %#x failed: %d\n", index, cmd, ret);
 	return ret;
+}
+
+/*
+ * Piano bq27z561 fg_get_soa_alert_level .text 0x401c and
+ * fg_get_isc_alert_level 0x3f0c: one byte of the read-only standard
+ * commands at .rodata 0x5168 entries SOA_L (0x70) and ISC (0x72).
+ */
+static int xiaomi_mca_gauge_alert(struct xiaomi_mca *mca, unsigned int index, u8 reg)
+{
+#if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(xiaomi_mca_gauge_alert, mca, index, reg);
+#endif
+	if (index >= ARRAY_SIZE(xiaomi_mca_supplied_to) ||
+	    (reg != MCA_FG_REG_SOA && reg != MCA_FG_REG_ISC) ||
+	    !of_machine_is_compatible("xiaomi,piano"))
+		return -EINVAL;
+	return xiaomi_mca_gauge_xfer(index, false, reg);
+}
+
+/*
+ * Piano fg_comp strategy_fg_dtpt_monitor_work .text 0x3220..0x3320, with
+ * support_dtpt=1 and fg_type=1 (parallel): read both gauges every 5 s, take
+ * the larger level of each alert, and assert DTPT for ISC level 3 or any
+ * SOA alert. A failed read counts as level 0, as in both stock getters.
+ */
+static void xiaomi_mca_dtpt_poll(struct xiaomi_mca *mca)
+{
+	u8 isc = 0, soa = 0;
+	bool dtpt;
+	int n;
+
+	if (mca->dtpt_sampled && time_before(jiffies, mca->dtpt_at))
+		return;
+	mca->dtpt_sampled = true;
+	mca->dtpt_at = jiffies + MCA_DTPT_INTERVAL;
+	for (n = 0; n < ARRAY_SIZE(mca->fg_isc); n++) {
+		mca->fg_isc[n] = max(xiaomi_mca_gauge_alert(mca, n, MCA_FG_REG_ISC), 0);
+		mca->fg_soa[n] = max(xiaomi_mca_gauge_alert(mca, n, MCA_FG_REG_SOA), 0);
+		isc = max(isc, mca->fg_isc[n]);
+		soa = max(soa, mca->fg_soa[n]);
+	}
+	dtpt = isc == 3 || soa;
+	if (dtpt != mca->dtpt)
+		dev_info(mca->dev, "battery safety alert %s: ISC %u/%u SOA %u/%u\n",
+			 dtpt ? "active, cell rows at 8/10" : "cleared",
+			 mca->fg_isc[0], mca->fg_isc[1], mca->fg_soa[0], mca->fg_soa[1]);
+	mca->dtpt = dtpt;
 }
 
 static int xiaomi_mca_gauge_mode(struct xiaomi_mca *mca, bool fast)
@@ -3988,7 +4084,7 @@ static u32 xiaomi_mca_cp_ibat_limit(struct xiaomi_mca *mca, int vbat, int ibat)
 		ibat <= steps[mca->cp_stage].taper_ma))
 		mca->cp_stage++;
 	ma = min3(ma, xiaomi_mca_cp_div2_limit(xiaomi_mca_cp_src_ma(mca)),
-		  steps[mca->cp_stage].ma);
+		  xiaomi_mca_dtpt_ma(mca, steps[mca->cp_stage].ma));
 	mca->cp_target_ma = ma;
 	return ma;
 }
@@ -5171,6 +5267,8 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca, u32 *sampled_type)
 		mca->hv_last_exit = NULL;
 
 		mca->zone_valid = false;
+		/* Sample the gauge alerts on the first tick of an attachment. */
+		mca->dtpt_sampled = false;
 		mca->policy_attach_generation = attachment;
 	}
 	if (xiaomi_mca_clear_auth(mca))
@@ -5203,6 +5301,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca, u32 *sampled_type)
 			xiaomi_mca_cp_stop(mca, "telemetry read failed");
 			return;
 		}
+		xiaomi_mca_dtpt_poll(mca);
 	} else {
 		mca->ibus_ua = 0;
 		mca->icl_ma = 0;
@@ -5779,7 +5878,7 @@ static ssize_t charge_profile_show(struct device *dev,
 		snprintf(t[2], sizeof(t[2]), "%d", mca->pmic_pack_tbat);
 	else
 		strscpy(t[2], "unavailable", sizeof(t[2]));
-	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u aicl_cap_ma=%u hv_exit=%s last_exit=%s conn_mc=%s conn2_mc=%s antiburn=%u pmic_chgr_status=%u pmic_fv_raw=%d pmic_fv_target=%u pmic_iterm_raw=%d pmic_pack_mv=%d buck_suspended=%u fw_recharge=%u fw_recharges=%u full=%u voltage_hold=%u recovery_5v=%u taper_count=%u stop_phase=%u sw_cv_steps=%u sw_cv_fcc=%u gauge_errors=%u pmic_pack_tbat=%s cp_total_errors=%u cp_chip_errors=%u fg_fast_mask=%u fg_full_mask=%u\n",
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u aicl_cap_ma=%u hv_exit=%s last_exit=%s conn_mc=%s conn2_mc=%s antiburn=%u pmic_chgr_status=%u pmic_fv_raw=%d pmic_fv_target=%u pmic_iterm_raw=%d pmic_pack_mv=%d buck_suspended=%u fw_recharge=%u fw_recharges=%u full=%u voltage_hold=%u recovery_5v=%u taper_count=%u stop_phase=%u sw_cv_steps=%u sw_cv_fcc=%u gauge_errors=%u pmic_pack_tbat=%s cp_total_errors=%u cp_chip_errors=%u fg_fast_mask=%u fg_full_mask=%u dtpt=%u isc=%u/%u soa=%u/%u\n",
 		 xiaomi_mca_profile_names[mca->cp_profile],
 		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
 		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma, mca->hv, mca->hv_pps,
@@ -5791,7 +5890,8 @@ static ssize_t charge_profile_show(struct device *dev,
 			mca->pmic_fv_raw, mca->pmic_fv_target, mca->pmic_iterm_raw,
 			mca->pmic_pack_mv, mca->cp_input_suspended, mca->fw_recharge, mca->fw_recharges,
 			mca->charging_done, mca->voltage_hold, mca->recover_5v, mca->cp_taper_count,
-			mca->cp_stop_phase, mca->buck_cv_steps, mca->buck_cv_fcc, mca->gauge_failures, t[2], mca->cp_total_errors, mca->cp_chip_errors, mca->fg_fast_mask, mca->fg_full_mask);
+			mca->cp_stop_phase, mca->buck_cv_steps, mca->buck_cv_fcc, mca->gauge_failures, t[2], mca->cp_total_errors, mca->cp_chip_errors, mca->fg_fast_mask, mca->fg_full_mask,
+			mca->dtpt, mca->fg_isc[0], mca->fg_isc[1], mca->fg_soa[0], mca->fg_soa[1]);
 }
 static DEVICE_ATTR_RO(charge_profile);
 

@@ -524,6 +524,8 @@ struct mca_policy_fixture {
 	bool fg_full_ready;
 	unsigned int fg_commands[2][3];
 	int fg_command_error[2];
+	int fg_alert[2][2];	/* [gauge][ISC, SOA] level, or a read error */
+	unsigned int fg_alert_reads;
 	bool term_restart;
 	int pack_error;
 	int vbus_error;
@@ -2134,6 +2136,14 @@ static bool mca_test_gauges_full(struct xiaomi_mca *mca)
 	struct mca_policy_fixture *f = container_of(mca, struct mca_policy_fixture, mca);
 
 	return f->fg_full_ready;
+}
+
+static int mca_test_gauge_alert(struct xiaomi_mca *mca, unsigned int n, u8 reg)
+{
+	struct mca_policy_fixture *f = container_of(mca, struct mca_policy_fixture, mca);
+
+	f->fg_alert_reads++;
+	return f->fg_alert[n][reg == MCA_FG_REG_SOA];
 }
 
 static struct mca_policy_fixture *mca_full_charge_fixture(struct kunit *test)
@@ -5484,7 +5494,122 @@ static void xiaomi_mca_test_stock_open_budget(struct kunit *test)
 	KUNIT_EXPECT_STREQ(test, mca->cp_last_exit, "no current");
 }
 
+/*
+ * Piano fg_comp DTPT: the larger ISC level of the two gauges must equal 3,
+ * or either gauge report an SOA alert. Every failed read counts as level 0.
+ * An active DTPT takes 8/10 of the pump and buck JEITA rows only.
+ */
+static void xiaomi_mca_test_dtpt_alert_matrix(struct kunit *test)
+{
+	static const struct {
+		int isc[2], soa[2];
+		bool dtpt;
+	} rows[] = {
+		{ { 0, 0 }, { 0, 0 }, false },
+		{ { 1, 2 }, { 0, 0 }, false },
+		{ { 3, 0 }, { 0, 0 }, true },
+		{ { 0, 3 }, { 0, 0 }, true },
+		{ { 0, 0 }, { 1, 0 }, true },
+		{ { 0, 0 }, { 0, 2 }, true },
+		{ { 3, 4 }, { 0, 0 }, false },
+		{ { 3, -EIO }, { -EIO, -EIO }, true },
+		{ { -EIO, 0 }, { 0, 0 }, false },
+		{ { -EIO, -ENODEV }, { 1, -EIO }, true },
+		{ { -ENODEV, -ENODEV }, { -ENODEV, -ENODEV }, false },
+	};
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	unsigned int i, n;
+
+	kunit_activate_static_stub(test, xiaomi_mca_gauge_alert, mca_test_gauge_alert);
+	for (i = 0; i < ARRAY_SIZE(rows); i++) {
+		bool dtpt = rows[i].dtpt;
+
+		for (n = 0; n < 2; n++) {
+			f->fg_alert[n][0] = rows[i].isc[n];
+			f->fg_alert[n][1] = rows[i].soa[n];
+		}
+		mca->dtpt_sampled = false;
+		f->fg_alert_reads = 0;
+		xiaomi_mca_dtpt_poll(mca);
+		KUNIT_EXPECT_EQ_MSG(test, f->fg_alert_reads, 4, "row %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, mca->dtpt, dtpt, "row %u", i);
+		for (n = 0; n < 2; n++) {
+			KUNIT_EXPECT_EQ_MSG(test, mca->fg_isc[n], max(rows[i].isc[n], 0), "row %u", i);
+			KUNIT_EXPECT_EQ_MSG(test, mca->fg_soa[n], max(rows[i].soa[n], 0), "row %u", i);
+		}
+
+		/* quickchg: the batt_para_lwn row, not the source or channel. */
+		mca->cp_ma = 6000;
+		mca->cp_profile = MCA_PROFILE_NORMAL;
+		mca->cp_stage = 0;
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 6000),
+				    dtpt ? 6400 : 8000, "row %u", i);
+		mca->cp_profile = MCA_PROFILE_FFC;
+		mca->cp_stage = 0;
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 9000),
+				    dtpt ? 9920 : 12000, "row %u", i);
+		mca->cp_ma = 3000;
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 6000), 6000,
+				    "row %u", i);
+
+		/* buckchg_jeita: 8/10 of the CC row, then the buck's own limit. */
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_fcc_thermal(mca, 4000, 0),
+				    dtpt ? 704 : 880, "row %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_fcc_thermal(mca, 4000, 5),
+				    dtpt ? 1414 : 1768, "row %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_fcc_thermal(mca, 4000, 10),
+				    dtpt ? 3616 : 4000, "row %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_fcc_thermal(mca, 4000, 15), 4000, "row %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_fcc_thermal(mca, 3600, 25), 3600, "row %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_fcc_thermal(mca, 4000, 50),
+				    dtpt ? 3616 : 4000, "row %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, xiaomi_mca_fcc_thermal(mca, 4000, 55), 500, "row %u", i);
+	}
+}
+
+/* fg_comp refreshes every 5 s; clearing the alert restores the full rows. */
+static void xiaomi_mca_test_dtpt_cadence_release(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	kunit_activate_static_stub(test, xiaomi_mca_gauge_alert, mca_test_gauge_alert);
+	mca->cp_profile = MCA_PROFILE_NORMAL;
+	f->fg_alert[1][1] = 1;
+	guard(mutex)(&mca->lock);
+	xiaomi_mca_policy_poll(mca, &(u32){ 0 });
+	KUNIT_EXPECT_TRUE(test, mca->dtpt);
+	KUNIT_EXPECT_EQ(test, f->fg_alert_reads, 4);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 6000), 6400);
+
+	/* Cleared in the gauge, but not sampled again within 5 s. */
+	f->fg_alert[1][1] = 0;
+	xiaomi_mca_policy_poll(mca, &(u32){ 0 });
+	KUNIT_EXPECT_EQ(test, f->fg_alert_reads, 4);
+	KUNIT_EXPECT_TRUE(test, mca->dtpt);
+	mca->dtpt_at = jiffies;
+	xiaomi_mca_policy_poll(mca, &(u32){ 0 });
+	KUNIT_EXPECT_EQ(test, f->fg_alert_reads, 8);
+	KUNIT_EXPECT_FALSE(test, mca->dtpt);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_ibat_limit(mca, 4000, 6000), 8000);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_fcc_thermal(mca, 4000, 5), 1768);
+
+	/* Detached: no gauge traffic. A new attachment samples at once. */
+	f->fg_alert[0][0] = 3;
+	f->vbus = 0;
+	xiaomi_mca_policy_poll(mca, &(u32){ 0 });
+	KUNIT_EXPECT_EQ(test, f->fg_alert_reads, 8);
+	f->vbus = 5000000;
+	WRITE_ONCE(mca->attach_generation, mca->attach_generation + 1);
+	xiaomi_mca_policy_poll(mca, &(u32){ 0 });
+	KUNIT_EXPECT_EQ(test, f->fg_alert_reads, 12);
+	KUNIT_EXPECT_TRUE(test, mca->dtpt);
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_dtpt_alert_matrix),
+	KUNIT_CASE(xiaomi_mca_test_dtpt_cadence_release),
 	KUNIT_CASE(xiaomi_mca_test_stock_open_budget),
 	KUNIT_CASE(xiaomi_mca_test_stock_command_deadlines),
 	KUNIT_CASE(xiaomi_mca_test_row_current_trim_without_grace),
