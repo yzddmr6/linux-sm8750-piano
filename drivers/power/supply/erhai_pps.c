@@ -805,7 +805,10 @@ static int pps_cp_step(struct erhai_pps *p)
 				 */
 				sc8547a_pps_share(cibus, diff, 0, &slave_ma);
 				slave_ma = 0;
-				p->slave_retry_at = jiffies + (HZ << min(p->slave_failures, 5U));
+				/* virtual_cp MONITOR_WORK_DELAY_MS: retry on its next
+				 * 500 ms observation, without a second 32 s holdoff.
+				 */
+				p->slave_retry_at = jiffies + msecs_to_jiffies(500);
 				p->slave_failures = min(p->slave_failures + 1, 6U);
 			} else {
 				p->slave_failures = 0;
@@ -823,6 +826,12 @@ static int pps_cp_step(struct erhai_pps *p)
 		if (max(cibus, slave_ma) > 4000)
 			target = min_t(unsigned int, target, max(0, cibus + slave_ma - 500));
 		cibus += slave_ma;
+		/* Count consecutive failed starts, not isolated drops spread
+		 * over a charge. A working converter and measured input end
+		 * the failure episode (stock start success clears retry_count).
+		 */
+		if (cibus >= pps_cp_min_ibus_ma)
+			p->cp_rearms = 0;
 		p->cp_fed_at = jiffies;
 		/* switching but carrying nothing: with the buck suspended the
 		 * pack would sit idle (vendor: 4 results under 300 mA) */
