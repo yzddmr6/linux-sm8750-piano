@@ -81,6 +81,7 @@
 #define MCA_PROP_TYPEC_MODE		0x21015
 #define MCA_NOTIFY_TYPE_CHANGE		0
 #define MCA_NOTIFY_BOOST			3
+#define MCA_NOTIFY_LPD_STATUS		4	/* data[0]: liquid detected, on change */
 #define MCA_NOTIFY_TYPEC_CHANGE		5
 #define MCA_NOTIFY_OTG_CP_CONFIG		10
 #define MCA_NOTIFY_HISTORY		32
@@ -104,6 +105,22 @@ static const __le32 xiaomi_mca_piano_otg_cfg[] = {
 #define MCA_PROP_USB_VOLTAGE_NOW	0x20002
 #define MCA_PROP_USB_CURRENT_NOW	0x20004
 #define MCA_PROP_USB_REAL_TYPE		0x2000c
+
+/*
+ * Liquid detection in the USB-C port, done by the charger firmware (Piano
+ * ADSP mca_check_if_enable_lpd enables it on production hardware). Getter
+ * 0x600300ac/0x600300c8 returns the port's bLpdEn/bLiquidDetected bytes;
+ * evaluate_typec_charger sends the latter as notification 4 on change.
+ * 0x201e..0x2023 are the measured pins the firmware decides on.
+ */
+#define MCA_PROP_LPD_ENABLE		0x20009
+#define MCA_PROP_LPD_STATUS		0x2000a
+#define MCA_PROP_LPD_SBU1		0x201e
+#define MCA_PROP_LPD_SBU2		0x201f
+#define MCA_PROP_LPD_CC1		0x2020
+#define MCA_PROP_LPD_CC2		0x2021
+#define MCA_PROP_LPD_DP			0x2022
+#define MCA_PROP_LPD_DM			0x2023
 
 /* Piano qcom_adsp_pd_protocol .text 0x3b0..3c8: raw PPS=11;
  * authentication promotes the protocol type to 12. Do not use Onyx
@@ -336,6 +353,19 @@ static bool mipps_auth = true;
 module_param(mipps_auth, bool, 0644);
 MODULE_PARM_DESC(mipps_auth,
 		 "Authenticate Xiaomi MiPPS adapters before PPS negotiation (default: on)");
+
+/*
+ * moisture_5v: while the firmware reports liquid in the USB-C port, keep
+ * the source at 5 V and the pump off; buck charging continues. This is
+ * stock's force_5v = lpd_status & lpd_charging (business_charger
+ * 0x231c..0x2384): the buck strategy's "lpd" vote holds the input voltage
+ * at 5 V and quickchg's "lpd" vote disables direct charging. lpd_charging
+ * is the stock userspace switch of this protection.
+ */
+static bool moisture_5v = true;
+module_param(moisture_5v, bool, 0644);
+MODULE_PARM_DESC(moisture_5v,
+		 "Hold 5 V without direct charging while the charger firmware reports liquid in the USB-C port (default: on)");
 
 /*
  * cp_charge: direct charging through the SC8541 2:1 switched-capacitor
@@ -697,6 +727,7 @@ struct xiaomi_mca {
 	bool dtpt, dtpt_sampled;
 	u8 fg_isc[2], fg_soa[2];
 	unsigned long dtpt_at;
+	bool moisture;		/* firmware USB-C liquid status, last read or notified */
 	int cell_zone;		/* coldest sensor: 0, 8, 13 or 18 C row */
 	bool zone_valid, ffc_warm, cold_fv, pmic_comp_warm, pmic_iterm_warm;
 	bool ffc_done;
@@ -2234,6 +2265,34 @@ static int xiaomi_mca_request_volt(struct xiaomi_mca *mca, u32 mv)
 	return xiaomi_mca_write_u32(mca, MCA_PROP_PD_FIXED_VOLT, mv);
 }
 
+static void xiaomi_mca_set_moisture(struct xiaomi_mca *mca, u32 status)
+{
+	/* force_5v takes bit 0, as stock's lpd_status & lpd_charging. */
+	bool wet = status & 1;
+
+	if (wet != mca->moisture)
+		dev_info(mca->dev, "firmware reports the USB-C port %s\n", wet ? "wet" : "dry");
+	mca->moisture = wet;
+}
+
+/*
+ * The port's current status, read on every policy pass with a source
+ * attached; notification 4 only brings that pass forward. A failed read
+ * keeps the last status, as a notification that did not arrive would.
+ */
+static void xiaomi_mca_lpd_poll(struct xiaomi_mca *mca)
+{
+	u32 status;
+
+	if (mca->piano_otg && !xiaomi_mca_read(mca, MCA_PROP_LPD_STATUS, &status))
+		xiaomi_mca_set_moisture(mca, status);
+}
+
+static bool xiaomi_mca_wet(struct xiaomi_mca *mca)
+{
+	return moisture_5v && mca->moisture;
+}
+
 /*
  * hv_charge state machine, one step per poll.  Returns the input current
  * the source allows at 9 V once the bus is there, 0 while at 5 V.
@@ -2256,6 +2315,13 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
 			return 0;
 		}
 		mca->hv = MCA_HV_OFF;
+	}
+	/* Piano buckchg "lpd" input-voltage vote: 5 V while the port is wet. */
+	if (xiaomi_mca_wet(mca)) {
+		if (mca->hv == MCA_HV_OFF)
+			return 0;
+		mca->hv_last_exit = "liquid detected";
+		goto vsafe5v;
 	}
 
 	if (xiaomi_mca_is_pd(mca->real_type))
@@ -2333,6 +2399,7 @@ static u32 xiaomi_mca_hv_step(struct xiaomi_mca *mca)
 		return 0;
 	}
 
+vsafe5v:
 	/* Recover vSafe5V before another negotiation. */
 	dev_info(mca->dev, "back to 5 V (bus %d mV)\n", mca->vbus_uv / 1000);
 	xiaomi_mca_request_volt(mca, 5000);
@@ -3292,6 +3359,7 @@ static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why)
 	if (mca->cp_stop_phase == 2) {
 		/* Original requests fixed PDOs, never a PPS contract at handoff. */
 		if (online && hv_charge && !mca->connector.tripped && !mca->charge_blocked &&
+		    !xiaomi_mca_wet(mca) &&
 		    ((xiaomi_mca_is_pd(mca->real_type) && xiaomi_mca_pd_9v_ma(mca, &pps) && !pps) ||
 		     xiaomi_mca_is_qc(mca->real_type))) {
 			ret = xiaomi_mca_request_volt(mca, MCA_HV_MV);
@@ -4124,7 +4192,8 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 	u32 start_mv, ma, src_ma, max_mv = 0;
 
 	if (xiaomi_mca_cp_failed(mca) || mca->cp_fault || mca->charging_done || mca->otg_active ||
-	    mca->otg_requested || mca->pen_on || mca->pen_dirty || mca->charge_blocked)
+	    mca->otg_requested || mca->pen_on || mca->pen_dirty || mca->charge_blocked ||
+	    xiaomi_mca_wet(mca))
 		return;
 	if (!cp_charge || !hv_charge || !charge_current ||
 	    (!xiaomi_mca_is_pd(mca->real_type) && !xiaomi_mca_is_qc_pump(mca->real_type)) ||
@@ -4401,6 +4470,13 @@ static void xiaomi_mca_cp_step(struct xiaomi_mca *mca)
 	u32 fcc, icl;
 
 	mca->cp_ramp_poll = false;
+	/* Piano quickchg "lpd" chg_en vote: direct charging ends while wet.
+	 * Recoverable: entry is allowed again once the firmware reports dry.
+	 */
+	if (xiaomi_mca_wet(mca)) {
+		xiaomi_mca_cp_stop(mca, "liquid detected");
+		return;
+	}
 	if (xiaomi_mca_gauges(mca, &vbat, &ibat, &tcool, &tbat, &vmin, &imax, &ocp)) {
 		xiaomi_mca_cp_stop(mca, "read failed");
 		return;
@@ -5103,6 +5179,10 @@ static void xiaomi_mca_process_notifications(struct xiaomi_mca *mca)
 			if (!ret && !record.data[0])
 				mca->otg_active = false;
 			break;
+		case MCA_NOTIFY_LPD_STATUS:
+			/* Piano proxy notify_cb 0x23b4..0x2450 forwards data[0]. */
+			xiaomi_mca_set_moisture(mca, record.data[0]);
+			continue;
 		case MCA_NOTIFY_BOOST:
 			/*
 			 * boost_src=0 bypasses proxy's ovpgate_with_check.
@@ -5167,7 +5247,8 @@ static void xiaomi_mca_callback(const void *data, size_t len, void *priv)
 		else
 			mca->notify_pending++;
 		if (record->id == MCA_NOTIFY_TYPE_CHANGE || record->id == MCA_NOTIFY_TYPEC_CHANGE ||
-		    record->id == MCA_NOTIFY_OTG_CP_CONFIG || record->id == MCA_NOTIFY_BOOST) {
+		    record->id == MCA_NOTIFY_OTG_CP_CONFIG || record->id == MCA_NOTIFY_BOOST ||
+		    record->id == MCA_NOTIFY_LPD_STATUS) {
 			mca->input_generation++;
 			mca->input_pending = mca->service_up;
 			if (mca->piano_otg && record->id == MCA_NOTIFY_OTG_CP_CONFIG)
@@ -5302,6 +5383,7 @@ static void xiaomi_mca_policy_poll(struct xiaomi_mca *mca, u32 *sampled_type)
 			return;
 		}
 		xiaomi_mca_dtpt_poll(mca);
+		xiaomi_mca_lpd_poll(mca);
 	} else {
 		mca->ibus_ua = 0;
 		mca->icl_ma = 0;
@@ -5878,7 +5960,7 @@ static ssize_t charge_profile_show(struct device *dev,
 		snprintf(t[2], sizeof(t[2]), "%d", mca->pmic_pack_tbat);
 	else
 		strscpy(t[2], "unavailable", sizeof(t[2]));
-	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u aicl_cap_ma=%u hv_exit=%s last_exit=%s conn_mc=%s conn2_mc=%s antiburn=%u pmic_chgr_status=%u pmic_fv_raw=%d pmic_fv_target=%u pmic_iterm_raw=%d pmic_pack_mv=%d buck_suspended=%u fw_recharge=%u fw_recharges=%u full=%u voltage_hold=%u recovery_5v=%u taper_count=%u stop_phase=%u sw_cv_steps=%u sw_cv_fcc=%u gauge_errors=%u pmic_pack_tbat=%s cp_total_errors=%u cp_chip_errors=%u fg_fast_mask=%u fg_full_mask=%u dtpt=%u isc=%u/%u soa=%u/%u\n",
+	return sysfs_emit(buf, "active=%s stage=%u target_ma=%u ffc=%u cp=%u source_ma=%u request_ma=%u bus_ceiling_ma=%u hv=%u hv_pps=%u request_mv=%u attach=%u type=%u pump_type=%u exits=%u retry_ms=%u aicl_cap_ma=%u hv_exit=%s last_exit=%s conn_mc=%s conn2_mc=%s antiburn=%u pmic_chgr_status=%u pmic_fv_raw=%d pmic_fv_target=%u pmic_iterm_raw=%d pmic_pack_mv=%d buck_suspended=%u fw_recharge=%u fw_recharges=%u full=%u voltage_hold=%u recovery_5v=%u taper_count=%u stop_phase=%u sw_cv_steps=%u sw_cv_fcc=%u gauge_errors=%u pmic_pack_tbat=%s cp_total_errors=%u cp_chip_errors=%u fg_fast_mask=%u fg_full_mask=%u dtpt=%u isc=%u/%u soa=%u/%u moisture=%u\n",
 		 xiaomi_mca_profile_names[mca->cp_profile],
 		 mca->cp_stage, mca->cp_target_ma, mca->ffc_active, mca->cp,
 		 mca->cp_ma, mca->cp_request_ma, mca->cp_ibus_ma, mca->hv, mca->hv_pps,
@@ -5891,7 +5973,8 @@ static ssize_t charge_profile_show(struct device *dev,
 			mca->pmic_pack_mv, mca->cp_input_suspended, mca->fw_recharge, mca->fw_recharges,
 			mca->charging_done, mca->voltage_hold, mca->recover_5v, mca->cp_taper_count,
 			mca->cp_stop_phase, mca->buck_cv_steps, mca->buck_cv_fcc, mca->gauge_failures, t[2], mca->cp_total_errors, mca->cp_chip_errors, mca->fg_fast_mask, mca->fg_full_mask,
-			mca->dtpt, mca->fg_isc[0], mca->fg_isc[1], mca->fg_soa[0], mca->fg_soa[1]);
+			mca->dtpt, mca->fg_isc[0], mca->fg_isc[1], mca->fg_soa[0], mca->fg_soa[1],
+			mca->moisture);
 }
 static DEVICE_ATTR_RO(charge_profile);
 
@@ -5946,6 +6029,14 @@ static const struct {
 	{ "aicl_enabled", MCA_PROP_AICL_ENABLED },
 	{ "aicl_status", MCA_PROP_AICL_STATUS },
 	{ "input_suspend", MCA_PROP_INPUT_SUSPEND },
+	{ "lpd_enable", MCA_PROP_LPD_ENABLE },
+	{ "lpd_status", MCA_PROP_LPD_STATUS },
+	{ "lpd_sbu1", MCA_PROP_LPD_SBU1 },
+	{ "lpd_sbu2", MCA_PROP_LPD_SBU2 },
+	{ "lpd_cc1", MCA_PROP_LPD_CC1 },
+	{ "lpd_cc2", MCA_PROP_LPD_CC2 },
+	{ "lpd_dp", MCA_PROP_LPD_DP },
+	{ "lpd_dm", MCA_PROP_LPD_DM },
 };
 
 /* Uncached reads of the properties above; the raw values, no unit conversion. */
@@ -6216,7 +6307,7 @@ static int xiaomi_mca_quiesce(struct xiaomi_mca *mca)
 	/* Standard PD can maintain a fixed 9 V PDO without CPU keepalives.
 	 * Always name the fixed PDO explicitly, even if PPS already reads 9 V. */
 	if (hv_charge && mca->voltage_written && xiaomi_mca_is_pd(mca->real_type) &&
-	    !mca->charge_blocked) {
+	    !mca->charge_blocked && !xiaomi_mca_wet(mca)) {
 		fixed_ma = xiaomi_mca_pd_9v_ma(mca, &pps);
 		if (fixed_ma && !pps) {
 			ret = xiaomi_mca_write_u32(mca, MCA_PROP_PD_FIXED_VOLT, MCA_HV_MV);

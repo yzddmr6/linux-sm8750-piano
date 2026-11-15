@@ -527,6 +527,9 @@ struct mca_policy_fixture {
 	int fg_alert[2][2];	/* [gauge][ISC, SOA] level, or a read error */
 	unsigned int fg_alert_reads;
 	unsigned int pps_requests;
+	u32 lpd;
+	int lpd_error;
+	unsigned int lpd_reads;
 	bool term_restart;
 	int pack_error;
 	int vbus_error;
@@ -770,6 +773,12 @@ static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 		break;
 	case MCA_PROP_ADAPTER_ID:
 		value = f->adapter_id;
+		break;
+	case MCA_PROP_LPD_STATUS:
+		f->lpd_reads++;
+		if (f->lpd_error)
+			return f->lpd_error;
+		value = f->lpd;
 		break;
 	default:
 		break;
@@ -5675,7 +5684,216 @@ static void xiaomi_mca_test_silent_gauge_keeps_pump_off(struct kunit *test)
 	}
 }
 
+static unsigned int mca_test_writes_of(struct mca_policy_fixture *f, u32 prop, u32 value)
+{
+	unsigned int i, n = 0;
+
+	for (i = 0; i < f->trace_count; i++)
+		n += f->trace[i].prop == prop && f->trace[i].value == value;
+	return n;
+}
+
+/*
+ * Stock force_5v = lpd_status & lpd_charging: bit 0 of the firmware's port
+ * status, read on each policy pass with a source attached and delivered
+ * early by notification 4. A failed read keeps the last status.
+ */
+static void xiaomi_mca_test_moisture_status(struct kunit *test)
+{
+	static const struct {
+		u32 lpd;
+		int error;
+		bool wet;
+	} reads[] = {
+		{ 1, 0, true }, { 0, 0, false }, { 2, 0, false }, { 3, 0, true },
+		{ 0, -ETIMEDOUT, true }, { 0, 0, false }, { 1, -EIO, false },
+	};
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	unsigned int i;
+	u32 generation;
+
+	mca->piano_otg = true;
+	guard(mutex)(&mca->lock);
+	for (i = 0; i < ARRAY_SIZE(reads); i++) {
+		f->lpd = reads[i].lpd;
+		f->lpd_error = reads[i].error;
+		xiaomi_mca_policy_poll(mca, &(u32){ 0 });
+		KUNIT_EXPECT_EQ_MSG(test, f->lpd_reads, i + 1, "read %u", i);
+		KUNIT_EXPECT_EQ_MSG(test, mca->moisture, reads[i].wet, "read %u", i);
+	}
+	f->lpd_error = 0;
+
+	/* The stock switch selects the action; the status is still kept. */
+	mca->moisture = true;
+	KUNIT_EXPECT_FALSE(test, xiaomi_mca_wet(mca));
+	moisture_5v = true;
+	KUNIT_EXPECT_TRUE(test, xiaomi_mca_wet(mca));
+	mca->moisture = false;
+
+	/* Without a source nothing is read. */
+	f->vbus = 0;
+	xiaomi_mca_policy_poll(mca, &(u32){ 0 });
+	KUNIT_EXPECT_EQ(test, f->lpd_reads, ARRAY_SIZE(reads));
+	f->vbus = 5000000;
+
+	/* Notification 4 applies the change and brings the next pass forward. */
+	generation = mca->input_generation;
+	mca_otg_send(mca, MCA_NOTIFY_LPD_STATUS, 1);
+	KUNIT_EXPECT_EQ(test, mca->input_generation, generation + 1);
+	xiaomi_mca_process_notifications(mca);
+	KUNIT_EXPECT_TRUE(test, mca->moisture);
+	mca_otg_send(mca, MCA_NOTIFY_LPD_STATUS, 0);
+	xiaomi_mca_process_notifications(mca);
+	KUNIT_EXPECT_FALSE(test, mca->moisture);
+
+	/* Only Piano's firmware layout is known. */
+	mca->piano_otg = false;
+	f->lpd = 1;
+	xiaomi_mca_policy_poll(mca, &(u32){ 0 });
+	KUNIT_EXPECT_EQ(test, f->lpd_reads, ARRAY_SIZE(reads));
+	KUNIT_EXPECT_FALSE(test, mca->moisture);
+}
+
+/* buckchg "lpd" vote: no 9 V while wet; an existing 9 V returns to 5 V. */
+static void xiaomi_mca_test_moisture_holds_5v(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	hv_charge = moisture_5v = true;
+	f->pdos[1] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(9000), cpu_to_le32(9000), cpu_to_le32(2000) };
+	mca->moisture = true;
+	guard(mutex)(&mca->lock);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_OFF);
+	KUNIT_EXPECT_EQ(test, mca_test_writes_of(f, MCA_PROP_PD_FIXED_VOLT, 9000), 0);
+
+	/* Dry: the same source is asked for 9 V at once. */
+	mca->moisture = false;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_REQUESTED);
+	KUNIT_EXPECT_EQ(test, mca_test_writes_of(f, MCA_PROP_PD_FIXED_VOLT, 9000), 1);
+	f->vbus = mca->vbus_uv = 9000000;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 2000);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_ON);
+
+	/* Wet at 9 V: back to vSafe5V and held there. */
+	mca->moisture = true;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_RECOVER_5V);
+	KUNIT_EXPECT_STREQ(test, mca->hv_last_exit, "liquid detected");
+	KUNIT_EXPECT_EQ(test, f->vbus, 5000000);
+	mca->vbus_uv = f->vbus;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_OFF);
+	KUNIT_EXPECT_EQ(test, mca_test_writes_of(f, MCA_PROP_PD_FIXED_VOLT, 9000), 1);
+
+	/* With the switch off the status is only reported. */
+	moisture_5v = false;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_REQUESTED);
+	moisture_5v = true;
+
+	/* QC: no HVDCP voltage request while wet either. */
+	mca->hv = MCA_HV_OFF;
+	f->type = mca->real_type = MCA_TYPE_HVDCP_3;
+	f->trace_count = 0;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca_test_writes_of(f, MCA_PROP_QC_VOLT, 9000), 0);
+	mca->moisture = false;
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_hv_step(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca_test_writes_of(f, MCA_PROP_QC_VOLT, 9000), 1);
+	hv_charge = false;
+}
+
+/*
+ * quickchg "lpd" chg_en vote: no pump entry while wet; a running pump hands
+ * back to buck at 5 V, without the fixed 9 V handoff, and is not counted as a
+ * pump failure. Entry is allowed again on the same attachment once dry.
+ */
+static void xiaomi_mca_test_moisture_stops_pump(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	full_charge = charge_policy = charge_current = cp_charge = hv_charge = true;
+	moisture_5v = true;
+	mca_test_named_stage(test, f, "sc8541");
+	power_supply_put(mca->cp_psy);
+	mca->cp_psy = NULL;
+	mca->cp = MCA_CP_OFF;
+	f->stage_on = false;
+	f->type = mca->real_type = MCA_TYPE_PD_PPS;
+	f->vbus = mca->vbus_uv = 9000000;
+	mca->hv = MCA_HV_ON;
+	f->pdos[1] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(9000), cpu_to_le32(9000), cpu_to_le32(3000) };
+	f->pdos[2] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(5000), cpu_to_le32(11000), cpu_to_le32(5000) };
+	f->cells[0].capacity = f->cells[1].capacity = 50;
+	mca->moisture = true;
+	guard(mutex)(&mca->lock);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_full_charge_poll(mca), 0);
+	xiaomi_mca_cp_try_start(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
+	KUNIT_EXPECT_EQ(test, f->pps_requests, 0);
+
+	mca->moisture = false;
+	xiaomi_mca_cp_try_start(mca);
+	KUNIT_ASSERT_EQ(test, mca->cp, MCA_CP_OPENING);
+	f->stage_on = true;
+	f->trace_count = 0;
+	mca->moisture = true;
+	xiaomi_mca_cp_step(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
+	KUNIT_EXPECT_FALSE(test, f->stage_on);
+	KUNIT_EXPECT_STREQ(test, mca->cp_last_exit, "liquid detected");
+	KUNIT_EXPECT_EQ(test, mca->cp_total_errors, 0);
+	KUNIT_EXPECT_EQ(test, mca->cp_chip_errors, 0);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_OFF);
+	KUNIT_EXPECT_EQ(test, mca_test_writes_of(f, MCA_PROP_PD_FIXED_VOLT, 5000), 1);
+	KUNIT_EXPECT_EQ(test, mca_test_writes_of(f, MCA_PROP_PD_FIXED_VOLT, 9000), 0);
+
+	mca->moisture = false;
+	mca->vbus_uv = f->vbus;
+	xiaomi_mca_cp_try_start(mca);
+	KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OPENING);
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_cp_stop(mca, "test complete"), 0);
+}
+
+/* The sleep handoff keeps a fixed 9 V PDO only for a dry port. */
+static void xiaomi_mca_test_moisture_sleep(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_policy_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+
+	hv_charge = moisture_5v = true;
+	mca->hv = MCA_HV_ON;
+	mca->voltage_written = true;
+	mca->icl_written = true;
+	mca->fcc_written = true;
+	f->vbus = 9000000;
+	f->pdos[0] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(9000), cpu_to_le32(9000), cpu_to_le32(1200) };
+	mca->moisture = true;
+	mutex_lock(&mca->lock);
+	KUNIT_EXPECT_EQ(test, xiaomi_mca_quiesce(mca), 0);
+	KUNIT_EXPECT_EQ(test, mca_test_writes_of(f, MCA_PROP_PD_FIXED_VOLT, 9000), 0);
+	KUNIT_EXPECT_EQ(test, f->vbus, 5000000);
+	KUNIT_EXPECT_FALSE(test, mca->voltage_written);
+	KUNIT_EXPECT_EQ(test, mca->hv, MCA_HV_OFF);
+	mutex_unlock(&mca->lock);
+	hv_charge = false;
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_moisture_status),
+	KUNIT_CASE(xiaomi_mca_test_moisture_holds_5v),
+	KUNIT_CASE(xiaomi_mca_test_moisture_stops_pump),
+	KUNIT_CASE(xiaomi_mca_test_moisture_sleep),
 	KUNIT_CASE(xiaomi_mca_test_silent_gauge_keeps_pump_off),
 	KUNIT_CASE(xiaomi_mca_test_dtpt_alert_matrix),
 	KUNIT_CASE(xiaomi_mca_test_dtpt_cadence_release),
@@ -5839,6 +6057,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 
 static bool * const mca_test_switches[] = {
 	&charge_policy, &charge_current, &full_charge, &hv_charge, &mipps_auth, &cp_charge,
+	&moisture_5v,
 };
 
 static void mca_test_restore_switches(void *data)
