@@ -3308,7 +3308,7 @@ static int xiaomi_mca_charge_wake_init(struct xiaomi_mca *mca)
 
 static int xiaomi_mca_charge_enable(struct xiaomi_mca *mca, bool enable)
 {
-	u8 value = enable, readback;
+	u8 value = enable;
 	int ret;
 
 	if (enable && mca->connector.tripped)
@@ -3316,11 +3316,12 @@ static int xiaomi_mca_charge_enable(struct xiaomi_mca *mca, bool enable)
 	/* Retain ownership after a lost disable acknowledgment. */
 	if (!enable)
 		mca->charge_disabled = true;
-	ret = xiaomi_mca_read_blob(mca, MCA_PROP_CHARGING_ENABLED,
-				   &readback, sizeof(readback));
-	if (ret || readback != value)
-		ret = xiaomi_mca_write_blob(mca, MCA_PROP_CHARGING_ENABLED,
-					    &value, sizeof(value));
+	/* Piano ADSP b19 0x600314d4..600315c8: this setter also configures
+	 * DCDC mode, whereas the getter reports only the charge-enable bit.
+	 * The stock proxy 0x140c..1454 always sends the complete operation.
+	 */
+	ret = xiaomi_mca_write_blob(mca, MCA_PROP_CHARGING_ENABLED,
+				    &value, sizeof(value));
 	if (!ret && enable)
 		mca->charge_disabled = false;
 	return ret;
