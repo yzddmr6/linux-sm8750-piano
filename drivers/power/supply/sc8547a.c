@@ -57,19 +57,8 @@
 #include "erhai_cell_envelope.h"
 #include "erhai_svooc_lcf.h"
 
-/*
- * Android parity for slow/noisy third-party (S)VOOC adapters.  The vendor
- * engine (v2/voocphy/oplus_adsp_voocphy.c) classifies SVOOC from BOTH the
- * ADSP/PD verdict (oplus_chglib_is_pd_svooc_adapter / adapter_sid_power over
- * pmic-glink) AND the D+/D- serial ladder, and on a comm error/timeout it
- * DELAYS and RETRIES instead of declining ("abnormal adapter need delay") —
- * which is why a non-OEM "SuperVOOC" brick that this driver's old single
- * SC8547_AUTO_IDENTIFY_MS=4000 window could never pass still fast-charges
- * on Android.  These knobs mirror that behaviour: the identify window is
- * re-armed (identify_retries) only when the charger shows VOOC signs — an
- * ADSP fast-charge-type verdict (adsp_classify) or actual VOOC serial frames
- * (sc->vooc_saw_any) — so a non-VOOC charger still declines on the FIRST
- * window exactly as before (D+/D- restored promptly).
+/* Recovery follows the AP VOOC switch-check windows (5/15/30 s).
+ * ADSP classification is evidence of the source, not a second PHY engine.
  */
 static bool serial_enable = true;
 module_param(serial_enable, bool, 0444);
@@ -77,15 +66,15 @@ MODULE_PARM_DESC(serial_enable, "Identify SUPERVOOC adapters on dedicated chargi
 
 static DEFINE_MUTEX(sc8547_pps_lock);
 
-static unsigned int identify_ms = 4000;
+static unsigned int identify_ms = 5000;
 module_param(identify_ms, uint, 0644);
 MODULE_PARM_DESC(identify_ms,
-		 "SVOOC serial-identify window per attempt (ms, default 4000)");
+		 "SVOOC serial-identify window per attempt (ms, default 5000; stock first switch check)");
 
-static unsigned int identify_retries = 3;
+static unsigned int identify_retries = 2;
 module_param(identify_retries, uint, 0644);
 MODULE_PARM_DESC(identify_retries,
-		 "re-arm the identify ladder this many times on a slow adapter (default 3)");
+		 "re-arm the identify ladder this many times on a slow adapter (default 2; stock checks at 5 and 15 seconds)");
 
 static bool adsp_classify = true;
 module_param(adsp_classify, bool, 0644);
@@ -369,24 +358,17 @@ MODULE_PARM_DESC(slave_drop_ticks,
 /* Project 24926 selects the domestic 67 W SC8547A curve. */
 #define SC8547_AUTO_CODE_CEILING	61	/* 24926 (24924 table): 6100 mA */
 
-#define SC8547_AUTO_IDENTIFY_MS		4000	/* window to see adapter_check_ok */
 #define SC8547_CURVE_SAMPLE_MS		500 /* VOOC_VOL_EVENT_TIME */
 #define SC8547_AUTO_STEP_DEBOUNCE	4	/* four 500 ms voltage samples */
-/*
- * A genuine SVOOC adapter periodically resets its VOOC link (drops output and
- * waits for a fresh handshake) after tens of seconds of CC. That is not an
- * unplug: re-arm the PHY and re-servo (matches the vendor engine) rather than
- * ending fast-charge. Bound consecutive re-servos so a genuinely failing adapter
- * still falls out to normal charge; a re-servo that follows a sustained CC period
- * refills the budget, so healthy periodic resets never exhaust it.
+/* Three unsuccessful recovery attempts, matching the stock switch-check
+ * ladder. Confirmed delivery resets this failure budget; there is no
+ * protocol-defined periodic adapter reset or timed refill allowance.
  */
-#define SC8547_AUTO_RESERVO_MAX		4	/* consecutive quick resets before give-up */
+#define SC8547_AUTO_RESERVO_MAX		3
 /* Oplus AP VOOC PHY: VOOC_COMMU_EVENT_TIME and VOOCPHY_UCP_SS_IBUS_MIN. */
 #define SC8547_COMMU_TIMEOUT_MS		200
 #define SC8547_UCP_ARM_MA		600
 #define SC8547_LOW_IBUS_MA		300	/* pump no-load floor, separate from gauge LCF */
-#define SC8547_AUTO_SUSTAINED_MS	5000	/* CC held this long -> reset is keep-alive */
-#define SC8547_AUTO_DETACH_DEBOUNCE_MS	2500	/* longer absence window while delivering */
 
 enum sc8547_vooc_vbus_status {
 	SC_VBUS_LOW = 0,
@@ -554,8 +536,6 @@ struct sc8547a_device {
 	u8 model_frames[2], model_flags[2];
 	const char *serial_last_exit;
 	const char *serial_last_retry;
-	unsigned long load_since;
-	bool load_seen;
 	bool serial_ucp_armed;
 	u8 change_polls;
 	u8 notified_code;
@@ -2488,7 +2468,6 @@ static void sc8547_vooc_reset_state(struct sc8547a_device *sc)
 	sc->adapter_vbat_mv = 0;
 	sc->serial_ucp_armed = false;
 	sc->low_ibus_count = 0;
-	sc->load_seen = false;
 	sc->slave_check_pending = sc->slave_trouble = false;
 	sc->leg_over_count = 0;
 	sc->next_leg_check = jiffies;
@@ -2574,16 +2553,9 @@ static void sc8547_auto_finish(struct sc8547a_device *sc, const char *why)
 	sc8547_serial_end(sc, why);
 }
 
-/*
- * Auto path re-servo: an SVOOC adapter periodically resets its VOOC link mid-CC
- * (drops output below the CP margin so CHG_EN self-clears; Vbus returns to ~5 V
- * and the adapter waits for a fresh handshake). Below the CV ceiling that is a
- * keep-alive reset, not an unplug (the >=CV case was already caught by the hard
- * backstop), so instead of ending fast-charge we drop the CP, re-arm the PHY and
- * return to identify to re-handshake and resume CC — matching the vendor engine.
- * The crossbar stays on the CP path (no USB re-enumeration churn). A re-servo
- * that follows a sustained CC period refills the retry budget; a burst of quick
- * collapses without progress exhausts it and hands back to normal charge.
+/* Lost frames, pump faults and current loss are failures, not keep-alives.
+ * Stop both pumps, reauthenticate within the bounded recovery ladder, then
+ * hand control back to the route arbiter if no working delivery is obtained.
  */
 static void sc8547_auto_reservo(struct sc8547a_device *sc, const char *why)
 {
@@ -2622,19 +2594,12 @@ static void sc8547_auto_reservo(struct sc8547a_device *sc, const char *why)
 		return;
 	sc->auto_state = SC_AUTO_IDENTIFY;
 	sc->auto_identify_deadline = jiffies +
-		msecs_to_jiffies(SC8547_AUTO_IDENTIFY_MS);
+		msecs_to_jiffies(identify_ms);
 }
 
-/*
- * Android parity for a slow/noisy serial ladder: when the identify window
- * expires without adapter_check_ok, RE-ARM the PHY + handshake (the vendor
- * engine's "abnormal adapter need delay" retry) up to identify_retries times,
- * instead of the old permanent single-shot decline.  The ADSP fast-charge
- * verdict is consulted (adsp_classify) as a second signal — the vendor keys
- * the retry off oplus_chglib_is_pd_svooc_adapter()/get_adapter_sid_power()
- * [>= 80 W] — but even without it we still give the serial ladder its bounded
- * chance, because the final decision stays with the serial exchange.
- * Returns true when re-armed (stay in IDENTIFY), false when declining.
+/* oplus_chg_vooc.c switch_check: initial 5 s, then checks at 15 and
+ * 30 s. Retain attachment evidence when rearming the frame decoder.
+ * Do not monopolize data pins for a source which has never answered.
  */
 static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
 {
@@ -2663,7 +2628,8 @@ static bool sc8547_auto_identify_retry(struct sc8547a_device *sc)
 	if (sc->auto_state == SC_AUTO_DECLINED)	/* DP alt-mode owns the switch */
 		return false;
 	sc->auto_state = SC_AUTO_IDENTIFY;
-	sc->auto_identify_deadline = jiffies + msecs_to_jiffies(identify_ms);
+	sc->auto_identify_deadline = jiffies +
+		msecs_to_jiffies(identify_ms * (1 + sc->auto_ident_retries));
 	return true;
 }
 
@@ -2735,7 +2701,6 @@ static void sc8547_auto_identify_tick(struct sc8547a_device *sc, int gret,
 		 sc->fastchg_curr_code);
 }
 
-#define SC8547_ATTACH_SETTLE_MS	300
 #define SC8547_ATTACH_POLL_MS	250
 
 /* Restore stock REG05 UCP and REG08 soft-start timeout after pickup.
@@ -2984,14 +2949,7 @@ static void sc8547_attach_work(struct work_struct *work)
 		}
 		if (cibus_total >= SC8547_LOW_IBUS_MA && !sc->above_request_count && sc->serial_request) {
 			sc->low_ibus_count = 0;
-			if (!sc->load_seen) {
-				sc->load_since = jiffies;
-				sc->load_seen = true;
-			}
-			if (time_after_eq(jiffies, sc->load_since + msecs_to_jiffies(SC8547_AUTO_SUSTAINED_MS)))
-				sc->auto_reservo_cnt = 0;
 		} else {
-			sc->load_seen = false;
 			if (!sc->asked_current || cibus_total >= SC8547_LOW_IBUS_MA)
 				sc->low_ibus_count = 0;
 			else if (++sc->low_ibus_count >= SC8547_AUTO_STEP_DEBOUNCE) {
@@ -3042,6 +3000,13 @@ static void sc8547_attach_work(struct work_struct *work)
 			bool slave_on = sc->slave_enabled > 0;
 
 			u8 switching;
+
+			/* Successful delivery, after checking frame/status/UCP I/O,
+			 * ends the failed negotiation episode (stock fastchg_started).
+			 */
+			if (cibus_total >= SC8547_LOW_IBUS_MA &&
+			    !sc->above_request_count && sc->serial_request)
+				sc->auto_reservo_cnt = 0;
 
 			/* Stock checks EN, switching, minimum slave load and pair
 			 * deviation after 300 ms, for up to 60 more 50 ms slots.
@@ -3396,7 +3361,7 @@ int sc8547a_serial_session(bool enable)
 		sc->slave_low_cnt = 0;
 		sc->vooc_started = true;
 		mod_delayed_work(system_wq, &sc->attach_work,
-				 msecs_to_jiffies(SC8547_ATTACH_SETTLE_MS));
+				 0);
 		return 0;
 	}
 
