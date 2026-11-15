@@ -526,6 +526,7 @@ struct mca_policy_fixture {
 	int fg_command_error[2];
 	int fg_alert[2][2];	/* [gauge][ISC, SOA] level, or a read error */
 	unsigned int fg_alert_reads;
+	unsigned int pps_requests;
 	bool term_restart;
 	int pack_error;
 	int vbus_error;
@@ -678,6 +679,8 @@ static int mca_policy_xfer(struct xiaomi_mca *mca, u32 op, u32 prop,
 		}
 		if (prop == MCA_PROP_CHARGE_CURRENT)
 			f->fcc = get_unaligned_le32(data);
+		if (prop == MCA_PROP_PPS_SELECT)
+			f->pps_requests++;
 		if (prop == MCA_PROP_PD_FIXED_VOLT && get_unaligned_le32(data) == 5000) {
 			f->voltage_requests++;
 			f->voltage_before_stop |= f->stage_on;
@@ -5607,7 +5610,73 @@ static void xiaomi_mca_test_dtpt_cadence_release(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, mca->dtpt);
 }
 
+/*
+ * A battery connector off one cell leaves its gauge silent (stock mca_bmd
+ * scheme 3/3 reads chip_ok over I2C; quickchg's pre_charge_check skips the
+ * pump while a gauge is in error). Through the production worker: with
+ * either gauge unreadable on every tick, the pump is never asked for,
+ * across the third-miss fallback to the firmware profile. The first
+ * complete sample is enough to open it again.
+ */
+static void xiaomi_mca_test_silent_gauge_keeps_pump_off(struct kunit *test)
+{
+	static const enum power_supply_property props[] = { POWER_SUPPLY_PROP_ONLINE };
+	static const struct power_supply_desc usb = {
+		.name = "mca-silent-gauge-usb", .type = POWER_SUPPLY_TYPE_USB,
+		.properties = props, .num_properties = ARRAY_SIZE(props),
+		.get_property = mca_auth_supply_get,
+	};
+	static const int errors[] = { -EIO, -ENODEV };
+	struct mca_policy_fixture *f = mca_full_charge_fixture(test);
+	struct xiaomi_mca *mca = &f->mca;
+	struct power_supply_config cfg = { .drv_data = mca };
+	int lost, tick;
+
+	full_charge = charge_policy = charge_current = cp_charge = hv_charge = true;
+	mca->psy = devm_power_supply_register(mca->dev, &usb, &cfg);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, mca->psy);
+	INIT_DELAYED_WORK(&mca->poll_work, mca_test_idle_poll);
+	flush_delayed_work(&mca->psy->deferred_register_work);
+	mca_test_named_stage(test, f, "sc8541");
+	power_supply_put(mca->cp_psy);
+	mca->cp_psy = NULL;
+	mca->cp = MCA_CP_OFF;
+	f->stage_on = false;
+	mca->poll_ready = true;
+	f->type = mca->real_type = MCA_TYPE_PD_PPS;
+	f->pdos[1] = (struct xiaomi_mca_pdo) {
+		cpu_to_le32(5000), cpu_to_le32(11000), cpu_to_le32(5000) };
+	f->cells[0].capacity = f->cells[1].capacity = 50;
+
+	for (lost = 0; lost < ARRAY_SIZE(errors); lost++) {
+		f->vbus = mca->vbus_uv = 9000000;
+		mca->hv = MCA_HV_ON;
+		f->pps_requests = 0;
+		f->cells[lost].error = errors[lost];
+		for (tick = 0; tick < 5; tick++) {
+			mca_test_wired_tick(f);
+			KUNIT_EXPECT_EQ_MSG(test, mca->cp, MCA_CP_OFF, "gauge %d tick %d", lost, tick);
+			KUNIT_EXPECT_FALSE_MSG(test, f->stage_on, "gauge %d tick %d", lost, tick);
+			KUNIT_EXPECT_TRUE_MSG(test, mca->charge_blocked, "gauge %d tick %d", lost, tick);
+		}
+		KUNIT_EXPECT_EQ(test, f->pps_requests, 0);
+		KUNIT_EXPECT_EQ(test, mca->gauge_failures, 3);
+		KUNIT_EXPECT_EQ(test, f->fcc, MCA_FCC_DEFAULT_MA);
+		KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+
+		f->cells[lost].error = 0;
+		mca_test_wired_tick(f);
+		KUNIT_EXPECT_FALSE(test, mca->charge_blocked);
+		KUNIT_EXPECT_EQ_MSG(test, mca->cp, MCA_CP_OPENING, "gauge %d readable again", lost);
+		KUNIT_EXPECT_GT(test, f->pps_requests, 0);
+		scoped_guard(mutex, &mca->lock)
+			KUNIT_ASSERT_EQ(test, xiaomi_mca_cp_stop(mca, "test complete"), 0);
+		KUNIT_EXPECT_EQ(test, mca->cp, MCA_CP_OFF);
+	}
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_silent_gauge_keeps_pump_off),
 	KUNIT_CASE(xiaomi_mca_test_dtpt_alert_matrix),
 	KUNIT_CASE(xiaomi_mca_test_dtpt_cadence_release),
 	KUNIT_CASE(xiaomi_mca_test_stock_open_budget),
