@@ -30,7 +30,8 @@ struct erhai_probe_status {
 	bool first_ufcs_timeout;
 	bool wired_online; /* Input from the current USB_ONLINE sample. */
 	bool connector_blocked;
-	bool serial_pumping;
+	bool serial_needs_buck_off;
+	bool serial_buck_ready;
 };
 
 /* All callbacks run under battmgr's charge_lock, including suspend/teardown. */
@@ -39,6 +40,7 @@ struct erhai_pps_ops {
 	bool (*enabled)(void);
 	void (*probe_status)(void *data, struct erhai_probe_status *status);
 	int (*serial_session)(bool enable);
+	void (*serial_buck_sample)(int ua);
 	bool (*ufcs_active)(void *data);
 	unsigned int (*ufcs_update)(void *data);
 	bool (*available)(void *data);
@@ -56,6 +58,7 @@ int erhai_otg_adsp_usb_prop(u32 property);
 int erhai_otg_adsp_prop_get(u32 opcode, u32 property);
 int erhai_otg_adsp_prop_set(u32 opcode, u32 property, u32 value);
 void erhai_charge_recheck(void);
+void erhai_charge_try_recheck(void);
 void erhai_charge_tail_complete(unsigned int route);
 bool erhai_otg_charge_inhibited(void);
 struct pmic_glink_client *
