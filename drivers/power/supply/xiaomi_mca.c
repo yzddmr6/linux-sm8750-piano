@@ -2864,8 +2864,44 @@ static int xiaomi_mca_restore_term_volt(struct xiaomi_mca *mca)
 	return ret;
 }
 
+static int xiaomi_mca_cp_stop(struct xiaomi_mca *mca, const char *why);
+static int xiaomi_mca_charge_enable(struct xiaomi_mca *mca, bool enable);
+
+/* Piano JEITA .text 0x958..0xa04, DT jeita_hot_termination_hyst=5.
+ * Use the cell table FV, before PMIC compensation and software CV votes.
+ * Low FV is a temperature hold, never a full-charge/recharge decision.
+ */
+static bool xiaomi_mca_voltage_hold(bool held, int vbat, int fv)
+{
+	if (fv <= 4200) {
+		if (vbat >= fv - 5)
+			return true;
+		if (vbat < fv - 150)
+			return false;
+		return held;
+	}
+	if (vbat > fv)
+		return true;
+	if (vbat <= fv - 20)
+		return false;
+	return held;
+}
+
+static int xiaomi_mca_stop_before_fv(struct xiaomi_mca *mca)
+{
+	int ret;
+
+	mca->charge_blocked = true;
+	/* CP teardown re-elects FV last. Disable PMIC before that election,
+	 * even if its single enable bit already reads zero.
+	 */
+	ret = xiaomi_mca_charge_enable(mca, false);
+	return ret ?: xiaomi_mca_cp_stop(mca, "cell voltage outside envelope");
+}
+
 static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 {
+	bool was_hot = mca->term_hot;
 	int vbat, ibat, cold, hot, vmin, imax, ret;
 	u32 pack;
 
@@ -2889,6 +2925,10 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 		 */
 		if (hot >= MCA_TERM_HOT_DEGC) {
 			mca->term_hot = true;
+			mca->voltage_hold = true;
+			ret = xiaomi_mca_stop_before_fv(mca);
+			if (ret)
+				return ret;
 			mca->cp_fv_base = 0;
 			return xiaomi_mca_apply_pmic_pair(mca, xiaomi_mca_pmic_fv(mca),
 						 xiaomi_mca_pmic_iterm(mca));
@@ -2909,6 +2949,16 @@ static int xiaomi_mca_full_charge_poll(struct xiaomi_mca *mca)
 		mca->ffc_active = fast;
 	}
 	xiaomi_mca_select_profile(mca, cold, hot);
+	/* JEITA withdraws its low-FV hold when the normal row returns. */
+	if (was_hot && !mca->term_hot)
+		mca->voltage_hold = false;
+	mca->voltage_hold = xiaomi_mca_voltage_hold(mca->voltage_hold, vbat,
+						 xiaomi_mca_cell_fv(mca));
+	if (mca->voltage_hold) {
+		ret = xiaomi_mca_stop_before_fv(mca);
+		if (ret)
+			return ret;
+	}
 	xiaomi_mca_adjust_pmic_fv(mca);
 	return xiaomi_mca_apply_pmic_pair(mca, xiaomi_mca_pmic_fv(mca), xiaomi_mca_pmic_iterm(mca));
 }
@@ -3641,6 +3691,12 @@ static int xiaomi_mca_fw_recharge(struct xiaomi_mca *mca)
 	 * below that endpoint or a restored temperature permits higher FV.
 	 */
 	if (status == 5 && mca->term_hot) {
+		/* The low-FV JEITA vote, not SOC/full, controls recharging.
+		 * A prior hold sent disable; withdrawing it must send enable
+		 * even if the status sample still describes that termination.
+		 */
+		if (vbat < (int)xiaomi_mca_cell_fv(mca) - 150)
+			return xiaomi_mca_charge_enable(mca, true);
 		mca->voltage_hold = mca->charge_blocked = true;
 		return xiaomi_mca_charge_stop(mca);
 	}
@@ -3874,9 +3930,10 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		return ret ?: err;
 	}
 	mca->gauge_failures = 0;
-	if (full_charge && vbat > xiaomi_mca_cell_fv(mca))
-		mca->voltage_hold = true;
-	else if (vbat <= (int)xiaomi_mca_cell_fv(mca) - 20)
+	if (full_charge)
+		mca->voltage_hold = xiaomi_mca_voltage_hold(mca->voltage_hold, vbat,
+						 xiaomi_mca_cell_fv(mca));
+	else
 		mca->voltage_hold = false;
 	mca->charge_blocked = mca->charge_hold || mca->charge_hot || mca->charge_cold ||
 		mca->voltage_hold;
@@ -4141,6 +4198,11 @@ static void xiaomi_mca_cp_try_start(struct xiaomi_mca *mca)
 		xiaomi_mca_cp_stop(mca, "profile float voltage not confirmed");
 		return;
 	}
+	/* A new gauge sample can withdraw opening through the JEITA hold.
+	 * Never continue with its released stage or reassert the zero ICL.
+	 */
+	if (mca->charge_blocked || mca->cp != MCA_CP_OPENING)
+		return;
 	dev_info(mca->dev, "direct-charge profile %s, source/cell/thermal limits retained\n",
 		 xiaomi_mca_profile_names[mca->cp_profile]);
 
