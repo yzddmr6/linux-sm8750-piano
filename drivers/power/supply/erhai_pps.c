@@ -593,7 +593,7 @@ static int pps_revert(struct erhai_pps *p)
 #undef PPS_RESTORE
 	online = pps_usb_get(0);
 	if (online > 0) {
-		msleep(100);
+		/* A voltage readback, not a fixed sleep, completes handoff. */
 		vbus = pps_usb_get(1);
 		if (vbus < 0 || vbus > 5500000)
 			err = err ?: -EAGAIN;
@@ -1266,7 +1266,7 @@ static void pps_cp_backstop(struct erhai_pps *p)
 	else
 		stuck = !p->cp_lift_since ||
 			time_after(jiffies, p->cp_lift_since +
-				   msecs_to_jiffies(pps_cp_lift_ms + 1000));
+				   msecs_to_jiffies(pps_cp_lift_ms));
 	if (!stuck)
 		return;
 	pr_warn("erhai_pps: CP backstop: buck suspended without a working pump - resuming the buck\n");
