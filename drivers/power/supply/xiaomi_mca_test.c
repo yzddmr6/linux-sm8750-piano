@@ -245,7 +245,7 @@ static void xiaomi_mca_test_usb_values(struct kunit *test)
 		POWER_SUPPLY_USB_TYPE_UNKNOWN, POWER_SUPPLY_USB_TYPE_DCP,
 		POWER_SUPPLY_USB_TYPE_DCP, POWER_SUPPLY_USB_TYPE_DCP,
 		POWER_SUPPLY_USB_TYPE_DCP, POWER_SUPPLY_USB_TYPE_C,
-		POWER_SUPPLY_USB_TYPE_PD, POWER_SUPPLY_USB_TYPE_PD,
+		POWER_SUPPLY_USB_TYPE_PD, POWER_SUPPLY_USB_TYPE_PD_PPS,
 		POWER_SUPPLY_USB_TYPE_PD_PPS, POWER_SUPPLY_USB_TYPE_UNKNOWN,
 		POWER_SUPPLY_USB_TYPE_UNKNOWN, POWER_SUPPLY_USB_TYPE_UNKNOWN,
 	};
@@ -5413,7 +5413,26 @@ static void xiaomi_mca_test_stock_low_fv_hold(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, mca->voltage_hold);
 }
 
+static void xiaomi_mca_test_piano_pd_type_numbers(struct kunit *test)
+{
+	struct xiaomi_mca *mca = kunit_kzalloc(test, sizeof(*mca), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, mca);
+	KUNIT_EXPECT_EQ(test, MCA_TYPE_PD_PPS, 11);
+	KUNIT_EXPECT_EQ(test, MCA_TYPE_PD_VERIFY, 12);
+	KUNIT_EXPECT_EQ(test, MCA_USB_REAL_TYPE_PPS, 11);
+	KUNIT_EXPECT_EQ(test, MCA_USB_REAL_TYPE_PD_VERIFY, 12);
+	for (int type = 11; type <= 12; type++) {
+		mca->real_type = type;
+		KUNIT_EXPECT_TRUE(test, xiaomi_mca_is_pd(type));
+		/* Neither name nor a stale authenticated-type number is proof. */
+		KUNIT_EXPECT_FALSE(test, xiaomi_mca_authenticated(mca));
+		KUNIT_EXPECT_EQ(test, xiaomi_mca_cp_capability_ma(6100, false), 5000);
+	}
+}
+
 static struct kunit_case xiaomi_mca_test_cases[] = {
+	KUNIT_CASE(xiaomi_mca_test_piano_pd_type_numbers),
 	KUNIT_CASE(xiaomi_mca_test_stock_low_fv_hold),
 	KUNIT_CASE(xiaomi_mca_test_hot_sample_cancels_opening),
 	KUNIT_CASE(xiaomi_mca_test_enable_compound_setter),

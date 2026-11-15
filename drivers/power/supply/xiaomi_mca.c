@@ -105,7 +105,10 @@ static const __le32 xiaomi_mca_piano_otg_cfg[] = {
 #define MCA_PROP_USB_CURRENT_NOW	0x20004
 #define MCA_PROP_USB_REAL_TYPE		0x2000c
 
-/* USB real type: enum xm_charger_type of Xiaomi's downstream MCA stack */
+/* Piano qcom_adsp_pd_protocol .text 0x3b0..3c8: raw PPS=11;
+ * authentication promotes the protocol type to 12. Do not use Onyx
+ * enum names here: its PD_VERIFY/PPS ordering differs from Piano.
+ */
 #define MCA_USB_REAL_TYPE_SDP		1
 #define MCA_USB_REAL_TYPE_CDP		2
 #define MCA_USB_REAL_TYPE_DCP		3
@@ -116,8 +119,8 @@ static const __le32 xiaomi_mca_piano_otg_cfg[] = {
 #define MCA_USB_REAL_TYPE_HVDCP3P5	8
 #define MCA_USB_REAL_TYPE_TYPEC		9
 #define MCA_USB_REAL_TYPE_PD		10
-#define MCA_USB_REAL_TYPE_PD_VERIFY	11
-#define MCA_USB_REAL_TYPE_PPS		12
+#define MCA_USB_REAL_TYPE_PPS		11
+#define MCA_USB_REAL_TYPE_PD_VERIFY	12
 #define MCA_USB_REAL_TYPE_OCP		15
 
 /*
@@ -216,8 +219,8 @@ enum mca_real_type {
 	MCA_TYPE_HVDCP_3P5,
 	MCA_TYPE_C,
 	MCA_TYPE_PD,
-	MCA_TYPE_PD_VERIFY,
 	MCA_TYPE_PD_PPS,
+	MCA_TYPE_PD_VERIFY,
 	MCA_TYPE_ACA = 14,
 	MCA_TYPE_DCP_B,
 	MCA_TYPE_BPP = 17,
@@ -901,8 +904,8 @@ static int xiaomi_mca_usb_type(u32 real_type)
 	case MCA_USB_REAL_TYPE_TYPEC:
 		return POWER_SUPPLY_USB_TYPE_C;
 	case MCA_USB_REAL_TYPE_PD:
-	case MCA_USB_REAL_TYPE_PD_VERIFY:
 		return POWER_SUPPLY_USB_TYPE_PD;
+	case MCA_USB_REAL_TYPE_PD_VERIFY:
 	case MCA_USB_REAL_TYPE_PPS:
 		return POWER_SUPPLY_USB_TYPE_PD_PPS;
 	default:
