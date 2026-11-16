@@ -3965,10 +3965,6 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		mca->charge_hold = false;
 	if (end == 100 && !charge_policy && !mca->charge_disabled) {
 		mca->charge_blocked = false;
-		if ((!mca->charge_write_valid ||
-		     mca->charge_write_generation != READ_ONCE(mca->input_generation)) &&
-		    !mca->otg_active && xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE) == 1)
-			return xiaomi_mca_charge_enable(mca, true);
 		return 0;
 	}
 	if (end < 100) {
@@ -5543,7 +5539,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 	struct xiaomi_mca_state now = { .real_type = U32_MAX };
 	struct xiaomi_mca_cells cells;
 	u32 generation, input_generation;
-	bool changed = false, policy_sample = false;
+	bool changed = false, policy_sample = false, auto_unlimited = false;
 	int ret;
 
 	scoped_guard(mutex, &mca->lock) {
@@ -5637,6 +5633,8 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		}
 		if (mca->charge_blocked)
 			goto out;
+		auto_unlimited = !charge_policy && READ_ONCE(mca->charge_end) == 100 &&
+				 !READ_ONCE(mca->inhibit_charge) && !mca->otg_active;
 		if (charge_policy && !mca->otg_active && !mca->pen_dirty) {
 			mca->policy_active = true;
 			xiaomi_mca_policy_poll(mca, &now.real_type);
@@ -5675,6 +5673,12 @@ out:
 		if (ret) {
 			mca->last_valid = false;
 		} else {
+			/* An unrestricted firmware policy has no periodic buck writes.
+			 * Replay its enable on a fresh sink using this very source sample.
+			 */
+			if (auto_unlimited && now.online && (!mca->last_valid || !mca->last.online ||
+			    !mca->charge_write_valid || mca->charge_write_generation != input_generation))
+				xiaomi_mca_charge_enable(mca, true);
 			if (policy_sample && !now.online)
 				xiaomi_mca_record_collapse(mca);
 			if (now.online)

@@ -2189,6 +2189,8 @@ static struct mca_policy_fixture *mca_full_charge_fixture(struct kunit *test)
 		f->cells[n].charge_full = 4600000;
 		psy = devm_power_supply_register(f->mca.dev, desc, &cfg);
 		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, psy);
+		/* A system uevent worker runs outside the task-local GLINK stub. */
+		dev_set_uevent_suppress(&psy->dev, true);
 	}
 	f->mca.service_up = true;
 	f->pdos[0].max_ma = cpu_to_le32(3000);
@@ -3230,6 +3232,34 @@ static void mca_test_wired_tick(struct mca_policy_fixture *f)
 	xiaomi_mca_poll(&f->mca.poll_work.work);
 	cancel_delayed_work_sync(&f->mca.poll_work);
 	flush_work(&f->mca.psy->changed_work);
+}
+
+static void xiaomi_mca_test_charge_mode_reconnect(struct kunit *test)
+{
+	struct mca_policy_fixture *f = mca_auth_fixture(test);
+	union power_supply_propval value;
+
+	INIT_DELAYED_WORK(&f->mca.poll_work, mca_test_idle_poll);
+	f->mca.charge_end = 100;
+	f->type = MCA_TYPE_SDP;
+	f->charging_enabled = 0; /* stale stop, even though the request is auto */
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_threshold_get(NULL, NULL, &f->mca,
+			POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR, &value), 0);
+	KUNIT_EXPECT_EQ(test, value.intval, POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE);
+	mca_test_wired_tick(f);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 1);
+
+	f->mca.inhibit_charge = true;
+	f->mca.input_generation++;
+	mca_test_wired_tick(f);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
+	f->charging_enabled = 1; /* a replacement source reset the hardware gate */
+	KUNIT_ASSERT_EQ(test, xiaomi_mca_threshold_get(NULL, NULL, &f->mca,
+			POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR, &value), 0);
+	KUNIT_EXPECT_EQ(test, value.intval, POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO);
+	f->mca.input_generation++;
+	mca_test_wired_tick(f);
+	KUNIT_EXPECT_EQ(test, f->charging_enabled, 0);
 }
 
 static void xiaomi_mca_test_wired_wake_transitions(struct kunit *test)
@@ -6027,6 +6057,7 @@ static struct kunit_case xiaomi_mca_test_cases[] = {
 	KUNIT_CASE(xiaomi_mca_test_connector),
 	KUNIT_CASE(xiaomi_mca_test_connector_stop),
 	KUNIT_CASE(xiaomi_mca_test_wake_policy),
+	KUNIT_CASE(xiaomi_mca_test_charge_mode_reconnect),
 	KUNIT_CASE(xiaomi_mca_test_wired_wake_transitions),
 	KUNIT_CASE(xiaomi_mca_test_wired_wake_reconnect),
 	KUNIT_CASE(xiaomi_mca_test_threshold_hysteresis),
