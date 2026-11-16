@@ -222,6 +222,7 @@ enum qcom_battmgr_pd_state {
 };
 
 enum qcom_battmgr_pd_event {
+	PD_EVENT_CHARGE_REAPPLY,
 	PD_EVENT_CAPS,
 	PD_EVENT_RESET,
 	PD_EVENT_SERVICE_RESET,
@@ -889,7 +890,7 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 {
 	struct qcom_battmgr *battmgr = power_supply_get_drvdata(psy);
 	enum qcom_battmgr_unit unit = battmgr->unit;
-	u32 raw_ua;
+	u32 raw_ua, enabled;
 	int ret;
 
 	if (!battmgr->service_up)
@@ -907,8 +908,14 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
-		val->intval = READ_ONCE(battmgr->inhibit_charge) ?
-			POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE : POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+		ret = qcom_battmgr_get_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						BATT_OPLUS_CHG_EN, &enabled);
+		if (ret)
+			return ret;
+		if (enabled > 1)
+			return -ENODATA;
+		val->intval = enabled ? POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO :
+				       POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
 		break;
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = battmgr->status.status;
@@ -1224,7 +1231,8 @@ static int qcom_battmgr_charge_enable(struct qcom_battmgr *battmgr, bool enable)
 {
 	int ret;
 
-	enable &= !READ_ONCE(battmgr->inhibit_charge) && !battmgr->buck.disable &&
+	enable &= !READ_ONCE(battmgr->inhibit_charge) && !READ_ONCE(battmgr->otg_request) &&
+		  !battmgr->buck.disable &&
 		  !test_bit(PD_EVENT_TAIL, &battmgr->pd_events);
 
 	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
@@ -1250,6 +1258,7 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 {
 	unsigned int start = READ_ONCE(battmgr->info.charge_ctrl_start);
 	unsigned int end = READ_ONCE(battmgr->info.charge_ctrl_end);
+	bool reapply = test_and_clear_bit(PD_EVENT_CHARGE_REAPPLY, &battmgr->pd_events);
 	unsigned int soc;
 	int ret;
 
@@ -1262,7 +1271,7 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 
 	if (!qcom_battmgr_charge_limited(battmgr)) {
 		battmgr->charge_policy_hold = false;
-		if ((battmgr->charge_inhibited || battmgr->charge_error) &&
+		if ((reapply || battmgr->charge_inhibited || battmgr->charge_error) &&
 		    !qcom_battmgr_charge_enable(battmgr, true)) {
 			battmgr->charge_inhibited = false;
 			dev_info(battmgr->dev, "charge limit removed, charging resumed\n");
@@ -1271,8 +1280,11 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 	}
 
 	ret = qcom_battmgr_bat_sm8350_update(battmgr, POWER_SUPPLY_PROP_CAPACITY);
-	if (ret)
+	if (ret) {
+		if (reapply)
+			set_bit(PD_EVENT_CHARGE_REAPPLY, &battmgr->pd_events);
 		return;
+	}
 
 	soc = battmgr->status.percent;
 	if (soc >= end)
@@ -1285,13 +1297,13 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 	 * when SOC has since moved between the thresholds.
 	 */
 	if (battmgr->charge_policy_hold) {
-		if ((soc >= end || !battmgr->charge_inhibited || battmgr->charge_error) &&
+		if ((reapply || soc >= end || !battmgr->charge_inhibited || battmgr->charge_error) &&
 		    !qcom_battmgr_charge_enable(battmgr, false) && !battmgr->charge_inhibited) {
 			battmgr->charge_inhibited = true;
 			dev_info(battmgr->dev, "charging stopped at %u%% (end threshold %u%%)\n",
 				 soc, end);
 		}
-	} else if ((battmgr->charge_inhibited || battmgr->charge_error) &&
+	} else if ((reapply || battmgr->charge_inhibited || battmgr->charge_error) &&
 		   !qcom_battmgr_charge_enable(battmgr, true)) {
 		battmgr->charge_inhibited = false;
 		dev_info(battmgr->dev, "charging resumed at %u%% (start threshold %u%%)\n",
@@ -1426,6 +1438,7 @@ static void qcom_battmgr_partner_removed(struct device *dev)
 			return;
 		qcom_battmgr_charge_wake_locked(b, false);
 		set_bit(PD_EVENT_DETACH, &b->pd_events);
+		set_bit(PD_EVENT_CHARGE_REAPPLY, &b->pd_events);
 		mod_delayed_work(system_freezable_wq, &b->charge_work, 0);
 	}
 }
@@ -2202,6 +2215,11 @@ read_source:
 			set_bit(PD_EVENT_DETACH, &battmgr->pd_events);
 		qcom_battmgr_pps_stop(battmgr, false, "USB_ONLINE-read-failed");
 		return PD_POLL_MS;
+	}
+	if (online && (!battmgr->buck_online || detached) &&
+	    !READ_ONCE(battmgr->otg_request)) {
+		set_bit(PD_EVENT_CHARGE_REAPPLY, &battmgr->pd_events);
+		qcom_battmgr_charge_limit_update(battmgr);
 	}
 	if (online && qcom_battmgr_get_property(battmgr, BATTMGR_USB_PROPERTY_GET,
 					       USB_ADAP_TYPE, &type))
@@ -2994,6 +3012,7 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 			return -EINVAL;
 		WRITE_ONCE(battmgr->inhibit_charge,
 			   pval->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE);
+		set_bit(PD_EVENT_CHARGE_REAPPLY, &battmgr->pd_events);
 		ret = 0;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
@@ -3469,6 +3488,8 @@ static void qcom_battmgr_notification(struct qcom_battmgr *battmgr,
 	case NOTIF_OPLUS_PLUGIN:
 	case NOTIF_OPLUS_APSD_DONE:
 		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE) {
+			if (notification == NOTIF_OPLUS_PLUGIN || notification == NOTIF_OPLUS_TYPEC_STATE)
+				set_bit(PD_EVENT_CHARGE_REAPPLY, &battmgr->pd_events);
 			set_bit(PD_EVENT_PARTNER, &battmgr->pd_events);
 			set_bit(PD_EVENT_CAPS, &battmgr->pd_events);
 			power_supply_changed(battmgr->usb_psy);
@@ -4117,6 +4138,7 @@ static void qcom_battmgr_pdr_notify(void *priv, int state)
 		return;
 
 	if (state == SERVREG_SERVICE_STATE_UP) {
+		set_bit(PD_EVENT_CHARGE_REAPPLY, &battmgr->pd_events);
 		battmgr->service_up = true;
 		schedule_work(&battmgr->enable_work);
 	} else {

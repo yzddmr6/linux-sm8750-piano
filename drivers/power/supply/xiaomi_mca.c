@@ -669,6 +669,7 @@ struct xiaomi_mca {
 
 	/* serializes requests, the cache and @req: one request in flight */
 	struct mutex lock;
+	struct mutex transfer_lock; /* one outstanding ADSP request */
 	struct completion ack;
 	struct xiaomi_mca_request req;
 	u32 seq;
@@ -736,6 +737,8 @@ struct xiaomi_mca {
 	bool ffc_active;		/* latches until stock full/recharge or detach */
 	/* Thresholds are shared by the two cells and protected by rx_lock. */
 	unsigned int charge_start, charge_end;
+	u32 charge_write_generation;
+	bool charge_write_valid;
 	bool inhibit_applied; /* buck and pump stop confirmed in the current poll */
 	bool inhibit_charge; /* user vote, retained across detach and system sleep */
 	struct wakeup_source *charge_ws;
@@ -1044,7 +1047,7 @@ static int xiaomi_mca_transfer_data(struct xiaomi_mca *mca, u32 opcode, u32 prop
 {
 	int ret;
 
-	lockdep_assert_held(&mca->lock);
+	guard(mutex)(&mca->transfer_lock);
 	if (mca->sleeping)
 		return -EHOSTDOWN;
 #if IS_ENABLED(CONFIG_CHARGER_XIAOMI_MCA_KUNIT_TEST)
@@ -1305,16 +1308,20 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		return -EBUSY;
 	if (prop == MCA_PROP_CHARGING_ENABLED) {
 		/* Stock qcom_subpmic_enable_charging sends one byte, not u32. */
-		scoped_guard(spinlock_irqsave, &mca->rx_lock)
-			generation = mca->service_generation;
-		memcpy(buf, data, len);
+		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+			generation = mca->input_generation;
+			buf[0] = *(const u8 *)data && !mca->inhibit_charge;
+		}
+		mca->charge_write_valid = false;
 		ret = xiaomi_mca_transfer_data(mca, MCA_OPCODE_WRITE, prop, buf, len);
 		if (ret)
 			return ret;
 		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
-			if (generation != mca->service_generation || !mca->service_up)
+			if (generation != mca->input_generation || !mca->service_up)
 				return -ECONNRESET;
 		}
+		mca->charge_write_generation = generation;
+		mca->charge_write_valid = true;
 		return 0;
 	}
 	if (prop == MCA_PROP_RESTART_AICL ||
@@ -3958,6 +3965,10 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 		mca->charge_hold = false;
 	if (end == 100 && !charge_policy && !mca->charge_disabled) {
 		mca->charge_blocked = false;
+		if ((!mca->charge_write_valid ||
+		     mca->charge_write_generation != READ_ONCE(mca->input_generation)) &&
+		    !mca->otg_active && xiaomi_mca_read_u32(mca, MCA_PROP_USB_ONLINE) == 1)
+			return xiaomi_mca_charge_enable(mca, true);
 		return 0;
 	}
 	if (end < 100) {
@@ -6114,7 +6125,7 @@ static int xiaomi_mca_frames_show(struct seq_file *s, void *unused)
 	struct xiaomi_mca_request req;
 	size_t reply_len;
 
-	scoped_guard(mutex, &mca->lock)
+	scoped_guard(mutex, &mca->transfer_lock)
 		req = mca->req;
 
 	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
@@ -6402,7 +6413,8 @@ static int xiaomi_mca_prepare(struct device *dev)
 				dev_err(dev, "cannot quiesce charging for system sleep: %d\n", ret);
 		}
 		if (!ret) {
-			mca->sleeping = true;
+			scoped_guard(mutex, &mca->transfer_lock)
+				mca->sleeping = true;
 			mca->last_valid = false;
 			xiaomi_mca_invalidate(mca);
 		}
@@ -6421,7 +6433,9 @@ static void xiaomi_mca_complete(struct device *dev)
 	scoped_guard(mutex, &mca->lock) {
 		if (!mca->sleeping)
 			return;
-		mca->sleeping = false;
+		scoped_guard(mutex, &mca->transfer_lock)
+			mca->sleeping = false;
+		mca->charge_write_valid = false;
 		/* Autonomous firmware owned the buck during sleep. Reapply even
 		 * when its pre-sleep setpoint equals the current policy target. */
 		mca->icl_set_ma = 0;
@@ -6445,12 +6459,25 @@ static int xiaomi_mca_threshold_get(struct power_supply *psy,
 {
 	struct xiaomi_mca *mca = data;
 
+	if (psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR) {
+		u32 enabled;
+		int ret;
+
+		/* The power-supply core holds extensions_sem here. Take only the
+		 * transport lock, never the policy lock that reads the two gauges.
+		 */
+		ret = xiaomi_mca_read(mca, MCA_PROP_CHARGING_ENABLED, &enabled);
+		if (ret)
+			return ret;
+		if (enabled > 1)
+			return -ENODATA;
+		val->intval = enabled || READ_ONCE(mca->cp) == MCA_CP_ON ?
+			POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO : POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
+		return 0;
+	}
+
 	guard(spinlock_irqsave)(&mca->rx_lock);
 	switch (psp) {
-	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
-		val->intval = mca->inhibit_charge ? POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
-						  POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
-		return 0;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 		val->intval = mca->charge_start;
 		return 0;
@@ -6737,6 +6764,9 @@ static int xiaomi_mca_probe(struct auxiliary_device *adev,
 	dev_set_drvdata(dev, mca);
 	init_completion(&mca->ack);
 	spin_lock_init(&mca->rx_lock);
+	ret = devm_mutex_init(dev, &mca->transfer_lock);
+	if (ret)
+		return ret;
 	ret = devm_mutex_init(dev, &mca->lock);
 	if (ret)
 		return ret;

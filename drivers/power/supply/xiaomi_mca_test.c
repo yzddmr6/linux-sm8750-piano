@@ -406,6 +406,7 @@ static void xiaomi_mca_test_readonly_session(struct kunit *test)
 
 	KUNIT_ASSERT_NOT_NULL(test, mca);
 	mutex_init(&mca->lock);
+	mutex_init(&mca->transfer_lock);
 	mutex_lock(&mca->lock);
 	/* No client: this must return without sending even a read. */
 	xiaomi_mca_restore_icl(mca);
@@ -805,6 +806,7 @@ static struct mca_policy_fixture *mca_policy_fixture(struct kunit *test)
 	f->mca.dev = kunit_device_register(test, "mca-policy-test");
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, f->mca.dev);
 	mutex_init(&f->mca.lock);
+	mutex_init(&f->mca.transfer_lock);
 	spin_lock_init(&f->mca.rx_lock);
 	KUNIT_ASSERT_EQ(test, xiaomi_mca_charge_wake_init(&f->mca), 0);
 	init_completion(&f->mca.ack);
@@ -1773,6 +1775,7 @@ static struct mca_otg_fixture *mca_otg_fixture(struct kunit *test)
 	f->mca.dev = kunit_device_register(test, "mca-otg-test");
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, f->mca.dev);
 	mutex_init(&f->mca.lock);
+	mutex_init(&f->mca.transfer_lock);
 	spin_lock_init(&f->mca.rx_lock);
 	INIT_DELAYED_WORK(&f->mca.poll_work, mca_otg_test_poll);
 	kunit_add_action_or_reset(test, xiaomi_mca_stop_poll, &f->mca);
