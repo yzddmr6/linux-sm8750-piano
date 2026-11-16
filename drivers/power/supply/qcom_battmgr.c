@@ -2977,10 +2977,8 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 		if (pval->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO &&
 		    pval->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)
 			return -EINVAL;
-		mutex_lock(&battmgr->charge_lock);
 		WRITE_ONCE(battmgr->inhibit_charge,
 			   pval->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE);
-		mutex_unlock(&battmgr->charge_lock);
 		ret = 0;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
@@ -4178,7 +4176,8 @@ qcom_battmgr_sm8350_bat_desc(struct qcom_battmgr *battmgr,
 	struct power_supply_desc *copy;
 	size_t i, n = 0;
 
-	if (!(battmgr->quirks & (QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW |
+	if (desc != &sm8550_bat_psy_desc &&
+	    !(battmgr->quirks & (QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW |
 				 QCOM_BATTMGR_QUIRK_NO_CHARGE_CONTROL)))
 		return desc;
 
