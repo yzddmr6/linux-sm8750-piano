@@ -565,9 +565,14 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 	}
 	raw = erhai_curve_select(svooc_curves, p->curve_soc, p->temp_ddc);
 	curve = erhai_curve_select(svooc_curves, p->curve_soc, p->curve_temp);
-	/* A running session ends on the counted full below, not on one sample at CV. */
+	/* Entry, and a counted range switch, refuse a cell already at the CV of
+	 * the range (stock ends PPS on the switch into the warm range above
+	 * pps_warm_allow_vol). Otherwise a running session ends on the counted
+	 * full below, not on one sample at CV.
+	 */
 	if (!raw || !curve || p->vbat_mv < (int)pps_vbat_min_mv ||
-	    (entering && p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp))))
+	    ((entering || last_temp != p->curve_temp) &&
+	     p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp))))
 		return 0;
 
 	new_table = entering || !p->curve || p->curve->steps != curve->steps ||
