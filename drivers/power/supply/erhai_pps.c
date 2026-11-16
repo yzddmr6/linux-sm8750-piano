@@ -349,6 +349,7 @@ struct erhai_pps {
 	int			temp_ddc;
 	const struct erhai_charge_curve *curve;
 	int curve_temp;
+	int curve_soc;		/* SOC the table was chosen at */
 	unsigned int curve_ma;
 	unsigned int		curve_idx;
 	unsigned int		source_ma;
@@ -468,6 +469,12 @@ static int pps_read_vbus(struct erhai_pps *p)
 /* The cell table accepts equality at entry. During
  * delivery, advance one row after 2500 ms continuously above target.
  * A last gear still delivers its specified current up to its CV.
+ *
+ * Stock picks the SOC row when the pump starts (puc_strategy_init(),
+ * oplus_chg_pps.c:2271) and puc_strategy_get_data() never reads SOC; a
+ * temperature change moves along the temperature axis of that entry row
+ * (as SUPERVOOC's curve_entry_soc does). Re-selecting on the live SOC
+ * dropped a running session to a lower SOC tier at 56, 76 and 86 %.
  */
 static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 {
@@ -478,9 +485,11 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 	int last_temp = p->curve_temp;
 	bool new_table;
 
-	raw = erhai_curve_select(svooc_curves, p->soc, p->temp_ddc);
 	p->curve_temp = entering || !p->curve ? p->temp_ddc : erhai_curve_temp(p->curve_temp, p->temp_ddc);
-	curve = erhai_curve_select(svooc_curves, p->soc, p->curve_temp);
+	if (entering || !p->curve)
+		p->curve_soc = p->soc;
+	raw = erhai_curve_select(svooc_curves, p->curve_soc, p->temp_ddc);
+	curve = erhai_curve_select(svooc_curves, p->curve_soc, p->curve_temp);
 	if (!raw || !curve || p->vbat_mv < (int)pps_vbat_min_mv ||
 	    p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp)))
 		return 0;
