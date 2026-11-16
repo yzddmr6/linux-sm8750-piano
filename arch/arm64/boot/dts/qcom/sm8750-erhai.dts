@@ -1099,7 +1099,7 @@
 
 		vreg_s1d_0p97: smps1 {
 			regulator-name = "vreg_s1d_0p97";
-			regulator-min-microvolt = <880000>;
+			regulator-min-microvolt = <976000>;
 			regulator-max-microvolt = <1100000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
@@ -1113,7 +1113,7 @@
 
 		vreg_s4d_0p85: smps4 {
 			regulator-name = "vreg_s4d_0p85";
-			regulator-min-microvolt = <852000>;
+			regulator-min-microvolt = <876000>;
 			regulator-max-microvolt = <1036000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
@@ -1161,7 +1161,7 @@
 
 		vreg_s5f_0p85: smps5 {
 			regulator-name = "vreg_s5f_0p85";
-			regulator-min-microvolt = <852000>;
+			regulator-min-microvolt = <876000>;
 			regulator-max-microvolt = <1000000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
@@ -1218,7 +1218,7 @@
 
 		vreg_s3g_1p8: smps3 {
 			regulator-name = "vreg_s3g_1p8";
-			regulator-min-microvolt = <1856000>;
+			regulator-min-microvolt = <1864000>;
 			regulator-max-microvolt = <2000000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_LPM>;
 			regulator-allow-set-load;
@@ -1277,7 +1277,7 @@
 
 		vreg_s7i_1p2: smps7 {
 			regulator-name = "vreg_s7i_1p2";
-			regulator-min-microvolt = <1224000>;
+			regulator-min-microvolt = <1312000>;
 			regulator-max-microvolt = <1340000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 		};
@@ -1347,7 +1347,7 @@
 
 		vreg_l1j_0p91: ldo1 {
 			regulator-name = "vreg_l1j_0p91";
-			regulator-min-microvolt = <880000>;
+			regulator-min-microvolt = <912000>;
 			regulator-max-microvolt = <920000>;
 			regulator-initial-mode = <RPMH_REGULATOR_MODE_HPM>;
 			regulator-allow-set-load;
