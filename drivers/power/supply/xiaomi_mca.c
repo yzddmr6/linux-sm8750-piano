@@ -737,6 +737,7 @@ struct xiaomi_mca {
 	bool ffc_active;		/* latches until stock full/recharge or detach */
 	/* Thresholds are shared by the two cells and protected by rx_lock. */
 	unsigned int charge_start, charge_end;
+	bool inhibit_charge; /* user vote, retained across detach and system sleep */
 	struct wakeup_source *charge_ws;
 	u32 input_generation;	/* changes that invalidate the wired source sample */
 	bool input_pending;	/* PM must let the worker classify this input */
@@ -3488,9 +3489,11 @@ static int xiaomi_mca_charge_wake_init(struct xiaomi_mca *mca)
 
 static int xiaomi_mca_charge_enable(struct xiaomi_mca *mca, bool enable)
 {
-	u8 value = enable;
+	u8 value;
 	int ret;
 
+	enable &= !READ_ONCE(mca->inhibit_charge);
+	value = enable;
 	if (enable && mca->connector.tripped)
 		return -EBUSY;
 	/* Retain ownership after a lost disable acknowledgment. */
@@ -3945,6 +3948,10 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
 		start = mca->charge_start;
 		end = mca->charge_end;
+	}
+	if (READ_ONCE(mca->inhibit_charge)) {
+		mca->charge_blocked = true;
+		return xiaomi_mca_charge_stop(mca);
 	}
 	if (end == 100)
 		mca->charge_hold = false;
@@ -5637,7 +5644,8 @@ static void xiaomi_mca_poll(struct work_struct *work)
 
 		}
 #endif
-		if (charge_policy || READ_ONCE(mca->charge_end) < 100 || mca->charge_disabled) {
+		if (charge_policy || READ_ONCE(mca->inhibit_charge) ||
+		    READ_ONCE(mca->charge_end) < 100 || mca->charge_disabled) {
 			xiaomi_mca_sample_cells(mca, &cells);
 			mca->poll_cells = &cells;
 		}
@@ -6480,6 +6488,10 @@ static int xiaomi_mca_threshold_get(struct power_supply *psy,
 
 	guard(spinlock_irqsave)(&mca->rx_lock);
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		val->intval = mca->inhibit_charge ? POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE :
+						  POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+		return 0;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 		val->intval = mca->charge_start;
 		return 0;
@@ -6502,6 +6514,12 @@ static int xiaomi_mca_threshold_set(struct power_supply *psy,
 	/* No mca->lock here: power_supply callers hold extensions_sem. */
 	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
 		switch (psp) {
+		case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+			if (value != POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO &&
+			    value != POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)
+				return -EINVAL;
+			mca->inhibit_charge = value == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;
+			break;
 		case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 			if (value < 0 || value >= mca->charge_end)
 				return -EINVAL;
@@ -6527,17 +6545,21 @@ static int xiaomi_mca_threshold_writeable(struct power_supply *psy,
 					  const struct power_supply_ext *ext, void *data,
 					  enum power_supply_property psp)
 {
-	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
+	return psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR ||
+	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
 	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
 }
 
 static const enum power_supply_property xiaomi_mca_threshold_props[] = {
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
 };
 
 static const struct power_supply_ext xiaomi_mca_battery_ext = {
 	.name = "xiaomi-mca",
+	.charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+			     BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE),
 	.properties = xiaomi_mca_threshold_props,
 	.num_properties = ARRAY_SIZE(xiaomi_mca_threshold_props),
 	.get_property = xiaomi_mca_threshold_get,

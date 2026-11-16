@@ -526,6 +526,7 @@ struct qcom_battmgr {
 	bool charge_inhibited;
 	bool charge_error;
 	bool charge_policy_hold;
+	bool inhibit_charge; /* user vote survives cable and firmware reconnect */
 	struct wakeup_source *charge_ws;
 	bool charge_awake; /* protected by notify_lock */
 
@@ -829,7 +830,8 @@ static bool qcom_battmgr_charge_ctrl_local(struct qcom_battmgr *battmgr,
 	if (!(battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE))
 		return false;
 
-	return psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
+	return psp == POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR ||
+	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD ||
 	       psp == POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD;
 }
 
@@ -903,6 +905,10 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 		return ret;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		val->intval = READ_ONCE(battmgr->inhibit_charge) ?
+			POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE : POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO;
+		break;
 	case POWER_SUPPLY_PROP_STATUS:
 		val->intval = battmgr->status.status;
 		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
@@ -1213,7 +1219,7 @@ static int qcom_battmgr_charge_enable(struct qcom_battmgr *battmgr, bool enable)
 {
 	int ret;
 
-	enable &= !battmgr->buck.disable &&
+	enable &= !READ_ONCE(battmgr->inhibit_charge) && !battmgr->buck.disable &&
 		  !test_bit(PD_EVENT_TAIL, &battmgr->pd_events);
 
 	ret = qcom_battmgr_set_property(battmgr, BATTMGR_BAT_PROPERTY_SET,
@@ -1241,6 +1247,13 @@ static void qcom_battmgr_charge_limit_update(struct qcom_battmgr *battmgr)
 	unsigned int end = READ_ONCE(battmgr->info.charge_ctrl_end);
 	unsigned int soc;
 	int ret;
+
+	if (READ_ONCE(battmgr->inhibit_charge)) {
+		battmgr->charge_policy_hold = true;
+		if (!qcom_battmgr_charge_enable(battmgr, false))
+			battmgr->charge_inhibited = true;
+		return;
+	}
 
 	if (!qcom_battmgr_charge_limited(battmgr)) {
 		battmgr->charge_policy_hold = false;
@@ -1898,6 +1911,8 @@ static int qcom_battmgr_buck_write(struct qcom_battmgr *b, unsigned int property
 {
 	int ret;
 
+	if (property == BATT_OPLUS_CHG_EN && READ_ONCE(b->inhibit_charge))
+		value = 0;
 	if (*applied == value)
 		return 0;
 	*applied = -1;
@@ -2925,6 +2940,8 @@ static int qcom_battmgr_bat_is_writeable(struct power_supply *psy,
 		return 0;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return !!(battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE);
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD:
 		return 1;
@@ -2949,6 +2966,18 @@ static int qcom_battmgr_bat_set_property(struct power_supply *psy,
 		return -EAGAIN;
 
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		if (!(battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE))
+			return -EOPNOTSUPP;
+		if (pval->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO &&
+		    pval->intval != POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)
+			return -EINVAL;
+		mutex_lock(&battmgr->charge_lock);
+		WRITE_ONCE(battmgr->inhibit_charge,
+			   pval->intval == POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE);
+		mutex_unlock(&battmgr->charge_lock);
+		ret = 0;
+		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD:
 		ret = qcom_battmgr_set_charge_start_threshold(battmgr, pval->intval);
 		break;
@@ -3037,6 +3066,7 @@ static const struct power_supply_desc x1e80100_bat_psy_desc = {
 };
 
 static const enum power_supply_property sm8350_bat_props[] = {
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_PRESENT,
@@ -4118,6 +4148,8 @@ static bool qcom_battmgr_bat_prop_hidden(struct qcom_battmgr *battmgr,
 					 enum power_supply_property psp)
 {
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
+		return !(battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE);
 	/* Leave POWER_NOW out rather than report a value that is not one */
 	case POWER_SUPPLY_PROP_POWER_NOW:
 		return battmgr->quirks & QCOM_BATTMGR_QUIRK_NO_BATT_POWER_NOW;
@@ -4152,6 +4184,9 @@ qcom_battmgr_sm8350_bat_desc(struct qcom_battmgr *battmgr,
 		if (!qcom_battmgr_bat_prop_hidden(battmgr, desc->properties[i]))
 			props[n++] = desc->properties[i];
 
+	if (battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE)
+		copy->charge_behaviours = BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
+					  BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE);
 	copy->properties = props;
 	copy->num_properties = n;
 
@@ -4305,7 +4340,8 @@ EXPORT_SYMBOL_GPL(erhai_otg_adsp_prop_set);
 bool erhai_otg_charge_inhibited(void)
 {
 	guard(mutex)(&erhai_bridge_lock);
-	return !erhai_battmgr || erhai_battmgr->charge_inhibited ||
+	return !erhai_battmgr || READ_ONCE(erhai_battmgr->inhibit_charge) ||
+	       erhai_battmgr->charge_inhibited ||
 	       erhai_battmgr->charge_policy_hold || erhai_battmgr->charge_error ||
 	       READ_ONCE(erhai_battmgr->otg_request);
 }
