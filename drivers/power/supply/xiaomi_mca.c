@@ -737,6 +737,7 @@ struct xiaomi_mca {
 	bool ffc_active;		/* latches until stock full/recharge or detach */
 	/* Thresholds are shared by the two cells and protected by rx_lock. */
 	unsigned int charge_start, charge_end;
+	bool inhibit_applied; /* buck and pump stop confirmed in the current poll */
 	bool inhibit_charge; /* user vote, retained across detach and system sleep */
 	struct wakeup_source *charge_ws;
 	u32 input_generation;	/* changes that invalidate the wired source sample */
@@ -3466,6 +3467,7 @@ static bool xiaomi_mca_apply_wired_sample(struct xiaomi_mca *mca, u32 generation
 		return false;
 	mca->input_pending = false;
 	return xiaomi_mca_charge_wake_locked(mca,
+			!(mca->inhibit_applied && mca->inhibit_charge) &&
 			xiaomi_mca_should_stay_awake(online == 1, mca->otg_requested, type));
 }
 
@@ -3951,7 +3953,9 @@ static int xiaomi_mca_charge_limit_poll(struct xiaomi_mca *mca)
 	}
 	if (READ_ONCE(mca->inhibit_charge)) {
 		mca->charge_blocked = true;
-		return xiaomi_mca_charge_stop(mca);
+		ret = xiaomi_mca_charge_stop(mca);
+		mca->inhibit_applied = !ret;
+		return ret;
 	}
 	if (end == 100)
 		mca->charge_hold = false;
@@ -5577,6 +5581,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 
 	scoped_guard(mutex, &mca->lock) {
 		scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+			mca->inhibit_applied = false;
 			generation = mca->service_generation;
 			input_generation = mca->input_generation;
 		}

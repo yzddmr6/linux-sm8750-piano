@@ -2169,6 +2169,7 @@ static unsigned int qcom_battmgr_pd_update(struct qcom_battmgr *battmgr)
 	struct erhai_probe_status status = {};
 	bool stable, ufcs_active, tail, probe_idle, prefer_pps, dedicated, can_probe, can_probe_pumps;
 	bool serial_source, detached, qc, try_qc, caps_changed, current_changed = false;
+	bool inhibit_applied;
 	u32 online, type = POWER_SUPPLY_USB_TYPE_UNKNOWN, health, vbat, vbus, ua, real_type;
 	int ret;
 
@@ -2215,6 +2216,16 @@ read_source:
 	/* Process the PHY evidence before the wake and routing decisions.
 	 * Do not transfer evidence across a replacement Type-C partner.
 	 */
+	inhibit_applied = false;
+	if (online && !detached && READ_ONCE(battmgr->inhibit_charge) &&
+	    battmgr->charge_inhibited && !battmgr->charge_error) {
+		/* Release the charging wake source only after both the pump and
+		 * fixed-voltage session have returned control to the firmware.
+		 */
+		inhibit_applied = !qcom_battmgr_pps_stop(battmgr, false, "charge inhibited") &&
+			!qcom_battmgr_pd_stop(battmgr, false, "charge inhibited") &&
+			battmgr->buck_enable_applied == 0;
+	}
 	status = (struct erhai_probe_status){ .wired_online = online && !detached };
 	if (online && !detached && battmgr->pps_ops)
 		battmgr->pps_ops->probe_status(battmgr->pps_data, &status);
@@ -2230,6 +2241,7 @@ read_source:
 		serial_source = !detached && (battmgr->retry_evidence & ERHAI_SERIAL);
 		battmgr->buck_online = online && !READ_ONCE(battmgr->otg_request);
 		qcom_battmgr_charge_wake_locked(battmgr,
+			!(inhibit_applied && READ_ONCE(battmgr->inhibit_charge)) &&
 			erhai_should_stay_awake(online == 1, battmgr->otg_request,
 						serial_source || (battmgr->buck.phase >= ERHAI_FFC_WAIT &&
 				battmgr->buck.phase <= ERHAI_FFC_IDLE) ? POWER_SUPPLY_USB_TYPE_DCP : type));
@@ -2293,6 +2305,9 @@ read_source:
 		if (!online)
 			return keep_tail ? PD_POLL_MS : 0;
 	}
+
+	if (inhibit_applied && READ_ONCE(battmgr->inhibit_charge))
+		return CHARGE_CTRL_POLL_MS;
 
 	power_supply_for_each_psy(&src, qcom_battmgr_pd_source_match);
 	if (type != battmgr->charge_detected_type)
