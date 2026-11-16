@@ -14,15 +14,16 @@
  * from the stock vendor_dlkm; see ~/erhai-pen/disasm-keyfuncs.txt and
  * ~/erhai-pen/fw-update-notes.md.
  *
- * The firmware SRAM update path (vendor fw_update_work_func) is implemented
- * as well: wireless_pen/<project>/cps8601_firmware.bin is requested, its
- * header version is compared against the running firmware, and on mismatch
- * (or with the fw_force module parameter) the embedded bootloader is loaded
- * into chip SRAM and the image is flashed and verified.  The vendor module
- * carries the whole machinery but nothing ever schedules it - the factory
- * image ships the matching version, so the path stays dormant there.  A
- * missing image or a failed update is not fatal: init keeps going with the
- * firmware the chip currently runs.
+ * The firmware check follows the vendor fw_update_work_func, which the
+ * vendor init_work runs once per probe: wireless_pen/<project>/
+ * cps8601_firmware.bin, which the stock ODM partition carries, is requested,
+ * its header version is compared against the running firmware, and only on
+ * a mismatch is the embedded bootloader loaded into chip SRAM and the image
+ * written to MTP and verified.  With the stock image both report 0x011e and
+ * nothing is written.  The application stays in MTP, so the check runs once
+ * per boot, not after each resume.  Unlike the vendor, a missing image or a
+ * failed update is not fatal: init keeps going with the firmware the chip
+ * currently runs.
  */
 
 #include <linux/module.h>
@@ -124,11 +125,6 @@ struct cps8601_hboost_msg {
  * (oplus_wireless_pen.ko .data, symbol cps8601_bl) */
 #include "cps8601_bl.h"
 
-static bool fw_force;
-module_param(fw_force, bool, 0644);
-MODULE_PARM_DESC(fw_force,
-	"reflash the pen charger firmware even if the version matches (unbrick switch)");
-
 /* vendor get_project(): the stock kernel log shows wireless_pen/24926/
  * (bugreport pen-bugreport-analysis.md; the 24976 note was wrong) */
 static unsigned int fw_project_id = 24926;
@@ -177,6 +173,8 @@ struct cps8601 {
 	int			irq;
 	bool			irq_armed;
 	unsigned int		init_retries;
+	/* The application firmware is nonvolatile across suspend/resume. */
+	bool			fw_checked;
 
 	u16			fw_version;
 	u16			chip_id;
@@ -719,6 +717,11 @@ static void cps8601_fw_update_check(struct cps8601 *chip)
 	u16 bin_ver, sys_ver = 0;
 	int ret = -ENOENT, tries;
 
+	/* init_work runs after resume too, but the app remains in MTP. */
+	if (chip->fw_checked)
+		return;
+	chip->fw_checked = true;
+
 	snprintf(path, sizeof(path), "wireless_pen/%u/cps8601_firmware.bin",
 		 fw_project_id);
 
@@ -756,11 +759,11 @@ static void cps8601_fw_update_check(struct cps8601 *chip)
 	gpiod_direction_output(chip->int_gpiod, 1);
 	msleep(50);
 
-	if (!fw_force && bin_ver == sys_ver) {
-		dev_dbg(chip->dev, "firmware up to date (0x%04x)\n", sys_ver);
+	if (bin_ver == sys_ver) {
+		dev_info(chip->dev, "firmware 0x%04x matches %s\n", sys_ver, path);
 	} else {
-		dev_info(chip->dev, "fw update: chip 0x%04x, image 0x%04x%s\n",
-			 sys_ver, bin_ver, fw_force ? " (forced)" : "");
+		dev_info(chip->dev, "fw update: chip 0x%04x, image 0x%04x\n",
+			 sys_ver, bin_ver);
 		mutex_lock(&chip->prog_lock);
 		ret = cps8601_do_fw_update(chip, fw->data, fw->size);
 		mutex_unlock(&chip->prog_lock);
@@ -947,8 +950,8 @@ static void cps8601_init_work(struct work_struct *work)
 		goto out_nopm;
 	}
 
-	/* vendor fw_update_work_func: reflash when the image version differs
-	 * (or fw_force is set); on failure keep going with what runs */
+	/* Vendor behavior: reflash only when the image version differs; on
+	 * failure keep going with the firmware already running on the chip. */
 	cps8601_fw_update_check(chip);
 
 	ret = cps8601_read16(chip, CPS8601_REG_FW_VER, &chip->fw_version);
