@@ -1222,6 +1222,8 @@ static bool xiaomi_mca_write_allowed(u32 prop, const void *data, size_t len)
 			val == (BIT(16) | 6000) || val == (BIT(16) | 6500));
 	case MCA_PROP_CID_CFG:
 		return len == sizeof(u32) && val == MCA_PIANO_CID_CFG;
+	case MCA_PROP_LPD_CONTROL:
+		return len == sizeof(u32) && val == 1;
 	case MCA_PROP_CHARGING_ENABLED:
 	case MCA_PROP_CP_STATE:
 	case MCA_PROP_CC_TOGGLE:
@@ -1408,6 +1410,7 @@ static int xiaomi_mca_write_blob(struct xiaomi_mca *mca, u32 prop,
 		return 0;
 	}
 	if (prop == MCA_PROP_CP_STATE || prop == MCA_PROP_OTG_CFG || prop == MCA_PROP_CID_CFG ||
+	    prop == MCA_PROP_LPD_CONTROL ||
 	    prop == MCA_PROP_PEN_BOOST_ENABLE || prop == MCA_PROP_PEN_BOOST_VOLTAGE) {
 		if (!mca->piano_otg)
 			return -EOPNOTSUPP;
