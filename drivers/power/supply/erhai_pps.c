@@ -349,6 +349,9 @@ struct erhai_pps {
 	int			temp_ddc;
 	const struct erhai_charge_curve *curve;
 	int curve_temp;
+	int			curve_temp_dir;		/* how the range was entered */
+	int			curve_temp_pending;	/* range change being counted */
+	unsigned int		curve_temp_samples;
 	int curve_soc;		/* SOC the table was chosen at */
 	unsigned int curve_ma;
 	unsigned int		curve_idx;
@@ -375,6 +378,12 @@ struct erhai_pps {
 	unsigned long		cp_fed_at;	/* last successful feed */
 	bool			inhibit_held;	/* policy inhibit seen this session */
 	unsigned int		cp_rearms;	/* pump attempts this plug */
+	/* oplus_pps_check_sw_full counters; a counted full ends the session */
+	unsigned int		full_cool_count;
+	unsigned int		full_sw_count;
+	unsigned int		full_hw_count;
+	unsigned int		full_warm_count;
+	bool			cell_full;
 };
 
 static void pps_enter(struct erhai_pps *p, enum pps_state st, const char *why);
@@ -466,9 +475,63 @@ static int pps_read_vbus(struct erhai_pps *p)
 	return 0;
 }
 
+/* oplus_pps_check_sw_full (cc463675855a) with the third-party adapter
+ * limits of oplus-chg-24924.dtsi (pps_full_*_vbat_third, pps_full_warm_vbat;
+ * the UFCS node has the same values), on the gauge's highest cell voltage
+ * every 500 ms monitor cycle: below pps_cool_temp, more than 4490 mV six
+ * times in a row; up to pps_batt_over_high_temp, more than 4490 mV on the
+ * last gear six times or more than 4540 mV three times, counted until the
+ * temperature leaves that range; in the warm range, more than 4130 mV six
+ * times in a row. The ranges use the battery temperature, as the rest of
+ * this engine does.
+ */
+#define ERHAI_PPS_FULL_COOL_TEMP	120
+#define ERHAI_PPS_FULL_OVER_HIGH_TEMP	510
+#define ERHAI_PPS_FULL_COOL_MV		4490
+#define ERHAI_PPS_FULL_SW_MV		4490
+#define ERHAI_PPS_FULL_HW_MV		4540
+#define ERHAI_PPS_FULL_WARM_MV		4130
+#define ERHAI_PPS_FULL_COUNTS		6
+#define ERHAI_PPS_FULL_HW_COUNTS	3
+
+static bool pps_cell_full(struct erhai_pps *p)
+{
+	bool last = p->curve->steps[p->curve_idx].last;
+	int temp = p->temp_ddc, mv = p->vbat_mv;
+
+	if (temp < ERHAI_PPS_FULL_COOL_TEMP && mv > ERHAI_PPS_FULL_COOL_MV) {
+		if (++p->full_cool_count >= ERHAI_PPS_FULL_COUNTS)
+			return true;
+	} else {
+		p->full_cool_count = 0;
+	}
+
+	if (temp >= ERHAI_PPS_FULL_COOL_TEMP && temp < ERHAI_PPS_FULL_OVER_HIGH_TEMP) {
+		if (last && mv > ERHAI_PPS_FULL_SW_MV &&
+		    ++p->full_sw_count >= ERHAI_PPS_FULL_COUNTS)
+			return true;
+		if (mv > ERHAI_PPS_FULL_HW_MV &&
+		    ++p->full_hw_count >= ERHAI_PPS_FULL_HW_COUNTS)
+			return true;
+	} else {
+		p->full_sw_count = 0;
+		p->full_hw_count = 0;
+	}
+
+	if (erhai_curve_temp_region(p->curve_temp) == ERHAI_CURVE_TEMP_WARM &&
+	    mv > ERHAI_PPS_FULL_WARM_MV) {
+		if (++p->full_warm_count >= ERHAI_PPS_FULL_COUNTS)
+			return true;
+	} else {
+		p->full_warm_count = 0;
+	}
+	return false;
+}
+
 /* The cell table accepts equality at entry. During
  * delivery, advance one row after 2500 ms continuously above target.
- * A last gear still delivers its specified current up to its CV.
+ * A last gear still delivers its specified current until the counted
+ * full of pps_cell_full(); entry is refused at the cell CV.
  *
  * Stock picks the SOC row when the pump starts (puc_strategy_init(),
  * oplus_chg_pps.c:2271) and puc_strategy_get_data() never reads SOC; a
@@ -485,13 +548,26 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 	int last_temp = p->curve_temp;
 	bool new_table;
 
-	p->curve_temp = entering || !p->curve ? p->temp_ddc : erhai_curve_temp(p->curve_temp, p->temp_ddc);
-	if (entering || !p->curve)
+	if (entering || !p->curve) {
+		p->curve_temp = p->temp_ddc;
 		p->curve_soc = p->soc;
+		p->curve_temp_dir = 0;
+		p->curve_temp_pending = 0;
+		p->curve_temp_samples = 0;
+		p->full_cool_count = 0;
+		p->full_sw_count = 0;
+		p->full_hw_count = 0;
+		p->full_warm_count = 0;
+		p->cell_full = false;
+	} else {
+		p->curve_temp = erhai_curve_temp(p->curve_temp, p->temp_ddc, &p->curve_temp_dir,
+						 &p->curve_temp_pending, &p->curve_temp_samples);
+	}
 	raw = erhai_curve_select(svooc_curves, p->curve_soc, p->temp_ddc);
 	curve = erhai_curve_select(svooc_curves, p->curve_soc, p->curve_temp);
+	/* A running session ends on the counted full below, not on one sample at CV. */
 	if (!raw || !curve || p->vbat_mv < (int)pps_vbat_min_mv ||
-	    p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp)))
+	    (entering && p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp))))
 		return 0;
 
 	new_table = entering || !p->curve || p->curve->steps != curve->steps ||
@@ -512,6 +588,11 @@ static unsigned int pps_cell_limit(struct erhai_pps *p, bool entering)
 		} else {
 			p->over_since = 0;
 		}
+	}
+
+	if (!entering && pps_cell_full(p)) {
+		p->cell_full = true;
+		return 0;
 	}
 
 	limit = curve->steps[p->curve_idx].ma;
@@ -1018,10 +1099,10 @@ static void pps_poll(struct erhai_pps *p)
 		}
 		cell_ma = pps_cell_limit(p, false);
 		if (!cell_ma) {
-			if (p->temp_ddc >= 0 && p->temp_ddc < 510 &&
-			    p->vbat_mv >= min(erhai_cell_cv(p->temp_ddc), erhai_cell_cv(p->curve_temp)))
+			/* As the stock CHG_FULL vote, hand the cell to the buck tail. */
+			if (p->cell_full)
 				erhai_charge_tail_complete(p->ufcs ? ERHAI_UFCS : ERHAI_PPS);
-			pps_exit(p, "battery limit");
+			pps_exit(p, p->cell_full ? "cell full" : "battery limit");
 			return;
 		}
 		if (p->state == PPS_CHARGING || p->state == PPS_TAPER) {

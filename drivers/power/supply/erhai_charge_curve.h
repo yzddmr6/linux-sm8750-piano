@@ -43,23 +43,63 @@ erhai_curve_select(const struct erhai_charge_curve curves[][7],
 	return &curves[s][t];
 }
 
-/* oplus_chg_comm.h BATT_TEMP_HYST = 20 deci-C. Retain the previous
- * region near a boundary. The caller also applies the raw region's
- * voltage/current limits immediately when they are tighter.
- */
-static inline int erhai_curve_temp(int last, int temp)
+#define ERHAI_CURVE_TEMP_END { 50, 120, 160, 210, 350, 440, 510 }
+#define ERHAI_CURVE_TEMP_WARM	6	/* 44-51 C */
+
+/* Temperature column of erhai_curve_select(); 7 is above the table. */
+static inline unsigned int erhai_curve_temp_region(int temp)
 {
-	static const int bounds[] = { 0, 50, 120, 160, 210, 350, 440, 510 };
+	static const int temp_end[] = ERHAI_CURVE_TEMP_END;
 	unsigned int i;
 
-	for (i = 1; i < ARRAY_SIZE(bounds); i++) {
-		if (last >= bounds[i - 1] && last < bounds[i]) {
-			if (temp >= bounds[i - 1] - 20 && temp < bounds[i] + 20)
-				return last;
+	for (i = 0; i < ARRAY_SIZE(temp_end); i++)
+		if (temp < temp_end[i])
 			break;
-		}
+	return i;
+}
+
+/*
+ * The PPS temperature ranges of oplus_chg_pps.c (cc463675855a). A range is
+ * left on the PPS_TEMP_OVER_COUNTS (second) sample beyond its boundary. The
+ * first such sample moves that boundary PPS_TEMP_LOW_RANGE_THD (one degree)
+ * back into the range, and entering a range moves the boundary just crossed
+ * one degree into the range that was left. The other boundary keeps its
+ * table value. @dir is how the range was entered (+1 from below, -1 from
+ * above, 0 at session entry) and @pending the direction counted so far.
+ * The return value is the temperature that selects the curve; the caller
+ * still applies the live temperature's tighter limits at once.
+ */
+static inline int erhai_curve_temp(int last, int temp, int *dir, int *pending,
+				   unsigned int *samples)
+{
+	static const int temp_end[] = ERHAI_CURVE_TEMP_END;
+	unsigned int cur = erhai_curve_temp_region(last);
+	int step;
+
+	/* Outside the table the live temperature ends the session anyway. */
+	if (cur == ARRAY_SIZE(temp_end))
+		return temp;
+
+	step = 0;
+	if (cur && temp < temp_end[cur - 1] + (*pending < 0 ? 10 : *dir > 0 ? -10 : 0))
+		step = -1;
+	else if (temp >= temp_end[cur] + (*pending > 0 ? -10 : *dir < 0 ? 10 : 0))
+		step = 1;
+	if (!step)
+		return last;
+
+	if (*pending != step) {
+		*pending = step;
+		*samples = 0;
 	}
-	return temp;
+	if (++*samples < 2)
+		return last;
+
+	*pending = 0;
+	*samples = 0;
+	*dir = step;
+	/* A sample just inside the moved boundary still enters the next range. */
+	return step > 0 ? max(temp, temp_end[cur]) : min(temp, temp_end[cur - 1] - 1);
 }
 
 /* PPS starts below its voltage target, SUPERVOOC also accepts equality. */
