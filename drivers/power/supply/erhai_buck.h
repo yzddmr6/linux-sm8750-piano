@@ -38,20 +38,6 @@ struct erhai_buck {
 	unsigned long next_sample, wait_until;
 };
 
-/* batt-them-thr has nine V3P7 regions; the V3P7.1 enum inserts an
- * unused little-cold-high region. ADSP FULL_CURR_SET uses that enum.
- */
-static inline int erhai_buck_region(int temp)
-{
-	static const int bounds[] = { -100, 0, 50, 120, 160, 350, 450, 530 };
-	unsigned int i;
-
-	for (i = 0; i < ARRAY_SIZE(bounds); i++)
-		if (temp < bounds[i])
-			break;
-	return i;
-}
-
 static inline int erhai_buck_age_mv(int cycles)
 {
 	/* dec-vol-cc-full-thr / dec-vol-fv-full-mv, including 1200 -> 40. */
