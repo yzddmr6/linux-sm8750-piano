@@ -3066,7 +3066,6 @@ static const struct power_supply_desc x1e80100_bat_psy_desc = {
 };
 
 static const enum power_supply_property sm8350_bat_props[] = {
-	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_PRESENT,
@@ -3099,6 +3098,7 @@ static const struct power_supply_desc sm8350_bat_psy_desc = {
 };
 
 static const enum power_supply_property sm8550_bat_props[] = {
+	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_HEALTH,
 	POWER_SUPPLY_PROP_PRESENT,
