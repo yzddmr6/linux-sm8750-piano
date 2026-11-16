@@ -789,6 +789,7 @@ static const u8 sm8350_bat_prop_map[] = {
 	[POWER_SUPPLY_PROP_TEMP] = BATT_TEMP,
 	[POWER_SUPPLY_PROP_TECHNOLOGY] = BATT_TECHNOLOGY,
 	[POWER_SUPPLY_PROP_CHARGE_COUNTER] =  BATT_CHG_COUNTER,
+	[POWER_SUPPLY_PROP_CHARGE_NOW] = BATT_CHG_COUNTER,
 	[POWER_SUPPLY_PROP_CYCLE_COUNT] = BATT_CYCLE_COUNT,
 	[POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN] =  BATT_CHG_FULL_DESIGN,
 	[POWER_SUPPLY_PROP_CHARGE_FULL] = BATT_CHG_FULL,
@@ -988,6 +989,10 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 		val->intval = battmgr->info.capacity_low;
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_NOW:
+		if (battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD) {
+			val->intval = battmgr->info.charge_count;
+			break;
+		}
 		if (unit != QCOM_BATTMGR_UNIT_mAh)
 			return -ENODATA;
 		val->intval = battmgr->status.capacity;
@@ -3098,6 +3103,7 @@ static const struct power_supply_desc sm8350_bat_psy_desc = {
 };
 
 static const enum power_supply_property sm8550_bat_props[] = {
+	POWER_SUPPLY_PROP_CHARGE_NOW,
 	POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_HEALTH,
@@ -4148,6 +4154,8 @@ static bool qcom_battmgr_bat_prop_hidden(struct qcom_battmgr *battmgr,
 					 enum power_supply_property psp)
 {
 	switch (psp) {
+	case POWER_SUPPLY_PROP_CHARGE_NOW:
+		return !(battmgr->quirks & QCOM_BATTMGR_QUIRK_OPLUS_PD);
 	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
 		return !(battmgr->quirks & QCOM_BATTMGR_QUIRK_CHARGE_ENABLE);
 	/* Leave POWER_NOW out rather than report a value that is not one */
