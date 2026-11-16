@@ -107,9 +107,9 @@ static const __le32 xiaomi_mca_piano_otg_cfg[] = {
 #define MCA_PROP_USB_REAL_TYPE		0x2000c
 
 /*
- * Liquid detection in the USB-C port, done by the charger firmware (Piano
- * ADSP mca_check_if_enable_lpd enables it on production hardware). Getter
- * 0x600300ac/0x600300c8 returns the port's bLpdEn/bLiquidDetected bytes;
+ * Liquid detection in the USB-C port is done by charger firmware. The
+ * qcom_subpmic_set_lpd_control proxy uses 0x2024 to enable it; the firmware
+ * getters 0x600300ac/0x600300c8 return bLpdEn/bLiquidDetected, and
  * evaluate_typec_charger sends the latter as notification 4 on change.
  * 0x201e..0x2023 are the measured pins the firmware decides on.
  */
@@ -121,6 +121,7 @@ static const __le32 xiaomi_mca_piano_otg_cfg[] = {
 #define MCA_PROP_LPD_CC2		0x2021
 #define MCA_PROP_LPD_DP			0x2022
 #define MCA_PROP_LPD_DM			0x2023
+#define MCA_PROP_LPD_CONTROL		0x2024
 
 /* Piano qcom_adsp_pd_protocol .text 0x3b0..3c8: raw PPS=11;
  * authentication promotes the protocol type to 12. Do not use Onyx
@@ -800,6 +801,8 @@ struct xiaomi_mca {
 	int failed_errno;
 	bool failed_reply;
 	u64 failed_ns;
+	bool lpd_control_attempted;
+	u32 lpd_control_generation;
 
 	/* orders the fields below against the GLINK callbacks */
 	spinlock_t rx_lock;
@@ -5096,6 +5099,47 @@ static void xiaomi_mca_cp_missing(struct xiaomi_mca *mca, int ret)
 	}
 }
 
+/* Enable charger-firmware liquid detection once each time its service starts. */
+static void xiaomi_mca_enable_lpd(struct xiaomi_mca *mca)
+{
+	u32 generation, control = 0, enabled = 0;
+	bool up;
+	int ret;
+
+	if (!mca->piano_otg)
+		return;
+
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		generation = mca->service_generation;
+		up = mca->service_up;
+	}
+	if (!up || (mca->lpd_control_attempted &&
+		    mca->lpd_control_generation == generation))
+		return;
+
+	mca->lpd_control_attempted = true;
+	mca->lpd_control_generation = generation;
+	ret = xiaomi_mca_write_u32(mca, MCA_PROP_LPD_CONTROL, 1);
+	if (!ret)
+		ret = xiaomi_mca_read(mca, MCA_PROP_LPD_CONTROL, &control);
+	if (!ret && control != 1)
+		ret = -EIO;
+	if (!ret)
+		ret = xiaomi_mca_read(mca, MCA_PROP_LPD_ENABLE, &enabled);
+	if (!ret && enabled != 1)
+		ret = -EIO;
+	scoped_guard(spinlock_irqsave, &mca->rx_lock) {
+		if (mca->service_generation != generation || !mca->service_up)
+			ret = -ESTALE;
+	}
+	if (ret)
+		dev_warn(mca->dev,
+			 "LPD enable generation %u failed: control %u enable %u (%d)\n",
+			 generation, control, enabled, ret);
+	else
+		dev_info(mca->dev, "LPD enabled for generation %u\n", generation);
+}
+
 /* Stock qcom_subpmic_sync_cfg_work: CP_STATE, OTG_CFG, then CID_CFG. */
 static void xiaomi_mca_sync_config(struct xiaomi_mca *mca)
 {
@@ -5535,6 +5579,7 @@ static void xiaomi_mca_poll(struct work_struct *work)
 		}
 		xiaomi_mca_observe_aicl(mca);
 		xiaomi_mca_sync_config(mca);
+		xiaomi_mca_enable_lpd(mca);
 		if (mca->policy_generation != generation) {
 			if (xiaomi_mca_cp_stop(mca, "ADSP restart"))
 				goto out;
@@ -6029,6 +6074,7 @@ static const struct {
 	{ "aicl_enabled", MCA_PROP_AICL_ENABLED },
 	{ "aicl_status", MCA_PROP_AICL_STATUS },
 	{ "input_suspend", MCA_PROP_INPUT_SUSPEND },
+	{ "lpd_control", MCA_PROP_LPD_CONTROL },
 	{ "lpd_enable", MCA_PROP_LPD_ENABLE },
 	{ "lpd_status", MCA_PROP_LPD_STATUS },
 	{ "lpd_sbu1", MCA_PROP_LPD_SBU1 },
