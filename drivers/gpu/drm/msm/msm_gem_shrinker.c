@@ -28,12 +28,17 @@ static bool can_swap(void)
 	return enable_eviction && get_nr_swap_pages() > 0;
 }
 
+/*
+ * Only kswapd waits for active BOs to become idle.  Direct reclaim runs in the
+ * allocating task, which may be the compositor or a task submitting GPU work
+ * and holding the locks of the BOs it submits, so waiting there for the GPU
+ * stalls that task, and everything waiting on it, for the length of the scan.
+ */
 static bool can_block(struct shrink_control *sc)
 {
 	if (!eviction_can_block)
 		return false;
-	return (sc->gfp_mask & __GFP_DIRECT_RECLAIM) ||
-	       (current_is_kswapd() && (sc->gfp_mask & __GFP_KSWAPD_RECLAIM));
+	return current_is_kswapd() && (sc->gfp_mask & __GFP_KSWAPD_RECLAIM);
 }
 
 static unsigned long
