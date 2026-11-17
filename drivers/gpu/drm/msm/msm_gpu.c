@@ -850,13 +850,46 @@ static void retire_worker(struct kthread_work *work)
 	retire_submits(gpu);
 }
 
-/* call from irq handler to schedule work to retire bo's */
+/*
+ * Signal the hw_fence of each submit the GPU has completed, in ring order.
+ *
+ * This must not depend on retire_submits(), which takes the reservation lock
+ * of each BO of a submit: dma_fence_wait() may be called with a reservation
+ * lock held (by the shrinker, for example), and that waiter would then block
+ * the signalling of the fence it waits for.
+ */
+static void signal_completed_submits(struct msm_ringbuffer *ring)
+{
+	struct msm_gem_submit *submit;
+	unsigned long flags;
+
+	spin_lock_irqsave(&ring->submit_lock, flags);
+	list_for_each_entry(submit, &ring->submits, node) {
+		/*
+		 * Submits on a ring complete in order, so stop at the first
+		 * one that is not complete.  dma_fence_is_signaled() signals
+		 * the fence when msm_fence_signaled() reports it complete.
+		 */
+		if (!dma_fence_is_signaled(submit->hw_fence))
+			break;
+	}
+	spin_unlock_irqrestore(&ring->submit_lock, flags);
+}
+
+/*
+ * call from irq handler to signal completed fences, and schedule work to
+ * retire bo's
+ */
 void msm_gpu_retire(struct msm_gpu *gpu)
 {
 	int i;
 
-	for (i = 0; i < gpu->nr_rings; i++)
-		msm_update_fence(gpu->rb[i]->fctx, gpu->rb[i]->memptrs->fence);
+	for (i = 0; i < gpu->nr_rings; i++) {
+		struct msm_ringbuffer *ring = gpu->rb[i];
+
+		msm_update_fence(ring->fctx, ring->memptrs->fence);
+		signal_completed_submits(ring);
+	}
 
 	kthread_queue_work(gpu->worker, &gpu->retire_work);
 }
