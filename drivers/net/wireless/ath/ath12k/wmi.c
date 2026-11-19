@@ -4421,6 +4421,48 @@ int ath12k_wmi_set_hw_mode(struct ath12k_base *ab,
 	return ret;
 }
 
+/* Keep the dual MAC configuration the firmware advertised in
+ * WMI_SERVICE_READY_EXT_EVENTID, minus asynchronous SBS. This is what the
+ * vendor driver sends with enable_sbs=0.
+ */
+int ath12k_wmi_disable_async_sbs(struct ath12k_base *ab)
+{
+	struct ath12k_wmi_base *wmi_ab = &ab->wmi_ab;
+	struct ath12k_wmi_pdev_set_mac_config_cmd *cmd;
+	u32 scan_config, fw_mode_config;
+	struct sk_buff *skb;
+	int ret;
+
+	scan_config = wmi_ab->default_conc_scan_config_bits;
+	fw_mode_config = wmi_ab->default_fw_config_bits &
+			 ~WMI_DBS_FW_MODE_CFG_ASYNC_SBS;
+
+	skb = ath12k_wmi_alloc_skb(wmi_ab, sizeof(*cmd));
+	if (!skb)
+		return -ENOMEM;
+
+	cmd = (struct ath12k_wmi_pdev_set_mac_config_cmd *)skb->data;
+	cmd->tlv_header = ath12k_wmi_tlv_cmd_hdr(WMI_TAG_PDEV_SET_MAC_CONFIG_CMD,
+						 sizeof(*cmd));
+	cmd->pdev_id = cpu_to_le32(WMI_PDEV_ID_SOC);
+	cmd->concurrent_scan_config_bits = cpu_to_le32(scan_config);
+	cmd->fw_mode_config_bits = cpu_to_le32(fw_mode_config);
+
+	ath12k_dbg(ab, ATH12K_DBG_WMI,
+		   "WMI pdev set mac config scan 0x%x fw mode 0x%x (default 0x%x)\n",
+		   scan_config, fw_mode_config, wmi_ab->default_fw_config_bits);
+
+	ret = ath12k_wmi_cmd_send(&wmi_ab->wmi[0], skb,
+				  WMI_PDEV_SET_MAC_CONFIG_CMDID);
+	if (ret) {
+		ath12k_warn(ab, "failed to send WMI_PDEV_SET_MAC_CONFIG_CMDID: %d\n",
+			    ret);
+		dev_kfree_skb(skb);
+	}
+
+	return ret;
+}
+
 int ath12k_wmi_cmd_init(struct ath12k_base *ab)
 {
 	struct ath12k_dp *dp = ath12k_ab_to_dp(ab);
@@ -5064,6 +5106,11 @@ static int ath12k_wmi_svc_rdy_ext_parse(struct ath12k_base *ab,
 			ath12k_warn(ab, "unable to extract ext params\n");
 			return ret;
 		}
+
+		ab->wmi_ab.default_conc_scan_config_bits =
+			svc_rdy_ext->arg.default_conc_scan_config_bits;
+		ab->wmi_ab.default_fw_config_bits =
+			svc_rdy_ext->arg.default_fw_config_bits;
 		break;
 
 	case WMI_TAG_SOC_MAC_PHY_HW_MODE_CAPS:

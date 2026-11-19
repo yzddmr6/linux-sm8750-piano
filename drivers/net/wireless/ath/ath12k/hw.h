@@ -241,6 +241,9 @@ struct ath12k_hw_params {
 
 	bool host_alloc_ml_id;
 	bool advertise_iface_mac_pool;
+
+	/* firmware must not switch to SBS on its own */
+	bool disable_async_sbs:1;
 };
 
 struct ath12k_hw_ops {

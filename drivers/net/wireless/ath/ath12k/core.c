@@ -1006,6 +1006,10 @@ static int ath12k_core_start(struct ath12k_base *ab)
 		}
 	}
 
+	/* Failure only leaves the firmware default in place. */
+	if (ab->hw_params->disable_async_sbs)
+		ath12k_wmi_disable_async_sbs(ab);
+
 	ret = ath12k_dp_tx_htt_h2t_ver_req_msg(ab);
 	if (ret) {
 		ath12k_err(ab, "failed to send htt version request message: %d\n",

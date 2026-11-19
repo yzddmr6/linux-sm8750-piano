@@ -808,6 +808,8 @@ static const struct ath12k_hw_params ath12k_wifi7_hw_params[] = {
 		.current_cc_support = true,
 
 		.dp_primary_link_only = false,
+
+		.disable_async_sbs = true,
 	},
 	{
 		.name = "qcc2072 hw1.0",

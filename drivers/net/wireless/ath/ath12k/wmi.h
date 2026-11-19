@@ -2549,6 +2549,18 @@ struct ath12k_wmi_pdev_set_hw_mode_cmd {
 	__le32 num_band_to_mac;
 } __packed;
 
+/* fw_mode_config_bits of WMI_PDEV_SET_MAC_CONFIG_CMDID: firmware may enter
+ * SBS (both MACs in the 5/6 GHz band) on its own.
+ */
+#define WMI_DBS_FW_MODE_CFG_ASYNC_SBS	BIT(26)
+
+struct ath12k_wmi_pdev_set_mac_config_cmd {
+	__le32 tlv_header;
+	__le32 pdev_id;
+	__le32 concurrent_scan_config_bits;
+	__le32 fw_mode_config_bits;
+} __packed;
+
 struct ath12k_wmi_ppe_threshold_params {
 	__le32 numss_m1; /** NSS - 1*/
 	__le32 ru_info;
@@ -5413,6 +5425,10 @@ struct ath12k_wmi_base {
 
 	enum wmi_host_hw_mode_config_type preferred_hw_mode;
 
+	/* dual MAC configuration the firmware starts with */
+	u32 default_conc_scan_config_bits;
+	u32 default_fw_config_bits;
+
 	struct ath12k_wmi_target_cap_arg *targ_cap;
 
 	struct ath12k_svc_ext_info svc_ext_info;
@@ -6663,6 +6679,7 @@ int ath12k_wmi_probe_resp_tmpl(struct ath12k *ar, u32 vdev_id,
 			       struct sk_buff *tmpl);
 int ath12k_wmi_set_hw_mode(struct ath12k_base *ab,
 			   enum wmi_host_hw_mode_config_type mode);
+int ath12k_wmi_disable_async_sbs(struct ath12k_base *ab);
 int ath12k_wmi_set_bios_cmd(struct ath12k_base *ab, u32 param_id,
 			    const u8 *buf, size_t buf_len);
 int ath12k_wmi_set_bios_sar_cmd(struct ath12k_base *ab, const u8 *psar_table);
