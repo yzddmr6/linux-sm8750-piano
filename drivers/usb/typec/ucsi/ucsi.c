@@ -7,6 +7,7 @@
  */
 
 #include <linux/completion.h>
+#include <linux/of.h>
 #include <linux/property.h>
 #include <linux/device.h>
 #include <linux/module.h>
@@ -1806,6 +1807,14 @@ static struct fwnode_handle *ucsi_find_fwnode(struct ucsi_connector *con)
 	u32 port;
 
 	device_for_each_child_node(con->ucsi->dev, fwnode) {
+		/*
+		 * A device tree node may describe more than its connectors.
+		 * Only the usb-c-connector children are UCSI connectors.
+		 */
+		if (is_of_node(fwnode) &&
+		    !fwnode_device_is_compatible(fwnode, "usb-c-connector"))
+			continue;
+
 		ret = fwnode_property_read_u32(fwnode, "reg", &port);
 		if (ret < 0) {
 			if (i == con->num)
