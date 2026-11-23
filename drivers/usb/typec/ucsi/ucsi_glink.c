@@ -431,6 +431,15 @@ static int pmic_glink_ucsi_probe(struct auxiliary_device *adev,
 	if (match)
 		ucsi->ucsi->quirks = *(unsigned long *)match->data;
 
+	/*
+	 * pmic_glink_altmode sets the mux of the same connectors from the
+	 * altmode notifications of the firmware, which carry the DisplayPort
+	 * pin assignment. The PPM does not report that here, so a USB state
+	 * set by UCSI would take the SBU and SuperSpeed lanes away from an
+	 * active DisplayPort link.
+	 */
+	ucsi->ucsi->quirks |= UCSI_EXTERNAL_MUX_MODE;
+
 	ucsi_set_drvdata(ucsi->ucsi, ucsi);
 
 	device_for_each_named_child_node_scoped(dev, fwnode, "connector") {

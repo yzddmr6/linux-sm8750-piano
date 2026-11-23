@@ -1309,12 +1309,20 @@ static int ucsi_register_partner(struct ucsi_connector *con)
 	return 0;
 }
 
+static void ucsi_set_mode(struct ucsi_connector *con, int mode)
+{
+	if (con->ucsi->quirks & UCSI_EXTERNAL_MUX_MODE)
+		return;
+
+	typec_set_mode(con->port, mode);
+}
+
 static void ucsi_unregister_partner(struct ucsi_connector *con)
 {
 	if (!con->partner)
 		return;
 
-	typec_set_mode(con->port, TYPEC_STATE_SAFE);
+	ucsi_set_mode(con, TYPEC_STATE_SAFE);
 	if (con->ucsi->ops->remove_partner_altmodes)
 		con->ucsi->ops->remove_partner_altmodes(con);
 
@@ -1351,14 +1359,14 @@ static void ucsi_partner_change(struct ucsi_connector *con)
 	if (UCSI_CONSTAT(con, CONNECTED)) {
 		switch (UCSI_CONSTAT(con, PARTNER_TYPE)) {
 		case UCSI_CONSTAT_PARTNER_TYPE_DEBUG:
-			typec_set_mode(con->port, TYPEC_MODE_DEBUG);
+			ucsi_set_mode(con, TYPEC_MODE_DEBUG);
 			break;
 		case UCSI_CONSTAT_PARTNER_TYPE_AUDIO:
-			typec_set_mode(con->port, TYPEC_MODE_AUDIO);
+			ucsi_set_mode(con, TYPEC_MODE_AUDIO);
 			break;
 		default:
 			if (UCSI_CONSTAT(con, PARTNER_FLAG_USB))
-				typec_set_mode(con->port, TYPEC_STATE_USB);
+				ucsi_set_mode(con, TYPEC_STATE_USB);
 		}
 
 		if (((con->ucsi->version >= UCSI_VERSION_3_0 &&

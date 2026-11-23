@@ -511,6 +511,13 @@ struct ucsi {
 
 /* USB4 connection can imply that USB communcation is supported */
 #define UCSI_USB4_IMPLIES_USB	BIT(2)
+
+/*
+ * Another driver sets the mode of the Type-C mux of the connectors, from
+ * information the PPM does not report here, such as the DisplayPort pin
+ * assignment. The USB, safe, audio and debug states UCSI sets would undo it.
+ */
+#define UCSI_EXTERNAL_MUX_MODE	BIT(3)
 };
 
 #define UCSI_MAX_DATA_LENGTH(u) (((u)->version < UCSI_VERSION_2_0) ? 0x10 : 0xff)
