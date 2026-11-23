@@ -2377,6 +2377,7 @@
 
 &usb {
 	/* role follows the pmic-glink Type-C notifications now that ADSP runs */
+	mode-switch;
 	status = "okay";
 };
 
