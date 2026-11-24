@@ -2627,6 +2627,9 @@ struct qmp_combo {
 	struct mutex phy_mutex;
 	int init_count;
 	enum qmpphy_mode qmpphy_mode;
+	/* mode requested by the Type-C mux while the DP PHY was powered on */
+	bool mode_pending;
+	enum qmpphy_mode pending_mode;
 
 	struct phy *usb_phy;
 	enum phy_mode phy_mode;
@@ -2652,6 +2655,7 @@ struct qmp_combo {
 	struct typec_mux_dev *mux;
 };
 
+static int qmp_combo_reconfigure_phy(struct qmp_combo *qmp, enum qmpphy_mode new_mode);
 static void qmp_v3_dp_aux_init(struct qmp_combo *qmp);
 static void qmp_v3_configure_dp_tx(struct qmp_combo *qmp);
 static int qmp_v3_configure_dp_clocks(struct qmp_combo *qmp);
@@ -4310,6 +4314,15 @@ static int qmp_combo_dp_power_on(struct phy *phy)
 	return 0;
 }
 
+/*
+ * Outside USB3-only mode the DP PHY drives lanes while powered on; the common
+ * block must not be reprogrammed under it.
+ */
+static bool qmp_combo_dp_holds_lanes(struct qmp_combo *qmp)
+{
+	return qmp->dp_powered_on && qmp->qmpphy_mode != QMPPHY_MODE_USB3_ONLY;
+}
+
 static int qmp_combo_dp_power_off(struct phy *phy)
 {
 	struct qmp_combo *qmp = phy_get_drvdata(phy);
@@ -4320,6 +4333,12 @@ static int qmp_combo_dp_power_off(struct phy *phy)
 	writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
 
 	qmp->dp_powered_on = false;
+
+	/* Apply the Type-C state that arrived while DP held the lanes */
+	if (qmp->mode_pending) {
+		qmp->mode_pending = false;
+		qmp_combo_reconfigure_phy(qmp, qmp->pending_mode);
+	}
 
 	mutex_unlock(&qmp->phy_mutex);
 
@@ -4458,10 +4477,16 @@ static int qmp_combo_usb_init(struct phy *phy)
 	if (ret)
 		return ret;
 
-	ret = qmp_combo_usb_power_on(phy);
-	if (ret) {
-		qmp_combo_com_exit(qmp, false);
-		return ret;
+	/*
+	 * In DP-only mode all four lanes carry DP and the USB3 PCS cannot come
+	 * up; qmp_combo_reconfigure_phy() powers it on once the mode allows.
+	 */
+	if (qmp->qmpphy_mode != QMPPHY_MODE_DP_ONLY) {
+		ret = qmp_combo_usb_power_on(phy);
+		if (ret) {
+			qmp_combo_com_exit(qmp, false);
+			return ret;
+		}
 	}
 
 	qmp->usb_init_count++;
@@ -4559,6 +4584,7 @@ static int qmp_combo_usb4_init(struct phy *phy)
 	}
 
 	/* USB4 mode takes precedence to USB3(+DP), force reconfigure the PHY */
+	qmp->mode_pending = false;
 	ret = qmp_combo_reconfigure_phy(qmp, QMPPHY_MODE_USB4);
 	if (ret) {
 		clk_disable_unprepare(qmp->p2rr2p_pipe_clk);
@@ -5084,13 +5110,23 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
 	guard(mutex)(&qmp->phy_mutex);
 	qmp->orientation = orientation;
 
+	/* com_init() in qmp_combo_dp_power_off() picks the orientation up */
+	if (qmp_combo_dp_holds_lanes(qmp)) {
+		if (!qmp->mode_pending) {
+			qmp->pending_mode = qmp->qmpphy_mode;
+			qmp->mode_pending = true;
+		}
+		return 0;
+	}
+
 	if (qmp->init_count) {
 		if (qmp->usb_init_count || qmp->usb4_init_count)
 			qmp_combo_usb_power_off(qmp->usb_phy);
 		qmp_combo_com_exit(qmp, true);
 
 		qmp_combo_com_init(qmp, true);
-		if (qmp->usb_init_count || qmp->usb4_init_count)
+		if ((qmp->usb_init_count || qmp->usb4_init_count) &&
+		    qmp->qmpphy_mode != QMPPHY_MODE_DP_ONLY)
 			qmp_combo_usb_power_on(qmp->usb_phy);
 		if (qmp->dp_init_count)
 			cfg->dp_aux_init(qmp);
@@ -5157,19 +5193,31 @@ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_s
 		new_mode = QMPPHY_MODE_USB3_ONLY;
 	}
 
+	if (qmp_combo_dp_holds_lanes(qmp)) {
+		/* keep a pending orientation change even if the mode is back */
+		if (new_mode != qmp->qmpphy_mode || qmp->mode_pending) {
+			dev_dbg(qmp->dev, "typec_mux_set: DP PHY is still in use, delaying switch\n");
+			qmp->pending_mode = new_mode;
+			qmp->mode_pending = true;
+		}
+		return 0;
+	}
+
+	qmp->mode_pending = false;
+
 	if (new_mode == qmp->qmpphy_mode) {
 		dev_dbg(qmp->dev, "typec_mux_set: same qmpphy mode, bail out\n");
 		return 0;
 	}
 
-	if (qmp->qmpphy_mode != QMPPHY_MODE_USB3_ONLY && qmp->dp_powered_on) {
-		dev_dbg(qmp->dev, "typec_mux_set: DP PHY is still in use, delaying switch\n");
+	/*
+	 * The mux still receives Type-C events, even if all PHYs are
+	 * uninitialized; com_init() programs the mode when one is initialized.
+	 */
+	if (!qmp->init_count) {
+		qmp->qmpphy_mode = new_mode;
 		return 0;
 	}
-
-	/* The mux still receives Type-C events, even if all PHYs are uninitialized */
-	if (!qmp->init_count)
-		return 0;
 
 	return qmp_combo_reconfigure_phy(qmp, new_mode);
 }
