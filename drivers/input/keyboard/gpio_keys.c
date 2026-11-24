@@ -357,7 +357,7 @@ static struct attribute *gpio_keys_attrs[] = {
 };
 ATTRIBUTE_GROUPS(gpio_keys);
 
-static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
+static int gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 {
 	const struct gpio_keys_button *button = bdata->button;
 	struct input_dev *input = bdata->input;
@@ -370,7 +370,7 @@ static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 	if (state < 0) {
 		dev_err(input->dev.parent,
 			"failed to get gpio state: %d\n", state);
-		return;
+		return state;
 	}
 
 	if (type == EV_ABS) {
@@ -379,14 +379,34 @@ static void gpio_keys_gpio_report_event(struct gpio_button_data *bdata)
 	} else {
 		input_event(input, type, *bdata->code, state);
 	}
+
+	return state;
 }
 
 static void gpio_keys_debounce_event(struct gpio_button_data *bdata)
 {
-	gpio_keys_gpio_report_event(bdata);
+	const struct gpio_keys_button *button = bdata->button;
+	int state;
+
+	state = gpio_keys_gpio_report_event(bdata);
 	input_sync(bdata->input);
 
-	if (bdata->button->wakeup)
+	/*
+	 * An input with an explicit wakeup action that changes into its
+	 * wakeup state while the system is on its way into suspend must end
+	 * that suspend: the wakeup interrupt is only armed later, or not at
+	 * all when a deasserting switch has already deasserted, so this edge
+	 * would otherwise be lost and a lid opened during suspend entry would
+	 * leave the system asleep with the lid open. Outside of a suspend the
+	 * pending abort is cleared when the next suspend starts freezing
+	 * tasks. Only interrupt-driven changes count, not the state reported
+	 * on open and resume.
+	 */
+	if (state >= 0 && button->wakeup && bdata->wakeup_trigger_type &&
+	    !!state == (button->wakeup_event_action == EV_ACT_ASSERTED))
+		pm_wakeup_hard_event(bdata->input->dev.parent);
+
+	if (button->wakeup)
 		pm_relax(bdata->input->dev.parent);
 }
 
