@@ -83,6 +83,16 @@ config PHY_QCOM_QMP_COMBO
 	  Enable this to support the QMP Combo PHY transceiver that is used
 	  with USB3 and DisplayPort controllers on Qualcomm chips.
 
+config PHY_QCOM_QMP_COMBO_KUNIT_TEST
+	bool "KUnit tests for QMP combo Type-C transitions" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && PHY_QCOM_QMP_COMBO=y && TYPEC=y
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise deferred DP release, quick reconnect, mode supersession and
+	  failure handling without real PHY hardware.
+	  Tests run against the driver transition functions with a mock USB
+	  consumer and no powered PHY. This is intended for development only.
+
 config PHY_QCOM_QMP_PCIE
 	tristate "Qualcomm QMP PCIe PHY Driver"
 	depends on PCI || COMPILE_TEST
