@@ -7,6 +7,7 @@
 #include <linux/io.h>
 #include <linux/of.h>
 #include <linux/clk.h>
+#include <linux/completion.h>
 #include <linux/irq.h>
 #include <linux/of_clk.h>
 #include <linux/module.h>
@@ -14,14 +15,12 @@
 #include <linux/interconnect.h>
 #include <linux/platform_device.h>
 #include <linux/phy/phy.h>
+#include <linux/phy/phy-qcom-qmp-combo.h>
 #include <linux/usb/of.h>
 #include <linux/reset.h>
 #include <linux/iopoll.h>
 #include <linux/usb/hcd.h>
 #include <linux/usb.h>
-#include <linux/usb/typec_altmode.h>
-#include <linux/usb/typec_dp.h>
-#include <linux/usb/typec_mux.h>
 #include "core.h"
 #include "glue.h"
 
@@ -54,6 +53,9 @@
 #define APPS_USB_PEAK_BW MBps_to_icc(40)
 
 /* Qualcomm SoCs with multiport support has up to 4 ports */
+#define QSCRATCH_EXTRA_INP_REG	0x1e4
+#define EXTRA_INP_SS_DISABLE	BIT(5)
+
 #define DWC3_QCOM_MAX_PORTS	4
 
 static const u32 pwr_evnt_irq_stat_reg[DWC3_QCOM_MAX_PORTS] = {
@@ -85,12 +87,15 @@ struct dwc3_qcom {
 	bool			is_suspended;
 	bool			pm_suspended;
 	bool			ignore_pipe_clk;
-	bool			dp_active;
 	bool			dp_only;
 	bool			utmi_pipe_clk;
-	/* protects dp_active, dp_only, utmi_pipe_clk and pm_suspended */
+	/* Serializes PHY changes with runtime and system PM. */
 	struct mutex		pipe_clk_lock;
-	struct typec_mux_dev	*mux;
+	struct completion	mode_probe_done;
+	bool			mode_registered;
+	bool			mode_ready;
+	bool			mode_pm_ref;
+	bool			mode_quiesced;
 	struct icc_path		*icc_path_ddr;
 	struct icc_path		*icc_path_apps;
 
@@ -451,50 +456,139 @@ static void dwc3_qcom_select_utmi_clk(struct dwc3_qcom *qcom, bool utmi)
 	qcom->utmi_pipe_clk = utmi;
 }
 
-static int dwc3_qcom_mux_set(struct typec_mux_dev *mux,
-			     struct typec_mux_state *state)
+static void dwc3_qcom_apply_usb_mode(struct dwc3_qcom *qcom)
 {
-	struct dwc3_qcom *qcom = typec_mux_get_drvdata(mux);
+	bool utmi = qcom->ignore_pipe_clk || qcom->dp_only;
+	u32 reg;
 
-	guard(mutex)(&qcom->pipe_clk_lock);
-
-	if (state->alt && state->alt->svid == USB_TYPEC_DP_SID) {
-		if (!qcom->dp_active)
-			qcom->dp_only = state->mode == TYPEC_DP_STATE_C ||
-					state->mode == TYPEC_DP_STATE_E;
-		qcom->dp_active = true;
-	} else if (state->mode == TYPEC_STATE_SAFE) {
-		qcom->dp_active = false;
-	} else if (!qcom->dp_active) {
-		qcom->dp_only = false;
+	qcom->dwc.usb3_disabled = utmi;
+	if (qcom->mode_registered) {
+		/* Stop SuperSpeed training in host mode as well as gadget mode. */
+		if (utmi)
+			dwc3_qcom_setbits(qcom->qscratch_base, QSCRATCH_EXTRA_INP_REG,
+					  EXTRA_INP_SS_DISABLE);
+		else
+			dwc3_qcom_clrbits(qcom->qscratch_base, QSCRATCH_EXTRA_INP_REG,
+					  EXTRA_INP_SS_DISABLE);
 	}
 
-	if (qcom->ignore_pipe_clk || qcom->pm_suspended ||
-	    qcom->dp_only == qcom->utmi_pipe_clk ||
-	    pm_runtime_resume_and_get(qcom->dev))
+	/* QSCRATCH may lose its contents during suspend. */
+	reg = readl(qcom->qscratch_base + QSCRATCH_GENERAL_CFG);
+	if (!!(reg & PIPE_UTMI_CLK_SEL) != utmi)
+		dwc3_qcom_select_utmi_clk(qcom, utmi);
+}
+
+static int dwc3_qcom_phy_mode_prepare(void *data)
+{
+	struct dwc3_qcom *qcom = data;
+	struct dwc3 *dwc = &qcom->dwc;
+	int ret;
+
+	/* The PHY callback can arrive as soon as registration completes. */
+	wait_for_completion(&qcom->mode_probe_done);
+	if (!qcom->mode_ready)
+		return -ENODEV;
+
+	/* QMP holds only its Type-C lock, never its PHY operations lock. */
+	mutex_lock(&dwc->mutex);
+	qcom->mode_pm_ref = false;
+	qcom->mode_quiesced = false;
+	if (!qcom->pm_suspended) {
+		ret = pm_runtime_resume_and_get(qcom->dev);
+		if (ret < 0) {
+			/* The failed resume left USB stopped. Resume it on UTMI. */
+			scoped_guard(mutex, &qcom->pipe_clk_lock) {
+				qcom->dp_only = true;
+				dwc->usb3_disabled = true;
+			}
+			goto unlock_role;
+		}
+		qcom->mode_pm_ref = true;
+	}
+
+	mutex_lock(&qcom->pipe_clk_lock);
+	if (qcom->mode_ready && !qcom->pm_suspended) {
+		ret = dwc3_prepare_phy_change(dwc);
+		if (ret)
+			goto unlock_pipe;
+		qcom->mode_quiesced = true;
+
+		/* Keep register access clocked while QMP resets its common block. */
+		dwc3_qcom_select_utmi_clk(qcom, true);
+	}
+
+	return 0;
+
+unlock_pipe:
+	mutex_unlock(&qcom->pipe_clk_lock);
+	if (qcom->mode_pm_ref)
+		pm_runtime_put_autosuspend(qcom->dev);
+unlock_role:
+	mutex_unlock(&dwc->mutex);
+	return ret;
+}
+
+static void dwc3_qcom_phy_mode_complete(void *data, bool usb3_available)
+{
+	struct dwc3_qcom *qcom = data;
+	struct dwc3 *dwc = &qcom->dwc;
+	int ret;
+
+	qcom->dp_only = !usb3_available;
+	dwc->usb3_disabled = qcom->ignore_pipe_clk || qcom->dp_only;
+	if (qcom->mode_quiesced) {
+		dwc3_qcom_apply_usb_mode(qcom);
+		ret = dwc3_complete_phy_change(dwc);
+		if (ret)
+			dev_err(qcom->dev, "failed to restart USB after PHY change: %d\n", ret);
+	} else if (qcom->pm_suspended && dwc->current_dr_role == DWC3_GCTL_PRTCAP_HOST) {
+		/* xHCI is already halted by system PM; re-enumerate on resume. */
+		dwc->xhci_power_lost = 1;
+	}
+
+	mutex_unlock(&qcom->pipe_clk_lock);
+	if (qcom->mode_pm_ref)
+		pm_runtime_put_autosuspend(qcom->dev);
+	mutex_unlock(&dwc->mutex);
+}
+
+static const struct qmp_combo_usb_mode_ops dwc3_qcom_usb_mode_ops = {
+	.prepare = dwc3_qcom_phy_mode_prepare,
+	.complete = dwc3_qcom_phy_mode_complete,
+};
+
+static int dwc3_qcom_register_phy_mode(struct dwc3 *dwc)
+{
+	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
+	bool usb3_available;
+	int ret;
+
+	if (dwc->num_usb3_ports != 1) {
+		dwc3_qcom_apply_usb_mode(qcom);
 		return 0;
+	}
 
-	dwc3_qcom_select_utmi_clk(qcom, qcom->dp_only);
-	pm_runtime_put_autosuspend(qcom->dev);
+	ret = qmp_combo_set_usb_mode_ops(dwc->usb3_generic_phy[0],
+					 &dwc3_qcom_usb_mode_ops, qcom, &usb3_available);
+	if (ret == -EOPNOTSUPP) {
+		dwc3_qcom_apply_usb_mode(qcom);
+		return 0;
+	}
+	if (ret)
+		return ret;
 
+	qcom->mode_registered = true;
+	qcom->dp_only = !usb3_available;
+	dwc3_qcom_apply_usb_mode(qcom);
 	return 0;
 }
 
-static int dwc3_qcom_mux_register(struct dwc3_qcom *qcom)
+static void dwc3_qcom_unregister_phy_mode(struct dwc3_qcom *qcom)
 {
-	struct typec_mux_desc desc = {};
-
-	if (!IS_ENABLED(CONFIG_TYPEC) ||
-	    !device_property_present(qcom->dev, "mode-switch"))
-		return 0;
-
-	desc.drvdata = qcom;
-	desc.fwnode = dev_fwnode(qcom->dev);
-	desc.set = dwc3_qcom_mux_set;
-
-	qcom->mux = typec_mux_register(qcom->dev, &desc);
-
-	return PTR_ERR_OR_ZERO(qcom->mux);
+	if (qcom->mode_registered) {
+		qmp_combo_set_usb_mode_ops(qcom->dwc.usb3_generic_phy[0], NULL, NULL, NULL);
+		qcom->mode_registered = false;
+	}
 }
 
 static int dwc3_qcom_request_irq(struct dwc3_qcom *qcom, int irq,
@@ -663,6 +757,7 @@ static void dwc3_qcom_run_stop_notifier(struct dwc3 *dwc, bool is_on)
 static struct dwc3_glue_ops dwc3_qcom_glue_ops = {
 	.pre_set_role	= dwc3_qcom_set_role_notifier,
 	.pre_run_stop	= dwc3_qcom_run_stop_notifier,
+	.post_phy_registration = dwc3_qcom_register_phy_mode,
 };
 
 static int dwc3_qcom_probe(struct platform_device *pdev)
@@ -737,8 +832,8 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	 */
 	qcom->ignore_pipe_clk =
 		device_property_read_bool(dev, "qcom,select-utmi-as-pipe-clk");
-	if (qcom->ignore_pipe_clk)
-		dwc3_qcom_select_utmi_clk(qcom, true);
+	/* The PHY may already be in DP-only mode before USB has probed. */
+	dwc3_qcom_select_utmi_clk(qcom, true);
 
 	qcom->mode = usb_get_dr_mode(dev);
 
@@ -756,6 +851,7 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	}
 
 	mutex_init(&qcom->pipe_clk_lock);
+	init_completion(&qcom->mode_probe_done);
 	qcom->dwc.glue_ops = &dwc3_qcom_glue_ops;
 
 	qcom->dwc.dev = dev;
@@ -764,6 +860,8 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	probe_data.ignore_clocks_and_resets = true;
 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
 	ret = dwc3_core_probe(&probe_data);
+	qcom->mode_ready = !ret;
+	complete_all(&qcom->mode_probe_done);
 	if (ret)  {
 		ret = dev_err_probe(dev, ret, "failed to register DWC3 Core\n");
 		goto clk_disable;
@@ -773,10 +871,6 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 	if (ret)
 		goto remove_core;
 
-	ret = dwc3_qcom_mux_register(qcom);
-	if (ret)
-		goto interconnect_exit;
-
 	wakeup_source = of_property_read_bool(dev->of_node, "wakeup-source");
 	device_init_wakeup(&pdev->dev, wakeup_source);
 
@@ -784,11 +878,11 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 
 	return 0;
 
-interconnect_exit:
-	dwc3_qcom_interconnect_exit(qcom);
 remove_core:
+	dwc3_qcom_unregister_phy_mode(qcom);
 	dwc3_core_remove(&qcom->dwc);
 clk_disable:
+	dwc3_qcom_unregister_phy_mode(qcom);
 	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
 
 	return ret;
@@ -799,11 +893,11 @@ static void dwc3_qcom_remove(struct platform_device *pdev)
 	struct dwc3 *dwc = platform_get_drvdata(pdev);
 	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
 
+	/* A failed resume must not leave a callback into the removed driver. */
+	dwc3_qcom_unregister_phy_mode(qcom);
 	if (pm_runtime_resume_and_get(qcom->dev) < 0)
 		return;
 
-	if (qcom->mux)
-		typec_mux_unregister(qcom->mux);
 	dwc3_core_remove(&qcom->dwc);
 	clk_bulk_disable_unprepare(qcom->num_clocks, qcom->clks);
 	dwc3_qcom_interconnect_exit(qcom);
@@ -818,18 +912,18 @@ static int dwc3_qcom_pm_suspend(struct device *dev)
 	bool wakeup = device_may_wakeup(dev);
 	int ret;
 
-	ret = dwc3_pm_suspend(&qcom->dwc);
+	guard(mutex)(&dwc->mutex);
+	guard(mutex)(&qcom->pipe_clk_lock);
+	ret = dwc3_pm_suspend(dwc);
 	if (ret)
 		return ret;
-
-	guard(mutex)(&qcom->pipe_clk_lock);
 
 	ret = dwc3_qcom_suspend(qcom, wakeup);
-	if (ret)
+	if (ret) {
+		dwc3_pm_resume(dwc);
 		return ret;
-
+	}
 	qcom->pm_suspended = true;
-
 	return 0;
 }
 
@@ -840,23 +934,17 @@ static int dwc3_qcom_pm_resume(struct device *dev)
 	bool wakeup = device_may_wakeup(dev);
 	int ret;
 
-	scoped_guard(mutex, &qcom->pipe_clk_lock) {
-		ret = dwc3_qcom_resume(qcom, wakeup);
-		if (ret)
-			return ret;
-
-		if (!qcom->ignore_pipe_clk &&
-		    qcom->dp_only != qcom->utmi_pipe_clk)
-			dwc3_qcom_select_utmi_clk(qcom, qcom->dp_only);
-
-		qcom->pm_suspended = false;
-	}
-
-	ret = dwc3_pm_resume(&qcom->dwc);
+	guard(mutex)(&dwc->mutex);
+	guard(mutex)(&qcom->pipe_clk_lock);
+	ret = dwc3_qcom_resume(qcom, wakeup);
 	if (ret)
-		return ret;
+		goto out;
 
-	return 0;
+	dwc3_qcom_apply_usb_mode(qcom);
+	ret = dwc3_pm_resume(dwc);
+out:
+	qcom->pm_suspended = false;
+	return ret;
 }
 
 static void dwc3_qcom_complete(struct device *dev)
@@ -870,6 +958,10 @@ static int dwc3_qcom_prepare(struct device *dev)
 {
 	struct dwc3 *dwc = dev_get_drvdata(dev);
 
+	/* Keep the system PM handshake even if runtime-suspended. */
+	if (to_dwc3_qcom(dwc)->mode_registered)
+		return 0;
+
 	return dwc3_pm_prepare(dwc);
 }
 
@@ -879,6 +971,7 @@ static int dwc3_qcom_runtime_suspend(struct device *dev)
 	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
 	int ret;
 
+	guard(mutex)(&qcom->pipe_clk_lock);
 	ret = dwc3_runtime_suspend(&qcom->dwc);
 	if (ret)
 		return ret;
@@ -892,10 +985,12 @@ static int dwc3_qcom_runtime_resume(struct device *dev)
 	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
 	int ret;
 
+	guard(mutex)(&qcom->pipe_clk_lock);
 	ret = dwc3_qcom_resume(qcom, true);
 	if (ret)
 		return ret;
 
+	dwc3_qcom_apply_usb_mode(qcom);
 	return dwc3_runtime_resume(&qcom->dwc);
 }
 

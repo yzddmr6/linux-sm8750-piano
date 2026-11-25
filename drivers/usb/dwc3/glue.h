@@ -80,6 +80,14 @@ int dwc3_pm_resume(struct dwc3 *dwc);
 void dwc3_pm_complete(struct dwc3 *dwc);
 int dwc3_pm_prepare(struct dwc3 *dwc);
 
+/*
+ * Quiesce an active controller around a PHY reconfiguration. The caller holds
+ * dwc->mutex and a runtime PM reference for the entire successful pair. Gadget
+ * registration survives the change; host mode is stopped before PIPE goes away.
+ */
+int dwc3_prepare_phy_change(struct dwc3 *dwc);
+int dwc3_complete_phy_change(struct dwc3 *dwc);
+
 
 /* All of the following functions must only be used with skip_core_init_mode */
 

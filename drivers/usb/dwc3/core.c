@@ -295,6 +295,66 @@ out:
 	mutex_unlock(&dwc->mutex);
 }
 
+static u32 dwc3_phy_change_role(struct dwc3 *dwc)
+{
+	if (dwc->current_dr_role != DWC3_GCTL_PRTCAP_OTG)
+		return dwc->current_dr_role;
+
+	switch (dwc->current_otg_role) {
+	case DWC3_OTG_ROLE_HOST:
+		return DWC3_GCTL_PRTCAP_HOST;
+	case DWC3_OTG_ROLE_DEVICE:
+		return DWC3_GCTL_PRTCAP_DEVICE;
+	default:
+		return 0;
+	}
+}
+
+/*
+ * The caller holds the role mutex across the pair. In device role the pair
+ * also excludes gadget pullup and error recovery until the PHY is ready.
+ */
+int dwc3_prepare_phy_change(struct dwc3 *dwc)
+{
+	int ret;
+
+	lockdep_assert_held(&dwc->mutex);
+	switch (dwc3_phy_change_role(dwc)) {
+	case DWC3_GCTL_PRTCAP_HOST:
+		if (dwc->xhci)
+			dwc3_host_exit(dwc);
+		break;
+	case DWC3_GCTL_PRTCAP_DEVICE:
+		mutex_lock(&dwc->connect_mutex);
+		ret = dwc3_gadget_prepare_phy_change(dwc);
+		if (ret)
+			dev_warn(dwc->dev, "failed to disconnect before PHY change: %d\n", ret);
+		break;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dwc3_prepare_phy_change);
+
+int dwc3_complete_phy_change(struct dwc3 *dwc)
+{
+	int ret = 0;
+
+	lockdep_assert_held(&dwc->mutex);
+	switch (dwc3_phy_change_role(dwc)) {
+	case DWC3_GCTL_PRTCAP_HOST:
+		ret = dwc3_host_init(dwc);
+		break;
+	case DWC3_GCTL_PRTCAP_DEVICE:
+		ret = dwc3_gadget_resume(dwc);
+		mutex_unlock(&dwc->connect_mutex);
+		break;
+	}
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(dwc3_complete_phy_change);
+
 static void __dwc3_queue_mode(struct dwc3 *dwc, u32 mode, enum usb_role role,
 			      bool notify_glue)
 {
@@ -1400,6 +1460,11 @@ int dwc3_core_init(struct dwc3 *dwc)
 		ret = dwc3_core_get_phy(dwc);
 		if (ret)
 			goto err_exit_ulpi;
+		if (dwc->glue_ops && dwc->glue_ops->post_phy_registration) {
+			ret = dwc->glue_ops->post_phy_registration(dwc);
+			if (ret)
+				goto err_exit_ulpi;
+		}
 		dwc->phys_ready = true;
 	}
 

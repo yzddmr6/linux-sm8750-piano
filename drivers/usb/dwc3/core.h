@@ -1003,10 +1003,12 @@ struct dwc3_scratchpad_array {
  * @pre_set_role: Notify glue of role switch notifications, called from
  *		  drd_work so that it does not run during system sleep
  * @pre_run_stop: Notify run stop enable/disable information to glue
+ * @post_phy_registration: Register PHY callbacks before the first PHY init
  */
 struct dwc3_glue_ops {
 	void	(*pre_set_role)(struct dwc3 *dwc, enum usb_role role);
 	void	(*pre_run_stop)(struct dwc3 *dwc, bool is_on);
+	int	(*post_phy_registration)(struct dwc3 *dwc);
 };
 
 /**
@@ -1032,6 +1034,7 @@ struct dwc3_glue_ops {
  * @gadget: device side representation of the peripheral controller
  * @gadget_driver: pointer to the gadget driver
  * @glue_ops: Vendor callbacks for flattened device implementations.
+ * @usb3_disabled: SuperSpeed lanes unavailable for the current connection
  * @bus_clk: clock for accessing the registers
  * @ref_clk: reference clock
  * @susp_clk: clock used when the SS phy is in low power (S3) state
@@ -1237,6 +1240,8 @@ struct dwc3 {
 	struct usb_gadget_driver *gadget_driver;
 
 	const struct dwc3_glue_ops	*glue_ops;
+	/* Dynamic lane availability; does not change the hardware capabilities. */
+	bool usb3_disabled;
 
 	struct clk		*bus_clk;
 	struct clk		*ref_clk;
@@ -1752,9 +1757,15 @@ static inline void dwc3_otg_host_init(struct dwc3 *dwc)
 
 /* power management interface */
 #if !IS_ENABLED(CONFIG_USB_DWC3_HOST)
+int dwc3_gadget_prepare_phy_change(struct dwc3 *dwc);
 int dwc3_gadget_suspend(struct dwc3 *dwc);
 int dwc3_gadget_resume(struct dwc3 *dwc);
 #else
+static inline int dwc3_gadget_prepare_phy_change(struct dwc3 *dwc)
+{
+	return 0;
+}
+
 static inline int dwc3_gadget_suspend(struct dwc3 *dwc)
 {
 	return 0;

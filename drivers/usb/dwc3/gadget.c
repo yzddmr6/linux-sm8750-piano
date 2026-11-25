@@ -2583,6 +2583,8 @@ static void __dwc3_gadget_set_speed(struct dwc3 *dwc)
 	speed = dwc->gadget_max_speed;
 	if (speed == USB_SPEED_UNKNOWN || speed > dwc->maximum_speed)
 		speed = dwc->maximum_speed;
+	if (dwc->usb3_disabled && speed > USB_SPEED_HIGH)
+		speed = USB_SPEED_HIGH;
 
 	if (speed == USB_SPEED_SUPER_PLUS &&
 	    DWC3_IP_IS(DWC32)) {
@@ -4989,6 +4991,18 @@ void dwc3_gadget_exit(struct dwc3 *dwc)
 			  dwc->ep0_trb, dwc->ep0_trb_addr);
 }
 EXPORT_SYMBOL_GPL(dwc3_gadget_exit);
+
+int dwc3_gadget_prepare_phy_change(struct dwc3 *dwc)
+{
+	int ret;
+
+	lockdep_assert_held(&dwc->connect_mutex);
+	ret = dwc3_gadget_soft_disconnect(dwc);
+	/* Reconnect after the PHY change will reset even a failed disconnect. */
+	dwc3_disconnect_gadget_sleepable(dwc);
+
+	return ret;
+}
 
 int dwc3_gadget_suspend(struct dwc3 *dwc)
 {

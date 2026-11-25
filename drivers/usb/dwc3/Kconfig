@@ -132,7 +132,7 @@ config USB_DWC3_QCOM
 	depends on ARCH_QCOM || COMPILE_TEST
 	depends on EXTCON || !EXTCON
 	depends on OF
-	depends on TYPEC || TYPEC=n
+	depends on PHY_QCOM_QMP_COMBO || !PHY_QCOM_QMP_COMBO
 	default USB_DWC3
 	help
 	  Some Qualcomm SoCs use DesignWare Core IP for USB2/3
