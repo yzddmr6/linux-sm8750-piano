@@ -153,6 +153,7 @@
 	pmic-glink {
 		compatible = "xiaomi,piano-pmic-glink", "qcom,sm8750-pmic-glink",
 			     "qcom,sm8550-pmic-glink", "qcom,pmic-glink";
+		orientation-gpios = <&tlmm 61 GPIO_ACTIVE_HIGH>;
 		xiaomi,charge-pump = <&sc8541>;
 		xiaomi,connector-cutoff-gpios = <&pm8550_gpios 9 GPIO_ACTIVE_HIGH>;
 		io-channels = <&pmk8550_vadc 0x747>, <&pmk8550_vadc 0x14b>,
@@ -2043,7 +2044,6 @@
 };
 
 &usb {
-	mode-switch;
 	dr_mode = "otg";
 	maximum-speed = "super-speed";
 	phys = <&usb_hsphy>, <&usb_dp_qmpphy QMP_USB43DP_USB3_PHY>;
