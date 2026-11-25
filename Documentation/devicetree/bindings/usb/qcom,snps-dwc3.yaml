@@ -158,8 +158,6 @@ properties:
       HS/FS/LS modes are supported.
     type: boolean
 
-  mode-switch: true
-
   wakeup-source: true
 
 required:
