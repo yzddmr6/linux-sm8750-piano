@@ -13,6 +13,7 @@ struct altmode_test_observation {
 
 struct altmode_test_ctx {
 	struct pmic_glink_altmode altmode;
+	struct pmic_glink_orientation orientation;
 	struct pmic_glink_altmode_port port;
 	struct device_node bridge_node;
 	struct drm_bridge *bridge;
@@ -102,6 +103,14 @@ static int altmode_test_ack(struct pmic_glink_altmode *altmode, u32 cmd, u32 arg
 	return 0;
 }
 
+static struct pmic_glink_orientation *
+altmode_test_orientation(struct pmic_glink_client *client, unsigned int port)
+{
+	struct altmode_test_ctx *ctx = kunit_get_current_test()->priv;
+
+	return &ctx->orientation;
+}
+
 static void altmode_test_hpd(void *data, enum drm_connector_status status)
 {
 	struct altmode_test_ctx *ctx = data;
@@ -162,6 +171,8 @@ static int altmode_test_init(struct kunit *test)
 	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ctx);
 	test->priv = ctx;
+	mutex_init(&ctx->orientation.lock);
+	kunit_activate_static_stub(test, pmic_glink_get_orientation, altmode_test_orientation);
 	/* Unattached identity node; no hardware tree is modified. */
 	of_node_init(&ctx->bridge_node);
 	ctx->bridge_node.full_name = "/kunit-pmic-glink-dp";
@@ -353,8 +364,24 @@ static void altmode_test_ack_only(struct kunit *test)
 	pan_ack = false;
 }
 
+static void altmode_test_stale_disconnect(struct kunit *test)
+{
+	struct altmode_test_ctx *ctx = test->priv;
+
+	atomic_inc(&ctx->orientation.epoch);
+	ctx->port.hpd_state = 0;
+	ctx->port.mux_ctrl = MUX_CTRL_STATE_NO_CONN;
+	pmic_glink_altmode_worker(&ctx->port.work);
+	KUNIT_EXPECT_EQ(test, ctx->switch_calls, 0U);
+	KUNIT_EXPECT_EQ(test, ctx->mux_seen.calls, 0U);
+	KUNIT_EXPECT_EQ(test, ctx->retimer_seen.calls, 0U);
+	KUNIT_EXPECT_EQ(test, ctx->hpd_calls, 0U);
+	KUNIT_EXPECT_EQ(test, ctx->ack_calls, 1U);
+}
+
 static struct kunit_case altmode_test_cases[] = {
 	KUNIT_CASE(altmode_test_ack_only),
+	KUNIT_CASE(altmode_test_stale_disconnect),
 	KUNIT_CASE_PARAM(altmode_test_dp_notification, altmode_test_pin_gen_params),
 	KUNIT_CASE(altmode_test_invalid_pins),
 	KUNIT_CASE(altmode_test_mux_error),

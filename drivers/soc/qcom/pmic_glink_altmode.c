@@ -27,7 +27,6 @@
 #include <kunit/static_stub.h>
 #endif
 
-#define PMIC_GLINK_MAX_PORTS	3
 
 #define USBC_SC8180X_NOTIFY_IND	0x13
 #define USBC_CMD_WRITE_REQ      0x15
@@ -127,6 +126,7 @@ struct pmic_glink_altmode_port {
 	u8 hpd_state;
 	u8 hpd_irq;
 	u8 mux_ctrl;
+	unsigned int orientation_epoch;
 };
 
 #define work_to_altmode(w) container_of((w), struct pmic_glink_altmode, enable_work)
@@ -415,6 +415,30 @@ static void pmic_glink_altmode_safe(struct pmic_glink_altmode *altmode,
 		dev_err(altmode->dev, "failed to setup retimer to USB: %d\n", ret);
 }
 
+static int pmic_glink_altmode_set_orientation(struct pmic_glink_altmode_port *port)
+{
+	struct pmic_glink_altmode *altmode = port->altmode;
+	struct pmic_glink_orientation *shared;
+
+	shared = pmic_glink_get_orientation(altmode->client, port->index);
+	if (!shared)
+		return -EINVAL;
+
+	guard(mutex)(&shared->lock);
+	if (!pmic_glink_orientation_sync(shared, port->orientation_epoch))
+		return -ENOTCONN;
+	pmic_glink_orientation_update(shared, port->orientation, true);
+	if (shared->gpio != TYPEC_ORIENTATION_NONE &&
+	    shared->gpio != port->orientation && !shared->warned) {
+		dev_warn(altmode->dev,
+			 "port %u: GPIO orientation %u differs from altmode %u; using altmode\n",
+			 port->index, shared->gpio, port->orientation);
+		shared->warned = true;
+	}
+
+	return typec_switch_set(port->typec_switch, port->orientation);
+}
+
 static void pmic_glink_altmode_worker(struct work_struct *work)
 {
 	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
@@ -431,7 +455,10 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 		goto out_ack;
 	}
 
-	ret = typec_switch_set(alt_port->typec_switch, alt_port->orientation);
+	ret = pmic_glink_altmode_set_orientation(alt_port);
+	/* The entire notification belongs to the old service generation. */
+	if (ret == -ENOTCONN)
+		goto out_ack;
 	if (ret)
 		dev_err(altmode->dev, "failed to set orientation: %d\n", ret);
 
@@ -534,6 +561,8 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
 	}
 
 	alt_port = &altmode->ports[port];
+	alt_port->orientation_epoch =
+		atomic_read(&pmic_glink_get_orientation(altmode->client, port)->epoch);
 	alt_port->orientation = pmic_glink_altmode_orientation(orientation);
 	alt_port->svid = svid;
 	alt_port->mode = mode;
@@ -575,6 +604,8 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
 	}
 
 	alt_port = &altmode->ports[port];
+	alt_port->orientation_epoch =
+		atomic_read(&pmic_glink_get_orientation(altmode->client, port)->epoch);
 	alt_port->orientation = pmic_glink_altmode_orientation(orientation);
 	alt_port->svid = svid;
 	alt_port->mux_ctrl = notify->mux_ctrl;

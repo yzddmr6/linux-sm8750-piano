@@ -3,6 +3,10 @@
  * Copyright (c) 2019-2020, The Linux Foundation. All rights reserved.
  * Copyright (c) 2022, Linaro Ltd
  */
+#if IS_ENABLED(CONFIG_QCOM_PMIC_GLINK_ALTMODE_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 #include <linux/auxiliary_bus.h>
 #include <linux/cleanup.h>
 #include <linux/delay.h>
@@ -64,6 +68,7 @@ struct pmic_glink {
 	unsigned int num_deferred;
 	unsigned int num_dropped;
 	struct work_struct deliver_work;
+	struct pmic_glink_orientation orientation[PMIC_GLINK_MAX_PORTS];
 };
 
 static struct pmic_glink *__pmic_glink;
@@ -89,6 +94,20 @@ struct pmic_glink_deferred_msg {
 	size_t len;
 	u8 data[] __counted_by(len);
 };
+
+struct pmic_glink_orientation *
+pmic_glink_get_orientation(struct pmic_glink_client *client, unsigned int port)
+{
+#if IS_ENABLED(CONFIG_QCOM_PMIC_GLINK_ALTMODE_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(pmic_glink_get_orientation, client, port);
+#endif
+
+	if (port >= ARRAY_SIZE(client->pg->orientation))
+		return NULL;
+
+	return &client->pg->orientation[port];
+}
+EXPORT_SYMBOL_GPL(pmic_glink_get_orientation);
 
 static void pmic_glink_client_relax(struct pmic_glink_client *client)
 {
@@ -429,6 +448,12 @@ static void pmic_glink_state_notify_clients(struct pmic_glink *pg, bool replay)
 		pmic_glink_drop_deferred(pg);
 
 	if (new_state != pg->client_state) {
+		if (new_state == SERVREG_SERVICE_STATE_DOWN) {
+			unsigned int i;
+
+			for (i = 0; i < ARRAY_SIZE(pg->orientation); i++)
+				atomic_inc(&pg->orientation[i].epoch);
+		}
 		spin_lock_irqsave(&pg->client_lock, flags);
 		list_for_each_entry(client, &pg->clients, node)
 			client->pdr_notify(client->priv, new_state);
@@ -547,6 +572,7 @@ static int pmic_glink_probe(struct platform_device *pdev)
 {
 	struct pdr_service *service;
 	struct pmic_glink *pg;
+	unsigned int i;
 	int ret;
 
 	pg = devm_kzalloc_obj(&pdev->dev, *pg);
@@ -560,6 +586,8 @@ static int pmic_glink_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&pg->clients);
 	spin_lock_init(&pg->client_lock);
 	mutex_init(&pg->state_lock);
+	for (i = 0; i < ARRAY_SIZE(pg->orientation); i++)
+		mutex_init(&pg->orientation[i].lock);
 
 	INIT_LIST_HEAD(&pg->deferred);
 	spin_lock_init(&pg->defer_lock);

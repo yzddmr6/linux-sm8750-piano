@@ -37,6 +37,16 @@ config QCOM_ABL_ROOT_IDENTITY_KUNIT_TEST
 	  missing, matching, absent and malformed values. The live tree is
 	  not modified.
 
+config QCOM_PMIC_GLINK_ORIENTATION_KUNIT_TEST
+	bool "PMIC GLINK orientation ownership tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test attach-time GPIO direction, authoritative altmode direction,
+	  disconnect and service restart using the shared orientation state.
+	  No GPIO, firmware transport or physical Type-C port is required.
+	  This option is intended for development and regression testing.
+
 config QCOM_AOSS_QMP
 	tristate "Qualcomm AOSS Driver"
 	depends on MAILBOX
