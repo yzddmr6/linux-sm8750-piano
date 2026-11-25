@@ -27,6 +27,16 @@ config TYPEC_UCSI
 
 if TYPEC_UCSI
 
+config UCSI_KUNIT_TEST
+	bool "KUnit tests for UCSI connection status" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && TYPEC_UCSI=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test status callbacks on connection rechecks, including resume
+	  and a new connection coalesced with an earlier disconnect by the
+	  PPM. The tests use a mock UCSI transport without physical Type-C
+	  hardware. This option is intended for development only.
+
 config UCSI_CCG
 	tristate "UCSI Interface Driver for Cypress CCGx"
 	depends on I2C

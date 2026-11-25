@@ -15,7 +15,6 @@
 #include <linux/soc/qcom/pmic_glink.h>
 #include "ucsi.h"
 
-#define PMIC_GLINK_MAX_PORTS		3
 
 #define UCSI_BUF_V1_SIZE		(UCSI_MESSAGE_OUT + (UCSI_MESSAGE_OUT - UCSI_MESSAGE_IN))
 #define UCSI_BUF_V2_SIZE		(UCSIv2_MESSAGE_OUT + (UCSIv2_MESSAGE_OUT - UCSI_MESSAGE_IN))
@@ -65,6 +64,7 @@ struct pmic_glink_ucsi {
 	struct device *dev;
 
 	struct gpio_desc *port_orientation[PMIC_GLINK_MAX_PORTS];
+	bool port_connected[PMIC_GLINK_MAX_PORTS];
 
 	struct pmic_glink_client *client;
 
@@ -202,29 +202,68 @@ static void pmic_glink_ucsi_update_connector(struct ucsi_connector *con)
 	    !ucsi->port_orientation[con->num - 1])
 		return;
 
+	ucsi->port_connected[con->num - 1] = false;
 	con->typec_cap.orientation_aware = true;
+}
+
+static bool pmic_glink_ucsi_new_connection(bool *connected, bool present, u16 change)
+{
+	bool attach = present && (!*connected || (change & UCSI_CONSTAT_CONNECT_CHANGE));
+
+	*connected = present;
+	return attach;
 }
 
 static void pmic_glink_ucsi_connector_status(struct ucsi_connector *con)
 {
 	struct pmic_glink_ucsi *ucsi = ucsi_get_drvdata(con->ucsi);
+	unsigned int port = con->num - 1;
+	struct pmic_glink_orientation *shared;
+	enum typec_orientation effective;
+	bool attach;
 	int orientation;
 
+	if (port >= PMIC_GLINK_MAX_PORTS)
+		return;
+
+	/* CONNECT_CHANGE also covers a disconnect/reconnect coalesced by the PPM. */
+	attach = pmic_glink_ucsi_new_connection(&ucsi->port_connected[port],
+						UCSI_CONSTAT(con, CONNECTED),
+						UCSI_CONSTAT(con, CHANGE));
+
+	shared = pmic_glink_get_orientation(ucsi->client, port);
+	if (!shared)
+		return;
+
+	guard(mutex)(&shared->lock);
+	if (!pmic_glink_orientation_sync(shared, atomic_read(&shared->epoch)))
+		return;
+
 	if (!UCSI_CONSTAT(con, CONNECTED)) {
+		pmic_glink_orientation_update(shared, TYPEC_ORIENTATION_NONE, false);
 		typec_set_orientation(con->port, TYPEC_ORIENTATION_NONE);
 		return;
 	}
 
-	if (con->num > PMIC_GLINK_MAX_PORTS ||
-	    !ucsi->port_orientation[con->num - 1])
+	/* The altmode service owns orientation once it has configured DP. */
+	if (!attach)
 		return;
 
-	orientation = gpiod_get_value(ucsi->port_orientation[con->num - 1]);
+	if (!ucsi->port_orientation[port])
+		return;
+
+	orientation = gpiod_get_value_cansleep(ucsi->port_orientation[port]);
 	if (orientation >= 0) {
-		typec_set_orientation(con->port,
-				      orientation ?
-				      TYPEC_ORIENTATION_REVERSE :
-				      TYPEC_ORIENTATION_NORMAL);
+		effective = orientation ? TYPEC_ORIENTATION_REVERSE : TYPEC_ORIENTATION_NORMAL;
+		effective = pmic_glink_orientation_update(shared, effective, false);
+		if (shared->altmode != TYPEC_ORIENTATION_NONE &&
+		    shared->altmode != shared->gpio && !shared->warned) {
+			dev_warn(ucsi->dev,
+				 "port %u: GPIO orientation %u differs from altmode %u; using altmode\n",
+				 port, shared->gpio, shared->altmode);
+			shared->warned = true;
+		}
+		typec_set_orientation(con->port, effective);
 	}
 }
 

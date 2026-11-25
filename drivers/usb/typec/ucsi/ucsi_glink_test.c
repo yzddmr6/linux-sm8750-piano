@@ -108,8 +108,28 @@ static void glink_test_registration(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, f->unregister_commands, 1);
 }
 
+static void glink_test_connection_edges(struct kunit *test)
+{
+	bool connected = false;
+	bool attach;
+
+	/* Initial status need not have a latched CONNECT_CHANGE bit. */
+	KUNIT_EXPECT_TRUE(test, pmic_glink_ucsi_new_connection(&connected, true, 0));
+	KUNIT_EXPECT_TRUE(test, connected);
+	attach = pmic_glink_ucsi_new_connection(&connected, true, UCSI_CONSTAT_POWER_DIR_CHANGE);
+	KUNIT_EXPECT_FALSE(test, attach);
+	/* The PPM may coalesce a fast unplug/replug, including across sleep. */
+	attach = pmic_glink_ucsi_new_connection(&connected, true, UCSI_CONSTAT_CONNECT_CHANGE);
+	KUNIT_EXPECT_TRUE(test, attach);
+	attach = pmic_glink_ucsi_new_connection(&connected, false, UCSI_CONSTAT_CONNECT_CHANGE);
+	KUNIT_EXPECT_FALSE(test, attach);
+	KUNIT_EXPECT_FALSE(test, connected);
+	KUNIT_EXPECT_TRUE(test, pmic_glink_ucsi_new_connection(&connected, true, 0));
+}
+
 static struct kunit_case glink_ucsi_cases[] = {
 	KUNIT_CASE(glink_test_registration),
+	KUNIT_CASE(glink_test_connection_edges),
 	{}
 };
 

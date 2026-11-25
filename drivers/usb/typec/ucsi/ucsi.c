@@ -854,6 +854,8 @@ static int ucsi_get_connector_status(struct ucsi_connector *con, bool conn_ack)
 
 	ret = ucsi_send_command_common(con->ucsi, command, &con->status, size,
 				       NULL, 0, conn_ack);
+	if (ret >= 0 && con->ucsi->ops->connector_status)
+		con->ucsi->ops->connector_status(con);
 
 	return ret < 0 ? ret : 0;
 }
@@ -1311,6 +1313,7 @@ static int ucsi_register_partner(struct ucsi_connector *con)
 
 static void ucsi_set_mode(struct ucsi_connector *con, int mode)
 {
+	/* The external owner also controls AUX routing during disconnect. */
 	if (con->ucsi->quirks & UCSI_EXTERNAL_MUX_MODE)
 		return;
 
@@ -1479,9 +1482,6 @@ static void ucsi_handle_connector_change(struct work_struct *work)
 	}
 
 	trace_ucsi_connector_change(con->num, con);
-
-	if (ucsi->ops->connector_status)
-		ucsi->ops->connector_status(con);
 
 	change = UCSI_CONSTAT(con, CHANGE);
 	role = UCSI_CONSTAT(con, PWR_DIR);
@@ -1947,9 +1947,6 @@ static int ucsi_register_port(struct ucsi *ucsi, struct ucsi_connector *con)
 		dev_err(ucsi->dev, "con%d: failed to get status\n", con->num);
 		goto out;
 	}
-
-	if (ucsi->ops->connector_status)
-		ucsi->ops->connector_status(con);
 
 	switch (UCSI_CONSTAT(con, PARTNER_TYPE)) {
 	case UCSI_CONSTAT_PARTNER_TYPE_UFP:
@@ -2465,3 +2462,7 @@ module_exit(ucsi_module_exit);
 MODULE_AUTHOR("Heikki Krogerus <heikki.krogerus@linux.intel.com>");
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("USB Type-C Connector System Software Interface driver");
+
+#if IS_ENABLED(CONFIG_UCSI_KUNIT_TEST)
+#include "ucsi_test.c"
+#endif
