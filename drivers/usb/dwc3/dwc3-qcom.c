@@ -614,8 +614,8 @@ static int dwc3_qcom_register_phy_mode(struct dwc3 *dwc)
 
 static void dwc3_qcom_unregister_phy_mode(struct dwc3_qcom *qcom)
 {
-	cancel_work_sync(&qcom->mode_work);
 	if (qcom->mode_registered) {
+		cancel_work_sync(&qcom->mode_work);
 		qmp_combo_set_usb_mode_ops(qcom->dwc.usb3_generic_phy[0], NULL, NULL, NULL);
 		qcom->mode_registered = false;
 	}
