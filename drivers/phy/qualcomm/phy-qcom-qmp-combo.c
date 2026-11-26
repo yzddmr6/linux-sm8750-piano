@@ -2635,6 +2635,8 @@ struct qmp_combo {
 	const struct qmp_combo_usb_mode_ops *usb_mode_ops;
 	void *usb_mode_data;
 	bool usb3_available;
+	bool usb3_blocked;
+	bool usb_recovery_pending;
 	int init_count;
 	bool com_enabled;
 	enum qmpphy_mode qmpphy_mode;
@@ -4624,15 +4626,17 @@ static int qmp_combo_reconfigure_phy(struct qmp_combo *qmp, enum qmpphy_mode new
 static int qmp_combo_apply_typec(struct qmp_combo *qmp, enum qmpphy_mode mode)
 {
 	bool prepared = false;
+	bool reconfigure;
 	int usb_ret = 0;
 	int ret = 0;
 
 	lockdep_assert_held(&qmp->typec_mutex);
 	scoped_guard(mutex, &qmp->phy_mutex) {
-		if (mode == qmp->qmpphy_mode &&
+		reconfigure = !(mode == qmp->qmpphy_mode &&
 		    qmp->orientation == qmp->requested_orientation &&
 		    (!qmp->init_count || qmp->com_enabled) &&
-		    (mode == QMPPHY_MODE_DP_ONLY || qmp->usb3_available)) {
+		    (mode == QMPPHY_MODE_DP_ONLY || qmp->usb3_available));
+		if (!reconfigure && !qmp->usb_recovery_pending && !qmp->usb3_blocked) {
 			qmp->mode_pending = false;
 			return 0;
 		}
@@ -4642,6 +4646,11 @@ static int qmp_combo_apply_typec(struct qmp_combo *qmp, enum qmpphy_mode mode)
 	qmp->pending_mode = mode;
 	if (qmp->usb_mode_ops) {
 		usb_ret = qmp->usb_mode_ops->prepare(qmp->usb_mode_data);
+		/* Keep both the PHY and its consumer untouched during system PM. */
+		if (usb_ret == -EAGAIN) {
+			qmp->usb_recovery_pending = true;
+			return 0;
+		}
 		prepared = !usb_ret;
 		/* Failed probe means there is no consumer to quiesce. */
 		if (usb_ret == -ENODEV)
@@ -4653,7 +4662,7 @@ static int qmp_combo_apply_typec(struct qmp_combo *qmp, enum qmpphy_mode mode)
 
 	scoped_guard(mutex, &qmp->phy_mutex) {
 		qmp->orientation = qmp->requested_orientation;
-		if (qmp->init_count)
+		if (qmp->init_count && reconfigure)
 			ret = qmp_combo_reconfigure_phy(qmp, mode);
 		else
 			qmp->qmpphy_mode = mode;
@@ -4662,6 +4671,7 @@ static int qmp_combo_apply_typec(struct qmp_combo *qmp, enum qmpphy_mode mode)
 		qmp->usb3_available = !ret && !usb_ret && mode != QMPPHY_MODE_DP_ONLY;
 		qmp->mode_pending = ret || usb_ret;
 		qmp->pending_mode = mode;
+		qmp->usb3_blocked = false;
 
 		/* Only a shared-resource failure can prevent DP from working. */
 		if (qmp->com_enabled)
@@ -4669,7 +4679,10 @@ static int qmp_combo_apply_typec(struct qmp_combo *qmp, enum qmpphy_mode mode)
 	}
 
 	if (prepared)
-		qmp->usb_mode_ops->complete(qmp->usb_mode_data, qmp->usb3_available);
+		usb_ret = qmp->usb_mode_ops->complete(qmp->usb_mode_data,
+						    qmp->usb3_available);
+	qmp->usb_recovery_pending = usb_ret != 0;
+	qmp->mode_pending |= qmp->usb_recovery_pending;
 
 	return ret;
 }
@@ -4798,7 +4811,7 @@ int qmp_combo_set_usb_mode_ops(struct phy *phy,
 	qmp->usb_mode_ops = ops;
 	qmp->usb_mode_data = data;
 	if (usb3_available)
-		*usb3_available = qmp->usb3_available;
+		*usb3_available = qmp->usb3_available && !qmp->usb3_blocked;
 
 	return 0;
 }
@@ -5234,6 +5247,36 @@ static int qmp_combo_register_clocks(struct qmp_combo *qmp, struct device_node *
 }
 
 #if IS_ENABLED(CONFIG_TYPEC)
+/* Leave DP's lanes alone, but do not train USB3 against a stale assignment. */
+static void qmp_combo_update_usb_block(struct qmp_combo *qmp)
+{
+	bool blocked = qmp->pending_mode != qmp->qmpphy_mode ||
+		       qmp->requested_orientation != qmp->orientation;
+	int ret;
+
+	if (blocked == qmp->usb3_blocked && !qmp->usb_recovery_pending)
+		return;
+	if (!qmp->usb3_available && !qmp->usb_recovery_pending) {
+		qmp->usb3_blocked = blocked;
+		return;
+	}
+	if (!qmp->usb_mode_ops) {
+		qmp->usb3_blocked = blocked;
+		return;
+	}
+
+	ret = qmp->usb_mode_ops->prepare(qmp->usb_mode_data);
+	if (ret == -EAGAIN) {
+		qmp->usb_recovery_pending = true;
+		return;
+	}
+	qmp->usb3_blocked = blocked;
+	if (!ret)
+		ret = qmp->usb_mode_ops->complete(qmp->usb_mode_data,
+					qmp->usb3_available && !blocked);
+	qmp->usb_recovery_pending = ret && ret != -ENODEV;
+}
+
 static int qmp_combo_request_mode(struct qmp_combo *qmp, enum qmpphy_mode new_mode)
 {
 	lockdep_assert_held(&qmp->typec_mutex);
@@ -5244,6 +5287,8 @@ static int qmp_combo_request_mode(struct qmp_combo *qmp, enum qmpphy_mode new_mo
 			qmp->pending_mode = new_mode;
 			qmp->mode_pending = true;
 		}
+		if (qmp->mode_pending)
+			qmp_combo_update_usb_block(qmp);
 		return 0;
 	}
 
@@ -5275,12 +5320,28 @@ static int qmp_combo_request_orientation(struct qmp_combo *qmp,
 			qmp->pending_mode = qmp->qmpphy_mode;
 			qmp->mode_pending = true;
 		}
+		qmp_combo_update_usb_block(qmp);
 		return 0;
 	}
 
 	return qmp_combo_apply_typec(qmp, qmp->mode_pending ?
 				    qmp->pending_mode : qmp->qmpphy_mode);
 }
+
+int qmp_combo_sync_usb_mode(struct phy *phy)
+{
+	struct qmp_combo *qmp;
+
+	if (!phy || phy->ops != &qmp_combo_usb_phy_ops)
+		return -EOPNOTSUPP;
+
+	qmp = phy_get_drvdata(phy);
+	guard(mutex)(&qmp->typec_mutex);
+	if (!qmp->mode_pending)
+		return 0;
+	return qmp_combo_request_mode(qmp, qmp->pending_mode);
+}
+EXPORT_SYMBOL_GPL(qmp_combo_sync_usb_mode);
 
 static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
 				      enum typec_orientation orientation)
@@ -5397,6 +5458,12 @@ static int qmp_combo_typec_register(struct qmp_combo *qmp)
 	return devm_add_action_or_reset(dev, qmp_combo_typec_mux_unregister, qmp);
 }
 #else
+int qmp_combo_sync_usb_mode(struct phy *phy)
+{
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL_GPL(qmp_combo_sync_usb_mode);
+
 static int qmp_combo_typec_register(struct qmp_combo *qmp)
 {
 	return 0;
@@ -5762,10 +5829,9 @@ static int qmp_combo_probe(struct platform_device *pdev)
 		} else {
 			dev_warn(dev, "unable to determine orientation & mode from data-lanes");
 		}
+		qmp->requested_orientation = qmp->orientation;
+		qmp->usb3_available = qmp->qmpphy_mode != QMPPHY_MODE_DP_ONLY;
 	}
-
-	qmp->requested_orientation = qmp->orientation;
-	qmp->usb3_available = qmp->qmpphy_mode != QMPPHY_MODE_DP_ONLY;
 
 	ret = drm_aux_bridge_register(dev);
 	if (ret)

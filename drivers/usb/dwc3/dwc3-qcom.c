@@ -528,11 +528,11 @@ unlock_role:
 	return ret;
 }
 
-static void dwc3_qcom_phy_mode_complete(void *data, bool usb3_available)
+static int dwc3_qcom_phy_mode_complete(void *data, bool usb3_available)
 {
 	struct dwc3_qcom *qcom = data;
 	struct dwc3 *dwc = &qcom->dwc;
-	int ret;
+	int ret = 0;
 
 	qcom->dp_only = !usb3_available;
 	dwc->usb3_disabled = qcom->ignore_pipe_clk || qcom->dp_only;
@@ -550,6 +550,7 @@ static void dwc3_qcom_phy_mode_complete(void *data, bool usb3_available)
 	if (qcom->mode_pm_ref)
 		pm_runtime_put_autosuspend(qcom->dev);
 	mutex_unlock(&dwc->mutex);
+	return ret;
 }
 
 static const struct qmp_combo_usb_mode_ops dwc3_qcom_usb_mode_ops = {

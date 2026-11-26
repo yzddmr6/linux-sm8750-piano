@@ -11,6 +11,7 @@ struct qmp_combo_test {
 	int common_error;
 	unsigned int aux_inits;
 	int prepare_error;
+	int complete_error;
 	unsigned int prepares;
 	unsigned int completes;
 	bool available;
@@ -24,12 +25,13 @@ static int qmp_combo_test_prepare(void *data)
 	return ctx->prepare_error;
 }
 
-static void qmp_combo_test_complete(void *data, bool available)
+static int qmp_combo_test_complete(void *data, bool available)
 {
 	struct qmp_combo_test *ctx = data;
 
 	ctx->completes++;
 	ctx->available = available;
+	return ctx->complete_error;
 }
 
 static const struct qmp_combo_usb_mode_ops qmp_combo_test_ops = {
@@ -304,7 +306,99 @@ static void qmp_combo_test_common_failure(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, qmp_combo_dp_power_on(&ctx->dp_phy), -EIO);
 }
 
+static void qmp_combo_test_restart_failure(struct kunit *test)
+{
+	struct qmp_combo_test *ctx = test->priv;
+	struct qmp_combo *qmp = &ctx->qmp;
+
+	/* A failed device soft-connect or host probe must survive the no-op path. */
+	ctx->complete_error = -EIO;
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, QMPPHY_MODE_USB3DP), 0);
+	KUNIT_EXPECT_TRUE(test, qmp->mode_pending);
+	ctx->complete_error = 0;
+	KUNIT_ASSERT_EQ(test, qmp_combo_request_orientation(qmp, TYPEC_ORIENTATION_NORMAL), 0);
+	KUNIT_EXPECT_EQ(test, ctx->completes, 2U);
+	KUNIT_EXPECT_FALSE(test, qmp->mode_pending);
+}
+
+static void qmp_combo_test_sleep_defers_apply(struct kunit *test)
+{
+	struct qmp_combo_test *ctx = test->priv;
+	struct qmp_combo *qmp = &ctx->qmp;
+
+	ctx->prepare_error = -EAGAIN;
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, QMPPHY_MODE_DP_ONLY), 0);
+	KUNIT_EXPECT_EQ(test, qmp->qmpphy_mode, QMPPHY_MODE_USB3_ONLY);
+	KUNIT_EXPECT_TRUE(test, qmp->mode_pending);
+	KUNIT_EXPECT_EQ(test, ctx->completes, 0U);
+	ctx->prepare_error = 0;
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, qmp->pending_mode), 0);
+	KUNIT_EXPECT_EQ(test, qmp->qmpphy_mode, QMPPHY_MODE_DP_ONLY);
+	KUNIT_EXPECT_EQ(test, ctx->completes, 1U);
+	KUNIT_EXPECT_FALSE(test, qmp->mode_pending);
+}
+
+static void qmp_combo_test_deferred_lanes_limit_usb(struct kunit *test)
+{
+	struct qmp_combo_test *ctx = test->priv;
+	struct qmp_combo *qmp = &ctx->qmp;
+
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, QMPPHY_MODE_USB3DP), 0);
+	qmp->dp_powered_on = true;
+	/* A new peer is opposite to the DP lanes still owned by the old peer. */
+	KUNIT_ASSERT_EQ(test, qmp_combo_request_orientation(qmp, TYPEC_ORIENTATION_REVERSE), 0);
+	KUNIT_EXPECT_FALSE(test, ctx->available);
+	KUNIT_EXPECT_EQ(test, qmp->orientation, TYPEC_ORIENTATION_NORMAL);
+	KUNIT_EXPECT_EQ(test, qmp->qmpphy_mode, QMPPHY_MODE_USB3DP);
+	KUNIT_EXPECT_EQ(test, ctx->completes, 2U);
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, QMPPHY_MODE_USB3_ONLY), 0);
+	KUNIT_EXPECT_FALSE(test, ctx->available);
+	KUNIT_EXPECT_EQ(test, ctx->completes, 2U);
+	KUNIT_ASSERT_EQ(test, qmp_combo_dp_power_off(&ctx->dp_phy), 0);
+	KUNIT_EXPECT_TRUE(test, ctx->available);
+	KUNIT_EXPECT_EQ(test, qmp->orientation, TYPEC_ORIENTATION_REVERSE);
+	KUNIT_EXPECT_EQ(test, qmp->qmpphy_mode, QMPPHY_MODE_USB3_ONLY);
+	KUNIT_EXPECT_EQ(test, ctx->completes, 3U);
+}
+
+static void qmp_combo_test_sleep_cancel(struct kunit *test)
+{
+	struct qmp_combo_test *ctx = test->priv;
+	struct qmp_combo *qmp = &ctx->qmp;
+
+	ctx->prepare_error = -EAGAIN;
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, QMPPHY_MODE_DP_ONLY), 0);
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, QMPPHY_MODE_USB3_ONLY), 0);
+	KUNIT_EXPECT_TRUE(test, qmp->mode_pending);
+	ctx->prepare_error = 0;
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, qmp->pending_mode), 0);
+	/* Restore the consumer's PIPE even though the PHY itself never changed. */
+	KUNIT_EXPECT_EQ(test, ctx->completes, 1U);
+	KUNIT_EXPECT_TRUE(test, ctx->available);
+	KUNIT_EXPECT_FALSE(test, qmp->mode_pending);
+}
+
+static void qmp_combo_test_deferred_cancel(struct kunit *test)
+{
+	struct qmp_combo_test *ctx = test->priv;
+	struct qmp_combo *qmp = &ctx->qmp;
+
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, QMPPHY_MODE_USB3DP), 0);
+	qmp->dp_powered_on = true;
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, QMPPHY_MODE_DP_ONLY), 0);
+	KUNIT_EXPECT_FALSE(test, ctx->available);
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, QMPPHY_MODE_USB3DP), 0);
+	KUNIT_EXPECT_TRUE(test, ctx->available);
+	KUNIT_EXPECT_EQ(test, qmp->qmpphy_mode, QMPPHY_MODE_USB3DP);
+	KUNIT_EXPECT_TRUE(test, qmp->dp_powered_on);
+}
+
 static struct kunit_case qmp_combo_test_cases[] = {
+	KUNIT_CASE(qmp_combo_test_restart_failure),
+	KUNIT_CASE(qmp_combo_test_sleep_defers_apply),
+	KUNIT_CASE(qmp_combo_test_sleep_cancel),
+	KUNIT_CASE(qmp_combo_test_deferred_lanes_limit_usb),
+	KUNIT_CASE(qmp_combo_test_deferred_cancel),
 	KUNIT_CASE(qmp_combo_test_dp_to_usb),
 	KUNIT_CASE(qmp_combo_test_latest_request),
 	KUNIT_CASE(qmp_combo_test_prepare_failure),
