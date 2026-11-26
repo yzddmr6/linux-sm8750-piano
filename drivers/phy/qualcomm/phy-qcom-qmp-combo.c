@@ -5271,10 +5271,12 @@ static void qmp_combo_update_usb_block(struct qmp_combo *qmp)
 		return;
 	}
 	qmp->usb3_blocked = blocked;
-	if (!ret)
+	if (ret == -ENODEV)
+		ret = 0;
+	else if (!ret)
 		ret = qmp->usb_mode_ops->complete(qmp->usb_mode_data,
 					qmp->usb3_available && !blocked);
-	qmp->usb_recovery_pending = ret && ret != -ENODEV;
+	qmp->usb_recovery_pending = ret != 0;
 }
 
 static int qmp_combo_request_mode(struct qmp_combo *qmp, enum qmpphy_mode new_mode)

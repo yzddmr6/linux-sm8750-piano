@@ -393,12 +393,32 @@ static void qmp_combo_test_deferred_cancel(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, qmp->dp_powered_on);
 }
 
+static void qmp_combo_test_deferred_restart_failure(struct kunit *test)
+{
+	struct qmp_combo_test *ctx = test->priv;
+	struct qmp_combo *qmp = &ctx->qmp;
+
+	KUNIT_ASSERT_EQ(test, qmp_combo_test_request(qmp, QMPPHY_MODE_USB3DP), 0);
+	qmp->dp_powered_on = true;
+	/* An unbound replacement host returns -ENODEV from complete, not prepare. */
+	ctx->complete_error = -ENODEV;
+	KUNIT_ASSERT_EQ(test, qmp_combo_request_orientation(qmp, TYPEC_ORIENTATION_REVERSE), 0);
+	KUNIT_EXPECT_EQ(test, ctx->completes, 2U);
+	ctx->complete_error = 0;
+	KUNIT_ASSERT_EQ(test, qmp_combo_request_orientation(qmp, TYPEC_ORIENTATION_REVERSE), 0);
+	KUNIT_EXPECT_EQ(test, ctx->completes, 3U);
+	KUNIT_EXPECT_FALSE(test, ctx->available);
+	KUNIT_ASSERT_EQ(test, qmp_combo_dp_power_off(&ctx->dp_phy), 0);
+	KUNIT_EXPECT_TRUE(test, ctx->available);
+}
+
 static struct kunit_case qmp_combo_test_cases[] = {
 	KUNIT_CASE(qmp_combo_test_restart_failure),
 	KUNIT_CASE(qmp_combo_test_sleep_defers_apply),
 	KUNIT_CASE(qmp_combo_test_sleep_cancel),
 	KUNIT_CASE(qmp_combo_test_deferred_lanes_limit_usb),
 	KUNIT_CASE(qmp_combo_test_deferred_cancel),
+	KUNIT_CASE(qmp_combo_test_deferred_restart_failure),
 	KUNIT_CASE(qmp_combo_test_dp_to_usb),
 	KUNIT_CASE(qmp_combo_test_latest_request),
 	KUNIT_CASE(qmp_combo_test_prepare_failure),
