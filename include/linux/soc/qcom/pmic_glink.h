@@ -24,6 +24,14 @@ struct pmic_glink_orientation {
 	unsigned int observed_epoch;
 };
 
+/* Caller holds lock. Leave PDR epochs alone so disconnect HPD is still delivered. */
+static inline void pmic_glink_orientation_disconnect(struct pmic_glink_orientation *state)
+{
+	state->gpio = TYPEC_ORIENTATION_NONE;
+	state->altmode = TYPEC_ORIENTATION_NONE;
+	state->warned = false;
+}
+
 /* Caller holds lock; a queued notification from before PDR must not win. */
 static inline bool
 pmic_glink_orientation_sync(struct pmic_glink_orientation *state, unsigned int epoch)

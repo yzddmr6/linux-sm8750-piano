@@ -110,24 +110,59 @@ static void glink_test_registration(struct kunit *test)
 
 static void glink_test_connection_edges(struct kunit *test)
 {
+	struct pmic_glink_orientation shared = {};
 	bool connected = false;
 	bool attach;
 
 	/* Initial status need not have a latched CONNECT_CHANGE bit. */
-	KUNIT_EXPECT_TRUE(test, pmic_glink_ucsi_new_connection(&connected, true, 0));
+	KUNIT_EXPECT_TRUE(test, pmic_glink_ucsi_new_connection(&connected, true, 0, &shared));
 	KUNIT_EXPECT_TRUE(test, connected);
-	attach = pmic_glink_ucsi_new_connection(&connected, true, UCSI_CONSTAT_POWER_DIR_CHANGE);
+	attach = pmic_glink_ucsi_new_connection(&connected, true,
+						UCSI_CONSTAT_POWER_DIR_CHANGE, &shared);
 	KUNIT_EXPECT_FALSE(test, attach);
 	/* The PPM may coalesce a fast unplug/replug, including across sleep. */
-	attach = pmic_glink_ucsi_new_connection(&connected, true, UCSI_CONSTAT_CONNECT_CHANGE);
+	attach = pmic_glink_ucsi_new_connection(&connected, true,
+						UCSI_CONSTAT_CONNECT_CHANGE, &shared);
 	KUNIT_EXPECT_TRUE(test, attach);
-	attach = pmic_glink_ucsi_new_connection(&connected, false, UCSI_CONSTAT_CONNECT_CHANGE);
+	attach = pmic_glink_ucsi_new_connection(&connected, false,
+						UCSI_CONSTAT_CONNECT_CHANGE, &shared);
 	KUNIT_EXPECT_FALSE(test, attach);
 	KUNIT_EXPECT_FALSE(test, connected);
-	KUNIT_EXPECT_TRUE(test, pmic_glink_ucsi_new_connection(&connected, true, 0));
+	KUNIT_EXPECT_TRUE(test, pmic_glink_ucsi_new_connection(&connected, true, 0, &shared));
+}
+
+static void glink_test_coalesced_orientation(struct kunit *test)
+{
+	struct pmic_glink_orientation shared = {};
+	bool connected = true;
+	bool attach;
+	enum typec_orientation effective;
+
+	pmic_glink_orientation_update(&shared, TYPEC_ORIENTATION_REVERSE, true);
+	attach = pmic_glink_ucsi_new_connection(&connected, true,
+						UCSI_CONSTAT_CONNECT_CHANGE, &shared);
+	KUNIT_ASSERT_TRUE(test, attach);
+	effective = pmic_glink_orientation_update(&shared, TYPEC_ORIENTATION_NORMAL, false);
+	KUNIT_EXPECT_EQ(test, effective, TYPEC_ORIENTATION_NORMAL);
+	/* A legitimate queued DP disconnect must still reach the HPD consumer. */
+	KUNIT_EXPECT_TRUE(test, pmic_glink_orientation_sync(&shared, 0));
+	/* The new peer's altmode notification can take ownership again. */
+	effective = pmic_glink_orientation_update(&shared, TYPEC_ORIENTATION_REVERSE, true);
+	KUNIT_EXPECT_EQ(test, effective, TYPEC_ORIENTATION_REVERSE);
+	attach = pmic_glink_ucsi_new_connection(&connected, false,
+						UCSI_CONSTAT_CONNECT_CHANGE, &shared);
+	KUNIT_EXPECT_FALSE(test, attach);
+	KUNIT_EXPECT_EQ(test, shared.altmode, TYPEC_ORIENTATION_NONE);
+	KUNIT_EXPECT_TRUE(test, pmic_glink_orientation_sync(&shared, 0));
+	/* Also discard cached altmode if UCSI missed the previous attachment. */
+	pmic_glink_orientation_update(&shared, TYPEC_ORIENTATION_REVERSE, true);
+	attach = pmic_glink_ucsi_new_connection(&connected, false, 0, &shared);
+	KUNIT_EXPECT_FALSE(test, attach);
+	KUNIT_EXPECT_EQ(test, shared.altmode, TYPEC_ORIENTATION_NONE);
 }
 
 static struct kunit_case glink_ucsi_cases[] = {
+	KUNIT_CASE(glink_test_coalesced_orientation),
 	KUNIT_CASE(glink_test_registration),
 	KUNIT_CASE(glink_test_connection_edges),
 	{}

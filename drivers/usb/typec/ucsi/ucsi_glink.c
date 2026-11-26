@@ -206,10 +206,13 @@ static void pmic_glink_ucsi_update_connector(struct ucsi_connector *con)
 	con->typec_cap.orientation_aware = true;
 }
 
-static bool pmic_glink_ucsi_new_connection(bool *connected, bool present, u16 change)
+static bool pmic_glink_ucsi_new_connection(bool *connected, bool present, u16 change,
+					   struct pmic_glink_orientation *shared)
 {
 	bool attach = present && (!*connected || (change & UCSI_CONSTAT_CONNECT_CHANGE));
 
+	if (!present || (*connected && (change & UCSI_CONSTAT_CONNECT_CHANGE)))
+		pmic_glink_orientation_disconnect(shared);
 	*connected = present;
 	return attach;
 }
@@ -226,11 +229,6 @@ static void pmic_glink_ucsi_connector_status(struct ucsi_connector *con)
 	if (port >= PMIC_GLINK_MAX_PORTS)
 		return;
 
-	/* CONNECT_CHANGE also covers a disconnect/reconnect coalesced by the PPM. */
-	attach = pmic_glink_ucsi_new_connection(&ucsi->port_connected[port],
-						UCSI_CONSTAT(con, CONNECTED),
-						UCSI_CONSTAT(con, CHANGE));
-
 	shared = pmic_glink_get_orientation(ucsi->client, port);
 	if (!shared)
 		return;
@@ -238,6 +236,11 @@ static void pmic_glink_ucsi_connector_status(struct ucsi_connector *con)
 	guard(mutex)(&shared->lock);
 	if (!pmic_glink_orientation_sync(shared, atomic_read(&shared->epoch)))
 		return;
+
+	/* CONNECT_CHANGE also covers a disconnect/reconnect coalesced by the PPM. */
+	attach = pmic_glink_ucsi_new_connection(&ucsi->port_connected[port],
+						UCSI_CONSTAT(con, CONNECTED),
+						UCSI_CONSTAT(con, CHANGE), shared);
 
 	if (!UCSI_CONSTAT(con, CONNECTED)) {
 		pmic_glink_orientation_update(shared, TYPEC_ORIENTATION_NONE, false);
