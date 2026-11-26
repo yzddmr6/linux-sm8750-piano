@@ -161,7 +161,7 @@
 			      <&pmk8550_vadc 0x146>, <&pmk8550_vadc 0x144>;
 		io-channel-names = "connector", "connector2", "quiet", "charger", "wifi", "cpu";
 
-		pinctrl-0 = <&connector_cutoff_default>;
+		pinctrl-0 = <&usb_orientation_default &connector_cutoff_default>;
 		pinctrl-names = "default";
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -1809,6 +1809,14 @@
 
 &tlmm {
 	gpio-reserved-ranges = <36 4>, <48 4>, <74 1>;
+
+	usb_orientation_default: usb-orientation-default-state {
+		pins = "gpio61";
+		function = "gpio";
+		drive-strength = <2>;
+		bias-pull-down;
+		output-disable;
+	};
 
 	/* The pen transmitter of the dock: its interrupt, the switch of the
 	 * transmitter, its low power control and the two Hall sensors.
