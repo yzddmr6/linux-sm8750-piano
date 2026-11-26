@@ -86,6 +86,8 @@ struct dwc3_qcom {
 	enum usb_dr_mode	mode;
 	bool			is_suspended;
 	bool			pm_suspended;
+	bool			pm_transition;
+	struct work_struct	mode_work;
 	bool			ignore_pipe_clk;
 	bool			dp_only;
 	bool			utmi_pipe_clk;
@@ -241,7 +243,9 @@ static void dwc3_qcom_interconnect_exit(struct dwc3_qcom *qcom)
 /* Only usable in contexts where the role can not change. */
 static bool dwc3_qcom_is_host(struct dwc3_qcom *qcom)
 {
-	return qcom->dwc.xhci;
+	struct platform_device *xhci = qcom->dwc.xhci;
+
+	return xhci && device_is_bound(&xhci->dev) && platform_get_drvdata(xhci);
 }
 
 static enum usb_device_speed dwc3_qcom_read_usb2_speed(struct dwc3_qcom *qcom, int port_index)
@@ -253,7 +257,11 @@ static enum usb_device_speed dwc3_qcom_read_usb2_speed(struct dwc3_qcom *qcom, i
 	/*
 	 * FIXME: Fix this layering violation.
 	 */
+	if (!dwc->xhci)
+		return USB_SPEED_UNKNOWN;
 	hcd = platform_get_drvdata(dwc->xhci);
+	if (!hcd || !hcd->self.root_hub)
+		return USB_SPEED_UNKNOWN;
 
 #ifdef CONFIG_USB
 	udev = usb_hub_find_child(hcd->self.root_hub, port_index + 1);
@@ -491,6 +499,15 @@ static int dwc3_qcom_phy_mode_prepare(void *data)
 
 	/* QMP holds only its Type-C lock, never its PHY operations lock. */
 	mutex_lock(&dwc->mutex);
+	if (qcom->pm_transition || qcom->pm_suspended) {
+		/* Resume on HS until the pending lane assignment is applied. */
+		scoped_guard(mutex, &qcom->pipe_clk_lock) {
+			qcom->dp_only = true;
+			dwc->usb3_disabled = true;
+		}
+		mutex_unlock(&dwc->mutex);
+		return -EAGAIN;
+	}
 	qcom->mode_pm_ref = false;
 	qcom->mode_quiesced = false;
 	if (!qcom->pm_suspended) {
@@ -501,6 +518,9 @@ static int dwc3_qcom_phy_mode_prepare(void *data)
 				qcom->dp_only = true;
 				dwc->usb3_disabled = true;
 			}
+			/* -EAGAIN is reserved for the system-PM deferral above. */
+			if (ret == -EAGAIN)
+				ret = -EIO;
 			goto unlock_role;
 		}
 		qcom->mode_pm_ref = true;
@@ -541,9 +561,6 @@ static int dwc3_qcom_phy_mode_complete(void *data, bool usb3_available)
 		ret = dwc3_complete_phy_change(dwc);
 		if (ret)
 			dev_err(qcom->dev, "failed to restart USB after PHY change: %d\n", ret);
-	} else if (qcom->pm_suspended && dwc->current_dr_role == DWC3_GCTL_PRTCAP_HOST) {
-		/* xHCI is already halted by system PM; re-enumerate on resume. */
-		dwc->xhci_power_lost = 1;
 	}
 
 	mutex_unlock(&qcom->pipe_clk_lock);
@@ -551,6 +568,17 @@ static int dwc3_qcom_phy_mode_complete(void *data, bool usb3_available)
 		pm_runtime_put_autosuspend(qcom->dev);
 	mutex_unlock(&dwc->mutex);
 	return ret;
+}
+
+static void dwc3_qcom_sync_phy_mode(struct work_struct *work)
+{
+	struct dwc3_qcom *qcom = container_of(work, struct dwc3_qcom, mode_work);
+	int ret;
+
+	/* The freezable queue runs after dpm_complete() unblocks device probing. */
+	ret = qmp_combo_sync_usb_mode(qcom->dwc.usb3_generic_phy[0]);
+	if (ret)
+		dev_err(qcom->dev, "failed to apply deferred PHY mode: %d\n", ret);
 }
 
 static const struct qmp_combo_usb_mode_ops dwc3_qcom_usb_mode_ops = {
@@ -586,6 +614,7 @@ static int dwc3_qcom_register_phy_mode(struct dwc3 *dwc)
 
 static void dwc3_qcom_unregister_phy_mode(struct dwc3_qcom *qcom)
 {
+	cancel_work_sync(&qcom->mode_work);
 	if (qcom->mode_registered) {
 		qmp_combo_set_usb_mode_ops(qcom->dwc.usb3_generic_phy[0], NULL, NULL, NULL);
 		qcom->mode_registered = false;
@@ -853,6 +882,7 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
 
 	mutex_init(&qcom->pipe_clk_lock);
 	init_completion(&qcom->mode_probe_done);
+	INIT_WORK(&qcom->mode_work, dwc3_qcom_sync_phy_mode);
 	qcom->dwc.glue_ops = &dwc3_qcom_glue_ops;
 
 	qcom->dwc.dev = dev;
@@ -951,17 +981,26 @@ out:
 static void dwc3_qcom_complete(struct device *dev)
 {
 	struct dwc3 *dwc = dev_get_drvdata(dev);
+	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
 
+	guard(mutex)(&dwc->mutex);
 	dwc3_pm_complete(dwc);
+	qcom->pm_transition = false;
+	if (qcom->mode_registered)
+		queue_work(system_freezable_wq, &qcom->mode_work);
 }
 
 static int dwc3_qcom_prepare(struct device *dev)
 {
 	struct dwc3 *dwc = dev_get_drvdata(dev);
+	struct dwc3_qcom *qcom = to_dwc3_qcom(dwc);
 
 	/* Keep the system PM handshake even if runtime-suspended. */
-	if (to_dwc3_qcom(dwc)->mode_registered)
+	if (qcom->mode_registered) {
+		guard(mutex)(&dwc->mutex);
+		qcom->pm_transition = true;
 		return 0;
+	}
 
 	return dwc3_pm_prepare(dwc);
 }
@@ -1029,3 +1068,7 @@ module_platform_driver(dwc3_qcom_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("DesignWare DWC3 QCOM Glue Driver");
+
+#if IS_ENABLED(CONFIG_USB_DWC3_QCOM_KUNIT_TEST)
+#include "dwc3-qcom-test.c"
+#endif

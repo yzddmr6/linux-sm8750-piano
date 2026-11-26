@@ -8,6 +8,10 @@
  *	    Sebastian Andrzej Siewior <bigeasy@linutronix.de>
  */
 
+#if IS_ENABLED(CONFIG_USB_DWC3_QCOM_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 #include <linux/kernel.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
@@ -4996,6 +5000,10 @@ int dwc3_gadget_prepare_phy_change(struct dwc3 *dwc)
 {
 	int ret;
 
+#if IS_ENABLED(CONFIG_USB_DWC3_QCOM_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(dwc3_gadget_prepare_phy_change, dwc);
+#endif
+
 	lockdep_assert_held(&dwc->connect_mutex);
 	ret = dwc3_gadget_soft_disconnect(dwc);
 	/* Reconnect after the PHY change will reset even a failed disconnect. */
@@ -5026,6 +5034,10 @@ int dwc3_gadget_suspend(struct dwc3 *dwc)
 
 int dwc3_gadget_resume(struct dwc3 *dwc)
 {
+#if IS_ENABLED(CONFIG_USB_DWC3_QCOM_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(dwc3_gadget_resume, dwc);
+#endif
+
 	if (!dwc->gadget_driver || !dwc->softconnect)
 		return 0;
 

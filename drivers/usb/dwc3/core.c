@@ -344,6 +344,12 @@ int dwc3_complete_phy_change(struct dwc3 *dwc)
 	switch (dwc3_phy_change_role(dwc)) {
 	case DWC3_GCTL_PRTCAP_HOST:
 		ret = dwc3_host_init(dwc);
+		/* Registration can succeed even when xHCI's probe fails or defers. */
+		if (!ret && (!device_is_bound(&dwc->xhci->dev) ||
+			     !platform_get_drvdata(dwc->xhci)))
+			ret = -ENODEV;
+		if (ret)
+			dwc3_host_exit(dwc);
 		break;
 	case DWC3_GCTL_PRTCAP_DEVICE:
 		ret = dwc3_gadget_resume(dwc);

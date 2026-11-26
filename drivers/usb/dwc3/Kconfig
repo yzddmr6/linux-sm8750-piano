@@ -141,6 +141,16 @@ config USB_DWC3_QCOM
 	  for peripheral mode support.
 	  Say 'Y' or 'M' if you have one such device.
 
+config USB_DWC3_QCOM_KUNIT_TEST
+	bool "Qualcomm DWC3 PHY transition tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && USB_DWC3_QCOM=y && USB_DWC3_DUAL_ROLE && PM_SLEEP
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise PHY transitions across system sleep and failed USB role
+	  restarts, including an xHCI device whose probe has not completed.
+	  Hardware-facing role operations are replaced with test doubles;
+	  the controller and PHY transition paths run unchanged.
+
 config USB_DWC3_IMX8MP
 	tristate "NXP iMX8MP Platform"
 	depends on OF && COMMON_CLK

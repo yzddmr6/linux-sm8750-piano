@@ -7,6 +7,10 @@
  * Authors: Felipe Balbi <balbi@ti.com>,
  */
 
+#if IS_ENABLED(CONFIG_USB_DWC3_QCOM_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 #include <linux/irq.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -144,6 +148,10 @@ int dwc3_host_init(struct dwc3 *dwc)
 	int			ret, irq;
 	int			prop_idx = 0;
 
+#if IS_ENABLED(CONFIG_USB_DWC3_QCOM_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(dwc3_host_init, dwc);
+#endif
+
 	/*
 	 * Some platforms need to power off all Root hub ports immediately after DWC3 set to host
 	 * mode to avoid VBUS glitch happen when xhci get reset later.
@@ -235,6 +243,10 @@ EXPORT_SYMBOL_GPL(dwc3_host_init);
 
 void dwc3_host_exit(struct dwc3 *dwc)
 {
+#if IS_ENABLED(CONFIG_USB_DWC3_QCOM_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(dwc3_host_exit, dwc);
+#endif
+
 	if (!dwc->xhci)
 		return;
 
